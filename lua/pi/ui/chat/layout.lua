@@ -5,6 +5,8 @@
 ---@field _history_win integer?
 ---@field _prompt_win integer?
 ---@field _attachments_win integer?
+---@field _tab integer? Tab the side windows live in (captured on show)
+---@field _winclosed_autocmd integer WinClosed handler id (for teardown/tests)
 ---@field _history pi.ChatHistory
 ---@field _prompt pi.ChatPrompt
 ---@field _attachments pi.ChatAttachments
@@ -128,6 +130,7 @@ function Layout.new(mode, history, prompt, attachments)
     self._history_win = nil
     self._prompt_win = nil
     self._attachments_win = nil
+    self._tab = nil
     self._history = history
     self._prompt = prompt
     self._attachments = attachments
@@ -138,7 +141,85 @@ function Layout.new(mode, history, prompt, attachments)
         self:_refresh_attachments()
     end)
 
+    -- After any window closes in this layout's tab, re-normalize the side
+    -- column heights (issue #31): closing a full-width window (e.g.
+    -- toggleterm's horizontal terminal, `botright split`) re-distributes the
+    -- freed height to the bottom window of each column frame, ignoring
+    -- 'winfixheight', so the prompt balloons and history stays compressed
+    -- until the next text change. WinClosed fires only when the window count
+    -- decreases — never on manual <C-w>+/drag — so user-adjusted heights are
+    -- preserved. The callback self-guards (tab, mode, π's own windows).
+    self._winclosed_autocmd = vim.api.nvim_create_autocmd("WinClosed", {
+        desc = "pi: re-normalize side column heights after a window closes",
+        callback = function(ev)
+            -- WinClosed's event table carries the closed window id only as
+            -- <afile> (a string), unlike WinNew/WinEnter which set ev.win.
+            -- The current tab at event time is the tab the window lived in.
+            self:_on_win_closed(tonumber(ev.file), vim.api.nvim_get_current_tabpage())
+        end,
+    })
+
     return self
+end
+
+--- Handle WinClosed: re-normalize the side column heights after an external
+--- window in the layout's tab closes.
+---@param closed_win integer? closed window id (nil when the event table is odd)
+---@param closed_tab integer tab the closed window lived in
+function Layout:_on_win_closed(closed_win, closed_tab)
+    -- The event-time tab is authoritative: the closed window lived there, and
+    -- by the time the deferred normalize runs the current tab may have moved.
+    if self._tab and closed_tab ~= self._tab then
+        return -- a window closed in another tab; this layout's column is untouched
+    end
+    if self._mode ~= "side" then
+        return -- floats are independent of the frame tree
+    end
+    -- π's own windows close through hide()/set_mode() (nvim_win_close keeps
+    -- the ids in _*_win until the fields are cleared afterwards), and a user
+    -- closing a π window externally leaves a broken layout normalize must not
+    -- fight. Both cases match the raw fields here; a nil closed_win (unexpected
+    -- event table) also lands in this branch and is a safe early return.
+    if closed_win == self._history_win or closed_win == self._prompt_win or closed_win == self._attachments_win then
+        return
+    end
+    -- Defer: WinClosed fires before the closed window's height is handed back
+    -- to the frame tree, so an immediate normalize would be overwritten by
+    -- the redistribution (issue #31). Run once the event loop settles.
+    vim.schedule(function()
+        if self._tab ~= closed_tab then
+            return -- the layout moved tabs while the callback was pending
+        end
+        if self._mode ~= "side" then
+            return
+        end
+        if not self:history_win() or not self:prompt_win() then
+            return -- layout hidden or torn down before the deferred normalize ran
+        end
+        self:_normalize_side_heights()
+    end)
+end
+
+--- Re-normalize the side column heights: let history take the full column
+--- height, then pin the prompt (and attachments) back to their content
+--- heights. Mirrors the height-fixing tail of _refresh_attachments;
+--- idempotent when the column is already correct.
+function Layout:_normalize_side_heights()
+    local hwin = self:history_win()
+    local pwin = self:prompt_win()
+    if not hwin or not pwin then
+        return
+    end
+    -- Capture the attachments height before wincmd _ shrinks it.
+    local awin = self:attachments_win()
+    local target_attachments_height = awin and vim.api.nvim_win_get_height(awin) or 0
+    vim.api.nvim_win_call(hwin, function()
+        vim.cmd("wincmd _")
+    end)
+    vim.api.nvim_win_set_height(pwin, self._prompt:content_height())
+    if awin and target_attachments_height > 0 then
+        vim.api.nvim_win_set_height(awin, target_attachments_height)
+    end
 end
 
 ---@param after_win integer
@@ -534,6 +615,7 @@ function Layout:show()
     if self._history_win and vim.api.nvim_win_is_valid(self._history_win) then
         return false
     end
+    self._tab = vim.api.nvim_get_current_tabpage()
     if self._mode == "float" then
         self:_open_in_float_layout()
     else
