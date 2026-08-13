@@ -245,7 +245,7 @@ require("pi").setup({
 | `:PiTree` | Navigate the session tree: jump back to any past conversation point |
 | `:PiSessions` | Toggle the live sessions overview (all active sessions: name + busy/idle/attention) |
 | `:PiSessionStats` | Show the session stats dashboard: messages, tokens (with cache split), per-model cost breakdown, cache re-billed waste, context usage |
-| `:PiDiff` | Review the git diff of every file changed by the current session in one panel: file list + diff |
+| `:PiDiff` | Review the git diff of every file changed by the current session in one panel: file list + diff, grouped per git work tree |
 | `:PiToggleStartupDetails` | Toggle the startup block between compact and expanded |
 | `:PiToggleThinking` | Show or hide thinking blocks |
 | `:PiCycleThinking` | Cycle to the next thinking level |

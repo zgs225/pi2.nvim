@@ -214,6 +214,7 @@ local function set_defaults()
     vim.api.nvim_set_hl(0, "PiSessionsListFloatTitle", { default = true, fg = title.fg, bold = true })
     vim.api.nvim_set_hl(0, "PiDiffReviewFile", { default = true, fg = title.fg, bold = true })
     vim.api.nvim_set_hl(0, "PiDiffReviewHint", { default = true, fg = comment.fg, italic = true })
+    vim.api.nvim_set_hl(0, "PiDiffReviewWorktree", { default = true, fg = title.fg, bold = true, italic = true })
     vim.api.nvim_set_hl(0, "PiDiffReviewFloatTitle", { default = true, fg = title.fg, bold = true })
 end
 

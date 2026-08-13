@@ -35,17 +35,31 @@ local current_idx = 1
 local skipped_outside = 0
 ---@type table<integer, { path: string, line: integer }> jump target per float buffer line
 local jump_targets = {}
+---@type pi.DiffReviewGroup[] ordered groups (display order)
+local groups = {}
+---@type table<string, string> work tree root -> display label
+local toplevel_branch = {}
+---@type table<integer, { group: integer, section: integer? }> list row (1-based) -> entry; header rows point at their group's first section
+local row_entries = {}
 
 --- Forward-declared (defined in the Jump section): <CR>/o handlers.
 local jump_to_target
 local list_jump
 
 ---@class pi.DiffReviewSection
----@field path string Display path (relative to the repo/cwd).
+---@field path string Display path (relative to the work tree root).
 ---@field abs string Absolute path used for jumping.
+---@field toplevel string Work tree root the file lives in.
 ---@field deleted boolean Whether the file was deleted (no jump target).
 ---@field status "A"|"M"|"D" File status shown in the list (added/modified/deleted).
 ---@field body string[] Diff body lines (everything after the `diff --git` header).
+
+---@class pi.DiffReviewGroup
+---@field toplevel string Work tree root.
+---@field branch string Display label (branch name, short HEAD, or toplevel basename).
+---@field rel_files string[] Changed-file paths relative to the work tree root.
+---@field abs_files string[] Absolute changed-file paths.
+---@field sections integer[] Indices into the flat `sections` list (1-based).
 
 --- Diff context (lines of surrounding context per hunk). Mirrors the
 --- pre-execution diff review: `'diffopt' context:` wins, default 6.
@@ -150,6 +164,57 @@ function M.compute_hunk_lines(body)
     return out
 end
 
+--- Resolve session-relative changed-file paths to absolute, anchored at the
+--- session's working directory (the cwd the pi process inherited at spawn).
+--- Symlinks are resolved so the result can be prefix-matched against the
+--- canonical work tree root `git rev-parse` returns.
+---@param files string[] raw paths from changed_files
+---@param base string session cwd
+---@return string[]
+local function resolve_abs_paths(files, base)
+    local out = {}
+    for _, f in ipairs(files) do
+        if vim.startswith(f, "/") then
+            out[#out + 1] = vim.fn.resolve(f)
+        else
+            out[#out + 1] = vim.fn.resolve(vim.fn.simplify(base .. "/" .. f))
+        end
+    end
+    return out
+end
+
+--- Order groups for display: the work tree containing `home` (the session cwd)
+--- first, the rest sorted by toplevel path.
+---@param by_tl table<string, pi.DiffReviewGroup>
+---@param tls string[]
+---@param home string
+---@return pi.DiffReviewGroup[]
+local function order_groups(by_tl, tls, home)
+    local home_tl = nil
+    for _, tl in ipairs(tls) do
+        if home == tl or vim.startswith(home, tl .. "/") then
+            home_tl = tl
+            break
+        end
+    end
+    table.sort(tls, function(a, b)
+        if home_tl then
+            if a == home_tl then
+                return true
+            end
+            if b == home_tl then
+                return false
+            end
+        end
+        return a < b
+    end)
+    local ordered = {}
+    for _, tl in ipairs(tls) do
+        ordered[#ordered + 1] = by_tl[tl]
+    end
+    return ordered
+end
+
 --- Close the float window and wipe its buffer.
 local function close_float()
     if win and vim.api.nvim_win_is_valid(win) then
@@ -206,11 +271,12 @@ end
 --- Build the float lines for one section: the file header plus the diff body.
 ---@param section pi.DiffReviewSection
 ---@param width integer
+---@param label string Display label (path, branch-prefixed when several work trees)
 ---@return string[]
 ---@return table<integer, { path: string, line: integer }>
-local function build_file_lines(section, width)
+local function build_file_lines(section, width, label)
     ---@type string[]
-    local lines = { header_line(section.path, width) }
+    local lines = { header_line(label, width) }
     ---@type table<integer, { path: string, line: integer }>
     local targets = {}
     if not section.deleted then
@@ -227,20 +293,50 @@ local function build_file_lines(section, width)
     return lines, targets
 end
 
+--- List line for a work tree group header: `branch · ~/path/to/worktree`.
+---@param group pi.DiffReviewGroup
+---@return string
+local function group_header_line(group)
+    local path = vim.fn.fnamemodify(group.toplevel, ":~")
+    return group.branch .. " · " .. path
+end
+
+--- Build the file list: the hint line, then per group a header line followed
+--- by its sections. Returns a row map (1-based list row -> entry) so header
+--- rows behave like their group's first section for follow/jump.
+---@param groups pi.DiffReviewGroup[]
 ---@param sections pi.DiffReviewSection[]
----@return string[]
-local function build_list_lines(sections)
+---@return string[] lines
+---@return table<integer, { group: integer, section: integer? }>
+local function build_list_layout(groups, sections)
     local count = #sections
     local hint = string.format("─ %d file%s · <CR> jump · q close", count, count == 1 and "" or "s")
+    if #groups > 1 then
+        hint = hint .. string.format(" · %d worktrees", #groups)
+    end
     if skipped_outside > 0 then
         hint = hint .. string.format(" · %d outside", skipped_outside)
     end
     ---@type string[]
     local lines = { hint }
-    for _, section in ipairs(sections) do
-        lines[#lines + 1] = section.status .. " " .. section.path
+    ---@type table<integer, { group: integer, section: integer? }>
+    local map = {}
+    if #groups == 0 then
+        for i, section in ipairs(sections) do
+            lines[#lines + 1] = section.status .. " " .. section.path
+            map[#lines] = { group = 1, section = i }
+        end
+        return lines, map
     end
-    return lines
+    for gi, group in ipairs(groups) do
+        lines[#lines + 1] = group_header_line(group)
+        map[#lines] = { group = gi, section = group.sections[1] }
+        for _, si in ipairs(group.sections) do
+            lines[#lines + 1] = sections[si].status .. " " .. sections[si].path
+            map[#lines] = { group = gi, section = si }
+        end
+    end
+    return lines, map
 end
 
 ---@param section pi.DiffReviewSection
@@ -255,19 +351,28 @@ local function status_hl(section)
     return "PiDiffReviewFile"
 end
 
---- Fill the list buffer from `sections` (status letters highlighted).
+--- Fill the list buffer (hint line, group headers, status letters).
 local function render_list()
     if not list_buf or not vim.api.nvim_buf_is_valid(list_buf) then
         return
     end
-    local lines = build_list_lines(sections)
+    local lines, map = build_list_layout(groups, sections)
+    row_entries = map
     vim.bo[list_buf].modifiable = true
     vim.api.nvim_buf_set_lines(list_buf, 0, -1, false, lines)
     vim.bo[list_buf].modifiable = false
     vim.api.nvim_buf_clear_namespace(list_buf, ns, 0, -1)
     vim.api.nvim_buf_set_extmark(list_buf, ns, 0, 0, { hl_group = "PiDiffReviewHint", end_col = #lines[1] })
-    for i, section in ipairs(sections) do
-        vim.api.nvim_buf_set_extmark(list_buf, ns, i, 0, { hl_group = status_hl(section), end_col = 1 })
+    for row, entry in pairs(map) do
+        local section = entry.section and sections[entry.section]
+        local hl = section and status_hl(section) or "PiDiffReviewWorktree"
+        vim.api.nvim_buf_set_extmark(
+            list_buf,
+            ns,
+            row - 1,
+            0,
+            { hl_group = hl, end_col = section and 1 or #lines[row] }
+        )
     end
 end
 
@@ -283,7 +388,14 @@ function M._show_file(idx)
     end
     local section = sections[idx]
     local width = vim.api.nvim_win_get_width(win)
-    local lines, targets = build_file_lines(section, width)
+    local label = section.path
+    if #groups > 1 then
+        local branch = toplevel_branch[section.toplevel]
+        if branch and branch ~= "" then
+            label = branch .. " · " .. section.path
+        end
+    end
+    local lines, targets = build_file_lines(section, width, label)
     vim.bo[buf].modifiable = true
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
     vim.bo[buf].modifiable = false
@@ -300,8 +412,9 @@ local function on_list_cursor_moved()
     if not list_win or not vim.api.nvim_win_is_valid(list_win) then
         return
     end
-    local idx = vim.api.nvim_win_get_cursor(list_win)[1] - 1
-    if idx >= 1 and idx <= #sections and idx ~= current_idx then
+    local entry = row_entries[vim.api.nvim_win_get_cursor(list_win)[1]]
+    local idx = entry and entry.section or nil
+    if idx and idx >= 1 and idx <= #sections and idx ~= current_idx then
         M._show_file(idx)
     end
 end
@@ -437,13 +550,18 @@ end
 --- float framing the file list and the diff of the first file.
 --- Closes any existing review first.
 ---@param rendered pi.DiffReviewSection[]
----@param opts? { skipped?: integer } number of changed files outside the git repo
+---@param opts? { skipped?: integer, groups?: pi.DiffReviewGroup[] } skipped: changed files outside any git work tree; groups: ordered work-tree groups (empty for a flat list)
 function M.render(rendered, opts)
     opts = opts or {}
     M.close()
     sections = rendered
     current_idx = 1
     skipped_outside = opts.skipped or 0
+    groups = opts.groups or {}
+    toplevel_branch = {}
+    for _, group in ipairs(groups) do
+        toplevel_branch[group.toplevel] = group.branch
+    end
 
     open_review_windows()
     render_list()
@@ -513,6 +631,9 @@ function M.close()
     current_idx = 1
     skipped_outside = 0
     jump_targets = {}
+    groups = {}
+    toplevel_branch = {}
+    row_entries = {}
 end
 
 -- Jump ----------------------------------------------------------------------
@@ -582,10 +703,12 @@ jump_to_target = function()
     open_at(target.path, target.line)
 end
 
---- List <CR>/o: jump to the selected file's first changed line.
+--- List <CR>/o: jump to the selected file's first changed line (a group
+--- header jumps to its first section).
 list_jump = function()
-    local idx = vim.api.nvim_win_get_cursor(0)[1] - 1
-    if idx < 1 or idx > #sections then
+    local entry = row_entries[vim.api.nvim_win_get_cursor(0)[1]]
+    local idx = entry and entry.section or nil
+    if not idx or idx < 1 or idx > #sections then
         return
     end
     local section = sections[idx]
@@ -599,124 +722,209 @@ end
 
 -- Collection -----------------------------------------------------------------
 
----@param files string[] changed-file paths as recorded by the session
----@param toplevel string git work tree root
----@return string[] paths inside the repo (passable to git)
----@return integer number of paths outside the repo (skipped)
-local function partition_inside(files, toplevel)
-    local inside = {}
-    local outside = 0
-    local tl = toplevel
-    if tl:sub(-1) ~= "/" then
-        tl = tl .. "/"
+---@param group pi.DiffReviewGroup
+---@param sections pi.DiffReviewSection[] global flat list (append target)
+local function append_parsed(parsed, group, sections)
+    for _, section in ipairs(parsed) do
+        section.toplevel = group.toplevel
+        section.abs = group.toplevel .. "/" .. section.path
+        group.sections[#group.sections + 1] = #sections + 1
+        sections[#sections + 1] = section
     end
-    for _, f in ipairs(files) do
-        local abs = vim.fn.fnamemodify(f, ":p")
-        if abs:sub(1, #tl) == tl then
-            inside[#inside + 1] = f
-        else
-            outside = outside + 1
-        end
-    end
-    return inside, outside
 end
 
---- For changed files that produced no main-diff section: show tracked files
---- with no diff vs. the index as-is (nothing to show), and untracked files
---- as full-file additions via `git diff --no-index`.
----@param files string[]
----@param cwd string
----@param sections pi.DiffReviewSection[]
----@param skipped integer
-local function fetch_untracked_sections(files, cwd, sections, skipped, idx)
-    idx = idx or 1
-    if idx > #files then
-        if #sections == 0 then
-            Notify.warn(":PiDiff — no diff output for this session's changed files")
+--- For changed files that produced no diff vs. HEAD (or the index in a fresh
+--- repository): tracked files with no diff have nothing to show; untracked
+--- files render as full-file additions via `git diff --no-index`.
+---@param uncovered string[] paths relative to the work tree root
+---@param group pi.DiffReviewGroup
+---@param sections pi.DiffReviewSection[] global flat list
+---@param done fun()
+local function fetch_untracked(uncovered, group, sections, done)
+    local idx = 1
+    local function step()
+        if idx > #uncovered then
+            done()
             return
         end
-        M.render(sections, { skipped = skipped })
-        return
-    end
-    local path = files[idx]
-    vim.system({ "git", "ls-files", "--error-unmatch", "--", path }, { cwd = cwd }, function(res)
-        vim.schedule(function()
-            if res.code == 0 then
-                -- Tracked and identical to the index: nothing to show.
-                fetch_untracked_sections(files, cwd, sections, skipped, idx + 1)
-                return
-            end
-            vim.system(
-                { "git", "diff", "--no-index", "--no-color", "--", "/dev/null", path },
-                { cwd = cwd },
-                function(res2)
-                    vim.schedule(function()
-                        local extra = M.parse_sections(res2.stdout or "")
-                        for _, section in ipairs(extra) do
-                            sections[#sections + 1] = section
-                        end
-                        fetch_untracked_sections(files, cwd, sections, skipped, idx + 1)
-                    end)
+        local rel = uncovered[idx]
+        vim.system({ "git", "-C", group.toplevel, "ls-files", "--error-unmatch", "--", rel }, {}, function(res)
+            vim.schedule(function()
+                if res.code == 0 then
+                    -- Tracked but identical to HEAD/index: nothing to show.
+                    idx = idx + 1
+                    step()
+                    return
                 end
-            )
+                vim.system(
+                    { "git", "-C", group.toplevel, "diff", "--no-index", "--no-color", "--", "/dev/null", rel },
+                    {},
+                    function(res2)
+                        vim.schedule(function()
+                            append_parsed(M.parse_sections(res2.stdout or ""), group, sections)
+                            idx = idx + 1
+                            step()
+                        end)
+                    end
+                )
+            end)
         end)
-    end)
+    end
+    step()
 end
 
---- Collect the diff of the session's changed files and render it.
----@param files string[]
-local function collect_and_render(files)
-    local cwd = vim.uv.cwd()
-    vim.system({ "git", "rev-parse", "--show-toplevel" }, { cwd = cwd }, function(res)
+local diff_group_content
+
+--- Diff one work tree group: branch label, then `git diff HEAD` (the union of
+--- staged and unstaged changes; `--cached` in a fresh repository without a
+--- HEAD), then untracked fallbacks.
+---@param group pi.DiffReviewGroup
+---@param sections pi.DiffReviewSection[] global flat list
+---@param done fun()
+local function diff_group(group, sections, done)
+    vim.system({ "git", "-C", group.toplevel, "branch", "--show-current" }, {}, function(res)
         vim.schedule(function()
-            local toplevel = vim.trim(res.stdout or "")
-            if res.code ~= 0 or toplevel == "" then
-                Notify.warn(":PiDiff — current directory is not inside a git work tree")
+            group.branch = vim.trim(res.stdout or "")
+            if group.branch ~= "" then
+                diff_group_content(group, sections, done)
                 return
             end
-            local inside, outside = partition_inside(files, toplevel)
-            if #inside == 0 then
-                Notify.warn(":PiDiff — no changed files are inside the current git repository")
-                return
-            end
-            local ctx = diff_context()
-            local cmd = { "git", "diff", "--no-color", "-U" .. ctx, "--" }
-            for _, f in ipairs(inside) do
-                cmd[#cmd + 1] = f
-            end
-            vim.system(cmd, { cwd = cwd }, function(res2)
+            -- Detached HEAD or no commits yet: fall back to the short hash,
+            -- then to the toplevel basename for a fresh repository.
+            vim.system({ "git", "-C", group.toplevel, "rev-parse", "--short", "HEAD" }, {}, function(res2)
                 vim.schedule(function()
-                    local sections = M.parse_sections(res2.stdout or "")
-                    local covered = {}
-                    for _, section in ipairs(sections) do
-                        covered[section.abs] = true
+                    group.branch = vim.trim(res2.stdout or "")
+                    if group.branch == "" then
+                        group.branch = vim.fn.fnamemodify(group.toplevel, ":t")
                     end
-                    ---@type string[]
-                    local uncovered = {}
-                    for _, f in ipairs(inside) do
-                        local abs = vim.fn.fnamemodify(f, ":p")
-                        if not covered[abs] then
-                            uncovered[#uncovered + 1] = f
-                        end
-                    end
-                    if #uncovered == 0 then
-                        if #sections == 0 then
-                            Notify.warn(":PiDiff — no diff output for this session's changed files")
-                            return
-                        end
-                        M.render(sections, { skipped = outside })
-                        return
-                    end
-                    fetch_untracked_sections(uncovered, cwd, sections, outside)
+                    diff_group_content(group, sections, done)
                 end)
             end)
         end)
     end)
 end
 
+---@param group pi.DiffReviewGroup
+---@param sections pi.DiffReviewSection[] global flat list
+---@param done fun()
+diff_group_content = function(group, sections, done)
+    local ctx = diff_context()
+    local args = { "git", "-C", group.toplevel, "diff", "--no-color", "-U" .. ctx }
+    vim.system({ "git", "-C", group.toplevel, "rev-parse", "--verify", "-q", "HEAD" }, {}, function(res)
+        vim.schedule(function()
+            if res.code == 0 then
+                args[#args + 1] = "HEAD"
+            else
+                -- Fresh repository (no commits yet): the index vs the empty tree.
+                args[#args + 1] = "--cached"
+            end
+            args[#args + 1] = "--"
+            for _, rel in ipairs(group.rel_files) do
+                args[#args + 1] = rel
+            end
+            vim.system(args, {}, function(res2)
+                vim.schedule(function()
+                    append_parsed(M.parse_sections(res2.stdout or ""), group, sections)
+                    local covered = {}
+                    for _, si in ipairs(group.sections) do
+                        covered[sections[si].path] = true
+                    end
+                    ---@type string[]
+                    local uncovered = {}
+                    for _, rel in ipairs(group.rel_files) do
+                        if not covered[rel] then
+                            uncovered[#uncovered + 1] = rel
+                        end
+                    end
+                    fetch_untracked(uncovered, group, sections, done)
+                end)
+            end)
+        end)
+    end)
+end
+
+--- Collect the diff of the session's changed files, grouped by the git work
+--- tree each file actually lives in. Files that resolve to no work tree are
+--- counted as `outside` (skipped, like before).
+---@param files string[] raw changed-file paths from the session
+---@param session_cwd string session working directory (path anchor)
+---@param done fun(sections: pi.DiffReviewSection[], groups: pi.DiffReviewGroup[], outside: integer)
+local function collect(files, session_cwd, done)
+    local abs_files = resolve_abs_paths(files, session_cwd)
+    ---@type table<string, string> dirname -> work tree root ("" = outside)
+    local dir_tl = {}
+    ---@type table<string, pi.DiffReviewGroup>
+    local by_tl = {}
+    ---@type string[]
+    local tls = {}
+    local outside = 0
+    local sections = {} ---@type pi.DiffReviewSection[]
+
+    local file_i = 1
+    local assign
+    local resolve_next
+    local collect_groups
+    assign = function(tl)
+        local abs = abs_files[file_i]
+        if tl == "" then
+            outside = outside + 1
+        else
+            local group = by_tl[tl]
+            if not group then
+                group = { toplevel = tl, branch = "", rel_files = {}, abs_files = {}, sections = {} }
+                by_tl[tl] = group
+                tls[#tls + 1] = tl
+            end
+            group.rel_files[#group.rel_files + 1] = abs:sub(#tl + 2)
+            group.abs_files[#group.abs_files + 1] = abs
+        end
+        file_i = file_i + 1
+        resolve_next()
+    end
+    resolve_next = function()
+        if file_i > #abs_files then
+            collect_groups()
+            return
+        end
+        local abs = abs_files[file_i]
+        local dir = vim.fn.fnamemodify(abs, ":h")
+        local cached = dir_tl[dir]
+        if cached ~= nil then
+            assign(cached)
+            return
+        end
+        vim.system({ "git", "-C", dir, "rev-parse", "--show-toplevel" }, {}, function(res)
+            vim.schedule(function()
+                local tl = ""
+                if res.code == 0 then
+                    tl = vim.fn.resolve(vim.trim(res.stdout or ""))
+                end
+                dir_tl[dir] = tl
+                assign(tl)
+            end)
+        end)
+    end
+    local group_i = 1
+    collect_groups = function()
+        if group_i > #tls then
+            local ordered = order_groups(by_tl, tls, vim.fn.resolve(session_cwd))
+            done(sections, ordered, outside)
+            return
+        end
+        local group = by_tl[tls[group_i]]
+        diff_group(group, sections, function()
+            group_i = group_i + 1
+            collect_groups()
+        end)
+    end
+    resolve_next()
+end
+
 --- Open the diff review for the current session's changed files.
---- No-op with a warning when there is no session, nothing was changed, or
---- the working directory is not a git work tree. Re-opening refreshes.
+--- No-op with a warning when there is no session or nothing was changed.
+--- Paths are anchored at the session's cwd and grouped by the git work tree
+--- they actually live in; files outside any work tree are counted and
+--- skipped. Re-opening refreshes.
 function M.open()
     local Sessions = require("pi.sessions.manager")
     local session = Sessions.get()
@@ -730,7 +938,23 @@ function M.open()
         return
     end
     M.close()
-    collect_and_render(files)
+    collect(files, session.cwd or vim.uv.cwd(), function(collected, ordered, outside)
+        vim.schedule(function()
+            if #collected == 0 then
+                Notify.warn(":PiDiff — no diff output for this session's changed files")
+                return
+            end
+            M.render(collected, { groups = ordered, skipped = outside })
+        end)
+    end)
+end
+
+--- Test hook: run the collection pipeline.
+---@param files string[]
+---@param session_cwd string
+---@param done fun(sections: pi.DiffReviewSection[], groups: pi.DiffReviewGroup[], outside: integer)
+function M._collect(files, session_cwd, done)
+    collect(files, session_cwd, done)
 end
 
 --- Test hook: list cursor moved (drives the float follow; the CursorMoved
@@ -749,6 +973,12 @@ end
 ---@return integer
 function M._current_idx()
     return current_idx
+end
+
+--- Test hook: list row map (row -> { group, section }).
+---@return table<integer, { group: integer, section: integer? }>
+function M._row_entries()
+    return row_entries
 end
 
 --- Test hook: close the review windows and clear all state.
