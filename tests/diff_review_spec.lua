@@ -371,18 +371,25 @@ describe("diff_review group list layout", function()
         assert.are.equal("main · " .. vim.fn.fnamemodify("/home/user/repo", ":~"), lines[2])
         assert.are.equal("M README.md", lines[3])
         assert.are.equal("A lua/pi/init.lua", lines[4])
-        assert.are.equal("feat-x · " .. vim.fn.fnamemodify("/home/user/repo-feat", ":~"), lines[5])
-        assert.are.equal("D gone.txt", lines[6])
+        -- a blank separator row sits between the two groups
+        assert.are.equal("", lines[5])
+        assert.are.equal("feat-x · " .. vim.fn.fnamemodify("/home/user/repo-feat", ":~"), lines[6])
+        assert.are.equal("D gone.txt", lines[7])
 
         -- header rows map to their group's first section
         local map = M._row_entries()
         assert.are.same({ group = 1, section = 1 }, map[2])
         assert.are.same({ group = 1, section = 2 }, map[4])
-        assert.are.same({ group = 2, section = 3 }, map[5])
+        -- the separator row is not mapped: the cursor there keeps the current file
+        assert.is_nil(map[5])
         assert.are.same({ group = 2, section = 3 }, map[6])
+        assert.are.same({ group = 2, section = 3 }, map[7])
 
-        -- moving the cursor onto a header shows the group's first file
+        -- the separator row does not follow; moving onto a header shows the group's first file
         vim.api.nvim_win_set_cursor(list_win, { 5, 0 })
+        M._on_list_cursor_moved()
+        assert.are.equal(1, M._current_idx())
+        vim.api.nvim_win_set_cursor(list_win, { 6, 0 })
         M._on_list_cursor_moved()
         assert.are.equal(3, M._current_idx())
 

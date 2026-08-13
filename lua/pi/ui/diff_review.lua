@@ -329,6 +329,11 @@ local function build_list_layout(groups, sections)
         return lines, map
     end
     for gi, group in ipairs(groups) do
+        if gi > 1 then
+            -- Blank separator between work tree groups (not mapped: the
+            -- cursor on it keeps the current file).
+            lines[#lines + 1] = ""
+        end
         lines[#lines + 1] = group_header_line(group)
         map[#lines] = { group = gi, section = group.sections[1] }
         for _, si in ipairs(group.sections) do
