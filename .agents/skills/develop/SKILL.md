@@ -24,7 +24,9 @@ flowchart TD
     J --> K{"Human code review"}
     K -- changes requested --> L["pr:changes-requested"] --> G
     K -- approved --> M["pr:approved"]
-    M --> N["merge --no-ff → push main\ndelete branch · remove worktree"]
+    M --> M2{"Docs sync gate\nmake docs-links · 用户可见变更逐项核对\nCHANGELOG 条目"}
+    M2 -- 不一致 --> G
+    M2 -- 通过 --> N["merge --no-ff → push main\ndelete branch · remove worktree"]
     N --> P{"CI run for the merge\ngreen? (GH Actions)"}
     P -- fail --> Q["fix → push main again"] --> P
     P -- green --> O["Close issue"]
@@ -40,6 +42,7 @@ flowchart TD
 | Test | Cheapest layer that can observe the behavior. State what was verified and what was not, and end the final report's verification section with a copy-pasteable manual-test nvim command (`PI_DEV_DIR` gate for worktree code — references/testing.md § Verification discipline). |
 | PR | Push branch → implementation comment → `pr:awaiting-review`. CI runs on the push; confirm the run is green before review. |
 | Review | `pr:changes-requested` → fix → re-push → back to `pr:awaiting-review`. `pr:approved` → merge. |
+| Docs gate | Merge 前必须通过 **docs sync gate**：`make docs-links` 绿；逐项核对用户可见变更（commands / keymaps / config / highlight groups / public API / documented behavior）已在**同一变更**里同步到 `README.md` 与 `doc/*.md`；`CHANGELOG.md` 有当日条目。不一致 → 回到 Implement 补齐后重新走 review。详见下方 "Docs sync gate (before merge)"。 |
 | Merge | In the **main checkout**: `git merge --no-ff`, push main, delete remote+local branch, `git worktree remove`. **Verify the CI run for the merge commit is green** (see CI verification below), then close issue. |
 
 Gitea: 所有交互统一使用 `tea` CLI（eos-bootstrap 安装，login `yuez`），**不要**手写 curl 调 API。issue 生命周期命令速查见 `references/gitea.md`。
@@ -86,6 +89,21 @@ A feature is **not complete until the CI run for its merge commit is green** —
 - **Highlight group** → `lua/pi/ui/highlights.lua` (`default = true`).
 - **Docs (README + `doc/`) + CHANGELOG** → docs-code consistency is mandatory: user-facing changes update `README.md` / the relevant `doc/*.md` in the same commit; internal changes still verify the docs remain accurate and fix any drift. Run `make docs-links` before committing.
 - **Tests** → `tests/<name>_spec.lua`; e2e per `references/testing.md`.
+
+## Docs sync gate (before merge)
+
+Merge 前对文档做一次显式核对（流程图 M2，Phase rule `Docs gate`）——不要只依赖实现阶段的自觉，文档与代码必须始终同源（AGENTS.md）：
+
+1. `make docs-links` —— 相对链接与锚点有效（提交前也要跑）。
+2. 逐项核对本次变更的用户可见面，确认已在同一变更里更新文档：
+   - `:Pi*` commands → `doc/usage.md`（命令表）
+   - keymaps → `doc/keymaps.md`
+   - config keys → `doc/configuration.md`（config.lua 三处，G19）
+   - highlight groups → `doc/highlight-groups.md`
+   - public API（`pi.*`）→ `doc/api.md`
+   - 行为/默认值变化 → `README.md` 与对应特性的 `doc/*.md`
+3. 用户可见变更必须有 `CHANGELOG.md` 当日条目（`date +%F`）。
+4. 漂移快扫：`git diff --stat <base>..HEAD -- doc README.md CHANGELOG.md` —— 用户可见变更却没有 doc/CHANGELOG diff 是红旗；用变更关键词在 `doc/` 里 grep 旧措辞。
 
 ## Gotchas
 
