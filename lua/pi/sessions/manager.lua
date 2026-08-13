@@ -23,6 +23,7 @@
 ---@field pinned_model? pi.ModelRef Model chosen in this tab. Reapplied after `new_session` so model switches made in other sessions (which core persists to global settings) don't leak into this tab's next conversation.
 ---@field startup_announcements table<string, pi.StartupAnnouncement> Extension startup data (keys ending with `:startup`) shown in the system preamble. Process-level: persists across session switches.
 ---@field system_errors pi.SystemErrorEntry[]
+---@field cwd string Working directory the session was started in (anchor for changed_files paths).
 ---@field changed_files table<string, true> Set of file paths modified by edit/write tools during the current session.
 ---@field _pending_file_change_args? table<string, table> Pending tool args by tool call id for file-changing tools.
 ---@field _compaction_rebuilding? boolean True while compacted messages are being fetched/replayed.
@@ -573,6 +574,7 @@ function M.get_or_create(opts)
         attention = { pending = {} },
         startup_announcements = {},
         system_errors = {},
+        cwd = vim.fn.getcwd(),
         changed_files = {},
     }
 

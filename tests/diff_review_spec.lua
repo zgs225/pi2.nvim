@@ -334,3 +334,216 @@ describe("diff_review render", function()
         assert.are.equal("pi-diff-review", vim.bo[vim.api.nvim_win_get_buf(vim.api.nvim_get_current_win())].filetype)
     end)
 end)
+
+describe("diff_review group list layout", function()
+    after_each(function()
+        M._reset()
+    end)
+
+    it("renders group headers, maps rows, and branch-prefixes the float header", function()
+        local sections = M.parse_sections(SAMPLE)
+        sections[1].toplevel = "/home/user/repo"
+        sections[2].toplevel = "/home/user/repo"
+        sections[3].toplevel = "/home/user/repo-feat"
+        local groups = {
+            {
+                toplevel = "/home/user/repo",
+                branch = "main",
+                rel_files = {},
+                abs_files = {},
+                sections = { 1, 2 },
+            },
+            {
+                toplevel = "/home/user/repo-feat",
+                branch = "feat-x",
+                rel_files = {},
+                abs_files = {},
+                sections = { 3 },
+            },
+        }
+        M.render(sections, { groups = groups })
+
+        local list_win = vim.api.nvim_get_current_win()
+        local list_buf = vim.api.nvim_win_get_buf(list_win)
+        local lines = vim.api.nvim_buf_get_lines(list_buf, 0, -1, false)
+        assert.matches("3 files", lines[1])
+        assert.matches("2 worktrees", lines[1])
+        assert.are.equal("main · " .. vim.fn.fnamemodify("/home/user/repo", ":~"), lines[2])
+        assert.are.equal("M README.md", lines[3])
+        assert.are.equal("A lua/pi/init.lua", lines[4])
+        -- a blank separator row sits between the two groups
+        assert.are.equal("", lines[5])
+        assert.are.equal("feat-x · " .. vim.fn.fnamemodify("/home/user/repo-feat", ":~"), lines[6])
+        assert.are.equal("D gone.txt", lines[7])
+
+        -- header rows map to their group's first section
+        local map = M._row_entries()
+        assert.are.same({ group = 1, section = 1 }, map[2])
+        assert.are.same({ group = 1, section = 2 }, map[4])
+        -- the separator row is not mapped: the cursor there keeps the current file
+        assert.is_nil(map[5])
+        assert.are.same({ group = 2, section = 3 }, map[6])
+        assert.are.same({ group = 2, section = 3 }, map[7])
+
+        -- the separator row does not follow; moving onto a header shows the group's first file
+        vim.api.nvim_win_set_cursor(list_win, { 5, 0 })
+        M._on_list_cursor_moved()
+        assert.are.equal(1, M._current_idx())
+        vim.api.nvim_win_set_cursor(list_win, { 6, 0 })
+        M._on_list_cursor_moved()
+        assert.are.equal(3, M._current_idx())
+
+        -- the diff float header carries the branch prefix
+        local float_win = assert(M._float_win())
+        local b = vim.api.nvim_win_get_buf(float_win)
+        local float_lines = vim.api.nvim_buf_get_lines(b, 0, -1, false)
+        assert.is_true(vim.startswith(float_lines[1], "── feat-x · gone.txt"))
+    end)
+
+    it("keeps the flat layout without groups", function()
+        M.render(M.parse_sections(SAMPLE))
+        local list_buf = vim.api.nvim_win_get_buf(vim.api.nvim_get_current_win())
+        local lines = vim.api.nvim_buf_get_lines(list_buf, 0, -1, false)
+        assert.are.equal("M README.md", lines[2])
+        assert.is_false(vim.startswith(lines[2], "·"))
+        -- no worktree count in the hint for a flat list
+        assert.is_false(vim.startswith(lines[1], "─ 2 worktrees"))
+        -- every section row maps to a section; there are no header rows
+        local map = M._row_entries()
+        assert.are.equal(3, #vim.tbl_keys(map))
+        assert.are.same({ group = 1, section = 3 }, map[4])
+    end)
+end)
+
+describe("diff_review collection", function()
+    local cleanup_dirs = {}
+
+    after_each(function()
+        for _, dir in ipairs(cleanup_dirs) do
+            pcall(vim.fn.delete, dir, "rf")
+        end
+        cleanup_dirs = {}
+        M._reset()
+    end)
+
+    ---@return string resolved tmp dir
+    local function tmp_dir()
+        local dir = vim.fn.resolve(vim.fn.tempname())
+        vim.fn.mkdir(dir, "p")
+        cleanup_dirs[#cleanup_dirs + 1] = dir
+        return dir
+    end
+
+    local function git(dir, ...)
+        return vim.fn.system({ "git", "-C", dir, ... })
+    end
+
+    ---@param dir string
+    ---@return string
+    local function init_repo(dir, branch)
+        vim.fn.mkdir(dir, "p")
+        git(dir, "init", "-q", "-b", branch)
+        git(dir, "config", "user.email", "t@t")
+        git(dir, "config", "user.name", "t")
+        return dir
+    end
+
+    ---@param files string[]
+    ---@param cwd string
+    local function collect_async(files, cwd)
+        local result = nil
+        M._collect(files, cwd, function(sections, groups, outside)
+            result = { sections = sections, groups = groups, outside = outside }
+        end)
+        assert.is_true(
+            vim.wait(10000, function()
+                return result ~= nil
+            end, 20),
+            "collection timed out"
+        )
+        return result
+    end
+
+    it("shows staged changes via git diff HEAD", function()
+        local dir = init_repo(tmp_dir(), "main")
+        vim.fn.writefile({ "v1" }, dir .. "/a.txt")
+        git(dir, "add", "a.txt")
+        git(dir, "commit", "-qm", "one")
+        vim.fn.writefile({ "v2" }, dir .. "/a.txt")
+        git(dir, "add", "a.txt")
+
+        local r = collect_async({ "a.txt" }, dir)
+        assert.are.equal(1, #r.sections)
+        assert.are.equal("M", r.sections[1].status)
+        assert.are.equal("a.txt", r.sections[1].path)
+        assert.are.equal("a.txt", vim.fn.fnamemodify(r.sections[1].abs, ":t"))
+        assert.are.equal(dir, r.groups[1].toplevel)
+        assert.are.equal("main", r.groups[1].branch)
+        assert.are.equal(0, r.outside)
+    end)
+
+    it("shows untracked files as full-file additions", function()
+        local dir = init_repo(tmp_dir(), "main")
+        vim.fn.writefile({ "u" }, dir .. "/new.txt")
+
+        local r = collect_async({ "new.txt" }, dir)
+        assert.are.equal(1, #r.sections)
+        assert.are.equal("A", r.sections[1].status)
+        assert.are.equal("new.txt", r.sections[1].path)
+    end)
+
+    it("skips committed changes (documented gap: no pre-change blob)", function()
+        local dir = init_repo(tmp_dir(), "main")
+        vim.fn.writefile({ "v1" }, dir .. "/a.txt")
+        git(dir, "add", "a.txt")
+        git(dir, "commit", "-qm", "one")
+        vim.fn.writefile({ "v2" }, dir .. "/a.txt")
+        git(dir, "add", "a.txt")
+        git(dir, "commit", "-qm", "two")
+
+        local r = collect_async({ "a.txt" }, dir)
+        assert.are.equal(0, #r.sections)
+        assert.are.equal(0, r.outside)
+    end)
+
+    it("handles a fresh repository without HEAD via --cached", function()
+        local dir = init_repo(tmp_dir(), "main")
+        vim.fn.writefile({ "s" }, dir .. "/staged.txt")
+        git(dir, "add", "staged.txt")
+
+        local r = collect_async({ "staged.txt" }, dir)
+        assert.are.equal(1, #r.sections)
+        assert.are.equal("A", r.sections[1].status)
+        assert.are.equal("staged.txt", r.sections[1].path)
+    end)
+
+    it("groups files by work tree with the session cwd's group first", function()
+        local dir_a = init_repo(tmp_dir(), "main")
+        vim.fn.writefile({ "a" }, dir_a .. "/a.txt")
+        local dir_b = init_repo(tmp_dir(), "feat-b")
+        vim.fn.writefile({ "b" }, dir_b .. "/b.txt")
+
+        -- session cwd inside repo A; one file in each repo
+        local r = collect_async({ "a.txt", dir_b .. "/b.txt" }, dir_a)
+        assert.are.equal(2, #r.groups)
+        -- session cwd's group first even though dir_b < dir_a alphabetically
+        assert.are.equal(dir_a, r.groups[1].toplevel)
+        assert.are.equal("main", r.groups[1].branch)
+        assert.are.equal(dir_b, r.groups[2].toplevel)
+        assert.are.equal("feat-b", r.groups[2].branch)
+        assert.are.equal(2, #r.sections)
+        assert.are.equal("a.txt", r.sections[1].path)
+        assert.are.equal(dir_a, r.sections[1].toplevel)
+        assert.are.equal("b.txt", r.sections[2].path)
+        assert.are.equal(dir_b, r.sections[2].toplevel)
+    end)
+
+    it("counts files outside any work tree as skipped", function()
+        local dir = tmp_dir() -- no git repo here
+        vim.fn.writefile({ "x" }, dir .. "/x.txt")
+
+        local r = collect_async({ "x.txt" }, dir)
+        assert.are.equal(0, #r.sections)
+        assert.are.equal(1, r.outside)
+    end)
+end)
