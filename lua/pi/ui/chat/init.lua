@@ -94,6 +94,8 @@ function Chat.new(tab, mode, agent)
     self._last_turn_stop_reason = nil
     self._zen = Zen.new(self._prompt)
     self._prompt_history = nil
+    self._prompt_nav = nil
+    self._cwd = nil
     self._last_applied_prompt = nil
     self._bash_running = false
     self._bash_req_id = nil
@@ -269,8 +271,8 @@ function Chat:_set_keymaps()
         if vim.fn.pumvisible() == 1 then
             return "<Down>"
         end
-        local store = self:_history_store()
-        local navigating = store and store:navigating() or false
+        local nav = self:_history_nav()
+        local navigating = nav and nav:navigating() or false
         local last_line = vim.api.nvim_buf_line_count(pbuf)
         if navigating or vim.api.nvim_win_get_cursor(0)[1] >= last_line then
             if self:history_next() then
@@ -299,9 +301,9 @@ function Chat:_set_keymaps()
             if cur == self._last_applied_prompt then
                 return
             end
-            local store = self:_history_store()
-            if store and store:navigating() then
-                store:reset_nav()
+            local nav = self:_history_nav()
+            if nav and nav:navigating() then
+                nav:reset()
             end
         end,
     })
@@ -817,8 +819,17 @@ function Chat:flush_compaction_queue(will_retry)
     end
 end
 
---- Get the prompt-history store for this chat, honoring config. Returns nil
---- when history is disabled so callers can no-op.
+--- Set the workspace cwd this chat's prompt history is scoped to. Called by
+--- the session manager right after creation; falls back to the current cwd
+--- when never set.
+---@param cwd string
+function Chat:set_cwd(cwd)
+    self._cwd = cwd
+end
+
+--- Get the prompt-history store for this chat, honoring config. History is
+--- scoped per workspace (the session cwd). Returns nil when history is
+--- disabled so callers can no-op.
 ---@return pi.PromptHistoryStore?
 function Chat:_history_store()
     local cfg = Config.options.prompt and Config.options.prompt.history
@@ -826,9 +837,27 @@ function Chat:_history_store()
         return nil
     end
     if not self._prompt_history then
-        self._prompt_history = PromptHistory.get({ max = cfg.max, path = cfg.path })
+        local cwd = self._cwd
+        if type(cwd) ~= "string" or cwd == "" then
+            cwd = vim.fn.getcwd()
+        end
+        self._prompt_history = PromptHistory.get_for_workspace(cwd, { max = cfg.max })
     end
     return self._prompt_history
+end
+
+--- Get this chat's readline navigation cursor (per-chat, so tabs sharing a
+--- workspace store don't interfere). Returns nil when history is disabled.
+---@return pi.PromptHistoryNav?
+function Chat:_history_nav()
+    local store = self:_history_store()
+    if not store then
+        return nil
+    end
+    if not self._prompt_nav then
+        self._prompt_nav = PromptHistory.Nav.new(store)
+    end
+    return self._prompt_nav
 end
 
 --- Current prompt buffer text (untrimmed; used as the draft to stash).
@@ -875,11 +904,11 @@ end
 --- Recall the previous (older) prompt into the prompt buffer.
 ---@return boolean handled
 function Chat:history_prev()
-    local store = self:_history_store()
-    if not store then
+    local nav = self:_history_nav()
+    if not nav then
         return false
     end
-    local entry = store:prev(self:_prompt_draft())
+    local entry = nav:prev(self:_prompt_draft())
     if entry == nil then
         return false
     end
@@ -890,11 +919,11 @@ end
 --- Recall the next (newer) prompt, restoring the draft at the present.
 ---@return boolean handled
 function Chat:history_next()
-    local store = self:_history_store()
-    if not store then
+    local nav = self:_history_nav()
+    if not nav then
         return false
     end
-    local entry = store:next()
+    local entry = nav:next()
     if entry == nil then
         return false
     end
@@ -944,6 +973,9 @@ function Chat:_send_message(queue_type)
     local hist_store = self:_history_store()
     if hist_store and text ~= "" then
         hist_store:add(text)
+    end
+    if self._prompt_nav then
+        self._prompt_nav:reset()
     end
 
     -- Exit zen mode before sending so the user returns to normal chat.
@@ -1027,6 +1059,9 @@ function Chat:_send_bash(raw_text, command, exclude)
     local hist_store = self:_history_store()
     if hist_store then
         hist_store:add(raw_text)
+    end
+    if self._prompt_nav then
+        self._prompt_nav:reset()
     end
 
     if self._zen:is_active() then

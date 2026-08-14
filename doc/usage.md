@@ -121,15 +121,14 @@ Every prompt you submit is recorded (raw, before `@mention` expansion) so you ca
 
 Walking up stashes whatever you're currently typing; walking back down past the newest entry restores that draft. Editing the buffer by hand leaves browse mode, so a stray `<Down>` never clobbers your typing. Recall is a no-op while the completion menu is open.
 
-History persists to `stdpath("data")/pi/prompt_history.json` (written atomically) and survives restarts. Configure it under `prompt.history`:
+History is scoped **per workspace** — the directory the session started in. Each workspace keeps its own file under `stdpath("data")/pi/history/` (named by a hash of the normalized cwd, with an `index.json` mapping hash to path), written atomically and surviving restarts. Recalling in one project never shows prompts submitted in another. Configure it under `prompt.history`:
 
 ```lua
 require("pi").setup({
     prompt = {
         history = {
             enabled = true, -- set false to disable recording/recall entirely
-            max = 500,      -- entries kept; oldest are dropped first
-            -- path = "...",  -- override the history file location
+            max = 500,      -- entries kept per workspace; oldest are dropped first
         },
     },
 })
