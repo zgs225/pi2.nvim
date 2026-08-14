@@ -352,7 +352,7 @@ When the current main model does not support image input, attached images cannot
 2. All attached images plus that instruction go to the configured vision model in a single batched call.
 3. The description replaces the images in your message; the agent reads it as part of your turn.
 
-While this runs, the history shows a pending preview row (`labels.vision_pending`) and the statusline a spinner; the final render is your original text followed by a collapsible vision block (header + model id + description, auto-collapsing like tool blocks). On replay the block is re-rendered from the stored message.
+While this runs, the history shows a pending preview row (`labels.vision_pending`) and the statusline a spinner with `vision.status_message` (default `Describing images…`; `%s` expands to the vision model id); the final render is your original text followed by a collapsible vision block (header + model id + description, auto-collapsing like tool blocks). On replay the block is re-rendered from the stored message.
 
 **Fast-fail semantics**: there is no silent fallback. If the configured model cannot be resolved, does not support images, or either model call fails, the submission is aborted — nothing is sent — you get a `[pi-vision] …` error notification, and the prompt text and attachments are restored so you can retry. When the main model already supports images (or `vision.model` is unset), attachments pass through untouched.
 

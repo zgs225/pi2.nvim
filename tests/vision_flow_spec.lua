@@ -115,6 +115,8 @@ describe("vision fallback flow", function()
         assert.is_false(buf_contains(chat._history:buf(), "fix this layout"))
         assert.is_not_nil(chat._vision_inflight)
         assert.is_not_nil(chat._history._vision_pending)
+        -- Short configurable statusline text (no model id by default).
+        assert.are.equal("Describing images…", chat._prompt:statusline()._state.busy.text)
 
         -- Deliver the transformed user message.
         local transformed = "fix this layout\n\n"

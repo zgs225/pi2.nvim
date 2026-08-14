@@ -971,7 +971,13 @@ function Chat:_send_message(queue_type)
     elseif vision_model then
         self._history:set_vision_pending({ text = text, image_count = image_count, model = vision_model })
         if not self._streaming and not self._compacting then
-            self:set_status({ type = "agent", text = ("Understanding images with %s…"):format(vision_model) })
+            local status_msg = (Config.options.vision or {}).status_message or "Describing images…"
+            if status_msg:find("%s", 1, true) then
+                status_msg = status_msg:gsub("%%s", function()
+                    return vision_model
+                end, 1)
+            end
+            self:set_status({ type = "agent", text = status_msg })
         end
     else
         -- Immediate: render in history now

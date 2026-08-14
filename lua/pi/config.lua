@@ -187,6 +187,7 @@
 
 ---@class pi.VisionConfig
 ---@field model? string Vision-capable model as "provider/modelId". When set, image attachments sent to a non-vision main model are described by this model first and the description replaces the images (fast-fail on any error; disabled when unset)
+---@field status_message? string Statusline text shown while the description is being generated (default: "Describing images…"); may contain %s for the vision model id
 
 ---@class pi.SessionsListFloatConfig
 ---@field width? number Width in columns (>=1) or fraction of editor width (<1, default 0.5)

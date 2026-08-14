@@ -198,6 +198,9 @@ require("pi").setup({
     -- and restores the prompt text and attachments. Disabled when unset.
     vision = {
         -- model = "google/gemini-2.5-pro",
+        -- Statusline text while the description is being generated; %s
+        -- expands to the vision model id (default: "Describing images…").
+        -- status_message = "Vision: %s…",
     },
 
     -- Sessions overview (:PiSessions): a live list of all active sessions
