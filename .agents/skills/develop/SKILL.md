@@ -87,6 +87,7 @@ A feature is **not complete until the CI run for its merge commit is green** —
 - **Chat wiring** → `lua/pi/ui/chat/init.lua`: keymaps in `_set_keymaps()`, submit logic in `_send_message()`.
 - **History rendering** → `lua/pi/ui/chat/history.lua`; tool renderers → `lua/pi/ui/chat/tools.lua`.
 - **Highlight group** → `lua/pi/ui/highlights.lua` (`default = true`).
+- **Checkable requirements (deps / version floors / config)** → `lua/pi/health.lua` + `lua/pi/compat.lua`: 新特性若引入用户可诊断的依赖、版本下限或配置要求，必须同步给 `:checkhealth pi` 新增检查项（ok/error/warn 三态），并在 `doc/troubleshooting.md` 描述该检查项。版本常量集中放在 `compat.lua`（如 vision fallback 的 `vision_min_supported = "0.81.0"`，与 `min_supported`/`validated` 同处），不要在 health.lua 里硬编码。参考实例：vision fallback 的 pi 0.81.0+ 版本下限检查（`feat(health): check pi version floor for vision fallback`）。
 - **Docs (README + `doc/`) + CHANGELOG** → docs-code consistency is mandatory: user-facing changes update `README.md` / the relevant `doc/*.md` in the same commit; internal changes still verify the docs remain accurate and fix any drift. Run `make docs-links` before committing.
 - **Tests** → `tests/<name>_spec.lua`; e2e per `references/testing.md`.
 
@@ -100,6 +101,7 @@ Merge 前对文档做一次显式核对（流程图 M2，Phase rule `Docs gate`�
    - keymaps → `doc/keymaps.md`
    - config keys → `doc/configuration.md`（config.lua 三处，G19）
    - highlight groups → `doc/highlight-groups.md`
+   - checkhealth 新增/变化的检查项 → `doc/troubleshooting.md`（同 commit 更新；如 vision fallback 的 pi 0.81.0+ 下限检查）
    - public API（`pi.*`）→ `doc/api.md`
    - 行为/默认值变化 → `README.md` 与对应特性的 `doc/*.md`
 3. 用户可见变更必须有 `CHANGELOG.md` 当日条目（`date +%F`）。
