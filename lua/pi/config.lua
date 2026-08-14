@@ -530,6 +530,11 @@ function M.setup(opts)
             M.options.verbs = { use_defaults = false, pairs = user_pairs }
         end
     end
+
+    -- The bundled vision extension re-reads its model reference from a
+    -- runtime file on every input event, so live setup() calls apply to
+    -- already-spawned RPC processes.
+    require("pi.vision").publish(M.options.vision and M.options.vision.model)
 end
 
 --- Resolve a config value that may be a function, merging the result with

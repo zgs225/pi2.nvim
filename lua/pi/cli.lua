@@ -125,16 +125,15 @@ function M.command()
             cmd[#cmd + 1] = ext
         end
     end
-    -- Inject the vision fallback extension when configured: images sent to
-    -- a non-vision main model are described by the configured vision model.
-    -- The model reference travels via PI_NVIM_VISION_MODEL (see rpc.lua).
-    local vision = Config.options.vision or {}
-    if type(vision.model) == "string" and vision.model ~= "" then
-        local ext = M.vision_extension_path()
-        if vim.fn.filereadable(ext) == 1 then
-            cmd[#cmd + 1] = "--extension"
-            cmd[#cmd + 1] = ext
-        end
+    -- Inject the vision fallback extension unconditionally (like tree.ts):
+    -- it is a no-op unless a vision model is configured. The model reference
+    -- travels via a runtime file the extension re-reads on every input event
+    -- (PI_NVIM_VISION_FILE, see rpc.lua), so live setup() calls apply without
+    -- respawning the RPC process.
+    local ext = M.vision_extension_path()
+    if vim.fn.filereadable(ext) == 1 then
+        cmd[#cmd + 1] = "--extension"
+        cmd[#cmd + 1] = ext
     end
     cmd[#cmd + 1] = "--mode"
     cmd[#cmd + 1] = "rpc"

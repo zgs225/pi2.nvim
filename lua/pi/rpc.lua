@@ -339,11 +339,10 @@ function Rpc:start()
     end
     self._stdout_parts = {}
     local cmd = Cli.command()
-    -- The bundled vision extension reads its configured model from here;
-    -- unset/empty disables it (it is also only injected when configured).
-    local vision_model = (Config.options.vision or {}).model
+    -- The bundled vision extension reads its configured model from this
+    -- runtime file on every input event (config.setup keeps it published).
     self._job_id = vim.fn.jobstart(cmd, {
-        env = type(vision_model) == "string" and vision_model ~= "" and { PI_NVIM_VISION_MODEL = vision_model } or nil,
+        env = { PI_NVIM_VISION_FILE = require("pi.vision").state_path() },
         on_stdout = function(_, data)
             self:_on_stdout(data)
         end,

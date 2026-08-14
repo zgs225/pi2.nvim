@@ -3,9 +3,11 @@
  *
  * When the main model cannot see images, attached images are described by a
  * configured vision-capable model and the description replaces the images in
- * the user message. Loaded by pi.nvim via `--extension <plugin>/extensions/vision.ts`
- * when `require("pi").setup({ vision = { model = "provider/modelId" } })` is
- * configured; the model reference arrives via PI_NVIM_VISION_MODEL.
+ * the user message. Loaded unconditionally by pi.nvim via
+ * `--extension <plugin>/extensions/vision.ts`; it stays a no-op unless a
+ * vision model is published. The model reference arrives via the
+ * PI_NVIM_VISION_FILE runtime file, re-read on every input event so live
+ * config changes apply immediately.
  *
  * Flow (input hook):
  *   1. Skip when there are no images or the main model supports them.
@@ -23,8 +25,14 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { AssistantMessage, ImageContent, Model } from "@earendil-works/pi-ai";
+import { readFileSync } from "node:fs";
 
-const ENV_MODEL = "PI_NVIM_VISION_MODEL";
+/**
+ * Runtime file published by pi.nvim's config.setup(): the process env is
+ * frozen at spawn, but this file is re-read on every input event so live
+ * setup() calls apply to already-running RPC processes.
+ */
+const ENV_FILE = "PI_NVIM_VISION_FILE";
 const NOTIFY_PREFIX = "[pi-vision]";
 const CLOSE_TAG = "</pi-vision>";
 
@@ -36,6 +44,18 @@ const DESCRIPTION_MAX_TOKENS = 2048;
 
 function openTag(modelRef: string): string {
 	return `<pi-vision model="${modelRef}">`;
+}
+
+function readModelRef(): string {
+	const path = process.env[ENV_FILE];
+	if (!path) {
+		return "";
+	}
+	try {
+		return readFileSync(path, "utf8").trim();
+	} catch {
+		return "";
+	}
 }
 
 function errorMessage(err: unknown): string {
@@ -105,15 +125,6 @@ function buildInstructionPrompt(context: string, nextMessage: string): string {
 }
 
 export default function visionFallback(pi: ExtensionAPI): void {
-	const modelRef = (process.env[ENV_MODEL] ?? "").trim();
-	if (modelRef === "") {
-		return;
-	}
-
-	const slash = modelRef.indexOf("/");
-	const provider = slash > 0 ? modelRef.slice(0, slash) : "";
-	const modelId = slash > 0 ? modelRef.slice(slash + 1) : "";
-
 	pi.on("input", async (event, ctx) => {
 		if (!event.images || event.images.length === 0) {
 			return { action: "continue" };
@@ -121,6 +132,14 @@ export default function visionFallback(pi: ExtensionAPI): void {
 		if (ctx.model?.input?.includes("image")) {
 			return { action: "continue" };
 		}
+
+		const modelRef = readModelRef();
+		if (modelRef === "") {
+			return { action: "continue" };
+		}
+		const slash = modelRef.indexOf("/");
+		const provider = slash > 0 ? modelRef.slice(0, slash) : "";
+		const modelId = slash > 0 ? modelRef.slice(slash + 1) : "";
 
 		const fail = (reason: string) => {
 			ctx.ui.notify(`${NOTIFY_PREFIX} ${reason}`, "error");

@@ -20,8 +20,56 @@ local M = {}
 --- fast-fail. pi.nvim uses it to restore the submit-time state.
 M.NOTIFY_PREFIX = "[pi-vision]"
 
+--- Runtime file conveying the configured vision model to already-spawned
+--- RPC processes: the process env is frozen at spawn, but the bundled
+--- extension re-reads this file on every input event, so a live
+--- `setup({ vision = { model = ... } })` takes effect immediately.
+---@return string
+function M.state_path()
+    if state_path_override then
+        return state_path_override
+    end
+    return vim.fn.stdpath("run") .. "/pi2nvim-vision-model"
+end
+
+--- Override the state file path (tests).
+---@param path string?
+function M._set_path(path)
+    state_path_override = path
+end
+
+--- Publish (or clear) the configured vision model for the extension.
+---@param model_ref string?
+function M.publish(model_ref)
+    local path = M.state_path()
+    if type(model_ref) == "string" and model_ref ~= "" then
+        local f = io.open(path, "w")
+        if f then
+            f:write(model_ref)
+            f:close()
+        end
+    else
+        vim.uv.fs_unlink(path)
+    end
+end
+
+--- The published vision model, if any (mirrors what the extension sees).
+---@return string?
+function M.published()
+    local f = io.open(M.state_path(), "r")
+    if not f then
+        return nil
+    end
+    local content = vim.trim(f:read("*a") or "")
+    f:close()
+    return content ~= "" and content or nil
+end
+
 local OPEN_TAG = '<pi-vision model="'
 local CLOSE_TAG = "</pi-vision>"
+
+---@type string?
+local state_path_override = nil
 
 --- Build the marker block appended to the user message by the extension.
 ---@param model string "provider/modelId" that produced the description
