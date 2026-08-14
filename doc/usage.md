@@ -356,6 +356,8 @@ While this runs, the history shows a pending preview row (`labels.vision_pending
 
 **Fast-fail semantics**: there is no silent fallback. If the configured model cannot be resolved, does not support images, or either model call fails, the submission is aborted — nothing is sent — you get a `[pi-vision] …` error notification, and the prompt text and attachments are restored so you can retry. When the main model already supports images (or `vision.model` is unset), attachments pass through untouched.
 
+The fallback also covers the agent itself: when the main model cannot see images and the agent uses the `read` tool on an image (e.g. a screenshot it just took), pi would normally replace the image with an "omitted" note and the agent stalls. The bundled extension replaces that tool result with a vision-model description instead, so the agent reads a successful description. On failure the original note is kept (a tool call cannot be aborted) and you get a `[pi-vision] …` notification. Note `read` renders inline, so the description is visible to the model but not expanded in the history.
+
 The bundled extension and its model reference are injected when the RPC process spawns; the reference itself travels through a runtime file that the extension re-reads on every submission, so a live `require("pi").setup({ vision = { model = ... } })` also applies to chats that are already open.
 
 ```lua

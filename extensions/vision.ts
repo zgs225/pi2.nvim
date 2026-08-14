@@ -33,7 +33,6 @@ import type {
 	SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 import { readFileSync } from "node:fs";
-
 /**
  * Runtime file published by pi.nvim's config.setup(): the process env is
  * frozen at spawn, but this file is re-read on every input event so live
@@ -77,10 +76,29 @@ interface RegistryLike {
 		options?: SimpleStreamOptions,
 	) => Promise<AssistantMessage>;
 	getProvider: (id: string) => Provider | undefined;
+	find?: (provider: string, modelId: string) => Model<any> | undefined;
 	getApiKeyAndHeaders: (model: Model<any>) => Promise<
 		| { ok: true; apiKey?: string; headers?: Record<string, string>; baseUrl?: string }
 		| { ok: false; error: string }
 	>;
+}
+
+/** Resolve and validate the configured vision model; throws on any mismatch. */
+function resolveVisionModel(registry: RegistryLike, modelRef: string): Model<any> {
+	const slash = modelRef.indexOf("/");
+	const provider = slash > 0 ? modelRef.slice(0, slash) : "";
+	const modelId = slash > 0 ? modelRef.slice(slash + 1) : "";
+	if (provider === "" || modelId === "") {
+		throw new Error(`invalid vision.model "${modelRef}" (expected "provider/modelId")`);
+	}
+	const model = registry.find?.(provider, modelId);
+	if (!model) {
+		throw new Error(`configured vision model "${modelRef}" not found`);
+	}
+	if (!model.input?.includes("image")) {
+		throw new Error(`configured vision model "${modelRef}" does not support images`);
+	}
+	return model;
 }
 
 async function completeModel(
@@ -175,6 +193,46 @@ function buildInstructionPrompt(context: string, nextMessage: string): string {
 		.join("\n\n");
 }
 
+interface DescribeCtx {
+	model?: Model<any>;
+	modelRegistry: RegistryLike;
+	sessionManager: {
+		buildContextEntries(): Array<{ type: string; message?: { role: string; content: unknown } }>;
+	};
+}
+
+/** Instruction call (main model) + batched description call (vision model). */
+async function describeImages(
+	ctx: DescribeCtx,
+	visionModel: Model<any>,
+	images: ImageContent[],
+	nextText: string,
+): Promise<string> {
+	if (!ctx.model) {
+		throw new Error("no current model available to generate the description instruction");
+	}
+	const prompt = buildInstructionPrompt(recentContext(ctx), nextText);
+	const instructionReply = await completeModel(
+		ctx.modelRegistry,
+		ctx.model,
+		{ messages: [{ role: "user", content: prompt, timestamp: Date.now() }] },
+		{ temperature: 0, maxTokens: INSTRUCTION_MAX_TOKENS },
+	);
+	const instruction = assertCompleted(instructionReply, "instruction generation failed");
+
+	const content: Array<{ type: "text"; text: string } | ImageContent> = [
+		{ type: "text", text: instruction },
+		...images,
+	];
+	const reply = await completeModel(
+		ctx.modelRegistry,
+		visionModel,
+		{ messages: [{ role: "user", content, timestamp: Date.now() }] },
+		{ maxTokens: DESCRIPTION_MAX_TOKENS },
+	);
+	return assertCompleted(reply, "vision model call failed");
+}
+
 export default function visionFallback(pi: ExtensionAPI): void {
 	pi.on("input", async (event, ctx) => {
 		if (!event.images || event.images.length === 0) {
@@ -188,58 +246,26 @@ export default function visionFallback(pi: ExtensionAPI): void {
 		if (modelRef === "") {
 			return { action: "continue" };
 		}
-		const slash = modelRef.indexOf("/");
-		const provider = slash > 0 ? modelRef.slice(0, slash) : "";
-		const modelId = slash > 0 ? modelRef.slice(slash + 1) : "";
 
 		const fail = (reason: string) => {
 			ctx.ui.notify(`${NOTIFY_PREFIX} ${reason}`, "error");
 			return { action: "handled" } as const;
 		};
 
-		if (provider === "" || modelId === "") {
-			return fail(`invalid vision.model "${modelRef}" (expected "provider/modelId")`);
-		}
-		const visionModel: Model<any> | undefined = ctx.modelRegistry.find(provider, modelId);
-		if (!visionModel) {
-			return fail(`configured vision model "${modelRef}" not found`);
-		}
-		if (!visionModel.input?.includes("image")) {
-			return fail(`configured vision model "${modelRef}" does not support images`);
+		let visionModel: Model<any>;
+		try {
+			visionModel = resolveVisionModel(ctx.modelRegistry, modelRef);
+		} catch (err) {
+			return fail(errorMessage(err));
 		}
 		if (!ctx.model) {
 			return fail("no current model available to generate the description instruction");
 		}
 
-		// 1) Main model: context-aware instruction for the vision model.
-		let instruction: string;
-		try {
-			const prompt = buildInstructionPrompt(recentContext(ctx), event.text);
-			const reply = await completeModel(
-				ctx.modelRegistry,
-				ctx.model,
-				{ messages: [{ role: "user", content: prompt, timestamp: Date.now() }] },
-				{ temperature: 0, maxTokens: INSTRUCTION_MAX_TOKENS },
-			);
-			instruction = assertCompleted(reply, "instruction generation failed");
-		} catch (err) {
-			return fail(errorMessage(err));
-		}
-
-		// 2) Vision model: describe all images in one batched call.
+		// 1) + 2) instruction (main model) and description (vision model).
 		let description: string;
 		try {
-			const content: Array<{ type: "text"; text: string } | ImageContent> = [
-				{ type: "text", text: instruction },
-				...event.images,
-			];
-			const reply = await completeModel(
-				ctx.modelRegistry,
-				visionModel,
-				{ messages: [{ role: "user", content, timestamp: Date.now() }] },
-				{ maxTokens: DESCRIPTION_MAX_TOKENS },
-			);
-			description = assertCompleted(reply, "vision model call failed");
+			description = await describeImages(ctx, visionModel, event.images, event.text);
 		} catch (err) {
 			return fail(errorMessage(err));
 		}
@@ -247,5 +273,64 @@ export default function visionFallback(pi: ExtensionAPI): void {
 		const separator = event.text.trim() !== "" ? "\n\n" : "";
 		const text = `${event.text}${separator}${openTag(modelRef)}\n${description}\n${CLOSE_TAG}`;
 		return { action: "transform", text, images: [] };
+	});
+
+	// read tool on an image while the main model cannot see images: pi's read
+	// replaces the image with an "omitted" note, which makes the agent fail.
+	// Replace that tool result with a vision-model description instead; the
+	// LLM sees a successful read. Failures keep the original note (the turn
+	// cannot be aborted from a tool hook) and notify the user.
+	pi.on("tool_result", async (event, ctx) => {
+		if (event.toolName !== "read") {
+			return undefined;
+		}
+		if (event.isError) {
+			return undefined;
+		}
+		// pi's read keeps the image blocks in the tool result; they are only
+		// replaced by "(image omitted…)" later, at the API layer. So the
+		// images are available here for the vision model.
+		const images = event.content.filter((block): block is ImageContent => block.type === "image");
+		if (images.length === 0) {
+			return undefined; // not an image read
+		}
+		if (ctx.model?.input?.includes("image")) {
+			return undefined; // main model saw the real image
+		}
+		const modelRef = readModelRef();
+		if (modelRef === "") {
+			return undefined;
+		}
+
+		const failSoft = (reason: string) => {
+			// A tool hook cannot abort the turn: keep the original result and
+			// surface the reason to the user.
+			ctx.ui.notify(`${NOTIFY_PREFIX} ${reason}`, "error");
+			return undefined;
+		};
+
+		let visionModel: Model<any>;
+		try {
+			visionModel = resolveVisionModel(ctx.modelRegistry, modelRef);
+		} catch (err) {
+			return failSoft(errorMessage(err));
+		}
+
+		const rawPath = (event.input as { path?: unknown }).path;
+		const where = typeof rawPath === "string" ? `the image file ${rawPath}` : "an image";
+		try {
+			const description = await describeImages(
+				ctx,
+				visionModel,
+				images,
+				`The agent just used the read tool on ${where}; describe it for the agent's ongoing task.`,
+			);
+			return {
+				content: [{ type: "text", text: `[Image described by ${modelRef}]\n${description}` }],
+				isError: false,
+			};
+		} catch (err) {
+			return failSoft(errorMessage(err));
+		}
 	});
 }
