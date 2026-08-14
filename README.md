@@ -298,6 +298,7 @@ Everything below is present in `pi2.nvim` and **not** in upstream `alex35mil/pi.
 - [Unsent-draft persistence](doc/usage.md#draft-persistence) — the prompt text survives restarts.
 - [Clipboard image paste](doc/usage.md#attachments) — pasting into the prompt while the clipboard holds an image attaches it; the rest of the editor's paste is untouched.
 - [Image compression for attachments](doc/usage.md#image-compression) — downscale/re-encode before sending (sips / magick / ffmpeg).
+- [Vision fallback for non-vision models](doc/usage.md#vision-fallback) — when the main model can't see images, a configured vision model describes them first and the description replaces the images (fast-fail with prompt restore).
 
 **Agent control**
 

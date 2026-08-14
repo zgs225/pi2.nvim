@@ -145,6 +145,19 @@ M.check = function()
         end
     end
 
+    -- ── Bundled vision extension ──────────────────────────────────────
+    local vision_cfg = Config.options.vision or {}
+    if type(vision_cfg.model) == "string" and vision_cfg.model ~= "" then
+        local vision_path = Cli.vision_extension_path()
+        if vim.uv.fs_stat(vision_path) then
+            vim.health.ok("bundled vision extension found (`vision.model = " .. vision_cfg.model .. "`")
+        else
+            vim.health.warn("bundled vision extension not found at " .. vision_path, {
+                "Reinstall pi2.nvim or unset `vision.model` to disable the vision fallback",
+            })
+        end
+    end
+
     -- ── Image compression tools ───────────────────────────────────────
     local compress_cfg = Config.options.prompt and Config.options.prompt.image_compress or {}
     if compress_cfg.enable ~= false then

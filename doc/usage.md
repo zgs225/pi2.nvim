@@ -344,6 +344,26 @@ Once attached, items appear in the attachments panel with an icon, the filename,
 
 Attachments are cleared automatically when the message is sent. If you want to discard the queue without sending, just delete each entry with `dd`/`x`.
 
+### Vision fallback
+
+When the current main model does not support image input, attached images cannot be sent as-is. With `vision.model` set to a vision-capable `"provider/modelId"`, π routes the images through that model before the agent turn starts:
+
+1. The main model (text-only, bounded recent context) writes one short, task-focused description instruction based on your message and the conversation so far.
+2. All attached images plus that instruction go to the configured vision model in a single batched call.
+3. The description replaces the images in your message; the agent reads it as part of your turn.
+
+While this runs, the history shows a pending preview row (`labels.vision_pending`) and the statusline a spinner; the final render is your original text followed by a collapsible vision block (header + model id + description, auto-collapsing like tool blocks). On replay the block is re-rendered from the stored message.
+
+**Fast-fail semantics**: there is no silent fallback. If the configured model cannot be resolved, does not support images, or either model call fails, the submission is aborted — nothing is sent — you get a `[pi-vision] …` error notification, and the prompt text and attachments are restored so you can retry. When the main model already supports images (or `vision.model` is unset), attachments pass through untouched.
+
+```lua
+require("pi").setup({
+    vision = {
+        model = "google/gemini-2.5-pro", -- configured ⇒ enabled
+    },
+})
+```
+
 ## Zen mode
 
 Zen mode is a full-screen overlay that promotes the π prompt to a centered floating window over a dimmed backdrop. The history, attachments, and the rest of your editor disappear behind the backdrop, leaving only the prompt visible. It's the right mode when you need to compose a long message — a multi-paragraph spec, a detailed bug report, a planning brain dump — without the rest of the UI distracting you.

@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-08-14
+
+- **ADDED:** vision fallback (`vision = { model = "provider/modelId" }`): when the current main model cannot see images, attachments are described by the configured vision-capable model before the turn starts — the main model first writes a context-aware description instruction, then the vision model describes all images in one batched call, and the description replaces the images in the user message. While the description is being generated the history shows a pending preview row and the statusline a spinner; the result renders as a collapsible block (header + model id + description) under the original message text, including on replay. Failure is fast-fail: nothing is sent, and the prompt text and attachments are restored for a retry. Disabled by default (unset).
+
 ## 2026-08-13
 
 - **FIXED:** In side layout, opening a full-width window in the prompt column (e.g. toggleterm's horizontal terminal) and closing it again no longer leaves the prompt ballooned and the history compressed until the next keystroke. Closing a full-width window re-distributes the freed height to the bottom window of each column, ignoring `'winfixheight'`; the panel now re-normalizes its column heights after any external window closes (WinClosed), pinning the prompt back to its content height and letting history take the rest. Manual `<C-w>+`/drag height adjustments are unaffected — WinClosed only fires when a window actually closes (#31).

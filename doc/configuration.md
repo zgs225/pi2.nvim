@@ -61,6 +61,7 @@ require("pi").setup({
         tool_failure = "",
         steer_message = "󰾘",
         follow_up_message = "󱇼",
+        vision_pending = "󰈈",
         thinking = "󰟶",
         compaction = "󰏗",
         attachment = "",
@@ -187,6 +188,16 @@ require("pi").setup({
     -- whose extension API exposes ctx.navigateTree.
     tree = {
         enabled = true,
+    },
+
+    -- Vision fallback for non-vision main models. When `model` is set
+    -- ("provider/modelId") and the current main model cannot see images,
+    -- attached images are described by this vision-capable model first and
+    -- the description replaces the images in the user message (rendered as a
+    -- dedicated block in the history). Any failure fast-fails the submission
+    -- and restores the prompt text and attachments. Disabled when unset.
+    vision = {
+        -- model = "google/gemini-2.5-pro",
     },
 
     -- Sessions overview (:PiSessions): a live list of all active sessions
