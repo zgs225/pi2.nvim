@@ -278,7 +278,8 @@ require("pi").setup({
             -- Maximum entries kept per workspace; oldest are dropped first.
             max = 500,
         },
-        -- Unsent-draft persistence across restarts.
+        -- Unsent-draft persistence across restarts, scoped per workspace
+        -- (like history: a draft typed in one project stays there).
         draft = {
             enabled = true,
         },

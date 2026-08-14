@@ -821,10 +821,12 @@ end
 
 --- Set the workspace cwd this chat's prompt history is scoped to. Called by
 --- the session manager right after creation; falls back to the current cwd
---- when never set.
+--- when never set. Also anchors the prompt's unsent-draft persistence, which
+--- is workspace-scoped the same way.
 ---@param cwd string
 function Chat:set_cwd(cwd)
     self._cwd = cwd
+    self._prompt:set_workspace(cwd)
 end
 
 --- Get the prompt-history store for this chat, honoring config. History is
