@@ -356,6 +356,8 @@ While this runs, the history shows a pending preview row (`labels.vision_pending
 
 **Fast-fail semantics**: there is no silent fallback. If the configured model cannot be resolved, does not support images, or either model call fails, the submission is aborted — nothing is sent — you get a `[pi-vision] …` error notification, and the prompt text and attachments are restored so you can retry. When the main model already supports images (or `vision.model` is unset), attachments pass through untouched.
 
+The bundled extension and its model reference are injected when the RPC process spawns, so setting (or changing) `vision.model` takes effect for **new sessions** — open the chat in a fresh tab or restart Neovim after configuring it (a live `require("pi").setup(...)` also works when it runs before the tab's chat is first opened).
+
 ```lua
 require("pi").setup({
     vision = {
