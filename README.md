@@ -116,7 +116,7 @@ https://github.com/user-attachments/assets/f210246a-2427-4fdb-b679-eeb6ceae4538
 ## Requirements
 
 - Neovim 0.10+
-- `pi` in `$PATH`
+- `pi` in `$PATH` — **pi 0.65.2+** overall; the [vision fallback](doc/usage.md#vision-fallback) additionally requires **pi 0.81.0+**
 - [`MeanderingProgrammer/render-markdown.nvim`](https://github.com/MeanderingProgrammer/render-markdown.nvim) for the default chat-history renderer (`render.engine = "render-markdown"`)
 
 Optional but useful:

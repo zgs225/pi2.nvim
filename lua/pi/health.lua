@@ -43,11 +43,13 @@ M.check = function()
 
     -- ── pi executable and version ─────────────────────────────────────
     local bin = Cli.bin()
+    local pi_version ---@type string?
     local bin_found = vim.fn.executable(bin) == 1
     if bin_found then
         vim.health.ok("`" .. bin .. "` executable found")
 
         local version, err = get_pi_version(bin)
+        pi_version = version
         if not version then
             vim.health.warn("Could not determine pi version: " .. (err or "unknown error"))
         else
@@ -155,6 +157,47 @@ M.check = function()
             vim.health.warn("bundled vision extension not found at " .. vision_path, {
                 "Reinstall pi2.nvim or unset `vision.model` to disable the vision fallback",
             })
+        end
+
+        -- Version floor: the vision extension needs a public
+        -- ModelRegistry.getProvider() (pi 0.81.0+). Below that every image
+        -- submission fast-fails with a `[pi-vision]` error and the prompt is
+        -- restored — no crash, but the feature never works.
+        local vision_min = Compat.vision_min_supported
+        if not pi_version then
+            vim.health.warn(
+                "Could not verify pi version against the vision fallback requirement (pi >= " .. vision_min .. ")",
+                {
+                    "Fix the pi version detection above, or unset `vision.model` to disable the vision fallback",
+                }
+            )
+        else
+            local cmp_vision = Compat.compare_versions(pi_version, vision_min)
+            if cmp_vision == nil then
+                vim.health.warn(
+                    "Could not compare pi version `"
+                        .. pi_version
+                        .. "` against the vision fallback minimum `"
+                        .. vision_min
+                        .. "`"
+                )
+            elseif cmp_vision < 0 then
+                vim.health.error(
+                    "pi version `" .. pi_version .. "` is older than the vision fallback minimum `" .. vision_min .. "`",
+                    {
+                        "Upgrade pi to " .. vision_min .. "+ or unset `vision.model` to disable the vision fallback",
+                        "With an older pi, image submissions fast-fail with a `[pi-vision]` error and the prompt is restored (no crash)",
+                    }
+                )
+            else
+                vim.health.ok(
+                    "pi version `"
+                        .. pi_version
+                        .. "` satisfies the vision fallback requirement (pi >= "
+                        .. vision_min
+                        .. ")"
+                )
+            end
         end
     end
 

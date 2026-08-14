@@ -196,6 +196,7 @@ require("pi").setup({
     -- the description replaces the images in the user message (rendered as a
     -- dedicated block in the history). Any failure fast-fails the submission
     -- and restores the prompt text and attachments. Disabled when unset.
+    -- Requires pi 0.81.0+ (see doc/usage.md#vision-fallback).
     vision = {
         -- model = "google/gemini-2.5-pro",
         -- Statusline text while the description is being generated; %s

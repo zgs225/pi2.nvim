@@ -185,7 +185,7 @@
 ---@field enabled? boolean Enable :PiTree session-tree navigation (default: true). Injects the bundled pi extension (extensions/tree.ts) into every RPC process; requires a pi version whose extension API exposes ctx.navigateTree.
 
 ---@class pi.VisionConfig
----@field model? string Vision-capable model as "provider/modelId". When set, image attachments sent to a non-vision main model are described by this model first and the description replaces the images (fast-fail on any error; disabled when unset)
+---@field model? string Vision-capable model as "provider/modelId". When set, image attachments sent to a non-vision main model are described by this model first and the description replaces the images (fast-fail on any error; disabled when unset). Requires pi 0.81.0+ (see doc/usage.md#vision-fallback)
 ---@field status_message? string Statusline text shown while the description is being generated (default: "Describing images…"); may contain %s for the vision model id
 
 ---@class pi.SessionsListFloatConfig

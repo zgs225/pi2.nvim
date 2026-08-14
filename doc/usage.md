@@ -347,6 +347,8 @@ Attachments are cleared automatically when the message is sent. If you want to d
 
 When the current main model does not support image input, attached images cannot be sent as-is. With `vision.model` set to a vision-capable `"provider/modelId"`, π routes the images through that model before the agent turn starts:
 
+> **Requires pi 0.81.0+** (0.81–0.83.x via the `provider.streamSimple()` fallback path, validated on 0.83.0; 0.84.0+ uses `ModelRegistry.complete()`). On older pi versions nothing crashes — every image submission fast-fails with a `[pi-vision] …` error notification and the prompt is restored (see [Health & debugging](troubleshooting.md)).
+
 1. The main model (text-only, bounded recent context) writes one short, task-focused description instruction based on your message and the conversation so far.
 2. All attached images plus that instruction go to the configured vision model in a single batched call.
 3. The description replaces the images in your message; the agent reads it as part of your turn.
