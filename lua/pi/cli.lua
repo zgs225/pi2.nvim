@@ -104,6 +104,12 @@ function M.tree_extension_path()
     return plugin_root() .. "/extensions/tree.ts"
 end
 
+--- Absolute path to the bundled pi extension backing the vision fallback.
+---@return string
+function M.vision_extension_path()
+    return plugin_root() .. "/extensions/vision.ts"
+end
+
 ---@return string[]
 function M.command()
     local cmd = { M.bin() }
@@ -114,6 +120,17 @@ function M.command()
     local tree = Config.options.tree or {}
     if tree.enabled ~= false then
         local ext = M.tree_extension_path()
+        if vim.fn.filereadable(ext) == 1 then
+            cmd[#cmd + 1] = "--extension"
+            cmd[#cmd + 1] = ext
+        end
+    end
+    -- Inject the vision fallback extension when configured: images sent to
+    -- a non-vision main model are described by the configured vision model.
+    -- The model reference travels via PI_NVIM_VISION_MODEL (see rpc.lua).
+    local vision = Config.options.vision or {}
+    if type(vision.model) == "string" and vision.model ~= "" then
+        local ext = M.vision_extension_path()
         if vim.fn.filereadable(ext) == 1 then
             cmd[#cmd + 1] = "--extension"
             cmd[#cmd + 1] = ext
