@@ -24,7 +24,14 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import type { AssistantMessage, ImageContent, Model } from "@earendil-works/pi-ai";
+import type {
+	AssistantMessage,
+	Context,
+	ImageContent,
+	Model,
+	Provider,
+	SimpleStreamOptions,
+} from "@earendil-works/pi-ai";
 import { readFileSync } from "node:fs";
 
 /**
@@ -56,6 +63,50 @@ function readModelRef(): string {
 	} catch {
 		return "";
 	}
+}
+
+/**
+ * One-shot completion across pi versions: newer releases expose
+ * ModelRegistry.complete(); older ones (e.g. 0.83.0) only expose providers,
+ * so fall back to provider.streamSimple() and await the stream result.
+ */
+interface RegistryLike {
+	complete?: (
+		model: Model<any>,
+		context: Context,
+		options?: SimpleStreamOptions,
+	) => Promise<AssistantMessage>;
+	getProvider: (id: string) => Provider | undefined;
+	getApiKeyAndHeaders: (model: Model<any>) => Promise<
+		| { ok: true; apiKey?: string; headers?: Record<string, string>; baseUrl?: string }
+		| { ok: false; error: string }
+	>;
+}
+
+async function completeModel(
+	registry: RegistryLike,
+	model: Model<any>,
+	context: Context,
+	options: SimpleStreamOptions,
+): Promise<AssistantMessage> {
+	if (typeof registry.complete === "function") {
+		return registry.complete(model, context, options);
+	}
+	const provider = registry.getProvider(model.provider);
+	if (!provider) {
+		throw new Error(`no provider available for "${model.provider}"`);
+	}
+	// Older pi versions resolve auth in the Models wrapper we bypass here;
+	// inject the resolved credential into the request options instead.
+	const merged: SimpleStreamOptions = { ...options };
+	const auth = await registry.getApiKeyAndHeaders(model);
+	if (auth?.ok) {
+		if (auth.apiKey) merged.apiKey = auth.apiKey;
+		if (auth.baseUrl) merged.baseUrl = auth.baseUrl;
+		if (auth.headers) merged.headers = { ...auth.headers, ...(merged.headers ?? {}) };
+	}
+	const stream = provider.streamSimple(model, context, merged);
+	return await stream.result();
 }
 
 function errorMessage(err: unknown): string {
@@ -164,10 +215,11 @@ export default function visionFallback(pi: ExtensionAPI): void {
 		let instruction: string;
 		try {
 			const prompt = buildInstructionPrompt(recentContext(ctx), event.text);
-			const reply = await ctx.modelRegistry.complete(
+			const reply = await completeModel(
+				ctx.modelRegistry,
 				ctx.model,
 				{ messages: [{ role: "user", content: prompt, timestamp: Date.now() }] },
-				{ reasoning: "minimal", temperature: 0, maxTokens: INSTRUCTION_MAX_TOKENS },
+				{ temperature: 0, maxTokens: INSTRUCTION_MAX_TOKENS },
 			);
 			instruction = assertCompleted(reply, "instruction generation failed");
 		} catch (err) {
@@ -181,10 +233,11 @@ export default function visionFallback(pi: ExtensionAPI): void {
 				{ type: "text", text: instruction },
 				...event.images,
 			];
-			const reply = await ctx.modelRegistry.complete(
+			const reply = await completeModel(
+				ctx.modelRegistry,
 				visionModel,
 				{ messages: [{ role: "user", content, timestamp: Date.now() }] },
-				{ reasoning: "minimal", maxTokens: DESCRIPTION_MAX_TOKENS },
+				{ maxTokens: DESCRIPTION_MAX_TOKENS },
 			);
 			description = assertCompleted(reply, "vision model call failed");
 		} catch (err) {
