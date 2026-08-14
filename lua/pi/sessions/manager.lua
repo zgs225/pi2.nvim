@@ -723,7 +723,7 @@ local function replay_messages(session, messages)
                 if parsed.text ~= "" then
                     session.chat:add_user_message(parsed.text, msg.timestamp, nil)
                 end
-                session.chat._history:add_vision_block(parsed.model, parsed.description or "")
+                session.chat:add_vision_block(parsed.model, parsed.description or "")
             elseif text ~= "" or image_count > 0 then
                 session.chat:add_user_message(text, msg.timestamp, image_count > 0 and image_count or nil)
             end

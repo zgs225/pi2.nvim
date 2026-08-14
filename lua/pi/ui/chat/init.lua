@@ -970,7 +970,9 @@ function Chat:_send_message(queue_type)
         self._history:add_pending_queue_entry(queue_type, text, expanded, image_count)
     elseif vision_model then
         self._history:set_vision_pending({ text = text, image_count = image_count, model = vision_model })
-        self:set_status({ type = "agent", text = ("Understanding images with %s…"):format(vision_model) })
+        if not self._streaming and not self._compacting then
+            self:set_status({ type = "agent", text = ("Understanding images with %s…"):format(vision_model) })
+        end
     else
         -- Immediate: render in history now
         self._history:add_user_message(text, nil, image_count)
@@ -1104,6 +1106,13 @@ end
 ---@param image_count? integer
 function Chat:add_user_message(msg, timestamp, image_count)
     self._history:add_user_message(msg, timestamp, image_count)
+end
+
+--- Render a vision description block (replay path).
+---@param model_ref string
+---@param description string
+function Chat:add_vision_block(model_ref, description)
+    self._history:add_vision_block(model_ref, description)
 end
 
 ---@param replaying boolean
