@@ -104,6 +104,12 @@ function M.tree_extension_path()
     return plugin_root() .. "/extensions/tree.ts"
 end
 
+--- Absolute path to the bundled pi extension backing the vision fallback.
+---@return string
+function M.vision_extension_path()
+    return plugin_root() .. "/extensions/vision.ts"
+end
+
 ---@return string[]
 function M.command()
     local cmd = { M.bin() }
@@ -118,6 +124,16 @@ function M.command()
             cmd[#cmd + 1] = "--extension"
             cmd[#cmd + 1] = ext
         end
+    end
+    -- Inject the vision fallback extension unconditionally (like tree.ts):
+    -- it is a no-op unless a vision model is configured. The model reference
+    -- travels via a runtime file the extension re-reads on every input event
+    -- (PI_NVIM_VISION_FILE, see rpc.lua), so live setup() calls apply without
+    -- respawning the RPC process.
+    local ext = M.vision_extension_path()
+    if vim.fn.filereadable(ext) == 1 then
+        cmd[#cmd + 1] = "--extension"
+        cmd[#cmd + 1] = ext
     end
     cmd[#cmd + 1] = "--mode"
     cmd[#cmd + 1] = "rpc"

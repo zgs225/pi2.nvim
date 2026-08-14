@@ -323,6 +323,20 @@ function Prompt:clear_text()
     end
 end
 
+--- Replace the prompt contents (used to restore a submission that a pi
+--- extension aborted, e.g. the vision fallback fast-fail).
+---@param text string
+function Prompt:set_text(text)
+    if self._buf and vim.api.nvim_buf_is_valid(self._buf) then
+        local lines = text == "" and { "" } or vim.split(text, "\n", { plain = true })
+        vim.api.nvim_buf_set_lines(self._buf, 0, -1, false, lines)
+        self:resize()
+        self:_render_statusline()
+        self:_refresh_bash_mode()
+        self:_save_draft()
+    end
+end
+
 --- Persist the current prompt text as the unsent draft (empty text clears it).
 --- Called (debounced) on text changes; exposed as a method so the save logic is
 --- testable independent of the TextChanged event.

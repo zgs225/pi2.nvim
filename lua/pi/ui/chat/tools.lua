@@ -33,6 +33,7 @@ local TOOL_ICONS = {
     fetch_content = nf(0xF059F), -- nf-md-web
     source_check = nf(0xF0565), -- nf-md-shield-check
     get_search_content = nf(0xF0866), -- nf-md-database-search
+    vision = nf(0xF0208), -- nf-md-eye (vision-fallback description block)
 }
 
 --- Get the nerd font icon for a tool name.
@@ -767,6 +768,18 @@ end
 
 ---@type table<string, pi.ToolRenderer>
 local renderers = {
+    -- Synthetic block rendered by pi.nvim (not a real tool call): the
+    -- description produced by the vision fallback for non-vision models.
+    vision = {
+        input_visible = 1,
+        output_visible = 8,
+        on_start = function(history, args)
+            if args and type(args.model) == "string" and args.model ~= "" then
+                render_body_line(history, args.model)
+            end
+        end,
+        on_end = render_result_output,
+    },
     bash = {
         input_visible = 1,
         output_visible = 1,

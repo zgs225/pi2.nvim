@@ -4,6 +4,7 @@ local M = {}
 
 local Attention = require("pi.attention")
 local Notify = require("pi.notify")
+local Vision = require("pi.vision")
 local Config = require("pi.config")
 local Startup = require("pi.startup")
 local CommandsCache = require("pi.cache.commands")
@@ -15,6 +16,17 @@ function M.handle(session, msg)
 
     -- Fire-and-forget methods
     if method == "notify" then
+        -- Vision-extension fast-fail: restore the aborted submission instead
+        -- of (only) surfacing the error. The chat adds its own notification.
+        local vision_reason
+        local message = msg.message
+        if msg.notifyType == "error" and type(message) == "string" then
+            vision_reason = Vision.parse_notify(message)
+        end
+        if vision_reason then
+            session.chat:_on_vision_failure(vision_reason)
+            return
+        end
         local handlers = {
             info = Notify.info,
             warning = Notify.warn,

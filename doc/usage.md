@@ -344,6 +344,30 @@ Once attached, items appear in the attachments panel with an icon, the filename,
 
 Attachments are cleared automatically when the message is sent. If you want to discard the queue without sending, just delete each entry with `dd`/`x`.
 
+### Vision fallback
+
+When the current main model does not support image input, attached images cannot be sent as-is. With `vision.model` set to a vision-capable `"provider/modelId"`, π routes the images through that model before the agent turn starts:
+
+1. The main model (text-only, bounded recent context) writes one short, task-focused description instruction based on your message and the conversation so far.
+2. All attached images plus that instruction go to the configured vision model in a single batched call.
+3. The description replaces the images in your message; the agent reads it as part of your turn.
+
+While this runs, the history shows a pending preview row (`labels.vision_pending`) and the statusline a spinner with `vision.status_message` (default `Describing images…`; `%s` expands to the vision model id); the final render is your original text followed by a collapsible vision block (header + model id + description, auto-collapsing like tool blocks). On replay the block is re-rendered from the stored message.
+
+**Fast-fail semantics**: there is no silent fallback. If the configured model cannot be resolved, does not support images, or either model call fails, the submission is aborted — nothing is sent — you get a `[pi-vision] …` error notification, and the prompt text and attachments are restored so you can retry. When the main model already supports images (or `vision.model` is unset), attachments pass through untouched.
+
+The fallback also covers the agent itself: when the main model cannot see images and the agent uses the `read` tool on an image (e.g. a screenshot it just took), pi would normally replace the image with an "omitted" note and the agent stalls. The bundled extension replaces that tool result with a vision-model description instead, so the agent reads a successful description. On failure the original note is kept (a tool call cannot be aborted) and you get a `[pi-vision] …` notification. Note `read` renders inline, so the description is visible to the model but not expanded in the history.
+
+The bundled extension and its model reference are injected when the RPC process spawns; the reference itself travels through a runtime file that the extension re-reads on every submission, so a live `require("pi").setup({ vision = { model = ... } })` also applies to chats that are already open.
+
+```lua
+require("pi").setup({
+    vision = {
+        model = "google/gemini-2.5-pro", -- configured ⇒ enabled
+    },
+})
+```
+
 ## Zen mode
 
 Zen mode is a full-screen overlay that promotes the π prompt to a centered floating window over a dimmed backdrop. The history, attachments, and the rest of your editor disappear behind the backdrop, leaving only the prompt visible. It's the right mode when you need to compose a long message — a multi-paragraph spec, a detailed bug report, a planning brain dump — without the rest of the UI distracting you.

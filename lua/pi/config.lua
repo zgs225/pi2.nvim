@@ -107,6 +107,7 @@
 ---@field tool_failure string
 ---@field steer_message string
 ---@field follow_up_message string
+---@field vision_pending string
 ---@field thinking string
 ---@field compaction string
 ---@field attachment string
@@ -183,6 +184,10 @@
 
 ---@class pi.TreeConfig
 ---@field enabled? boolean Enable :PiTree session-tree navigation (default: true). Injects the bundled pi extension (extensions/tree.ts) into every RPC process; requires a pi version whose extension API exposes ctx.navigateTree.
+
+---@class pi.VisionConfig
+---@field model? string Vision-capable model as "provider/modelId". When set, image attachments sent to a non-vision main model are described by this model first and the description replaces the images (fast-fail on any error; disabled when unset)
+---@field status_message? string Statusline text shown while the description is being generated (default: "Describing images…"); may contain %s for the vision model id
 
 ---@class pi.SessionsListFloatConfig
 ---@field width? number Width in columns (>=1) or fraction of editor width (<1, default 0.5)
@@ -275,6 +280,7 @@
 ---@field quickfix pi.QuickfixConfig
 ---@field abort pi.AbortConfig
 ---@field tree pi.TreeConfig
+---@field vision pi.VisionConfig
 ---@field sessions_list pi.SessionsListConfig
 ---@field diff_review pi.DiffReviewConfig
 ---@field zen pi.ZenConfig
@@ -325,6 +331,7 @@ local defaults = {
         tool_failure = "",
         steer_message = "󰾘",
         follow_up_message = "󱇼",
+        vision_pending = "󰈈",
         thinking = "󰟶",
         compaction = "󰏗",
         attachment = "",
@@ -405,6 +412,7 @@ local defaults = {
     tree = {
         enabled = true,
     },
+    vision = {},
     sessions_list = {
         mode = "follow",
         auto_open = false,
@@ -523,6 +531,11 @@ function M.setup(opts)
             M.options.verbs = { use_defaults = false, pairs = user_pairs }
         end
     end
+
+    -- The bundled vision extension re-reads its model reference from a
+    -- runtime file on every input event, so live setup() calls apply to
+    -- already-spawned RPC processes.
+    require("pi.vision").publish(M.options.vision and M.options.vision.model)
 end
 
 --- Resolve a config value that may be a function, merging the result with

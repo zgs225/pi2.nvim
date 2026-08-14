@@ -332,6 +332,25 @@ function Attachments:count()
     return #self._items
 end
 
+--- Shallow copy of the raw items (richer than get(): keeps name/size).
+---@return pi.Attachment[]
+function Attachments:items()
+    local copy = {} ---@type pi.Attachment[]
+    for _, item in ipairs(self._items) do
+        copy[#copy + 1] = { name = item.name, data = item.data, mime = item.mime, size = item.size }
+    end
+    return copy
+end
+
+--- Re-add previously captured items (restores attachments after an aborted
+--- submission, e.g. the vision fallback fast-fail).
+---@param items pi.Attachment[]?
+function Attachments:restore(items)
+    for _, item in ipairs(items or {}) do
+        self:_add_item(item.name, item.data, item.mime, item.size)
+    end
+end
+
 ---@return integer
 function Attachments:buf()
     return self._buf
