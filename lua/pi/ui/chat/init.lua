@@ -44,6 +44,7 @@ local Render = require("pi.ui.render")
 local Prompt = require("pi.ui.chat.prompt")
 local Attachments = require("pi.ui.chat.attachments")
 local Mentions = require("pi.ui.chat.mentions")
+local Vision = require("pi.vision")
 local Zen = require("pi.ui.chat.zen")
 local PromptHistory = require("pi.prompt_history")
 
@@ -53,6 +54,14 @@ local PromptHistory = require("pi.prompt_history")
 ---@field mode "steer"|"follow_up"
 ---@field images? table[]
 ---@field image_count? integer
+
+--- Snapshot of a submission being rewritten by the vision extension; used to
+--- restore the prompt when the extension fast-fails.
+---@class pi.VisionInflight
+---@field queue_type "steer"|"follow_up"|nil
+---@field text string raw prompt text (for prompt restore)
+---@field expanded string mention-expanded text (matches the pending entry)
+---@field attachments pi.Attachment[]?
 
 ---@param tab pi.TabId
 ---@param mode pi.LayoutMode
@@ -89,6 +98,10 @@ function Chat.new(tab, mode, agent)
     self._bash_running = false
     self._bash_req_id = nil
     self._bash_req_counter = 0
+    ---@type boolean? current main model vision capability (nil = unknown)
+    self._model_supports_vision = nil
+    ---@type pi.VisionInflight?
+    self._vision_inflight = nil
     self._prompt:set_on_bash_mode_change(function(is_bash)
         self._layout:set_bash_mode(is_bash)
     end)
@@ -940,17 +953,37 @@ function Chat:_send_message(queue_type)
 
     self._prompt:clear_text()
 
-    local attachments = self._attachments:count() > 0 and self._attachments:get() or nil
+    local attachments = self._attachments:count() > 0 and self._attachments:items() or nil
     self._attachments:clear()
 
     local expanded = Mentions.expand(text)
 
+    local image_count = attachments and #attachments or nil
+    -- When the vision fallback applies, the bundled extension rewrites the
+    -- submission (images -> description marker) before the agent sees it.
+    -- Defer the final render until the user-message event arrives and keep a
+    -- snapshot to restore the prompt on fast-fail.
+    local vision_model = Vision.expects_transform(Config.options, self._model_supports_vision, image_count or 0)
+
     if queue_type then
         -- Queued message: show in pending area, render in history on delivery
-        self._history:add_pending_queue_entry(queue_type, text, expanded, attachments and #attachments or nil)
+        self._history:add_pending_queue_entry(queue_type, text, expanded, image_count)
+    elseif vision_model then
+        self._history:set_vision_pending({ text = text, image_count = image_count, model = vision_model })
+        self:set_status({ type = "agent", text = ("Understanding images with %s…"):format(vision_model) })
     else
         -- Immediate: render in history now
-        self._history:add_user_message(text, nil, attachments and #attachments or nil)
+        self._history:add_user_message(text, nil, image_count)
+    end
+
+    if vision_model then
+        ---@type pi.VisionInflight
+        self._vision_inflight = {
+            queue_type = queue_type,
+            text = text,
+            expanded = expanded,
+            attachments = attachments,
+        }
     end
 
     ---@type pi.RpcCommand
@@ -963,7 +996,9 @@ function Chat:_send_message(queue_type)
         cmd = { type = "prompt", message = expanded }
     end
     if attachments and #attachments > 0 then
-        cmd.images = attachments
+        cmd.images = vim.tbl_map(function(item)
+            return { type = "image", data = item.data, mimeType = item.mime }
+        end, attachments)
     end
 
     self._agent.send(cmd)
@@ -1248,6 +1283,44 @@ function Chat:on_message_start(msg)
                 end
             end
         end
+        local parsed = Vision.parse(text)
+        if parsed.model then
+            -- Vision-transformed delivery: the extension replaced the images
+            -- with a description marker. Render the original text plus a
+            -- dedicated vision block, then settle the pending state.
+            self._vision_inflight = nil
+            self._history:set_vision_pending(nil)
+            if not self._streaming and not self._compacting then
+                self:set_status(nil)
+            end
+            local entry = self._history:remove_pending_queue_entry(text)
+                or self:_remove_replay_flushed_queue_entry(text)
+            self._history:add_user_message(
+                entry and entry.text or parsed.text,
+                nil,
+                nil,
+                entry and entry.queue_type or nil
+            )
+            self._history:add_vision_block(parsed.model, parsed.description or "")
+            self:_remove_flushed_queue_entry(text)
+            return
+        end
+
+        -- A transform was predicted but the message arrived untransformed
+        -- (extension not loaded, model changed, ...): settle the pending
+        -- state and render the immediate send that was deferred.
+        if self._vision_inflight then
+            local inflight = self._vision_inflight
+            self._vision_inflight = nil
+            self._history:set_vision_pending(nil)
+            if not self._streaming and not self._compacting then
+                self:set_status(nil)
+            end
+            if not inflight.queue_type then
+                self._history:add_user_message(text, nil, image_count > 0 and image_count or nil)
+            end
+        end
+
         local entry = self._history:remove_pending_queue_entry(text) or self:_remove_replay_flushed_queue_entry(text)
         if entry then
             self._history:add_user_message(
@@ -1317,6 +1390,39 @@ end
 ---@param data table
 function Chat:update_state(data)
     self._prompt:statusline():update_state(data)
+    local model = data.model
+    if type(model) == "table" and type(model.input) == "table" then
+        self._model_supports_vision = vim.tbl_contains(model.input, "image")
+    else
+        self._model_supports_vision = nil
+    end
+end
+
+--- Handle a vision-extension fast-fail: tear down the pending state and
+--- restore the prompt text and attachments so the user can retry.
+---@param reason string
+function Chat:_on_vision_failure(reason)
+    local inflight = self._vision_inflight
+    self._vision_inflight = nil
+    self._history:set_vision_pending(nil)
+    if not self._streaming and not self._compacting then
+        self:set_status(nil)
+    end
+    if not inflight then
+        return
+    end
+    if inflight.queue_type then
+        -- Queued submission are rendered from the pending queue; drop the
+        -- entry that never delivered.
+        self._history:remove_pending_queue_entry(inflight.expanded)
+    end
+    if inflight.text ~= "" then
+        self._prompt:set_text(inflight.text)
+    end
+    if inflight.attachments and #inflight.attachments > 0 then
+        self._attachments:restore(inflight.attachments)
+    end
+    Notify.error("Vision fallback failed: " .. reason)
 end
 
 --- Accumulate usage stats on the status line (e.g. after session replay).

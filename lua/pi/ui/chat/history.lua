@@ -500,6 +500,8 @@ function History.new(tab)
     self._startup_loaded = false
     self._startup_errors = {}
     self._pending_queue = {}
+    self._vision_pending = nil
+    self._vision_block_seq = 0
     self._pending_queue_extmark_id = nil
     self._status_virt_line_count = 0
     self._replaying = false
@@ -661,7 +663,7 @@ function History:_update_status_extmark()
     end
     -- Hot path: with an empty queue there is nothing to render. Bail before
     -- touching the window so per-delta calls stay O(1).
-    if #self._pending_queue == 0 then
+    if #self._pending_queue == 0 and not self._vision_pending then
         if self._status_extmark_id then
             self:_clear_status_virt_lines()
         end
@@ -673,6 +675,30 @@ function History:_update_status_extmark()
     -- hls entries are { start_col, end_col, hl_group } in 0-indexed byte offsets.
     ---@type { text: string, hls: table[] }[]
     local rows = {}
+
+    -- Vision fallback in progress: the latest submission is being rewritten
+    -- (images described by the configured vision model).
+    if self._vision_pending then
+        local label = Config.options.labels.vision_pending .. " "
+        local preview = self._vision_pending.text:gsub("\n", " ")
+        if preview == "" and self._vision_pending.image_count and self._vision_pending.image_count > 0 then
+            preview = format_attachment_info(self._vision_pending.image_count)
+        end
+        if #preview > 80 then
+            preview = preview:sub(1, 77) .. "…"
+        end
+        local suffix = " → " .. self._vision_pending.model .. "…"
+        local prefix = "  " .. label
+        local line = prefix .. preview .. suffix
+        rows[#rows + 1] = {
+            text = line,
+            hls = {
+                { 2, #prefix, "PiPendingQueueLabel" },
+                { #prefix, #prefix + #preview, "PiPendingQueueText" },
+                { #prefix + #preview, #line, "PiPendingQueueLabel" },
+            },
+        }
+    end
 
     -- Pending queue rows (left-aligned with a 2-space indent)
     for _, entry in ipairs(self._pending_queue) do
@@ -3799,6 +3825,17 @@ function History:remove_pending_queue_entry(text)
             return entry
         end
     end
+    -- Vision-transformed deliveries grow the text (description marker
+    -- appended), so exact matching misses; fall back to prefix matching.
+    for i, entry in ipairs(self._pending_queue) do
+        local expanded = entry.expanded_text
+        if expanded ~= "" and text:sub(1, #expanded) == expanded then
+            table.remove(self._pending_queue, i)
+            self:_update_status_extmark()
+            self:_emit_queue_count()
+            return entry
+        end
+    end
     return nil
 end
 
@@ -3806,6 +3843,34 @@ end
 ---@return pi.PendingQueueEntry[]
 function History:get_pending_queue()
     return { unpack(self._pending_queue) }
+end
+
+---@class pi.VisionPending
+---@field text string
+---@field image_count integer?
+---@field model string
+
+--- Show or clear the preview row indicating that the vision fallback is
+--- rewriting the latest submission (images being described).
+---@param entry pi.VisionPending?
+function History:set_vision_pending(entry)
+    self._vision_pending = entry
+    self:_update_status_extmark()
+    if entry and self:_should_auto_scroll() then
+        self:_scroll_to_bottom()
+    end
+end
+
+--- Render a vision description as a completed synthetic tool block below the
+--- user message. Reuses the tool-block machinery (borders, highlights,
+--- auto-collapse, toggle) so it behaves like any other block.
+---@param model_ref string
+---@param description string
+function History:add_vision_block(model_ref, description)
+    self._vision_block_seq = self._vision_block_seq + 1
+    local block_id = "vision-" .. self._vision_block_seq
+    self:on_tool_start("vision", block_id, { model = model_ref })
+    self:on_tool_end("vision", block_id, { content = { { type = "text", text = description } } }, false)
 end
 
 --- Clear all pending queue entries.

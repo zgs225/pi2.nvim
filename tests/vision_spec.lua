@@ -41,7 +41,7 @@ describe("vision", function()
         end)
 
         it("returns the text unchanged for an unterminated marker", function()
-            local text = "hello\n\n<pi-vision model=\"a/b\">\npartial"
+            local text = 'hello\n\n<pi-vision model="a/b">\npartial'
             local parsed = Vision.parse(text)
             assert.are.equal(text, parsed.text)
             assert.is_nil(parsed.model)

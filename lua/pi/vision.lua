@@ -28,7 +28,7 @@ local CLOSE_TAG = "</pi-vision>"
 ---@param description string
 ---@return string
 function M.make_marker(model, description)
-    return OPEN_TAG .. model .. "\">\n" .. description .. "\n" .. CLOSE_TAG
+    return OPEN_TAG .. model .. '">\n' .. description .. "\n" .. CLOSE_TAG
 end
 
 ---@class pi.VisionParseResult
