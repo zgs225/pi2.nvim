@@ -79,15 +79,12 @@ function Prompt.new(tab, attachments)
     -- paths to this prompt's attachments. It only acts inside a π prompt buffer.
     Paste.register(self._buf, self._attachments)
 
-    -- Unsent-draft persistence: restore a draft saved before a restart (once
-    -- per process) and keep saving the current text (debounced) thereafter.
+    -- Unsent-draft persistence: keep saving the current text (debounced). The
+    -- restore of a pre-restart draft is deferred to set_workspace(), because
+    -- drafts are scoped per workspace and the cwd is only known after the
+    -- session manager anchors the chat.
     local draft_cfg = Config.options.prompt and Config.options.prompt.draft
     if draft_cfg and draft_cfg.enabled ~= false then
-        local draft = Draft.restore_once()
-        if draft and draft ~= "" then
-            vim.api.nvim_buf_set_lines(self._buf, 0, -1, false, vim.split(draft, "\n", { plain = true }))
-        end
-
         local save_timer = assert(vim.uv.new_timer())
         vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
             buffer = self._buf,
@@ -334,6 +331,26 @@ function Prompt:set_text(text)
         self:_render_statusline()
         self:_refresh_bash_mode()
         self:_save_draft()
+    end
+end
+
+--- Anchor unsent-draft persistence to a workspace cwd. Called by the session
+--- manager right after the chat is created, once the cwd is known. Restores a
+--- draft saved before a restart (at most once per process) from this
+--- workspace's draft file — never from another project's.
+---@param cwd string
+function Prompt:set_workspace(cwd)
+    Draft.set_workspace(cwd)
+    local draft_cfg = Config.options.prompt and Config.options.prompt.draft
+    if not draft_cfg or draft_cfg.enabled == false then
+        return
+    end
+    if not self._buf or not vim.api.nvim_buf_is_valid(self._buf) then
+        return
+    end
+    local draft = Draft.restore_once()
+    if draft and draft ~= "" then
+        vim.api.nvim_buf_set_lines(self._buf, 0, -1, false, vim.split(draft, "\n", { plain = true }))
     end
 end
 

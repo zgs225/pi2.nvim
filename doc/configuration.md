@@ -269,17 +269,17 @@ require("pi").setup({
 
     -- Prompt buffer behavior.
     prompt = {
-        -- Readline-style recall of previously submitted prompts.
+        -- Readline-style recall of previously submitted prompts, scoped per
+        -- workspace (the cwd the session started in).
         history = {
             -- Record submissions and allow recalling them with
             -- <C-p>/<C-n> and <Up>/<Down>.
             enabled = true,
-            -- Maximum entries kept; oldest are dropped first.
+            -- Maximum entries kept per workspace; oldest are dropped first.
             max = 500,
-            -- History file. nil = stdpath("data")/pi/prompt_history.json.
-            path = nil,
         },
-        -- Unsent-draft persistence across restarts.
+        -- Unsent-draft persistence across restarts, scoped per workspace
+        -- (like history: a draft typed in one project stays there).
         draft = {
             enabled = true,
         },

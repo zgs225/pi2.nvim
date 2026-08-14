@@ -578,6 +578,9 @@ function M.get_or_create(opts)
         changed_files = {},
     }
 
+    -- Prompt history is scoped per workspace: anchor it to the session cwd.
+    chat:set_cwd(session.cwd)
+
     rpc:set_handler(function(msg)
         M.handle_event(session, msg)
     end)

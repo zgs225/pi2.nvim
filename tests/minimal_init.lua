@@ -21,3 +21,8 @@ for _, path in ipairs({ plenary, root }) do
         vim.opt.runtimepath:prepend(path)
     end
 end
+
+-- Hermetic guard: keep unit tests from writing prompt-history/draft files
+-- into the user's real pi data dir (specs that construct a Chat fall back to
+-- the process cwd and would otherwise persist to stdpath("data")).
+require("pi.prompt_history")._set_base_dir(vim.fn.tempname())

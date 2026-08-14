@@ -121,15 +121,14 @@ Every prompt you submit is recorded (raw, before `@mention` expansion) so you ca
 
 Walking up stashes whatever you're currently typing; walking back down past the newest entry restores that draft. Editing the buffer by hand leaves browse mode, so a stray `<Down>` never clobbers your typing. Recall is a no-op while the completion menu is open.
 
-History persists to `stdpath("data")/pi/prompt_history.json` (written atomically) and survives restarts. Configure it under `prompt.history`:
+History is scoped **per workspace** — the directory the session started in. Each workspace keeps its own file under `stdpath("data")/pi/history/` (named by a hash of the normalized cwd, with an `index.json` mapping hash to path), written atomically and surviving restarts. Recalling in one project never shows prompts submitted in another. Configure it under `prompt.history`:
 
 ```lua
 require("pi").setup({
     prompt = {
         history = {
             enabled = true, -- set false to disable recording/recall entirely
-            max = 500,      -- entries kept; oldest are dropped first
-            -- path = "...",  -- override the history file location
+            max = 500,      -- entries kept per workspace; oldest are dropped first
         },
     },
 })
@@ -137,7 +136,7 @@ require("pi").setup({
 
 ## Draft persistence
 
-While [prompt history](#prompt-history) remembers what you've *sent*, draft persistence makes sure you don't lose what you're *typing*. The unsent prompt is saved to `stdpath("data")/pi/draft.txt` as you edit (debounced) and restored into the prompt the next time Neovim starts — so a crash or restart no longer costs you a half-written message. Sending or clearing the prompt removes the stored draft. To avoid surprises, a draft is restored at most once per Neovim process (an in-session `:PiNewSession` won't re-restore a stale draft).
+While [prompt history](#prompt-history) remembers what you've *sent*, draft persistence makes sure you don't lose what you're *typing*. The unsent prompt is saved as you edit (debounced) and restored into the prompt the next time Neovim starts — so a crash or restart no longer costs you a half-written message. Like history, drafts are scoped **per workspace** (stored as `<hash>.draft` next to the workspace's history file), so a half-written message in one project never resurfaces in another. Sending or clearing the prompt removes the stored draft. To avoid surprises, a draft is restored at most once per Neovim process (an in-session `:PiNewSession` won't re-restore a stale draft).
 
 Disable it under `prompt.draft`:
 

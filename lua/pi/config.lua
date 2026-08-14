@@ -45,8 +45,7 @@
 
 ---@class pi.PromptHistoryConfig
 ---@field enabled? boolean Record submitted prompts and allow recalling them (default: true)
----@field max? integer Maximum number of entries kept (oldest dropped, default: 500)
----@field path? string Override the history file (default: stdpath("data")/pi/prompt_history.json)
+---@field max? integer Maximum number of entries kept per workspace (oldest dropped, default: 500)
 
 ---@class pi.PromptConfig
 ---@field history pi.PromptHistoryConfig
