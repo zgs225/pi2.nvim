@@ -130,6 +130,7 @@ function Layout.new(mode, history, prompt, attachments)
     self._history_win = nil
     self._prompt_win = nil
     self._attachments_win = nil
+    self._terminal_win = nil
     self._tab = nil
     self._history = history
     self._prompt = prompt
@@ -183,6 +184,13 @@ function Layout:_on_win_closed(closed_win, closed_tab)
     if closed_win == self._history_win or closed_win == self._prompt_win or closed_win == self._attachments_win then
         return
     end
+    -- The bash terminal window is optional chrome: when it closes (user :q or
+    -- external close) just drop the reference; the buffer survives and the
+    -- window is re-created on demand (next bash run or :PiBashOpen).
+    if closed_win == self._terminal_win then
+        self._terminal_win = nil
+        return
+    end
     -- Defer: WinClosed fires before the closed window's height is handed back
     -- to the frame tree, so an immediate normalize would be overwritten by
     -- the redistribution (issue #31). Run once the event loop settles.
@@ -210,15 +218,20 @@ function Layout:_normalize_side_heights()
     if not hwin or not pwin then
         return
     end
-    -- Capture the attachments height before wincmd _ shrinks it.
+    -- Capture the attachments/terminal heights before wincmd _ shrinks them.
     local awin = self:attachments_win()
     local target_attachments_height = awin and vim.api.nvim_win_get_height(awin) or 0
+    local twin = self:terminal_win()
+    local target_terminal_height = twin and vim.api.nvim_win_get_height(twin) or 0
     vim.api.nvim_win_call(hwin, function()
         vim.cmd("wincmd _")
     end)
     vim.api.nvim_win_set_height(pwin, self._prompt:content_height())
     if awin and target_attachments_height > 0 then
         vim.api.nvim_win_set_height(awin, target_attachments_height)
+    end
+    if twin and target_terminal_height > 0 then
+        vim.api.nvim_win_set_height(twin, target_terminal_height)
     end
 end
 
@@ -315,6 +328,160 @@ function Layout:_close_attachments_win()
     self._attachments_win = nil
 end
 
+--- Resolve a dimension (width or height) from a config value.
+--- Values < 1 are treated as fractions of the available space.
+---@param value number
+---@param available integer
+---@return integer
+local function resolve_dimension(value, available)
+    if value < 1 then
+        return math.floor(available * value)
+    end
+    return math.floor(value)
+end
+
+--- Resolve side panel width in columns from config.
+---@return integer
+local function resolve_side_width()
+    local side_cfg = Config.resolve_side_layout()
+    return resolve_dimension(side_cfg.width, vim.o.columns)
+end
+
+--- Resolve float dimensions in pixels from config.
+---@param float_cfg? pi.FloatLayout Pre-resolved config; resolved internally if omitted.
+---@return integer width, integer total_height
+local function resolve_float_size(float_cfg)
+    float_cfg = float_cfg or Config.resolve_float_layout()
+    local width = resolve_dimension(float_cfg.width, vim.o.columns)
+    local total_height = resolve_dimension(float_cfg.height, vim.o.lines - vim.o.cmdheight - 1)
+    return width, total_height
+end
+
+-- ---------------------------------------------------------------------------
+-- Bash terminal window (config: bash.terminal). Same optional-chrome pattern
+-- as attachments: opened on demand below the history window, closed by user
+-- or programmatically, never re-created by show()/hide() itself.
+-- ---------------------------------------------------------------------------
+
+--- Resolve the terminal window height in lines from bash.terminal_height.
+---@return integer
+function Layout:_terminal_height()
+    local cfg = Config.options.bash or {}
+    local available
+    local hwin = self:history_win()
+    if hwin then
+        available = vim.api.nvim_win_get_height(hwin)
+    else
+        available = vim.o.lines - vim.o.cmdheight - 1
+    end
+    return math.max(3, resolve_dimension(cfg.terminal_height or 0.35, available))
+end
+
+--- Set common window options for the terminal window.
+---@param win integer
+function Layout:_set_terminal_win_opts(win)
+    vim.wo[win].winfixheight = true
+    vim.wo[win].winfixwidth = true
+    vim.wo[win].signcolumn = "no"
+    vim.wo[win].foldcolumn = editor_foldcolumn
+    vim.wo[win].winfixbuf = true
+    vim.wo[win].wrap = false
+    -- Fingerprint options — see pi.ui.winfix
+    vim.wo[win].concealcursor = "nvic"
+    vim.wo[win].number = false
+    vim.wo[win].relativenumber = false
+    vim.wo[win].cursorline = false
+end
+
+function Layout:_open_terminal_in_side_layout(buf)
+    local hwin = self._history_win
+    local prev_win = vim.api.nvim_get_current_win()
+    vim.api.nvim_win_call(hwin, function()
+        vim.cmd("belowright " .. self:_terminal_height() .. "split")
+    end)
+    self._terminal_win = vim.api.nvim_get_current_win()
+    -- The split inherits winfixbuf from the history window; clear it so the
+    -- terminal buffer can be installed (_set_terminal_win_opts re-arms it).
+    vim.wo[self._terminal_win].winfixbuf = false
+    vim.api.nvim_win_set_buf(self._terminal_win, buf)
+    self:_set_terminal_win_opts(self._terminal_win)
+    vim.api.nvim_set_current_win(prev_win)
+end
+
+---@param buf integer
+function Layout:_open_terminal_in_float_layout(buf)
+    local float_cfg = Config.resolve_float_layout()
+    local width = self._history_win and vim.api.nvim_win_get_width(self._history_win)
+        or select(1, resolve_float_size(float_cfg))
+    local border = float_cfg.border or "rounded"
+    -- Row/col are corrected by _reposition_float_stack right after opening.
+    self._terminal_win = vim.api.nvim_open_win(buf, false, {
+        relative = "editor",
+        width = width,
+        height = self:_terminal_height(),
+        col = 0,
+        row = 0,
+        style = "minimal",
+        border = border,
+        zindex = FLOAT_ZINDEX,
+    })
+    self:_set_terminal_win_opts(self._terminal_win)
+end
+
+--- Open (or reuse) the terminal window showing buf. Never steals focus unless
+--- requested; the side layout restores the previous window after splitting.
+---@param buf integer terminal buffer to display
+---@param focus boolean move focus into the terminal window
+function Layout:open_terminal_win(buf, focus)
+    if not self:is_visible() then
+        return
+    end
+    local twin = self:terminal_win()
+    if twin then
+        if vim.api.nvim_win_get_buf(twin) ~= buf then
+            vim.api.nvim_win_set_buf(twin, buf)
+        end
+    elseif self._mode == "float" then
+        self:_open_terminal_in_float_layout(buf)
+        self:_reposition_float_stack()
+    else
+        self:_open_terminal_in_side_layout(buf)
+    end
+    if focus then
+        twin = self:terminal_win()
+        if twin then
+            vim.api.nvim_set_current_win(twin)
+        end
+    end
+end
+
+function Layout:close_terminal_win()
+    local twin = self:terminal_win()
+    if not twin then
+        self._terminal_win = nil
+        return
+    end
+    clear_winbar(twin)
+    if vim.api.nvim_get_current_win() == twin then
+        vim.cmd("wincmd p")
+        if vim.api.nvim_get_current_win() == twin then
+            vim.cmd("wincmd w")
+        end
+    end
+    vim.api.nvim_win_close(twin, false)
+    self._terminal_win = nil
+end
+
+--- Winbar title for the terminal window (command + status).
+---@param text string
+---@param hl_group? string
+function Layout:set_terminal_title(text, hl_group)
+    local twin = self:terminal_win()
+    if twin then
+        set_winbar(twin, text, hl_group or "PiToolStatus")
+    end
+end
+
 --- Reposition (and optionally resize) the float window stack.
 --- When target_width / target_height are given, windows are resized to match
 --- the new dimensions (used on VimResized). Without them, the current window
@@ -339,6 +506,8 @@ function Layout:_reposition_float_stack(target_width, target_height, float_cfg)
     local width = target_width or vim.api.nvim_win_get_width(self._history_win)
     local prompt_height = vim.api.nvim_win_get_height(self._prompt_win)
     local attach_count = self._attachments:count()
+    local term_win = self:terminal_win()
+    local term_height = term_win and vim.api.nvim_win_get_height(term_win) or 0
 
     local history_height
     if target_height then
@@ -346,6 +515,9 @@ function Layout:_reposition_float_stack(target_width, target_height, float_cfg)
         history_height = target_height - prompt_height - 1
         if attach_count > 0 then
             history_height = history_height - attach_count - 2
+        end
+        if term_height > 0 then
+            history_height = history_height - term_height - 2
         end
         history_height = math.max(3, history_height)
     else
@@ -356,6 +528,9 @@ function Layout:_reposition_float_stack(target_width, target_height, float_cfg)
     local total = history_height + 2 + prompt_height + 2
     if attach_count > 0 then
         total = total + attach_count + 2
+    end
+    if term_height > 0 then
+        total = total + term_height + 2
     end
 
     -- Shrink history if stack doesn't fit
@@ -370,6 +545,19 @@ function Layout:_reposition_float_stack(target_width, target_height, float_cfg)
         total = total - attach_count - 2
         attach_count = 0
         self:_close_attachments_win()
+    end
+
+    -- If it still doesn't fit, shrink (or as a last resort drop) the terminal
+    if total > ui_height and term_height > 0 then
+        local rest = total - term_height - 2
+        if ui_height - rest >= 3 then
+            term_height = ui_height - rest
+            total = rest + term_height + 2
+        else
+            self:close_terminal_win()
+            term_height = 0
+            total = rest
+        end
     end
 
     local col = math.floor((ui_width - width) / 2)
@@ -391,8 +579,9 @@ function Layout:_reposition_float_stack(target_width, target_height, float_cfg)
         width = width,
     })
 
+    local next_row = prompt_row + prompt_height + 2
     if attach_count > 0 then
-        local attach_row = prompt_row + prompt_height + 2
+        local attach_row = next_row
         local awin = self:attachments_win()
         if awin then
             vim.api.nvim_win_set_config(awin, {
@@ -404,6 +593,20 @@ function Layout:_reposition_float_stack(target_width, target_height, float_cfg)
             })
         else
             self:_open_attachments_in_float_layout(col, attach_row, width, border)
+        end
+        next_row = attach_row + attach_count + 2
+    end
+
+    if term_height > 0 then
+        local twin = self:terminal_win()
+        if twin then
+            vim.api.nvim_win_set_config(twin, {
+                relative = "editor",
+                row = next_row,
+                col = col,
+                width = width,
+                height = term_height,
+            })
         end
     end
 end
@@ -451,9 +654,11 @@ function Layout:_refresh_attachments()
             end
             vim.api.nvim_win_set_height(awin, aheight)
         end
-        -- Maximize history, then re-fix prompt and attachments heights.
-        -- Capture attachment height before wincmd _ steals its space.
+        -- Maximize history, then re-fix prompt, attachments and terminal
+        -- heights. Capture heights before wincmd _ steals their space.
         local target_attachments_height = awin and vim.api.nvim_win_get_height(awin) or 0
+        local twin = self:terminal_win()
+        local target_terminal_height = twin and vim.api.nvim_win_get_height(twin) or 0
         vim.api.nvim_win_call(self._history_win, function()
             vim.cmd("wincmd _")
         end)
@@ -461,36 +666,10 @@ function Layout:_refresh_attachments()
         if awin then
             vim.api.nvim_win_set_height(awin, target_attachments_height)
         end
+        if twin and target_terminal_height > 0 then
+            vim.api.nvim_win_set_height(twin, target_terminal_height)
+        end
     end
-end
-
---- Resolve a dimension (width or height) from a config value.
---- Values < 1 are treated as fractions of the available space.
----@param value number
----@param available integer
----@return integer
-local function resolve_dimension(value, available)
-    if value < 1 then
-        return math.floor(available * value)
-    end
-    return math.floor(value)
-end
-
---- Resolve side panel width in columns from config.
----@return integer
-local function resolve_side_width()
-    local side_cfg = Config.resolve_side_layout()
-    return resolve_dimension(side_cfg.width, vim.o.columns)
-end
-
---- Resolve float dimensions in pixels from config.
----@param float_cfg? pi.FloatLayout Pre-resolved config; resolved internally if omitted.
----@return integer width, integer total_height
-local function resolve_float_size(float_cfg)
-    float_cfg = float_cfg or Config.resolve_float_layout()
-    local width = resolve_dimension(float_cfg.width, vim.o.columns)
-    local total_height = resolve_dimension(float_cfg.height, vim.o.lines - vim.o.cmdheight - 1)
-    return width, total_height
 end
 
 function Layout:_open_in_side_layout()
@@ -632,6 +811,10 @@ end
 function Layout:hide()
     -- Clear winbars before closing to prevent window-buffer-local
     -- winbar state from leaking into the next layout's windows.
+    local twin = self:terminal_win()
+    if twin then
+        clear_winbar(twin)
+    end
     local awin = self:attachments_win()
     if awin then
         clear_winbar(awin)
@@ -646,6 +829,7 @@ function Layout:hide()
     end
 
     self:_close_attachments_win()
+    self:close_terminal_win()
     self:_close_prompt_win()
     self:_close_history_win()
 end
@@ -713,6 +897,15 @@ function Layout:attachments_win()
     if self._attachments_win and vim.api.nvim_win_is_valid(self._attachments_win) then
         return self._attachments_win
     end
+    return nil
+end
+
+---@return integer?
+function Layout:terminal_win()
+    if self._terminal_win and vim.api.nvim_win_is_valid(self._terminal_win) then
+        return self._terminal_win
+    end
+    self._terminal_win = nil
     return nil
 end
 

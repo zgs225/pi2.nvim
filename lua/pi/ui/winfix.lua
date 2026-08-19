@@ -39,6 +39,7 @@ local PI_FILETYPES = {
     [Ft.history] = true,
     [Ft.prompt] = true,
     [Ft.attachments] = true,
+    [Ft.bash_terminal] = true,
 }
 
 --- User defaults captured at setup time.

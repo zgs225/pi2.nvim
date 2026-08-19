@@ -64,6 +64,14 @@ function M.setup()
         Pi.abort_bash()
     end, { desc = "Abort the running direct bash (!) command" })
 
+    vim.api.nvim_create_user_command("PiBashOpen", function()
+        Pi.bash_terminal_open(false)
+    end, { desc = "Open the Ï bash terminal window (agent bash output)" })
+
+    vim.api.nvim_create_user_command("PiBashFocus", function()
+        Pi.bash_terminal_open(true)
+    end, { desc = "Open and focus the Ï bash terminal window" })
+
     vim.api.nvim_create_user_command("PiStop", function()
         Pi.stop()
     end, { desc = "Stop π process and close chat" })

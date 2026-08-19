@@ -183,6 +183,21 @@ require("pi").setup({
         message = "Press <Esc> again to abort",
     },
 
+    -- Bash tool output (agent-run bash). Does not affect direct (!) commands.
+    bash = {
+        -- Stream agent bash output into a terminal window inside the chat
+        -- panel instead of the chat tool block. The history keeps a summary
+        -- card (status + line count); the full output stays in the terminal's
+        -- scrollback, searchable and copyable like any :terminal. Reopen a
+        -- hidden window with :PiBashOpen; jump to it with :PiBashFocus.
+        terminal = false,
+        -- Close the terminal window automatically when the command finishes.
+        terminal_auto_close = false,
+        -- Terminal window height: lines >= 1, or a fraction of the available
+        -- column/screen height when < 1.
+        terminal_height = 0.35,
+    },
+
     -- Session tree navigation (:PiTree). Injects the bundled pi extension
     -- (extensions/tree.ts) into every RPC process; requires a pi version
     -- whose extension API exposes ctx.navigateTree.

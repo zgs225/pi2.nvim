@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-08-19
+
+- **ADDED:** `bash.terminal` — agent bash tool output streams into a real `:terminal` window inside the chat panel instead of the chat tool block. The history keeps a summary card (command header, live `streaming in terminal (N lines)` spinner, then a status line), while the full uncapped output stays in the terminal scrollback where it is searchable and copyable — removing the 2000-line display cap and the per-delta re-render churn for long runs. The window opens without stealing focus, is reused across runs in a session (`$ <command>` separators), and survives closing; `:PiBashOpen`/`:PiBashFocus` (`pi.bash_terminal_open(focus?)`) reveal it, `<C-c>` aborts the agent turn and `<Esc><Esc>` returns to the prompt inside it. Direct `!` commands and session replay are unaffected. Off by default; `bash.terminal_auto_close` and `bash.terminal_height` tune it (#65).
+
 ## 2026-08-14
 
 - **BREAKING:** prompt history is now scoped **per workspace** (the cwd the session started in) instead of one global file — recalling in one project no longer shows prompts submitted in another. Each workspace persists to its own file under `stdpath("data")/pi/history/` (hash-named, with an `index.json` mapping hash to cwd). The old global `stdpath("data")/pi/prompt_history.json` is silently removed on first use and its entries are **not** migrated; the `prompt.history.path` option is removed (#89).

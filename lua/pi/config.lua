@@ -181,6 +181,11 @@
 ---@field timeout? integer Window in milliseconds for the second <Esc> to count (default: 1500)
 ---@field message? string Hint shown in the statusline center on the first <Esc> (default: "Press <Esc> again to abort")
 
+---@class pi.BashConfig
+---@field terminal? boolean Stream agent bash tool output into a terminal window instead of the chat tool block. The history keeps a summary card; the full output stays in the terminal's scrollback. Does not apply to direct (!) bash commands. (default: false)
+---@field terminal_auto_close? boolean Close the terminal window automatically when the command finishes (default: false)
+---@field terminal_height? integer|number Terminal window height: lines >= 1, or a fraction of the chat column/screen height when < 1 (default: 0.35)
+
 ---@class pi.TreeConfig
 ---@field enabled? boolean Enable :PiTree session-tree navigation (default: true). Injects the bundled pi extension (extensions/tree.ts) into every RPC process; requires a pi version whose extension API exposes ctx.navigateTree.
 
@@ -275,6 +280,7 @@
 ---@field statusline pi.StatusLineConfig
 ---@field diff pi.DiffConfig
 ---@field attention pi.UiAttentionConfig
+---@field bash pi.BashConfig
 ---@field reload pi.ReloadConfig
 ---@field quickfix pi.QuickfixConfig
 ---@field abort pi.AbortConfig
@@ -407,6 +413,11 @@ local defaults = {
         enabled = true,
         timeout = 1500,
         message = "Press <Esc> again to abort",
+    },
+    bash = {
+        terminal = false,
+        terminal_auto_close = false,
+        terminal_height = 0.35,
     },
     tree = {
         enabled = true,

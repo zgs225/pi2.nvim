@@ -89,6 +89,8 @@ History._stream_flush_ms = 30
 ---@field tool_input? table
 ---@field inline? boolean
 ---@field finished? boolean
+---@field terminal_mode? boolean bash tool routed to the terminal window (bash.terminal); history shows a summary only
+---@field terminal_lines? integer completed output lines seen so far (terminal_mode progress/summary)
 ---@field expanded? boolean
 ---@field expanded_inner_lines? string[]
 ---@field expanded_inner_extmarks? table[]
@@ -1324,9 +1326,16 @@ function History:set_status(status)
                         if blk.spinner_extmark and not blk.finished then
                             local pos = vim.api.nvim_buf_get_extmark_by_id(self._buf, ns, blk.spinner_extmark, {})
                             if pos[1] then
+                                local label = "  " .. frame
+                                if blk.terminal_mode then
+                                    label = label .. " streaming in terminal"
+                                    if blk.terminal_lines then
+                                        label = label .. " (" .. blk.terminal_lines .. " lines)"
+                                    end
+                                end
                                 vim.api.nvim_buf_set_extmark(self._buf, ns, pos[1], pos[2] or 0, {
                                     id = blk.spinner_extmark,
-                                    virt_text = { { "  " .. frame, "PiToolRunning" } },
+                                    virt_text = { { label, "PiToolRunning" } },
                                     virt_text_pos = "inline",
                                 })
                             end
@@ -2457,7 +2466,7 @@ function History:on_tool_start(tool_name, tool_call_id, tool_input)
             -- on_tool_end uses it to insert output at the right position
             -- when multiple tools run in parallel.
             local tail_row = vim.api.nvim_buf_line_count(self._buf) - 1
-            self._tool_blocks[tool_call_id] = {
+            local block = {
                 tool_name = tool_name,
                 icon_extmark = icon_extmark,
                 spinner_extmark = spinner_virt,
@@ -2465,6 +2474,13 @@ function History:on_tool_start(tool_name, tool_call_id, tool_input)
                 tool_input = tool_input,
                 expanded = true,
             }
+            -- bash.terminal: live runs of the agent's bash tool stream into a
+            -- terminal window; history keeps a summary card only. Replay still
+            -- renders the (backend-truncated) output inline, as before.
+            if tool_name == "bash" and not self._replaying and Config.options.bash.terminal then
+                block.terminal_mode = true
+            end
+            self._tool_blocks[tool_call_id] = block
         end
         -- Live updates that arrived before the block existed land now.
         self:_flush_tool_updates()
@@ -2501,6 +2517,17 @@ function History:on_tool_end(tool_name, tool_call_id, result, is_error)
                 pcall(vim.api.nvim_buf_del_extmark, self._buf, ns, block.spinner_extmark)
                 block.spinner_extmark = nil
             end
+        end
+
+        -- Terminal-mode bash: the full output lives in the terminal window's
+        -- scrollback; history gets a one-line summary card instead.
+        if block and block.terminal_mode then
+            self:_finish_bash_terminal_block(block, tool_name, result, is_error)
+            self._needs_breathing_line = true
+            if should_scroll then
+                self:_scroll_to_bottom()
+            end
+            return
         end
 
         -- Inline tools: append status indicator to the existing line
@@ -3007,6 +3034,13 @@ function History:_apply_tool_update(tool_call_id, msg)
         return
     end
 
+    -- Terminal-mode bash: no history rendering; only track the line count so
+    -- the spinner label and the final summary card can report it.
+    if block.terminal_mode then
+        block.terminal_lines = select(2, text:gsub("\n", "")) + 1
+        return
+    end
+
     local should_scroll = self:_should_auto_scroll()
     local lines = build_tool_live_update_lines(text)
     local start_row
@@ -3049,6 +3083,57 @@ function History:_apply_tool_update(tool_call_id, msg)
     self:_update_status_extmark()
     if should_scroll then
         self:_scroll_to_bottom()
+    end
+end
+
+--- Render the terminal-mode bash summary card (replaces the full output).
+---@param block pi.ToolBlock
+---@param tool_name string
+---@param result? table
+---@param is_error? boolean
+function History:_finish_bash_terminal_block(block, tool_name, result, is_error)
+    local labels = Config.options.labels
+    local status = Tools.resolve_status(result, is_error)
+    local is_success = status == "completed"
+    local status_icon = is_success and labels.tool_success or labels.tool_failure
+    local hl = is_success and "PiToolStatus" or "PiToolError"
+
+    local n = block.terminal_lines or 0
+    local footer = Tools.GLYPHS.INDENT .. status_icon .. " " .. n .. " lines · output in terminal (:PiBashOpen)"
+
+    -- Insert after the block's on_start content (the command), keeping
+    -- positional correctness when multiple tools run in parallel.
+    local insert_at ---@type integer?
+    if block.tail_extmark then
+        local tail_pos = vim.api.nvim_buf_get_extmark_by_id(self._buf, ns, block.tail_extmark, {})
+        if tail_pos[1] then
+            insert_at = tail_pos[1] + 1
+        end
+    end
+    local start
+    if insert_at then
+        start = self:_insert_lines(insert_at, { footer })
+    else
+        start = self:_append_lines({ footer })
+    end
+    block.end_extmark = vim.api.nvim_buf_set_extmark(self._buf, ns, start, 0, {
+        end_col = #footer,
+        hl_group = hl,
+        line_hl_group = "PiToolBody",
+    })
+    block.end_hl_group = hl
+
+    -- Color the header icon like other finished tools.
+    local icon_hl = is_success and "PiToolHeader" or "PiToolError"
+    local icon = Tools.get_tool_icon(tool_name)
+    local fold = Tools.GLYPHS.FOLD_OPEN
+    local pos = vim.api.nvim_buf_get_extmark_by_id(self._buf, ns, block.icon_extmark, {})
+    if pos[1] then
+        vim.api.nvim_buf_set_extmark(self._buf, ns, pos[1], #fold, {
+            id = block.icon_extmark,
+            end_col = #fold + #icon,
+            hl_group = icon_hl,
+        })
     end
 end
 
@@ -4086,6 +4171,7 @@ local PI_PANEL_FILETYPES = {
     [Ft.attachments] = true,
     [Ft.dialog] = true,
     [Ft.sessions] = true,
+    [Ft.bash_terminal] = true,
 }
 
 --- Open the file referenced on the history line under the cursor in an editor

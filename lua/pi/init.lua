@@ -155,6 +155,17 @@ function M.abort_bash()
     end
 end
 
+--- Open the bash terminal window showing agent bash output (bash.terminal).
+--- No-op with a notice when no bash output exists yet.
+---@param focus? boolean move focus into the terminal window
+function M.bash_terminal_open(focus)
+    local session = require("pi.sessions.manager").get()
+    if not session then
+        return
+    end
+    session.chat:open_bash_terminal(focus == true)
+end
+
 --- Cancel an in-progress auto-retry backoff (the "Retrying…" state). Only
 --- takes effect while the core is between retry attempts; the retry is
 --- cancelled and the failed turn ends. Sent by the double-<Esc> abort gesture

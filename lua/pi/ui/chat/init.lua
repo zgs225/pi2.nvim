@@ -31,6 +31,8 @@
 ---@field _bash_running boolean
 ---@field _bash_req_id string?
 ---@field _bash_req_counter integer
+---@field _bash_terminal pi.BashTerminal? Terminal surface for agent bash output (bash.terminal)
+---@field _replaying boolean True while session history is being replayed
 local Chat = {}
 Chat.__index = Chat
 
@@ -47,6 +49,8 @@ local Mentions = require("pi.ui.chat.mentions")
 local Vision = require("pi.vision")
 local Zen = require("pi.ui.chat.zen")
 local PromptHistory = require("pi.prompt_history")
+local Tools = require("pi.ui.chat.tools")
+local BashTerminal = require("pi.ui.chat.bash_terminal")
 
 ---@class pi.CompactionQueuedMessage
 ---@field text string
@@ -100,6 +104,7 @@ function Chat.new(tab, mode, agent)
     self._bash_running = false
     self._bash_req_id = nil
     self._bash_req_counter = 0
+    self._replaying = false
     ---@type boolean? current main model vision capability (nil = unknown)
     self._model_supports_vision = nil
     ---@type pi.VisionInflight?
@@ -1160,6 +1165,7 @@ end
 
 ---@param replaying boolean
 function Chat:set_replaying(replaying)
+    self._replaying = replaying
     self._history._replaying = replaying
     -- Pause render-markdown while replaying: it would otherwise re-render the
     -- whole buffer on every edit (hundreds of edits during a large session
@@ -1538,6 +1544,72 @@ function Chat:on_system_error(error_message, opts)
     self._history:on_system_error(error_message, opts)
 end
 
+--- Raw cumulative text of a tool_execution_update. Unlike the history path,
+--- no sanitize/trim: the terminal delta computation needs byte-exact,
+--- prefix-monotonic text.
+---@param msg table
+---@return string?
+local function raw_tool_update_text(msg)
+    local partial = msg and msg.partialResult
+    local content = partial and partial.content
+    if type(content) == "string" then
+        return content
+    end
+    if type(content) ~= "table" then
+        return nil
+    end
+    local parts = {}
+    for _, item in ipairs(content) do
+        if type(item) == "table" and item.type == "text" and type(item.text) == "string" then
+            parts[#parts + 1] = item.text
+        elseif type(item) == "string" then
+            parts[#parts + 1] = item
+        end
+    end
+    if #parts == 0 then
+        return nil
+    end
+    return table.concat(parts, "\n")
+end
+
+--- Lazily-created terminal surface for agent bash output.
+---@return pi.BashTerminal
+function Chat:bash_terminal()
+    if not self._bash_terminal then
+        self._bash_terminal = BashTerminal.new(self._tab, self._layout, {
+            focus_prompt = function()
+                self:focus_prompt()
+            end,
+            on_abort = function()
+                require("pi").abort()
+            end,
+        })
+    end
+    return self._bash_terminal
+end
+
+--- Whether a bash tool call routes to the terminal window.
+---@param tool_name string
+---@return boolean
+function Chat:_bash_in_terminal(tool_name)
+    return tool_name == "bash" and not self._replaying and self:bash_terminal():enabled()
+end
+
+--- Open (and optionally focus) the bash terminal window.
+--- Used by :PiBashOpen/:PiBashFocus.
+---@param focus boolean
+function Chat:open_bash_terminal(focus)
+    local bt = self:bash_terminal()
+    if not bt:has_output() then
+        Notify.info("No bash output yet")
+        return
+    end
+    if not self:is_visible() then
+        self:show()
+    end
+    bt:show(focus)
+end
+
 ---@param tool_name string
 ---@param tool_call_id string
 ---@param tool_input? table
@@ -1547,6 +1619,10 @@ function Chat:on_tool_start(tool_name, tool_call_id, tool_input)
         self._assistant_tool_only_header_rendered = true
     end
     self._history:on_tool_start(tool_name, tool_call_id, tool_input)
+    if self:_bash_in_terminal(tool_name) then
+        local cmd = (tool_input and (tool_input.command or tool_input.cmd)) or ""
+        self:bash_terminal():start(tool_call_id, cmd)
+    end
 end
 
 ---@param tool_name string
@@ -1555,12 +1631,23 @@ end
 ---@param is_error? boolean
 function Chat:on_tool_end(tool_name, tool_call_id, result, is_error)
     self._history:on_tool_end(tool_name, tool_call_id, result, is_error)
+    if self:_bash_in_terminal(tool_name) then
+        local status = Tools.resolve_status(result, is_error)
+        local ok = status == "completed"
+        self:bash_terminal():finish(tool_call_id, ok, ok and "done" or status)
+    end
 end
 
 ---@param tool_name string
 ---@param tool_call_id string
 ---@param msg table
 function Chat:on_tool_update(tool_name, tool_call_id, msg)
+    if self:_bash_in_terminal(tool_name) then
+        local text = raw_tool_update_text(msg)
+        if text then
+            self:bash_terminal():update(tool_call_id, text)
+        end
+    end
     self._history:on_tool_update(tool_name, tool_call_id, msg)
 end
 
@@ -1613,6 +1700,10 @@ function Chat:clear()
     self._active_verb = nil
     self._done_verb = nil
     self._last_turn_stop_reason = nil
+    if self._bash_terminal then
+        self._bash_terminal:destroy()
+        self._bash_terminal = nil
+    end
     self._history:clear()
     self._prompt:statusline():reset_usage()
 end

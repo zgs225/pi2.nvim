@@ -108,6 +108,30 @@ A few details that match the TUI:
 - A single `<Esc>` (in either insert or normal mode on the prompt) cancels a running `!` command — the same as `:PiAbortBash` / `pi.abort_bash()`. This is separate from the double-`<Esc>` agent abort above: `<Esc>` cancels a bash command when one is running, and arms the double-`<Esc>` agent abort when the agent is streaming.
 - `!` commands are recorded in the prompt history, so `<C-p>` / `<Up>` recalls them like normal prompts.
 
+## Bash output in a terminal window (`bash.terminal`)
+
+Direct `!` commands are short-lived and yours; the **agent's** bash tool calls are a different story — test suites, builds, long migrations. By default that output renders into the chat tool block, which caps display at 2000 lines and isn't searchable. With `bash = { terminal = true }` ([config](configuration.md)), agent bash output streams into a real terminal window inside the chat panel instead:
+
+- The window opens when the agent starts a bash tool call — **without stealing focus** — below the history in side layout, or as an extra stacked float in float layout. Its winbar shows `$ <command> · running`, then `$ <command> · done · N lines`.
+- The chat history keeps only a summary card: the command header, a live `streaming in terminal (N lines)` spinner while running, then `✓ N lines · output in terminal (:PiBashOpen)`. No 2000-line cap, no re-render churn.
+- The terminal buffer is reused across runs in the same session (each run gets a `$ <command>` separator), so it reads like a session shell log. Closing the window never loses output; the buffer survives until the session is cleared.
+- Replay is unaffected: resuming an old session renders bash output inline as before (the session file only stores the backend-truncated result).
+- This only applies to agent bash tool calls; direct `!` commands keep their in-chat block.
+
+Terminal window keymaps:
+
+| Key | Mode | Action |
+|-----|------|--------|
+| `<C-c>` | terminal | Abort the running agent turn (the terminal has no child process of its own — the command runs inside the agent; same as `:PiAbort`) |
+| `<Esc><Esc>` | terminal | Back to the prompt (first `<Esc>` leaves terminal mode, second jumps — within `abort.timeout`) |
+
+Commands:
+
+- `:PiBashOpen` — open (or reveal) the terminal window without moving focus.
+- `:PiBashFocus` — open and focus the terminal window.
+
+Both notify `No bash output yet` when nothing has run in this session. Related config: `bash.terminal_auto_close` (auto-close the window when the command finishes) and `bash.terminal_height` (window height, lines or fraction).
+
 ## Prompt history
 
 Every prompt you submit is recorded (raw, before `@mention` expansion) so you can recall it later, readline-style. Multi-line prompts are stored intact.
