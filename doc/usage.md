@@ -597,6 +597,8 @@ pi.scroll_chat_history_to_last_agent_response()    -- jump to the last agent res
 
 The agent-response jumps are particularly handy when the agent produced multiple text blocks for one prompt: use the first jump to start reading that turn, or the last jump to revisit the newest block.
 
+**Auto-follow.** While new content streams in, the history window follows the bottom as long as your cursor is parked there. The moment you move the cursor away — any movement in the history window, or `pi.scroll_chat_history("up")` from the prompt — following stops: streaming keeps appending but never moves your cursor or scroll position again. Following re-attaches when you return to the very bottom (`G`, scrolling back down, or `pi.scroll_chat_history_to_bottom()`). The agent-response jumps also detach, so you can read a past block in peace while the agent keeps working.
+
 Like the focus functions, all scroll functions are no-ops when no session is active. See the [Keymaps](keymaps.md) example for typical bindings inside the prompt buffer.
 
 ### Open file under cursor

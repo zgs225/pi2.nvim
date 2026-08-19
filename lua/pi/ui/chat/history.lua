@@ -5,6 +5,8 @@
 ---@field _win integer?
 ---@field _tab pi.TabId
 ---@field _scroll_scheduled boolean
+---@field _auto_follow boolean whether streaming pins the window to the bottom (user cursor movement toggles it)
+---@field _pending_cursor integer[]? landing spot of our last programmatic cursor move (CursorMoved guard)
 ---@field _status_extmark_id integer?
 ---@field _status_virt_line_count integer
 ---@field _status_text string?
@@ -144,8 +146,10 @@ local Text = require("pi.ui.chat.text")
 
 local ns = vim.api.nvim_create_namespace("pi-chat")
 
-local SCROLL_THRESHOLD = 10
 local STARTUP_HL_PRIORITY = 200
+
+-- CursorMoved watchers for the auto-follow state, one per History buffer.
+local follow_group = vim.api.nvim_create_augroup("PiHistoryScrollFollow", { clear = false })
 
 ---@return integer
 local function now_ms()
@@ -464,6 +468,8 @@ function History.new(tab)
     self._win = nil
     self._tab = tab
     self._scroll_scheduled = false
+    self._auto_follow = true
+    self._pending_cursor = nil
     self._status_extmark_id = nil
     self._status_text = nil
     self._status_start_time = nil
@@ -534,27 +540,72 @@ function History.new(tab)
     -- Optional richer markdown rendering (no-op for the builtin engine).
     Render.attach_history(self._buf)
 
+    -- Follow state: user cursor movement in the history window toggles
+    -- auto-follow (see _on_cursor_moved). Buffer-local, so it dies with
+    -- the buffer.
+    vim.api.nvim_create_autocmd("CursorMoved", {
+        group = follow_group,
+        buffer = self._buf,
+        callback = function()
+            self:_on_cursor_moved()
+        end,
+    })
+
     return self
 end
 
 ---@param fn fun()
 function History:_with_modifiable(fn)
     vim.bo[self._buf].modifiable = true
+    -- Buffer edits can drag the window cursor (insertion at the cursor
+    -- position moves it; line replacement clamps it). The cursor belongs
+    -- to the user (or to our own pending scroll), so hold it in place.
+    local restore ---@type integer[]?
+    if self._win and vim.api.nvim_win_is_valid(self._win) then
+        local cursor_ok, pos = pcall(vim.api.nvim_win_get_cursor, self._win)
+        if cursor_ok then
+            restore = pos
+        end
+    end
     local ok, err = pcall(fn)
+    if restore then
+        pcall(vim.api.nvim_win_set_cursor, self._win, restore)
+    end
     vim.bo[self._buf].modifiable = false
     if not ok then
         error(err)
     end
 end
 
+--- Whether streaming should pin the history window to the bottom.
+---
+--- Following is explicit state, not cursor proximity: auto-scroll itself
+--- parks the cursor at the bottom, so a proximity check cannot tell "pinned
+--- by the plugin" from "the user wants to read here". Any user cursor
+--- movement away from the last line disables following; returning to the
+--- last line re-enables it (see _on_cursor_moved).
 ---@return boolean
 function History:_should_auto_scroll()
     if not self._win or not vim.api.nvim_win_is_valid(self._win) then
         return false
     end
-    local cursor_line = vim.api.nvim_win_get_cursor(self._win)[1]
-    local total = vim.api.nvim_buf_line_count(self._buf)
-    return (total - cursor_line) <= SCROLL_THRESHOLD
+    if not self._auto_follow then
+        return false
+    end
+    -- Lazy drift check: while following, the cursor is parked where our
+    -- last scroll left it. Any drift is user movement that CursorMoved has
+    -- not (yet) reported — notably in headless contexts where the event
+    -- never fires. Detach instead of snapping the user back.
+    local pending = self._pending_cursor
+    if pending then
+        local cursor = vim.api.nvim_win_get_cursor(self._win)
+        if cursor[1] ~= pending[1] or cursor[2] ~= pending[2] then
+            self._auto_follow = false
+            self._pending_cursor = nil
+            return false
+        end
+    end
+    return true
 end
 
 function History:_maybe_scroll()
@@ -567,11 +618,17 @@ function History:_maybe_scroll()
     self._scroll_scheduled = true
     vim.schedule(function()
         self._scroll_scheduled = false
-        self:_scroll_to_bottom()
+        -- Re-check: the user may have moved away between scheduling and now.
+        if self:_should_auto_scroll() then
+            self:_scroll_to_bottom()
+        end
     end)
 end
 
 --- Scroll to the last line with cursor at bottom of the window.
+---
+--- Pins the follow state: the cursor ends up at the bottom by our own hand,
+--- so following stays on until the user moves away.
 function History:_scroll_to_bottom()
     if not self._win or not vim.api.nvim_win_is_valid(self._win) then
         return
@@ -586,6 +643,29 @@ function History:_scroll_to_bottom()
             vim.cmd("normal! " .. n .. "\x05")
         end
     end)
+    self._auto_follow = true
+    -- Remember where we parked the cursor so _on_cursor_moved can tell our
+    -- own move apart from the user's.
+    self._pending_cursor = vim.api.nvim_win_get_cursor(self._win)
+end
+
+--- CursorMoved handler: the cursor moved in the history window.
+---
+--- Programmatic moves record their landing spot in _pending_cursor; a match
+--- is our own move and leaves the follow state untouched. Anything else is
+--- user intent: follow only while the cursor sits on the last line.
+function History:_on_cursor_moved()
+    if not self._win or vim.api.nvim_get_current_win() ~= self._win then
+        return
+    end
+    local cursor = vim.api.nvim_win_get_cursor(self._win)
+    local pending = self._pending_cursor
+    self._pending_cursor = nil
+    if pending and cursor[1] == pending[1] and cursor[2] == pending[2] then
+        return
+    end
+    local total = vim.api.nvim_buf_line_count(self._buf)
+    self._auto_follow = cursor[1] >= total
 end
 
 local DEFAULT_SCROLL_LINES = 15
@@ -602,6 +682,18 @@ function History:scroll(direction, lines)
     vim.api.nvim_win_call(self._win, function()
         vim.cmd("normal! " .. count .. key)
     end)
+    -- Explicit navigation from the prompt: peeking up detaches from the
+    -- stream; scrolling down re-attaches once the cursor is back on the
+    -- last line. Record the landing spot so _on_cursor_moved treats the
+    -- move as ours.
+    local cursor = vim.api.nvim_win_get_cursor(self._win)
+    self._pending_cursor = cursor
+    local total = vim.api.nvim_buf_line_count(self._buf)
+    if direction == "up" then
+        self._auto_follow = false
+    elseif cursor[1] >= total then
+        self._auto_follow = true
+    end
 end
 
 --- Scroll the history window to the bottom (most recent message).
@@ -627,6 +719,10 @@ function History:_scroll_to_agent_response(extmark_id)
         vim.api.nvim_win_set_cursor(self._win, { pos[1] + 1, 0 })
         vim.cmd("normal! zt")
     end)
+    -- Navigation jump: the user is reading a specific response — detach from
+    -- the stream until they return to the bottom.
+    self._auto_follow = false
+    self._pending_cursor = vim.api.nvim_win_get_cursor(self._win)
 end
 
 --- Scroll the history window to the first agent response in the current user turn.
@@ -1252,6 +1348,11 @@ end
 ---@param win integer?
 function History:set_win(win)
     self._win = win
+    if not win then
+        -- Window closed: the next open starts pinned to the latest content.
+        self._auto_follow = true
+        self._pending_cursor = nil
+    end
 end
 
 ---@return integer?
@@ -2484,8 +2585,6 @@ function History:on_tool_end(tool_name, tool_call_id, result, is_error)
         end
         self:_flush_tool_updates() -- latest live update lands before teardown
 
-        local should_scroll = self:_should_auto_scroll()
-
         local block = tool_call_id and self._tool_blocks[tool_call_id]
 
         -- Guard: skip if this tool already finished (race between
@@ -2559,7 +2658,7 @@ function History:on_tool_end(tool_name, tool_call_id, result, is_error)
 
             self._needs_breathing_line = true
             self:_update_status_extmark()
-            if should_scroll then
+            if self:_should_auto_scroll() then
                 self:_scroll_to_bottom()
             end
             return
@@ -2629,7 +2728,7 @@ function History:on_tool_end(tool_name, tool_call_id, result, is_error)
 
         self._needs_breathing_line = true
 
-        if should_scroll then
+        if self:_should_auto_scroll() then
             self:_scroll_to_bottom()
         end
     end)
@@ -3007,7 +3106,6 @@ function History:_apply_tool_update(tool_call_id, msg)
         return
     end
 
-    local should_scroll = self:_should_auto_scroll()
     local lines = build_tool_live_update_lines(text)
     local start_row
     local old_line_count = block.live_update_line_count
@@ -3047,7 +3145,7 @@ function History:_apply_tool_update(tool_call_id, msg)
     block.live_update_line_count = #lines
     self:_apply_tool_live_update_extmarks(start_row, lines)
     self:_update_status_extmark()
-    if should_scroll then
+    if self:_should_auto_scroll() then
         self:_scroll_to_bottom()
     end
 end
@@ -3282,8 +3380,6 @@ function History:_apply_bash_output(block, delta)
         block.partial = chunk_lines[#chunk_lines]
     end
 
-    local should_scroll = self:_should_auto_scroll()
-
     self:_bash_clear_partial(block)
 
     if #completed > 0 and not block.display_capped then
@@ -3315,7 +3411,7 @@ function History:_apply_bash_output(block, delta)
     end
 
     self:_update_status_extmark()
-    if should_scroll then
+    if self:_should_auto_scroll() then
         self:_scroll_to_bottom()
     end
 end
@@ -3391,8 +3487,6 @@ function History:on_bash_end(id, result)
         end
         block.finished = true
 
-        local should_scroll = self:_should_auto_scroll()
-
         if block.spinner_extmark then
             pcall(vim.api.nvim_buf_del_extmark, self._buf, ns, block.spinner_extmark)
             block.spinner_extmark = nil
@@ -3441,7 +3535,7 @@ function History:on_bash_end(id, result)
 
         self._needs_breathing_line = true
         self:_update_status_extmark()
-        if should_scroll then
+        if self:_should_auto_scroll() then
             self:_scroll_to_bottom()
         end
     end)
