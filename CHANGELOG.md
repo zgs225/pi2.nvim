@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-08-19
+
+- **FIXED:** during streaming, cursor movement in the history buffer (`h`/`j`/`k`/`l`, any navigation) was effectively impossible whenever the cursor was at — or within 10 lines of — the bottom: every render event (text delta, tool update, queue/status change) snapped the cursor back to the last line, because auto-follow was decided purely by cursor proximity and escaping required moving more than 10 lines inside one 30ms flush window. Following is now explicit state mirroring the TUI: the stream pins the window to the bottom only while you are parked there; the first cursor movement away detaches — streaming keeps appending but never moves your cursor or scroll position again — and following re-attaches when you return to the very bottom (`G` / `pi.scroll_chat_history_to_bottom()`). Scrolling the history up from the prompt (`pi.scroll_chat_history("up")`) and the agent-response jumps detach too; buffer edits while detached no longer drag the cursor (#90).
+
 ## 2026-08-14
 
 - **BREAKING:** prompt history is now scoped **per workspace** (the cwd the session started in) instead of one global file — recalling in one project no longer shows prompts submitted in another. Each workspace persists to its own file under `stdpath("data")/pi/history/` (hash-named, with an `index.json` mapping hash to cwd). The old global `stdpath("data")/pi/prompt_history.json` is silently removed on first use and its entries are **not** migrated; the `prompt.history.path` option is removed (#89).

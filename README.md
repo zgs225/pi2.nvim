@@ -328,6 +328,7 @@ Everything below is present in `pi2.nvim` and **not** in upstream `alex35mil/pi.
 - Thinking blocks render after inline tools (correct turn order); CJK / UTF-8 thinking-preview truncation no longer corrupts text; tool-block collapse/expand no longer corrupts the footer extmark; nerd-font icon codepoints corrected.
 - The streaming thinking header no longer flickers (the rolling preview is drawn as end-of-line virtual text instead of `inline`).
 - The busy spinner and abort hints live in the prompt statusline at a fixed position that never scrolls away.
+- Auto-scroll follows explicit intent: streaming pins the history to the bottom only while you are parked there, and never fights your cursor once you move away.
 
 **Developer infrastructure**
 
