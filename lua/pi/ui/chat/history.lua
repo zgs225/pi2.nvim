@@ -570,6 +570,15 @@ function History:_with_modifiable(fn)
     local ok, err = pcall(fn)
     if restore then
         pcall(vim.api.nvim_win_set_cursor, self._win, restore)
+        -- If the edit itself moved the cursor (a shrink clamps the restore
+        -- to the new last line; an insertion at the cursor position drags
+        -- it), the drift expectation must move with it: re-park the pending
+        -- cursor at the real position, otherwise _should_auto_scroll reads
+        -- our own edit as user movement and silently detaches follow (#91).
+        local now_ok, now = pcall(vim.api.nvim_win_get_cursor, self._win)
+        if now_ok and (now[1] ~= restore[1] or now[2] ~= restore[2]) then
+            self._pending_cursor = now
+        end
     end
     vim.bo[self._buf].modifiable = false
     if not ok then

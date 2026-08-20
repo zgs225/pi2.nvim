@@ -118,4 +118,53 @@ describe("history auto-follow state (issue #90)", function()
         assert.is_true(h._auto_follow)
         assert.are.equal(total(), cursor_line())
     end)
+
+    it("buffer shrink above the parked cursor does not detach follow (#91)", function()
+        for i = 1, 10 do
+            stream("prefill " .. i .. "\n")
+        end
+        assert.are.equal(total(), cursor_line())
+        local parked_pending = h._pending_cursor
+        assert.is_truthy(parked_pending)
+
+        -- What tool-block collapse / bash cleanup do in a real turn: delete
+        -- lines above the parked cursor. The restore in _with_modifiable
+        -- clamps to the new last line; the drift check must read that as
+        -- our own edit, not user movement.
+        h:_with_modifiable(function()
+            vim.api.nvim_buf_set_lines(h:buf(), 2, 8, false, {})
+        end)
+        pump(30)
+        assert.is_true(h._auto_follow, "shrink must not detach follow")
+
+        stream("post-shrink content\n")
+        assert.are.equal(total(), cursor_line(), "streaming must re-pin after a shrink")
+    end)
+
+    it("keeps following through a collapsing tool block into a thinking block (#91)", function()
+        stream("intro text\n")
+
+        -- A bash tool whose long output auto-collapses on end (shrinks the
+        -- buffer while the cursor is parked at the bottom).
+        h:on_tool_start("bash", "t-shrink", { command = "seq 1 100" })
+        pump(40)
+        local long_out = {}
+        for i = 1, 60 do
+            long_out[#long_out + 1] = "line " .. i
+        end
+        h:on_tool_end("bash", "t-shrink", table.concat(long_out, "\n"), false)
+        pump(60)
+        assert.is_true(h._auto_follow, "collapse shrink must not detach follow")
+
+        -- Thinking block lands at the bottom afterwards; the turn keeps
+        -- streaming and the view must ride the bottom.
+        h:on_thinking_start()
+        pump(40)
+        h:on_thinking_delta("thinking about the collapsed output...")
+        pump(40)
+        h:on_thinking_end()
+        pump(40)
+        stream("final answer\n")
+        assert.are.equal(total(), cursor_line(), "view must stay pinned after thinking completes")
+    end)
 end)
