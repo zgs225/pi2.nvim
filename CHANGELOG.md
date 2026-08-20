@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-08-20
+
+- **FIXED:** regression from the auto-follow rework (#90): when a buffer edit *shrank* the history above the parked cursor — most commonly a long tool block auto-collapsing at the end of a tool call, or bash output cleanup — the cursor-holding restore clamped to the new last line and the follow drift check misread that as user movement, silently detaching auto-follow for the rest of the turn (a thinking block completing at the bottom, or any later content, never scrolled again while the cursor sat in the prompt). Edits that move the cursor themselves now re-park the drift expectation, so only real user movement detaches (#91).
+
 ## 2026-08-19
 
 - **FIXED:** during streaming, cursor movement in the history buffer (`h`/`j`/`k`/`l`, any navigation) was effectively impossible whenever the cursor was at — or within 10 lines of — the bottom: every render event (text delta, tool update, queue/status change) snapped the cursor back to the last line, because auto-follow was decided purely by cursor proximity and escaping required moving more than 10 lines inside one 30ms flush window. Following is now explicit state mirroring the TUI: the stream pins the window to the bottom only while you are parked there; the first cursor movement away detaches — streaming keeps appending but never moves your cursor or scroll position again — and following re-attaches when you return to the very bottom (`G` / `pi.scroll_chat_history_to_bottom()`). Scrolling the history up from the prompt (`pi.scroll_chat_history("up")`) and the agent-response jumps detach too; buffer edits while detached no longer drag the cursor (#90).
