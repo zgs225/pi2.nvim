@@ -125,6 +125,47 @@ describe("sessions overview", function()
         end)
     end)
 
+    describe("spinner_frame", function()
+        it("cycles through the braille frames", function()
+            local seen = {}
+            local count = 0
+            for tick = 0, 19 do
+                local frame = SessionList.spinner_frame(tick)
+                if not seen[frame] then
+                    seen[frame] = true
+                    count = count + 1
+                end
+            end
+            assert.are.equal(10, count)
+            assert.are.equal(SessionList.spinner_frame(0), SessionList.spinner_frame(10))
+            assert.are.equal(SessionList.spinner_frame(1), SessionList.spinner_frame(11))
+        end)
+    end)
+
+    describe("build_rows", function()
+        it("derives title_generating from the generating_of callback", function()
+            local sessions = {
+                fake_session({ tab = 1 }),
+                fake_session({ tab = 2 }),
+            }
+            local rows = SessionList.build_rows(
+                sessions,
+                function()
+                    return 0
+                end,
+                function()
+                    return "name"
+                end,
+                nil,
+                function(session)
+                    return session.tab == 1
+                end
+            )
+            assert.is_true(rows[1].title_generating)
+            assert.is_false(rows[2].title_generating)
+        end)
+    end)
+
     describe("format_line", function()
         it("puts the dot at the left edge and the name right after it", function()
             local row = { tab = 1, status = "idle", attention = 0, name = "fix login" }
@@ -140,6 +181,38 @@ describe("sessions overview", function()
         it("renders a pending placeholder when the name is unknown", function()
             local _, chunks = SessionList.format_line({ tab = 1, status = "idle", attention = 0, name = nil }, 0)
             assert.are.equal("PiSessionsListPending", chunks[2][3])
+        end)
+
+        it("animates the row while a title is being generated", function()
+            local row = { tab = 1, status = "idle", attention = 0, name = nil, title_generating = true }
+            local line, chunks = SessionList.format_line(row, 0)
+            assert.are.equal(" ● ⠋ …", line)
+            assert.are.equal(3, #chunks)
+            -- dot, spinner, pending name
+            assert.are.equal("PiSessionsListSpinner", chunks[2][3])
+            assert.are.equal("⠋", line:sub(chunks[2][1] + 1, chunks[2][2]))
+            assert.are.equal("PiSessionsListPending", chunks[3][3])
+            -- a later tick advances the frame, keeping the same line length
+            local line2, chunks2 = SessionList.format_line(row, 3)
+            assert.are.equal("⠸", line2:sub(chunks2[2][1] + 1, chunks2[2][2]))
+            assert.are.equal(#line, #line2)
+        end)
+
+        it("prefixes the spinner to a resolved name while generating", function()
+            local row = { tab = 1, status = "idle", attention = 0, name = "fix login", title_generating = true }
+            local line, chunks = SessionList.format_line(row, 0)
+            assert.are.equal(" ● ⠋ fix login", line)
+            assert.are.equal("PiSessionsListSpinner", chunks[2][3])
+            assert.are.equal("Normal", chunks[3][3])
+        end)
+
+        it("is static when the row is not generating", function()
+            local line, chunks = SessionList.format_line(
+                { tab = 1, status = "idle", attention = 0, name = nil, title_generating = false },
+                7
+            )
+            assert.are.equal(" ● …", line)
+            assert.are.equal(2, #chunks)
         end)
 
         it("colors the dot by status and tick", function()

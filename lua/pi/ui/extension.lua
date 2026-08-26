@@ -45,6 +45,12 @@ function M.handle(session, msg)
         local value = msg.statusText -- nil clears
         if type(key) == "string" then
             session.chat:set_extension_status(key, value)
+            -- The auto-title extension toggles "pi-title" while it generates
+            -- a session name; keep the :PiSessions overview in sync (spinner
+            -- on/off) without repainting for unrelated keys.
+            if key == "pi-title" then
+                require("pi.ui.sessions").request_refresh()
+            end
         end
         return
     end

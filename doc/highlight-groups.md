@@ -146,7 +146,8 @@ The dashboard reuses `PiToolHeader` for its section headers, `Comment` for dimme
 | --- | --- |
 | `PiSessionsListBusy` | Status dot while the agent is working (blinking yellow) |
 | `PiSessionsListCompacting` | Status dot while the session is compacting |
-| `PiSessionsListPending` | Status dot when the session needs attention |
+| `PiSessionsListPending` | Pending placeholder while the display name is being fetched |
+| `PiSessionsListSpinner` | Auto-title spinner while the backend generates a session name |
 | `PiSessionsListDone` | Status dot when a turn finished while you were elsewhere (blinking green) |
 | `PiSessionsListError` | Status dot when the last turn errored / the process died (blinking red) |
 | `PiSessionsListExited` | Status dot for a dead process (steady error color) |
