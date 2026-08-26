@@ -40,6 +40,8 @@ And mid-session management:
 | --- | --- | --- |
 | `:PiNewSession` | `pi.new_session()` | Discard the current session in this tab and start a fresh one. Extensions can cancel this via the `session_before_switch` hook (e.g. to warn about unsaved draft state). |
 | `:PiTree` | `pi.tree()` | Navigate the session tree: jump back to any past conversation point, optionally summarizing the abandoned branch. See [Session tree navigation](#session-tree-navigation-pitree). |
+| `:PiFork` | `pi.fork()` | Start a new session from a past user message. See [Fork and clone](#fork-and-clone). |
+| `:PiClone` | `pi.clone()` | Duplicate the current branch into a new session file. See [Fork and clone](#fork-and-clone). |
 | `:PiSessions` | `pi.sessions()` | Toggle the live overview of all active sessions (name + busy/idle/attention). See [Sessions overview](#sessions-overview-pisessions). |
 | `:PiSessionName [name]` | `pi.set_session_name(name?)` | Set a human-readable display name for the current session. Without an argument, opens an input dialog prefilled with the current name. Names appear in the `:PiResume` picker so you can identify long-running conversations at a glance. |
 | `:PiStop` | `pi.stop()` | Tear down the current session entirely, killing the backing `pi --mode rpc` process. Different from `:PiToggleChat`, which just hides the windows while the session keeps running. |
@@ -65,6 +67,21 @@ require("pi").setup({
 ```
 
 Requires a pi version whose extension API exposes `ctx.navigateTree` — on older versions the command fails with an explicit error telling you to upgrade or disable the feature.
+
+## Fork and clone
+
+`:PiTree` creates new branches **inside** the current session file. Sometimes you want a **separate session file** instead — pi offers two operations for this, mirroring the TUI's built-in `/fork` and `/clone` (typing `/fork` or `/clone` in the prompt works too):
+
+| | `:PiFork` | `:PiClone` |
+| --- | --- | --- |
+| Selects | one past **user message** (a picker lists all forkable messages with a `[user]` kind tag and a one-line preview) | nothing (current position) |
+| New file starts | the fork replays history **up to** the selected message, then places the message text back in the prompt — edit and resend to re-ask | the **entire active branch** is duplicated up to the current leaf; the chat keeps its content |
+| Typical use | "rewind to that earlier question and ask it differently" | "snapshot all my work so far into a fresh file and continue there" |
+| New session file | ✓ | ✓ |
+
+The difference in one line: **fork** rewinds to an earlier turn and lets you re-ask (a new narrative from a chosen message), **clone** duplicates everything so far and lets you continue the same narrative in a separate file. In both cases the current tab's session rebinds to the new session file — the original file stays on disk untouched — and the [sessions overview](#sessions-overview-pisessions) refreshes so the new file is reachable from `:PiResume`.
+
+Both operations are refused while the agent is streaming, and both can be **cancelled by extensions** via the `session_before_fork` hook: when an extension refuses the operation (the response carries `cancelled`), nothing happens — no new session, no error.
 
 ## Sessions overview (:PiSessions)
 

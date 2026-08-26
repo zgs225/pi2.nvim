@@ -68,6 +68,9 @@
 ---| "get_tree"
 ---| "get_session_stats"
 ---| "get_entries"
+---| "get_fork_messages"
+---| "fork"
+---| "clone"
 
 ---@class pi.RpcImageContent
 ---@field type "image"

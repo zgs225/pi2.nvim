@@ -243,6 +243,8 @@ require("pi").setup({
 | `:PiAttention` | Open the next queued attention request |
 | `:PiNewSession` | Start a new conversation in the current tab/session |
 | `:PiTree` | Navigate the session tree: jump back to any past conversation point |
+| `:PiFork` | Start a new session from a past user message (rewind and re-ask) |
+| `:PiClone` | Duplicate the current session branch into a new session file |
 | `:PiSessions` | Toggle the live sessions overview (all active sessions: name + busy/idle/attention) |
 | `:PiSessionStats` | Show the session stats dashboard: messages, tokens (with cache split), per-model cost breakdown, cache re-billed waste, context usage |
 | `:PiDiff` | Review the git diff of every file changed by the current session in one panel: file list + diff, grouped per git work tree |
@@ -270,7 +272,7 @@ Detailed guides live in [`doc/`](doc/):
 | Doc | What's inside |
 | --- | --- |
 | [doc/usage.md](doc/usage.md) | Chat & layouts, prompt (submit/queue/abort), direct bash mode (`!`), prompt history & drafts, `@mentions`, slash commands, completion, attachments, zen mode, statusline, navigation, quickfix, tool blocks, models, thinking, markdown rendering, buffer reload, startup block |
-| [doc/sessions.md](doc/sessions.md) | One session per tab, storage & cwd scoping, continue/resume, session tree (`:PiTree`), sessions overview (`:PiSessions`), compaction |
+| [doc/sessions.md](doc/sessions.md) | One session per tab, storage & cwd scoping, continue/resume, session tree (`:PiTree`), fork/clone (`:PiFork`/`:PiClone`), sessions overview (`:PiSessions`), compaction |
 | [doc/diff-review.md](doc/diff-review.md) | Two-way diff review of agent edits, review notes, permission-extension protocol reference, session diff review (`:PiDiff`) |
 | [doc/attention.md](doc/attention.md) | Attention queue, dialogs, notifications, queue inspection API |
 | [doc/extensions.md](doc/extensions.md) | Extension UI routing, startup announcements, `on_widget` custom blocks, adapting non-upstream RPC backends |
@@ -320,6 +322,7 @@ Everything below is present in `pi2.nvim` and **not** in upstream `alex35mil/pi.
 
 - [Sessions overview (`:PiSessions`)](doc/sessions.md#sessions-overview-pisessions) — a live, shared dashboard of every active session with animated status dots.
 - [Session tree navigation (`:PiTree`)](doc/sessions.md#session-tree-navigation-pitree) — jump back to any past conversation point, optionally summarizing the abandoned branch.
+- [Fork and clone (`:PiFork` / `:PiClone`)](doc/sessions.md#fork-and-clone) — rewind to a past user message and re-ask in a new session, or duplicate the whole current branch into a new session file, mirroring the TUI's `/fork` and `/clone`.
 - [Per-tab model pinning](doc/usage.md#per-tab-model-pinning) — model switches in one tab don't leak into other tabs' new sessions.
 - [Auto-reload of open buffers](doc/usage.md#buffer-reload) — files modified by the agent reload in place; unsaved buffers are never touched.
 

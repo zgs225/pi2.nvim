@@ -61,6 +61,8 @@ vim.keymap.set({ "n", "v" }, "<Leader>pc", "<Cmd>PiContinue<CR>",               
 vim.keymap.set({ "n", "v" }, "<Leader>pr", "<Cmd>PiResume<CR>",                       { desc = "Pi resume past session" })
 vim.keymap.set({ "n", "v" }, "<Leader>pm", "<Cmd>PiSendMention<CR>",                  { desc = "Pi mention file/selection" })
 vim.keymap.set({ "n", "v" }, "<Leader>pa", "<Cmd>PiAttention<CR>",                    { desc = "Pi open next attention request" })
+vim.keymap.set({ "n", "v" }, "<Leader>pF", "<Cmd>PiFork<CR>",                       { desc = "Pi fork session from a past message" })
+vim.keymap.set({ "n", "v" }, "<Leader>pC", "<Cmd>PiClone<CR>",                      { desc = "Pi clone session into a new file" })
 ```
 
 The `<S-Up>` / `<S-Down>` mappings below are sort of placeholders — replace them with whatever keys you already use to move between windows in the rest of Neovim. The idea is that focus navigation inside π windows should match your normal buffer/window navigation, not introduce new conventions.

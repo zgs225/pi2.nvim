@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-08-26
+
+- **ADDED:** `:PiFork` / `pi.fork()` (and a bare `/fork` in the prompt) — start a new session from a past user message, mirroring the TUI's built-in `/fork`. A picker (kind `pi-fork-select`) lists all forkable user messages on the active branch with a `[user]` tag and a one-line preview; picking one creates a new session file whose history is the conversation up to that message, and the message text lands back in the prompt for editing and resending. The current tab's session rebinds to the new file and the sessions overview refreshes.
+- **ADDED:** `:PiClone` / `pi.clone()` (and a bare `/clone` in the prompt) — duplicate the entire current active branch into a new session file at the current position, mirroring the TUI's built-in `/clone`. No picker, no prompt prefill; the chat keeps its content, only the backing file and the sessions overview change.
+- Both new commands are refused while the agent is streaming and can be **cancelled by extensions** via the `session_before_fork` hook (`cancelled` response → silent no-op, no new session, no error); backend errors are surfaced through `:messages`. Backed by the RPC protocol's `fork` / `clone` / `get_fork_messages` commands (#85).
+
 ## 2026-08-20
 
 - **FIXED:** regression from the auto-follow rework (#90): when a buffer edit *shrank* the history above the parked cursor — most commonly a long tool block auto-collapsing at the end of a tool call, or bash output cleanup — the cursor-holding restore clamped to the new last line and the follow drift check misread that as user movement, silently detaching auto-follow for the rest of the turn (a thinking block completing at the bottom, or any later content, never scrolled again while the cursor sat in the prompt). Edits that move the cursor themselves now re-park the drift expectation, so only real user movement detaches (#91).

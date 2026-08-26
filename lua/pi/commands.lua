@@ -80,6 +80,14 @@ function M.setup()
         Pi.tree()
     end, { desc = "Navigate π session tree" })
 
+    vim.api.nvim_create_user_command("PiFork", function()
+        Pi.fork()
+    end, { desc = "Fork π session from a past message" })
+
+    vim.api.nvim_create_user_command("PiClone", function()
+        Pi.clone()
+    end, { desc = "Duplicate current π session branch into a new session" })
+
     vim.api.nvim_create_user_command("PiSessions", function()
         Pi.sessions()
     end, { desc = "Toggle π sessions overview list" })
