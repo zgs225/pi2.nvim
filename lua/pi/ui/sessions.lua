@@ -27,6 +27,7 @@ local ns = vim.api.nvim_create_namespace("pi-sessions-list")
 ---@field done boolean last turn finished while the user was elsewhere
 ---@field error boolean last turn failed and the user hasn't seen it yet
 ---@field name string? display name (nil while still fetching)
+---@field title_generating boolean backend auto-title generation in progress
 
 ---@type integer? shared list buffer
 local buf = nil
@@ -95,7 +96,35 @@ function M.dot_hl(row, tick)
     return "PiSessionsListIdle"
 end
 
+--- Extension status key the auto-title extension uses while generating a
+--- session name (extensions/title.ts). Any non-empty value = generating.
+local TITLE_STATUS_KEY = "pi-title"
+
+--- Whether the backend is currently generating a session name for a session.
+---@param session pi.Session
+---@return boolean
+local function title_generating(session)
+    local read = session.chat and session.chat.extension_status
+    if type(read) ~= "function" then
+        return false
+    end
+    local value = read(session.chat, TITLE_STATUS_KEY)
+    return value ~= nil and value ~= ""
+end
+
+--- Spinner frames for the auto-title animation, rendered in place of the
+--- pending placeholder while the backend generates a session name.
+local SPINNER_FRAMES = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
+
+--- Spinner frame at an animation tick (pure; drives the test hook too).
+---@param tick integer
+---@return string
+function M.spinner_frame(tick)
+    return SPINNER_FRAMES[(tick % #SPINNER_FRAMES) + 1]
+end
+
 --- Format a row: the status dot at the left edge, the name right after it.
+--- While the backend generates a title the pending placeholder is animated.
 --- Chunks are byte ranges: { col_start, col_end, hl_group }.
 ---@param row pi.SessionsListRow
 ---@param tick integer
@@ -105,13 +134,24 @@ function M.format_line(row, tick)
     local indent = " "
     local dot = "●"
     local name = row.name or "…"
-    local line = indent .. dot .. " " .. name
+    local pending = row.name == nil
+    -- While the backend generates a title, animate the provisional label
+    -- (pending placeholder or "(unnamed)"). Once a real name shows — the
+    -- generated title arriving via session_info_changed — the spinner
+    -- disappears immediately, even if the "generating" status is still set
+    -- for a tick: the label transition is a single change, not two.
+    local provisional = pending or name == "(unnamed)"
+    local spinner = row.title_generating and provisional and M.spinner_frame(tick)
+    local line = indent .. dot .. " " .. (spinner and spinner .. " " or "") .. name
     local dot_start = #indent
-    local name_start = dot_start + #dot + 1
+    local name_start = dot_start + #dot + 1 + (spinner and #spinner + 1 or 0)
     local chunks = {
         { dot_start, dot_start + #dot, M.dot_hl(row, tick) },
-        { name_start, name_start + #name, row.name and "Normal" or "PiSessionsListPending" },
+        { name_start, name_start + #name, pending and "PiSessionsListPending" or "Normal" },
     }
+    if spinner then
+        table.insert(chunks, 2, { name_start - #spinner - 1, name_start - 1, "PiSessionsListSpinner" })
+    end
     return line, chunks
 end
 
@@ -120,8 +160,9 @@ end
 ---@param attention_count fun(tab: pi.TabId): integer
 ---@param name_of fun(session: pi.Session): string?
 ---@param flags_of? fun(session: pi.Session): { done: boolean, error: boolean }
+---@param generating_of? fun(session: pi.Session): boolean
 ---@return pi.SessionsListRow[]
-function M.build_rows(sessions, attention_count, name_of, flags_of)
+function M.build_rows(sessions, attention_count, name_of, flags_of, generating_of)
     ---@type pi.SessionsListRow[]
     local out = {}
     for _, session in ipairs(sessions) do
@@ -133,6 +174,7 @@ function M.build_rows(sessions, attention_count, name_of, flags_of)
             done = f ~= nil and f.done == true,
             error = f ~= nil and f.error == true,
             name = name_of(session),
+            title_generating = generating_of ~= nil and generating_of(session) == true,
         }
     end
     return out
@@ -225,6 +267,14 @@ local function resolve_name(session)
     end
     if entry.name then
         return entry.name --[[@as string]]
+    end
+    -- While the backend generates a session name, keep the provisional
+    -- first-message fallback off the row so the label goes straight from
+    -- "(unnamed)" to the generated title — one visible change, not two
+    -- (the fallback is pi data, usually similar to the title; the jump is
+    -- the flicker this suppresses).
+    if title_generating(session) then
+        return "(unnamed)"
     end
     if entry.first_message then
         return entry.first_message --[[@as string]]
@@ -330,10 +380,26 @@ local blink_tick = 0
 ---@type uv.uv_timer_t?
 local blink_timer = nil
 
+--- Spinner animation state (auto-title generation). Drives its own faster
+--- timer so the frame rate is not tied to the 500ms dot blink.
+local spinner_tick = 0
+---@type uv.uv_timer_t?
+local spinner_timer = nil
+
 ---@return boolean whether any row animates (busy/compacting/done/error)
 local function has_animated_row()
     for _, row in ipairs(rows) do
         if row.status == "busy" or row.status == "compacting" or row.done or row.error then
+            return true
+        end
+    end
+    return false
+end
+
+---@return boolean whether any row shows the auto-title spinner
+local function has_spinner_row()
+    for _, row in ipairs(rows) do
+        if row.title_generating then
             return true
         end
     end
@@ -375,6 +441,42 @@ local function ensure_blink()
     )
 end
 
+--- Stop the auto-title spinner timer, if running.
+local function stop_spinner()
+    if not spinner_timer then
+        return
+    end
+    pcall(spinner_timer.stop, spinner_timer)
+    if not spinner_timer:is_closing() then
+        spinner_timer:close()
+    end
+    spinner_timer = nil
+end
+
+--- Run the spinner timer only while a title-generating row is on screen.
+local function ensure_spinner()
+    if not any_win_visible() or not has_spinner_row() then
+        stop_spinner()
+        return
+    end
+    if spinner_timer and not spinner_timer:is_closing() then
+        return
+    end
+    spinner_timer = assert(uv.new_timer())
+    spinner_timer:start(
+        120,
+        120,
+        vim.schedule_wrap(function()
+            if not any_win_visible() or not has_spinner_row() then
+                vim.schedule(stop_spinner)
+                return
+            end
+            spinner_tick = spinner_tick + 1
+            M._render()
+        end)
+    )
+end
+
 ---@type fun()
 local refresh_current_markers
 
@@ -400,6 +502,8 @@ function M._render()
         return name
     end, function(session)
         return flags[session] or { done = false, error = false }
+    end, function(session)
+        return title_generating(session)
     end)
 
     ---@type string[]
@@ -449,6 +553,7 @@ function M._render()
     end
 
     ensure_blink()
+    ensure_spinner()
     refresh_current_markers()
 end
 
@@ -855,6 +960,12 @@ function M._set_blink_tick(tick)
     blink_tick = tick
 end
 
+--- Test hook: set the spinner animation tick (drives the auto-title frames).
+---@param tick integer
+function M._set_spinner_tick(tick)
+    spinner_tick = tick
+end
+
 --- Test hook: resolved display name for a session (nil while fetching).
 ---@param session pi.Session
 ---@return string?
@@ -872,7 +983,9 @@ end
 --- Test hook: drop all module state.
 function M._reset()
     stop_blink()
+    stop_spinner()
     blink_tick = 0
+    spinner_tick = 0
     for list_win in pairs(help_wins) do
         close_help(list_win)
     end

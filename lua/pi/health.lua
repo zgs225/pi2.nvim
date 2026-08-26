@@ -201,6 +201,54 @@ M.check = function()
         end
     end
 
+    -- ── Bundled auto-title extension ──────────────────────────────────
+    if Config.options.title == nil or Config.options.title.enabled ~= false then
+        local title_path = Cli.title_extension_path()
+        if vim.uv.fs_stat(title_path) then
+            vim.health.ok("bundled auto-title extension found")
+        else
+            vim.health.warn("bundled auto-title extension not found at " .. title_path, {
+                "Reinstall pi2.nvim or set `title.enabled = false` to disable auto titles",
+            })
+        end
+
+        -- Version floor: the title extension needs pi.setSessionName() /
+        -- pi.getSessionName() and the extension turn_end event. Below the
+        -- floor sessions stay unnamed (first-message fallback) — no crash.
+        local title_min = Compat.title_min_supported
+        if not pi_version then
+            vim.health.warn(
+                "Could not verify pi version against the auto-title requirement (pi >= " .. title_min .. ")",
+                {
+                    "Fix the pi version detection above, or set `title.enabled = false` to disable auto titles",
+                }
+            )
+        else
+            local cmp_title = Compat.compare_versions(pi_version, title_min)
+            if cmp_title == nil then
+                vim.health.warn(
+                    "Could not compare pi version `"
+                        .. pi_version
+                        .. "` against the auto-title minimum `"
+                        .. title_min
+                        .. "`"
+                )
+            elseif cmp_title < 0 then
+                vim.health.error(
+                    "pi version `" .. pi_version .. "` is older than the auto-title minimum `" .. title_min .. "`",
+                    {
+                        "Upgrade pi to " .. title_min .. "+ or set `title.enabled = false` to disable auto titles",
+                        "With an older pi, sessions stay unnamed (first-message fallback) — no crash",
+                    }
+                )
+            else
+                vim.health.ok(
+                    "pi version `" .. pi_version .. "` satisfies the auto-title requirement (pi >= " .. title_min .. ")"
+                )
+            end
+        end
+    end
+
     -- ── Image compression tools ───────────────────────────────────────
     local compress_cfg = Config.options.prompt and Config.options.prompt.image_compress or {}
     if compress_cfg.enable ~= false then

@@ -1490,6 +1490,13 @@ function Chat:set_extension_status(key, value)
     self._prompt:statusline():set_extension_status(key, value)
 end
 
+--- Current value of an extension status key on the status line.
+---@param key string
+---@return string?
+function Chat:extension_status(key)
+    return self._prompt:statusline():extension_status(key)
+end
+
 --- Render a custom block inline in the chat history.
 ---@param block pi.CustomBlock
 function Chat:append_custom_block(block)

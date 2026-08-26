@@ -204,6 +204,24 @@ require("pi").setup({
         -- status_message = "Vision: %s…",
     },
 
+    -- Auto session titles. When enabled (default), the bundled pi extension
+    -- (extensions/title.ts) gives an unnamed session a display name: right
+    -- after its first turn it asks the session's own model for a short title
+    -- and persists it via pi.setSessionName(). The name then appears in
+    -- :PiSessions / :PiResume — while it is being generated, the session's
+    -- row in :PiSessions animates a spinner. Generation is fire-and-forget
+    -- (never blocks the agent loop) and runs at most once per session;
+    -- user-set names (:PiSessionName / `r`) are never overwritten. Failures
+    -- stay silent and the session keeps the first-message fallback.
+    -- Requires pi 0.44.0+ (see doc/sessions.md#auto-title); the config is
+    -- re-read live, so setup() changes apply without restarting a session.
+    title = {
+        enabled = true,
+        max_chars = 40, -- hard cap on generated titles (truncated with …)
+        -- lang = "zh-CN", -- nil (default) = title language follows the conversation
+        -- model = "openai/gpt-4o-mini", -- pinned generation model; nil = the session's own model
+    },
+
     -- Sessions overview (:PiSessions): a live list of all active sessions
     -- (one per tab) — a status dot whose color/animation encodes the state
     -- (busy/compacting/attention/done/error/idle/exited) plus the session

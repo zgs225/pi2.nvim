@@ -110,6 +110,12 @@ function M.vision_extension_path()
     return plugin_root() .. "/extensions/vision.ts"
 end
 
+--- Absolute path to the bundled pi extension backing auto session titles.
+---@return string
+function M.title_extension_path()
+    return plugin_root() .. "/extensions/title.ts"
+end
+
 ---@return string[]
 function M.command()
     local cmd = { M.bin() }
@@ -134,6 +140,15 @@ function M.command()
     if vim.fn.filereadable(ext) == 1 then
         cmd[#cmd + 1] = "--extension"
         cmd[#cmd + 1] = ext
+    end
+    -- Inject the auto-title extension unconditionally (like vision.ts): it
+    -- is a no-op unless enabled, and its options travel via a runtime file
+    -- re-read on every turn_end (PI_NVIM_TITLE_FILE, see rpc.lua), so live
+    -- setup() calls apply without respawning the RPC process.
+    local title_ext = M.title_extension_path()
+    if vim.fn.filereadable(title_ext) == 1 then
+        cmd[#cmd + 1] = "--extension"
+        cmd[#cmd + 1] = title_ext
     end
     cmd[#cmd + 1] = "--mode"
     cmd[#cmd + 1] = "rpc"

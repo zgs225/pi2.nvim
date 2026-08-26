@@ -369,6 +369,13 @@ function StatusLine:set_extension_status(key, value)
     self:render()
 end
 
+--- Current value of an extension status key (nil when unset).
+---@param key string
+---@return string?
+function StatusLine:extension_status(key)
+    return self._state.extensions[key]
+end
+
 --- Update the busy (spinner) display model; nil hides the spinner.
 ---@param busy pi.StatusLineBusy?
 function StatusLine:set_busy(busy)

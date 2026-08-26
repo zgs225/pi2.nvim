@@ -49,6 +49,14 @@ describe("statusline", function()
         return m
     end
 
+    it("exposes extension status values via the getter", function()
+        assert.is_nil(sl:extension_status("pi-title"))
+        sl:set_extension_status("pi-title", "generating")
+        assert.are.equal("generating", sl:extension_status("pi-title"))
+        sl:set_extension_status("pi-title", nil)
+        assert.is_nil(sl:extension_status("pi-title"))
+    end)
+
     it("hides the spinner component when idle", function()
         local text = status_row()
         assert.is_nil(text:find("Working", 1, true))

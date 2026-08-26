@@ -95,6 +95,24 @@ require("pi").setup({
 
 The dot colors are driven by `PiSessionsList*` highlight groups (`Busy`, `Compacting`, `Pending` (attention), `Done`, `Error`, `Exited`, `Idle`, `DotDim`, `Current`) — see [Highlight groups](highlight-groups.md#sessions-overview).
 
+While the backend is generating a session name (see [Auto session titles](#auto-session-titles)), the session's row animates a spinner between the status dot and the displayed name. The label under the dot stays provisional (the pending placeholder or `(unnamed)`) — the first-message fallback is held back during generation, so the row makes exactly **one** visible change: `(unnamed)` → the generated title (or → the fallback, when generation fails).
+
+## Auto session titles
+
+pi itself does not name sessions: `session_info.name` is only written when someone calls `setSessionName`. With `title` enabled (on by default), pi2.nvim injects a small extension (`extensions/title.ts`) into every RPC process that closes this gap: once per session, right after the **first turn** of a run, it asks the session's own model for a short title and persists it with `pi.setSessionName()`. The name then flows through the normal `session_info_changed` path — `:PiSessions` / `:PiResume` pick it up with no extra plumbing.
+
+Behavior and knobs (`title.*`, see [Configuration](configuration.md)):
+
+- **Generates at most once per session** — the extension skips sessions that already have a name, which also means **user-set names are never overwritten** (`:PiSessionName` / `r` in the sessions list).
+- **Language follows the conversation** — the prompt tells the model to title in the language of the user's message; set `title.lang` (e.g. `"zh-CN"`) to pin a language instead.
+- **Generation model** — by default the session's own model titles the session; set `title.model` (e.g. `"openai/gpt-4o-mini"`) to pin a separate (e.g. cheaper/faster) model. An unresolvable pin silently falls back to the session model.
+- **Length hard-capped** — `title.max_chars` (default 40) is enforced in code: the model hint asks for a short title, the completion is token-capped conservatively, and the final clamp truncates by character with an ellipsis.
+- **Never blocks the agent** — generation is fire-and-forget: the `turn_end` handler only schedules the model call and returns, so the agent loop is not stalled between turns.
+- **Silent** — no toasts or notifications; progress is visible only as the spinner in `:PiSessions`. Failures keep the session unnamed, falling back to the first user message.
+- **Live config** — the options travel through a runtime file re-read on every `turn_end`, so a `setup()` change applies to already-running RPC processes.
+
+Requires **pi 0.44.0+** (the `turn_end` extension event and `setSessionName` were introduced there; on older versions the extension fails to load and sessions stay unnamed — no crash).
+
 ## Compaction
 
 Long sessions eventually run into the model's context window limit. pi delegates this to a **compaction** step: the backend summarizes older parts of the conversation and replaces them with the summary, freeing up tokens for new turns. pi supports both automatic and manual compaction.

@@ -341,8 +341,13 @@ function Rpc:start()
     local cmd = Cli.command()
     -- The bundled vision extension reads its configured model from this
     -- runtime file on every input event (config.setup keeps it published).
+    -- The auto-title extension reads its options from PI_NVIM_TITLE_FILE on
+    -- every turn_end event (same live-reload rationale).
     self._job_id = vim.fn.jobstart(cmd, {
-        env = { PI_NVIM_VISION_FILE = require("pi.vision").state_path() },
+        env = {
+            PI_NVIM_VISION_FILE = require("pi.vision").state_path(),
+            PI_NVIM_TITLE_FILE = require("pi.title").state_path(),
+        },
         on_stdout = function(_, data)
             self:_on_stdout(data)
         end,
