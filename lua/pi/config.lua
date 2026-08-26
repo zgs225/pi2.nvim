@@ -188,6 +188,11 @@
 ---@field model? string Vision-capable model as "provider/modelId". When set, image attachments sent to a non-vision main model are described by this model first and the description replaces the images (fast-fail on any error; disabled when unset). Requires pi 0.81.0+ (see doc/usage.md#vision-fallback)
 ---@field status_message? string Statusline text shown while the description is being generated (default: "Describing images…"); may contain %s for the vision model id
 
+---@class pi.TitleConfig
+---@field enabled? boolean Inject the bundled auto-title extension and generate display names for unnamed sessions (default: true). The extension names a session once, after its first turn, via pi.setSessionName() — user-set names (:PiSessionName) are never overwritten. Requires pi 0.44.0+ (see doc/sessions.md#auto-session-titles)
+---@field max_chars? integer Maximum length of a generated title in characters, truncated with an ellipsis when exceeded (default: 40)
+---@field lang? string|nil Language of generated titles (e.g. "zh-CN", "en"). When nil, the title language follows the conversation (default: nil)
+
 ---@class pi.SessionsListFloatConfig
 ---@field width? number Width in columns (>=1) or fraction of editor width (<1, default 0.5)
 ---@field height? number Height in lines (>=1) or fraction of editor height (<1, default 0.4)
@@ -280,6 +285,7 @@
 ---@field abort pi.AbortConfig
 ---@field tree pi.TreeConfig
 ---@field vision pi.VisionConfig
+---@field title pi.TitleConfig
 ---@field sessions_list pi.SessionsListConfig
 ---@field diff_review pi.DiffReviewConfig
 ---@field zen pi.ZenConfig
@@ -412,6 +418,11 @@ local defaults = {
         enabled = true,
     },
     vision = {},
+    title = {
+        enabled = true,
+        max_chars = 40,
+        lang = nil,
+    },
     sessions_list = {
         mode = "follow",
         auto_open = false,
@@ -535,6 +546,10 @@ function M.setup(opts)
     -- runtime file on every input event, so live setup() calls apply to
     -- already-spawned RPC processes.
     require("pi.vision").publish(M.options.vision and M.options.vision.model)
+
+    -- The bundled auto-title extension re-reads its options from a runtime
+    -- file on every turn_end event; same live-reload rationale as vision.
+    require("pi.title").publish(M.options.title)
 end
 
 --- Resolve a config value that may be a function, merging the result with

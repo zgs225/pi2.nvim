@@ -2,6 +2,7 @@
 ---@field min_supported string minimum pi version supported by this plugin
 ---@field validated string latest pi version manually validated against this plugin
 ---@field vision_min_supported string minimum pi version for the bundled vision fallback extension (extensions/vision.ts)
+---@field title_min_supported string minimum pi version for the bundled auto-title extension (extensions/title.ts)
 local M = {
     -- Keep these in sync with release validation notes.
     min_supported = "0.65.2",
@@ -12,6 +13,12 @@ local M = {
     -- ModelRegistry.complete(). Validated on 0.83.0 (see git log for
     -- extensions/vision.ts).
     vision_min_supported = "0.81.0",
+    -- The title extension uses pi.setSessionName() / pi.getSessionName()
+    -- (extensions since 0.44.0) and the extension turn_end event (hooks
+    -- since 0.18.0, extension events before 0.44.0). Below the floor the
+    -- extension fails to load and sessions stay unnamed (first-message
+    -- fallback) — no crash.
+    title_min_supported = "0.44.0",
 }
 
 ---@param version string
