@@ -50,11 +50,12 @@ interface TitleConfig {
 	enabled: boolean;
 	maxChars: number;
 	lang: string | null;
+	model: string | null;
 }
 
 function readConfig(): TitleConfig {
 	const path = process.env[ENV_FILE];
-	const cfg: TitleConfig = { enabled: true, maxChars: DEFAULT_MAX_CHARS, lang: null };
+	const cfg: TitleConfig = { enabled: true, maxChars: DEFAULT_MAX_CHARS, lang: null, model: null };
 	if (!path) {
 		return cfg;
 	}
@@ -63,10 +64,12 @@ function readConfig(): TitleConfig {
 			enabled?: unknown;
 			maxChars?: unknown;
 			lang?: unknown;
+			model?: unknown;
 		};
 		if (typeof parsed.enabled === "boolean") cfg.enabled = parsed.enabled;
 		if (typeof parsed.maxChars === "number" && parsed.maxChars > 0) cfg.maxChars = parsed.maxChars;
 		if (typeof parsed.lang === "string" && parsed.lang !== "") cfg.lang = parsed.lang;
+		if (typeof parsed.model === "string" && parsed.model !== "") cfg.model = parsed.model;
 	} catch {
 		// Unreadable/corrupt file: fall back to defaults.
 	}
@@ -200,17 +203,27 @@ async function generateTitle(pi: ExtensionAPI, ctx: {
 	sessionManager: { buildContextEntries(): Array<{ type: string; message?: { role: string; content: unknown } }> };
 	ui: { setStatus(key: string, text: string | undefined): void };
 }, assistantText: string): Promise<string | undefined> {
-	if (!ctx.model) {
-		return undefined;
-	}
 	const cfg = readConfig();
 	if (!cfg.enabled) {
+		return undefined;
+	}
+	// A pinned model (title.model = "provider/modelId") makes title
+	// generation independent of the conversation's model — e.g. a cheap or
+	// fast one. Unresolvable pins fall back to the session's own model.
+	let model = ctx.model;
+	if (cfg.model !== null && typeof ctx.modelRegistry?.find === "function") {
+		const slash = cfg.model.indexOf("/");
+		const provider = slash > 0 ? cfg.model.slice(0, slash) : "";
+		const modelId = slash > 0 ? cfg.model.slice(slash + 1) : "";
+		model = ctx.modelRegistry.find(provider, modelId) ?? model;
+	}
+	if (!model) {
 		return undefined;
 	}
 	const prompt = buildPrompt(cfg, titleBasis(ctx.sessionManager, assistantText), assistantText);
 	const reply = await completeModel(
 		ctx.modelRegistry,
-		ctx.model,
+		model,
 		{ messages: [{ role: "user", content: prompt, timestamp: Date.now() }] },
 		// Conservative token cap for the character budget; the code-side
 		// clamp is the final guarantee.

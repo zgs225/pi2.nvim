@@ -219,6 +219,7 @@ require("pi").setup({
         enabled = true,
         max_chars = 40, -- hard cap on generated titles (truncated with …)
         -- lang = "zh-CN", -- nil (default) = title language follows the conversation
+        -- model = "openai/gpt-4o-mini", -- pinned generation model; nil = the session's own model
     },
 
     -- Sessions overview (:PiSessions): a live list of all active sessions

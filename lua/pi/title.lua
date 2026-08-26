@@ -38,6 +38,7 @@ function M.publish(cfg)
         enabled = cfg.enabled ~= false,
         maxChars = type(cfg.max_chars) == "number" and cfg.max_chars or 40,
         lang = type(cfg.lang) == "string" and cfg.lang ~= "" and cfg.lang or nil,
+        model = type(cfg.model) == "string" and cfg.model ~= "" and cfg.model or nil,
     })
     local f = io.open(path, "w")
     if f then
@@ -48,7 +49,7 @@ end
 
 --- The published title options, if the file exists (mirrors what the
 --- extension sees).
----@return { enabled: boolean, maxChars: integer, lang: string? }?
+---@return { enabled: boolean, maxChars: integer, lang: string?, model: string? }?
 function M.published()
     local f = io.open(M.state_path(), "r")
     if not f then
@@ -64,6 +65,7 @@ function M.published()
         enabled = decoded.enabled ~= false,
         maxChars = type(decoded.maxChars) == "number" and decoded.maxChars or 40,
         lang = type(decoded.lang) == "string" and decoded.lang ~= "" and decoded.lang or nil,
+        model = type(decoded.model) == "string" and decoded.model ~= "" and decoded.model or nil,
     }
 end
 

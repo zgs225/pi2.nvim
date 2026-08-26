@@ -192,6 +192,7 @@
 ---@field enabled? boolean Inject the bundled auto-title extension and generate display names for unnamed sessions (default: true). The extension names a session once, after its first turn, via pi.setSessionName() — user-set names (:PiSessionName) are never overwritten. Requires pi 0.44.0+ (see doc/sessions.md#auto-session-titles)
 ---@field max_chars? integer Maximum length of a generated title in characters, truncated with an ellipsis when exceeded (default: 40)
 ---@field lang? string|nil Language of generated titles (e.g. "zh-CN", "en"). When nil, the title language follows the conversation (default: nil)
+---@field model? string Model used for title generation as "provider/modelId". When unset the session's own model is used (default: nil); the pinned model is a fall-back to the session model if it cannot be resolved
 
 ---@class pi.SessionsListFloatConfig
 ---@field width? number Width in columns (>=1) or fraction of editor width (<1, default 0.5)
@@ -422,6 +423,7 @@ local defaults = {
         enabled = true,
         max_chars = 40,
         lang = nil,
+        model = nil,
     },
     sessions_list = {
         mode = "follow",
