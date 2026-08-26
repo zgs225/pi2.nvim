@@ -215,6 +215,22 @@ function M.tree()
     require("pi.tree").open()
 end
 
+--- Fork the current session (:PiFork): pick a past user message and start a
+--- new session from it — the new session replays history up to that message,
+--- and the message text lands back in the prompt for editing and resending.
+--- Refused while the agent is streaming; cancellable by extensions.
+function M.fork()
+    require("pi.fork").fork()
+end
+
+--- Clone the current session (:PiClone): duplicate the current active branch
+--- into a new session file at the current position. The chat keeps its
+--- content; only the backing file and the sessions overview change. Refused
+--- while the agent is streaming; cancellable by extensions.
+function M.clone()
+    require("pi.fork").clone()
+end
+
 --- Toggle the sessions overview list (:PiSessions): a live list of all
 --- active sessions with their display name and status (busy/idle/attention).
 --- One shared buffer; each tab opens its own window on it.

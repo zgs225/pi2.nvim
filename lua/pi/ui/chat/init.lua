@@ -967,6 +967,22 @@ function Chat:_send_message(queue_type)
         return
     end
 
+    -- A bare "/fork" opens the fork picker (new session from a past user
+    -- message); a bare "/clone" duplicates the current branch into a new
+    -- session. Both are handled locally like /tree — the backend's native
+    -- fork/clone RPC commands do the work, but the picker prefill for fork
+    -- is frontend-side.
+    if text == "/fork" then
+        self._prompt:clear_text()
+        require("pi.fork").fork()
+        return
+    end
+    if text == "/clone" then
+        self._prompt:clear_text()
+        require("pi.fork").clone()
+        return
+    end
+
     if text == "" and self._attachments:count() == 0 then
         return
     end

@@ -21,6 +21,9 @@ pi.continue_session(opts?)    -- load the most recent session for the current cw
 pi.resume_session(opts?)      -- pick a past session for the current cwd
 pi.new_session()              -- start a fresh conversation in the current tab
 pi.tree()                     -- navigate the session tree (:PiTree)
+pi.fork()                     -- new session from a past user message; picks forkable
+                              -- messages, then prefills the prompt for re-asking (:PiFork)
+pi.clone()                    -- duplicate the current branch into a new session (:PiClone)
 pi.sessions()                 -- toggle the live sessions overview (:PiSessions)
 pi.session_stats()            -- show the session stats dashboard (:PiSessionStats)
 pi.diff_review()              -- review the git diff of every file changed this session (:PiDiff)
