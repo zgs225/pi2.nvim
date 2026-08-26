@@ -440,7 +440,7 @@ The **center** group is centered in the window and has placement priority: when 
 | `attention` | `󰵚` / `󰵚 2` | There's at least one pending attention request |
 | `model` | `claude-opus-4-6` | A model is active |
 | `thinking` | `xhigh` / `thinking off` | The current model supports reasoning |
-| `spinner` | `⠋ Working… 12s · Thinking` | The agent is busy. While the double-<Esc> abort gesture is armed, the hint temporarily replaces the spinner; an `Aborted` confirmation outranks both |
+| `spinner` | `⠋ Working… 12s · Thinking` | The agent is busy. The elapsed figure counts from the start of the run (the first `agent_start`) and keeps counting across mid-run status changes — compaction, retries, and the resumed `agent_start` after compaction — resetting only when the run ends. While the double-<Esc> abort gesture is armed, the hint temporarily replaces the spinner; an `Aborted` confirmation outranks both |
 | `queue` | `⏵ 2` | There are pending steer/follow-up messages |
 
 Any component that has nothing to show returns `nil` and is silently skipped (along with its adjacent separator).

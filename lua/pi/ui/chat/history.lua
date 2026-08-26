@@ -1399,8 +1399,19 @@ function History:set_status(status)
         if text == self._status_text then
             return
         end
+        -- The elapsed counter measures the whole busy period (the agent run),
+        -- not the current status text. Mid-run text changes (compaction,
+        -- retry, the post-compaction agent_start) must keep the start time;
+        -- only a real idle transition (nil) restarts it (issue #93).
+        local was_busy = self._status_text ~= nil
         self._status_text = text
-        self._status_start_time = text and math.floor(vim.uv.hrtime() / 1e9) or nil
+        if text then
+            if not was_busy then
+                self._status_start_time = math.floor(vim.uv.hrtime() / 1e9)
+            end
+        else
+            self._status_start_time = nil
+        end
         self._spinner_index = 1
         self:_emit_status()
         -- Force scroll (bypass _scroll_scheduled guard) so the turn start is
