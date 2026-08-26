@@ -1243,7 +1243,20 @@ function Chat:clear_for_compaction_rebuild()
     self:preserve_flushed_queue_for_rebuild()
     local replay_flushed_queue_entries = self._replay_flushed_queue_entries
     local compaction_queue = self._compaction_queue
+    -- The rebuild clears the history, but the agent run itself continues
+    -- afterwards (pi emits another agent_start after compaction_end). Keep
+    -- the verb and the busy-status timing across the rebuild so
+    -- restore_active_agent_status can re-arm the spinner without restarting
+    -- the elapsed counter (issue #93).
+    local active_verb = self._active_verb
+    local done_verb = self._done_verb
+    local status_text = self._history._status_text
+    local status_start_time = self._history._status_start_time
     self:clear()
+    self._active_verb = active_verb
+    self._done_verb = done_verb
+    self._history._status_text = status_text
+    self._history._status_start_time = status_start_time
     self._compacting = true
     self._replay_flushed_queue_entries = replay_flushed_queue_entries
     self._compaction_queue = compaction_queue
