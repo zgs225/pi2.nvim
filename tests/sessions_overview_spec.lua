@@ -6,7 +6,7 @@ local Ft = require("pi.filetypes")
 local SessionList = require("pi.ui.sessions")
 
 --- Build a fake pi.Session with just enough surface for the list.
----@param opts? { running?: boolean, streaming?: boolean, compacting?: boolean, verb?: string, tab?: integer }
+---@param opts? { running?: boolean, streaming?: boolean, compacting?: boolean, verb?: string, tab?: integer, title_status?: string }
 local function fake_session(opts)
     opts = opts or {}
     return {
@@ -25,6 +25,12 @@ local function fake_session(opts)
             end,
             active_verb = function()
                 return opts.verb
+            end,
+            extension_status = function(_, key)
+                if key == "pi-title" then
+                    return opts.title_status
+                end
+                return nil
             end,
         },
     }
@@ -198,12 +204,22 @@ describe("sessions overview", function()
             assert.are.equal(#line, #line2)
         end)
 
-        it("prefixes the spinner to a resolved name while generating", function()
+        it("animates an (unnamed) label while the title generates", function()
+            local row = { tab = 1, status = "idle", attention = 0, name = "(unnamed)", title_generating = true }
+            local line, chunks = SessionList.format_line(row, 0)
+            assert.are.equal(" ● ⠋ (unnamed)", line)
+            assert.are.equal(3, #chunks)
+            assert.are.equal("PiSessionsListSpinner", chunks[2][3])
+        end)
+
+        it("drops the spinner the moment a real name shows", function()
+            -- The generated title arrives via session_info_changed while the
+            -- "generating" status may still be set for a tick; the label must
+            -- not flicker spinner + title twice.
             local row = { tab = 1, status = "idle", attention = 0, name = "fix login", title_generating = true }
             local line, chunks = SessionList.format_line(row, 0)
-            assert.are.equal(" ● ⠋ fix login", line)
-            assert.are.equal("PiSessionsListSpinner", chunks[2][3])
-            assert.are.equal("Normal", chunks[3][3])
+            assert.are.equal(" ● fix login", line)
+            assert.are.equal(2, #chunks)
         end)
 
         it("is static when the row is not generating", function()
@@ -383,6 +399,46 @@ describe("sessions overview", function()
                 error(err)
             end
         end)
+    end)
+
+    it("suppresses the first-message fallback while a title generates", function()
+        -- Session file with a first user message: the fallback label.
+        local dir = vim.fn.tempname()
+        vim.fn.mkdir(dir, "p")
+        local file = dir .. "/session.jsonl"
+        local f = io.open(file, "w")
+        f:write('{"type":"session","id":"s","timestamp":"2026-08-26T00:00:00.000Z","cwd":"/tmp"}\n')
+        f:write(
+            '{"type":"message","id":"m","parentId":null,"timestamp":"2026-08-26T00:00:00.000Z","message":{"role":"user","content":"fix the login redirect"}}\n'
+        )
+        f:close()
+
+        local s = fetchable_session()
+        SessionList._fetch_name(s)
+        s.respond({ sessionFile = file })
+        local fallback = SessionList._name_of(s)
+        assert.are.equal("fix the login redirect", fallback)
+
+        -- While the backend generates a title, the row stays on the
+        -- provisional label: one visible change ((unnamed) → title),
+        -- not fallback → title.
+        s.chat.extension_status = function()
+            return "generating"
+        end
+        assert.are.equal("(unnamed)", SessionList._name_of(s))
+        s.chat.extension_status = fake_session().chat.extension_status
+        assert.are.equal("fix the login redirect", SessionList._name_of(s))
+        vim.fn.delete(dir, "rf")
+    end)
+
+    it("keeps a resolved name while a title generates", function()
+        local s = fetchable_session()
+        SessionList._fetch_name(s)
+        s.respond({ sessionName = "user set" })
+        s.chat.extension_status = function()
+            return "generating"
+        end
+        assert.are.equal("user set", SessionList._name_of(s))
     end)
 
     describe("rename", function()

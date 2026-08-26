@@ -100,6 +100,18 @@ end
 --- session name (extensions/title.ts). Any non-empty value = generating.
 local TITLE_STATUS_KEY = "pi-title"
 
+--- Whether the backend is currently generating a session name for a session.
+---@param session pi.Session
+---@return boolean
+local function title_generating(session)
+    local read = session.chat and session.chat.extension_status
+    if type(read) ~= "function" then
+        return false
+    end
+    local value = read(session.chat, TITLE_STATUS_KEY)
+    return value ~= nil and value ~= ""
+end
+
 --- Spinner frames for the auto-title animation, rendered in place of the
 --- pending placeholder while the backend generates a session name.
 local SPINNER_FRAMES = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
@@ -123,10 +135,13 @@ function M.format_line(row, tick)
     local dot = "●"
     local name = row.name or "…"
     local pending = row.name == nil
-    -- While the backend generates a title, animate the row regardless of the
-    -- currently resolved label; the spinner disappears when the generated
-    -- name arrives (session_info_changed redraw, status cleared right after).
-    local spinner = row.title_generating and M.spinner_frame(tick)
+    -- While the backend generates a title, animate the provisional label
+    -- (pending placeholder or "(unnamed)"). Once a real name shows — the
+    -- generated title arriving via session_info_changed — the spinner
+    -- disappears immediately, even if the "generating" status is still set
+    -- for a tick: the label transition is a single change, not two.
+    local provisional = pending or name == "(unnamed)"
+    local spinner = row.title_generating and provisional and M.spinner_frame(tick)
     local line = indent .. dot .. " " .. (spinner and spinner .. " " or "") .. name
     local dot_start = #indent
     local name_start = dot_start + #dot + 1 + (spinner and #spinner + 1 or 0)
@@ -252,6 +267,14 @@ local function resolve_name(session)
     end
     if entry.name then
         return entry.name --[[@as string]]
+    end
+    -- While the backend generates a session name, keep the provisional
+    -- first-message fallback off the row so the label goes straight from
+    -- "(unnamed)" to the generated title — one visible change, not two
+    -- (the fallback is pi data, usually similar to the title; the jump is
+    -- the flicker this suppresses).
+    if title_generating(session) then
+        return "(unnamed)"
     end
     if entry.first_message then
         return entry.first_message --[[@as string]]
@@ -480,12 +503,7 @@ function M._render()
     end, function(session)
         return flags[session] or { done = false, error = false }
     end, function(session)
-        local read = session.chat.extension_status
-        if type(read) ~= "function" then
-            return false
-        end
-        local value = read(session.chat, TITLE_STATUS_KEY)
-        return value ~= nil and value ~= ""
+        return title_generating(session)
     end)
 
     ---@type string[]
