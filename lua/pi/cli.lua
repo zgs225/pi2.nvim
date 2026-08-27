@@ -116,6 +116,13 @@ function M.title_extension_path()
     return plugin_root() .. "/extensions/title.ts"
 end
 
+--- Absolute path to the bundled pi extension reporting the backend model
+--- scope (pi --models / enabledModels) for :PiSelectModel fallback.
+---@return string
+function M.scoped_models_extension_path()
+    return plugin_root() .. "/extensions/scoped-models.ts"
+end
+
 ---@return string[]
 function M.command()
     local cmd = { M.bin() }
@@ -149,6 +156,15 @@ function M.command()
     if vim.fn.filereadable(title_ext) == 1 then
         cmd[#cmd + 1] = "--extension"
         cmd[#cmd + 1] = title_ext
+    end
+    -- Inject the model-scope bridge unconditionally (like title.ts): a no-op
+    -- outside pi.nvim or on pi < 0.83.0. It reports the backend's resolved
+    -- model scope (--models / enabledModels) via PI_NVIM_SCOPE_FILE so the
+    -- :PiSelectModel picker can fall back from config.models to that scope.
+    local scope_ext = M.scoped_models_extension_path()
+    if vim.fn.filereadable(scope_ext) == 1 then
+        cmd[#cmd + 1] = "--extension"
+        cmd[#cmd + 1] = scope_ext
     end
     cmd[#cmd + 1] = "--mode"
     cmd[#cmd + 1] = "rpc"

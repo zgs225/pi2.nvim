@@ -253,7 +253,7 @@ require("pi").setup({
 | `:PiCycleThinking` | Cycle to the next thinking level |
 | `:PiSelectThinking` | Pick a thinking level |
 | `:PiCycleModel` | Cycle the current model |
-| `:PiSelectModel` | Pick from configured models, or all models if none are configured |
+| `:PiSelectModel` | Pick from configured models, then pi's model scope (`--models`/`enabledModels`), then all models |
 | `:PiSelectModelAll` | Pick from all available models |
 | `:PiSendMention` | Mention the current file; in visual mode or with a range, mention the selection lines |
 | `:PiAttachImage {path}` | Attach an image file to the prompt |

@@ -346,10 +346,19 @@ function Rpc:start()
     -- runtime file on every input event (config.setup keeps it published).
     -- The auto-title extension reads its options from PI_NVIM_TITLE_FILE on
     -- every turn_end event (same live-reload rationale).
+    -- The model-scope bridge writes the backend scope (--models /
+    -- enabledModels) to PI_NVIM_SCOPE_FILE once per session_start. The path
+    -- is per-tab: project settings (.pi/settings.json) resolve against the
+    -- session cwd, so two tabs may legitimately see different scopes. Remove
+    -- any stale file first — a dead process's scope must never leak into the
+    -- new process' :PiSelectModel fallback.
+    local scope_path = require("pi.scoped_models").state_path(self._tab)
+    os.remove(scope_path)
     self._job_id = vim.fn.jobstart(cmd, {
         env = {
             PI_NVIM_VISION_FILE = require("pi.vision").state_path(),
             PI_NVIM_TITLE_FILE = require("pi.title").state_path(),
+            PI_NVIM_SCOPE_FILE = scope_path,
         },
         on_stdout = function(_, data)
             self:_on_stdout(data)

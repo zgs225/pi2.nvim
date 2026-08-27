@@ -71,3 +71,66 @@ describe("models.resolve_entries", function()
         assert.matches("Configured model not found", notes[1].msg)
     end)
 end)
+
+-- The :PiSelectModel candidate ladder: config.models → backend scope → all.
+describe("models.resolve_select_candidates", function()
+    local Models = require("pi.models")
+    local ScopedModels = require("pi.scoped_models")
+
+    local scope_path = os.tmpname()
+    after_each(function()
+        notes = {}
+    end)
+
+    --- Write a scope file the same way extensions/scoped-models.ts does.
+    ---@param models table[]?
+    local function set_scope(models)
+        if models == nil then
+            os.remove(scope_path)
+            return
+        end
+        local f = io.open(scope_path, "w")
+        f:write(vim.json.encode({ models = models }))
+        f:close()
+    end
+
+    local function read_scope()
+        return ScopedModels.read(scope_path)
+    end
+
+    it("prefers matching config-model entries over the backend scope", function()
+        set_scope({ { provider = "kimi-coding", id = "k3" } })
+        local candidates = Models.resolve_select_candidates({ "deepseek-v4-flash" }, read_scope(), all_models)
+        -- bare ID matches every provider copy of deepseek-v4-flash
+        assert.are.same(3, #candidates)
+    end)
+
+    it("falls through to the backend scope when entries match nothing", function()
+        set_scope({ { provider = "kimi-coding", id = "k3" } })
+        local candidates = Models.resolve_select_candidates({ "no-such-model" }, read_scope(), all_models)
+        assert.are.same(1, #candidates)
+        assert.are.same("k3", candidates[1].id)
+        assert.are.same(1, #notes) -- resolve_entries still reported the miss
+    end)
+
+    it("uses the backend scope when no config-model entries are set", function()
+        set_scope({ { provider = "deepseek", id = "deepseek-v4-flash" } })
+        local candidates = Models.resolve_select_candidates(nil, read_scope(), all_models)
+        -- scope pins one provider/modelId pair of the three copies
+        assert.are.same(1, #candidates)
+        assert.are.same("deepseek", candidates[1].provider)
+    end)
+
+    it("ignores an empty backend scope", function()
+        set_scope({})
+        local candidates = Models.resolve_select_candidates(nil, read_scope(), all_models)
+        assert.are.same(#all_models, #candidates)
+    end)
+
+    it("falls back to all models when both layers are absent or empty", function()
+        set_scope(nil) -- no file: extension silent (pi < 0.83.0 / unscoped)
+        assert.are.same(#all_models, #Models.resolve_select_candidates(nil, read_scope(), all_models))
+        set_scope({})
+        assert.are.same(#all_models, #Models.resolve_select_candidates({}, {}, all_models))
+    end)
+end)

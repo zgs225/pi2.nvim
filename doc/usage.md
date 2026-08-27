@@ -702,6 +702,8 @@ The prefix is stripped from the displayed text before the block is rendered, so 
 
 The top-level `models` option in `setup()` is an optional **preferred list** of model entries. When set, it curates the subset used by the cycle and select commands below. When unset, pi2.nvim falls back to whatever the backend has available.
 
+It stacks with pi's own model scoping (`--models` CLI flag or `enabledModels` in pi's settings.json, which the backend resolves per session): a configured `models` list wins; otherwise `:PiSelectModel` mirrors the backend scope like cycling already does (see [Cycling and selecting](#cycling-and-selecting)). The two layers are not interchangeable — glob scoping can express provider-wide patterns (`anthropic/*`) or pin thinking levels (`anthropic/*:high`), while `latest = true` below has no glob equivalent — so scope cross-frontend sets in pi's settings, and curate your editor-local shortlist here.
+
 Each entry is one of:
 
 ```lua
@@ -740,8 +742,8 @@ Three commands, each with a Lua API counterpart:
 | Command | Lua | What it does |
 | --- | --- | --- |
 | `:PiCycleModel` | `pi.cycle_model()` | Step to the next model. With `models` configured, cycles within the resolved subset; otherwise uses the backend's own cycle. |
-| `:PiSelectModel` | `pi.select_model()` | Open a picker (`vim.ui.select`) to pick a model. With `models` configured, shows only the resolved subset; otherwise falls back to all available models. |
-| `:PiSelectModelAll` | `pi.select_model_all()` | Open a picker with **all** backend-available models, ignoring the `models` config. Useful when you want to reach for something you haven't curated into your short list. |
+| `:PiSelectModel` | `pi.select_model()` | Open a picker (`vim.ui.select`) to pick a model. Candidates resolve in order: the resolved `models` subset when it has any match → the backend's model scope (`--models` / `enabledModels`, same set cycling and the TUI use) → all available models. An entry list that matches nothing warns and keeps falling through instead of dead-ending the picker. |
+| `:PiSelectModelAll` | `pi.select_model_all()` | Open a picker with **all** backend-available models, ignoring both the `models` config and the backend scope. Useful when you want to reach for something you haven't curated into your short list. |
 
 All three take effect immediately and persist for the current session. The active model appears in the `model` statusline component (see [Statusline](#statusline)).
 

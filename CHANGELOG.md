@@ -2,6 +2,7 @@
 
 ## 2026-08-27
 
+- **ADDED:** `:PiSelectModel` now resolves its candidates as a three-layer ladder: the resolved `models` subset when any entry matches → pi's own model scope (the backend-resolved `--models` CLI flag / `enabledModels` setting, the same set `:PiCycleModel` and the TUI picker already use) → all available models. Previously the select picker ignored backend scoping entirely, so cycle and select disagreed about which models were reachable. `models` still wins when configured (editor-local shortlist); an entry list that matches nothing warns and falls through instead of dead-ending the picker. Backed by a new bundled pi extension (`extensions/scoped-models.ts`) that reports the scope via a per-tab runtime file, since the RPC protocol never exposes it. Requires pi 0.83.0+ for the scope layer (`ctx.scopedModels`; health check added — below the floor select just lists all models, no crash). Thinking-level suffixes in scope patterns (e.g. `anthropic/*:high`) are not yet applied on selection (#95).
 - **ADDED:** sessions-overview row keys `a` / `i`: open the session under the cursor and drop straight into Insert mode with the cursor appended past the very end of its prompt draft — multi-line drafts land after the last line (`A` semantics). `<CR>` / `o` keep their plain jump semantics (#94).
 
 ## 2026-08-26

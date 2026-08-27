@@ -4,6 +4,7 @@ local M = {}
 
 local Config = require("pi.config")
 local Notify = require("pi.notify")
+local ScopedModels = require("pi.scoped_models")
 
 --- Resolve configured model entries against available backend models.
 --- Returns the matched subset in config order.
@@ -182,18 +183,42 @@ function M.cycle(session)
     end)
 end
 
---- Select a model from configured models (or all if none configured).
---- Rendered through vim.ui.select.
+--- Resolve the :PiSelectModel candidate list as a three-layer ladder:
+--- 1. config-model entries matching available models (editor-local curated
+---    shortlist wins, mirroring its role in cycling);
+--- 2. the backend's resolved model scope (--models / enabledModels, read by
+---    extensions/scoped-models.ts) intersected with available models;
+--- 3. all available models.
+--- Entries that match nothing already produced a Notify.warn inside
+--- resolve_entries; a zero-match entry list falls through to the next layer
+--- instead of dead-ending the picker.
+---@param entries pi.ModelEntry[]? config.models; nil/empty skips layer 1
+---@param scope { provider: string, id: string }[]? backend scope; nil/empty skips layer 2
+---@param all_models table[] models from get_available_models
+---@return table[] candidates non-empty unless all_models is empty
+function M.resolve_select_candidates(entries, scope, all_models)
+    if entries and #entries > 0 then
+        local resolved = M.resolve_entries(entries, all_models)
+        if #resolved > 0 then
+            return resolved
+        end
+    end
+    local scoped = ScopedModels.filter(scope, all_models)
+    if #scoped > 0 then
+        return scoped
+    end
+    return all_models
+end
+
+--- Select a model from configured models, then the backend's model scope,
+--- then all available models. Rendered through the model dialog.
 ---@param session pi.Session
 function M.select(session)
     local Dialog = require("pi.ui.dialog")
     M.with_available(session, function(all_models)
         local entries = Config.options.models
-        local models = (entries and #entries > 0) and M.resolve_entries(entries, all_models) or all_models
-        if #models == 0 then
-            Notify.warn("No configured models matched available models")
-            return
-        end
+        local scope = ScopedModels.read(ScopedModels.state_path(session.tab))
+        local models = M.resolve_select_candidates(entries, scope, all_models)
         ---@type string[]
         local labels = {}
         for i, m in ipairs(models) do

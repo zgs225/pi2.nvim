@@ -3,6 +3,7 @@
 ---@field validated string latest pi version manually validated against this plugin
 ---@field vision_min_supported string minimum pi version for the bundled vision fallback extension (extensions/vision.ts)
 ---@field title_min_supported string minimum pi version for the bundled auto-title extension (extensions/title.ts)
+---@field scoped_models_min_supported string minimum pi version for the bundled model-scope bridge extension (extensions/scoped-models.ts)
 local M = {
     -- Keep these in sync with release validation notes.
     min_supported = "0.65.2",
@@ -19,6 +20,11 @@ local M = {
     -- extension fails to load and sessions stay unnamed (first-message
     -- fallback) — no crash.
     title_min_supported = "0.44.0",
+    -- The model-scope bridge reads ctx.scopedModels, exposed in pi 0.83.0+
+    -- (upstream #7191/#7215). Below the floor the property is absent and the
+    -- bridge stays silent: :PiSelectModel falls back to config.models or the
+    -- full model list — degraded scope mirroring, no crash.
+    scoped_models_min_supported = "0.83.0",
 }
 
 ---@param version string
