@@ -162,11 +162,14 @@ end
 --- Create the fake telescope module tree and return recording state.
 local function install_fake_telescope()
     ---@class FakeTeleState
-    local state = { new_cfgs = {}, maps = {}, entry = nil }
+    local state = { new_cfgs = {}, maps = {}, themes = {}, entry = nil }
 
     package.loaded["telescope"] = {}
     package.loaded["telescope.themes"] = {
+        -- Record the theme input: pickers.new(opts, defaults) gives `opts`
+        -- precedence, so the titles passed here are the ones telescope uses.
         get_dropdown = function(opts)
+            state.themes[#state.themes + 1] = opts
             return opts or {}
         end,
     }
@@ -413,11 +416,17 @@ describe("pi resume picker", function()
             assert.equals(1, #tele.new_cfgs)
             assert.equals(nil, select_spy.pending, "fallback vim.ui.select must not be used")
 
+            -- Titles live in the theme table (first pickers.new arg), which
+            -- wins over get_dropdown's own results_title = false.
+            local theme = tele.themes[1]
+            assert.is_not_nil(theme)
+            assert.equals("Resume session", theme.prompt_title)
+            assert.truthy(theme.results_title:find("<CR>/o open", 1, true))
+            assert.truthy(theme.results_title:find("t/<C%-t> new tab", 1, false))
+            assert.truthy(theme.results_title:find("<C%-x> delete", 1, false))
+
             local cfg = tele.new_cfgs[1]
-            assert.equals("Resume session", cfg.prompt_title)
-            assert.truthy(cfg.results_title:find("<CR>/o open", 1, true))
-            assert.truthy(cfg.results_title:find("t/<C%-t> new tab", 1, false))
-            assert.truthy(cfg.results_title:find("<C%-x> delete", 1, false))
+            assert.equals(false, theme.previewer)
             assert.equals(2, #cfg.finder.results)
             assert.equals(T_TARGET, cfg.finder.results[1].file)
         end)

@@ -1094,86 +1094,94 @@ local function open_with_telescope(items, opts)
         return { value = item, display = format_resume_item(item.session), ordinal = format_resume_item(item.session) }
     end
 
+    -- NOTE: pickers.new(opts, defaults) lets `opts` (this first table) win on
+    -- key conflicts, and get_dropdown pins results_title = false. The titles
+    -- must live in that same first table or the key hint gets clobbered.
     pickers
-        .new(themes.get_dropdown({ previewer = false }), {
-            prompt_title = "Resume session",
-            results_title = " <CR>/o open · t/<C-t> new tab · <C-x> delete ",
-            finder = finders.new_table({ results = items, entry_maker = entry_maker }),
-            sorter = conf.generic_sorter(),
-            attach_mappings = function(prompt_bufnr, map)
-                local function open(new_tab)
-                    local selection = action_state.get_selected_entry(prompt_bufnr)
-                    if not selection then
-                        return
-                    end
-                    actions.close(prompt_bufnr)
-                    vim.schedule(function()
-                        open_resume_target(selection.value.file, opts, new_tab)
-                    end)
-                end
-
-                actions.select_default:replace(function()
-                    open(false)
-                end)
-                map("n", "o", function()
-                    open(false)
-                end)
-                map("n", "t", function()
-                    open(true)
-                end)
-                map("n", "<C-t>", function()
-                    open(true)
-                end)
-                map("i", "<C-t>", function()
-                    open(true)
-                end)
-
-                map({ "n", "i" }, "<C-x>", function()
-                    local targets = {} ---@type string[]
-                    for _, entry in ipairs(action_state.get_multi_selection(prompt_bufnr)) do
-                        targets[#targets + 1] = entry.value.file
-                    end
-                    if #targets == 0 then
+        .new(
+            themes.get_dropdown({
+                previewer = false,
+                prompt_title = "Resume session",
+                results_title = " <CR>/o open · t/<C-t> new tab · <C-x> delete ",
+            }),
+            {
+                finder = finders.new_table({ results = items, entry_maker = entry_maker }),
+                sorter = conf.generic_sorter(),
+                attach_mappings = function(prompt_bufnr, map)
+                    local function open(new_tab)
                         local selection = action_state.get_selected_entry(prompt_bufnr)
-                        if selection then
-                            targets[1] = selection.value.file
+                        if not selection then
+                            return
                         end
-                    end
-                    if #targets == 0 then
-                        return
-                    end
-                    local msg = #targets == 1 and "Delete session?" or (("Delete %d sessions?"):format(#targets))
-                    if vim.fn.confirm(msg, "&Yes\n&No", 2) ~= 1 then
-                        return
-                    end
-                    ---@type table<string, boolean>
-                    local deleted = {}
-                    for _, path in ipairs(targets) do
-                        deleted[path] = true
-                        local ok, err = os.remove(path)
-                        if not ok then
-                            Notify.warn("Failed to delete session: " .. (err or path))
-                        end
-                    end
-                    local remaining = {}
-                    for _, item in ipairs(items) do
-                        if not deleted[item.file] then
-                            remaining[#remaining + 1] = item
-                        end
-                    end
-                    items = remaining
-                    if #remaining == 0 then
                         actions.close(prompt_bufnr)
-                        Notify.info("No sessions remaining")
-                        return
+                        vim.schedule(function()
+                            open_resume_target(selection.value.file, opts, new_tab)
+                        end)
                     end
-                    action_state
-                        .get_current_picker(prompt_bufnr)
-                        :refresh(finders.new_table({ results = remaining, entry_maker = entry_maker }))
-                end)
-                return true
-            end,
-        })
+
+                    actions.select_default:replace(function()
+                        open(false)
+                    end)
+                    map("n", "o", function()
+                        open(false)
+                    end)
+                    map("n", "t", function()
+                        open(true)
+                    end)
+                    map("n", "<C-t>", function()
+                        open(true)
+                    end)
+                    map("i", "<C-t>", function()
+                        open(true)
+                    end)
+
+                    map({ "n", "i" }, "<C-x>", function()
+                        local targets = {} ---@type string[]
+                        for _, entry in ipairs(action_state.get_multi_selection(prompt_bufnr)) do
+                            targets[#targets + 1] = entry.value.file
+                        end
+                        if #targets == 0 then
+                            local selection = action_state.get_selected_entry(prompt_bufnr)
+                            if selection then
+                                targets[1] = selection.value.file
+                            end
+                        end
+                        if #targets == 0 then
+                            return
+                        end
+                        local msg = #targets == 1 and "Delete session?" or (("Delete %d sessions?"):format(#targets))
+                        if vim.fn.confirm(msg, "&Yes\n&No", 2) ~= 1 then
+                            return
+                        end
+                        ---@type table<string, boolean>
+                        local deleted = {}
+                        for _, path in ipairs(targets) do
+                            deleted[path] = true
+                            local ok, err = os.remove(path)
+                            if not ok then
+                                Notify.warn("Failed to delete session: " .. (err or path))
+                            end
+                        end
+                        local remaining = {}
+                        for _, item in ipairs(items) do
+                            if not deleted[item.file] then
+                                remaining[#remaining + 1] = item
+                            end
+                        end
+                        items = remaining
+                        if #remaining == 0 then
+                            actions.close(prompt_bufnr)
+                            Notify.info("No sessions remaining")
+                            return
+                        end
+                        action_state
+                            .get_current_picker(prompt_bufnr)
+                            :refresh(finders.new_table({ results = remaining, entry_maker = entry_maker }))
+                    end)
+                    return true
+                end,
+            }
+        )
         :find()
     return true
 end
