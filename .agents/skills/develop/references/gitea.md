@@ -18,6 +18,7 @@ tea whoami   # verify
 | Action | Command |
 |--------|---------|
 | Create | `tea issue create -r yuez/pi2.nvim -t "<title>" -d "$(cat body.md)" -L "rpc,priority:low,review:pending"` |
+| Migrate from GitHub (Gitea is the source of truth) | Recreate on Gitea then delete on GitHub: `tea issue create -r yuez/pi2.nvim -t "..." -d "$(cat body.md)" -L "original,priority:medium,review:pending"` and `gh issue delete --repo zgs225/pi2.nvim <gh-number> --yes` |
 | List | `tea issue list -r yuez/pi2.nvim` |
 | Show one | `tea issue show -r yuez/pi2.nvim <index>` |
 | Comment (implementation notes) | `tea comments add -r yuez/pi2.nvim <index> "note"` |

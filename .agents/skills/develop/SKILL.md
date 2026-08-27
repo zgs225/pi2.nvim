@@ -36,7 +36,7 @@ flowchart TD
 
 | Phase | Key rules |
 |-------|-----------|
-| Issue | Body is the spec — never overwrite it. Implementation notes go in **comments**. Labels: type (`rpc`/`original`), priority, review gate. |
+| Issue | Body is the spec — never overwrite it. Implementation notes go in **comments**. Labels: type (`rpc`/`original`), priority, review gate. **Gitea is the source of truth for issues; do not create them on GitHub.** If one is accidentally opened on GitHub, recreate it on Gitea and delete the GitHub copy. |
 | Branch | Create a **git worktree** on `feat/<short-kebab-name>` and develop there — never in the live `lazy/pi2.nvim` checkout. Baseline `make test` green before starting. |
 | Implement | Follow the **standard places** checklist below. Config knobs touch **three** spots in `config.lua` (G19). |
 | Test | Cheapest layer that can observe the behavior. State what was verified and what was not, and end the final report's verification section with a copy-pasteable manual-test nvim command (`PI_DEV_DIR` gate for worktree code — references/testing.md § Verification discipline). |
