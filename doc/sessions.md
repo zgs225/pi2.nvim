@@ -32,7 +32,21 @@ There are three ways to open a chat — each honors the usual `layout=side|float
 | --- | --- | --- |
 | `:Pi` | `pi.show()` / `pi.toggle()` | Open the chat. If the current tab has no session yet, starts a fresh conversation. |
 | `:PiContinue` | `pi.continue_session()` | Load the **most recent** session for the current cwd. Skips the session currently live in another tab, so you can continue a different one. |
-| `:PiResume` | `pi.resume_session()` | Open a picker listing **all past sessions for the current cwd**, with their display names, timestamps, and message counts. |
+| `:PiResume` | `pi.resume_session()` | Open a picker listing **all past sessions for the current cwd**, with their display names and timestamps. See [Resume picker](#resume-picker) for its keybindings. |
+
+### Resume picker
+
+When [telescope.nvim](https://github.com/nvim-telescope/telescope.nvim) is installed, `:PiResume` opens a dedicated picker instead of the generic `vim.ui.select` one. The keybindings are shown as a fixed hint in the picker title:
+
+| Key | Action |
+| --- | --- |
+| `<CR>` / `o` | Open the session in the **current** tab |
+| `t` / `<C-t>` | Open the session in a **new** tab |
+| `<C-x>` | Delete the selected session file(s) (multi-select aware) |
+
+`<C-t>` exists because typing in the picker prompt is filtering — plain letters (`o`, `t`) work once you leave insert mode with `<Esc>`.
+
+Other `vim.ui.select` backends keep their generic rendering; with snacks.nvim, `t` / `<C-t>` map to "open in new tab" and `<C-x>` still deletes. Whatever the backend, opening a conversation that is still live in another tab asks for confirmation first — resuming it twice would spawn two backend processes writing the same session file, so the copies would diverge.
 
 And mid-session management:
 

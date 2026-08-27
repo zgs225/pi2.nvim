@@ -234,7 +234,7 @@ require("pi").setup({
 | --- | --- |
 | `:Pi [layout=side\|float]` | Open or toggle the chat in the current tab |
 | `:PiContinue [layout=side\|float]` | Continue the most recent session for the current working directory |
-| `:PiResume [layout=side\|float]` | Pick and resume a past session for the current working directory |
+| `:PiResume [layout=side\|float]` | Pick and resume a past session for the current working directory — with Telescope: `<CR>`/`o` here, `t`/`<C-t>` in a new tab |
 | `:PiToggleChat` | Toggle chat visibility |
 | `:PiToggleLayout` | Switch between side and float layout |
 | `:PiAbort` | Abort the current agent operation |
