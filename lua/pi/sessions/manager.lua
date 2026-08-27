@@ -21,6 +21,7 @@
 ---@field chat pi.Chat
 ---@field attention pi.SessionAttention
 ---@field pinned_model? pi.ModelRef Model chosen in this tab. Reapplied after `new_session` so model switches made in other sessions (which core persists to global settings) don't leak into this tab's next conversation.
+---@field session_file? string Backend-reported session file path (from get_state responses). Lets the resume picker detect "still open in another tab" without extra RPC round-trips.
 ---@field startup_announcements table<string, pi.StartupAnnouncement> Extension startup data (keys ending with `:startup`) shown in the system preamble. Process-level: persists across session switches.
 ---@field system_errors pi.SystemErrorEntry[]
 ---@field cwd string Working directory the session was started in (anchor for changed_files paths).
@@ -171,12 +172,24 @@ local function stash_file_tool_args(session, tool_name, tool_call_id, args)
     session._pending_file_change_args[tool_call_id] = decoded
 end
 
---- Fetch current state and update the status line.
+--- Remember the backend's current session file path from a get_state
+--- response, next to the model pin. The resume picker uses this to warn when
+--- a picked conversation is still live in another tab.
+---@param session pi.Session
+---@param state table? get_state response data
+local function capture_session_file(session, state)
+    if type(state) == "table" and type(state.sessionFile) == "string" and state.sessionFile ~= "" then
+        session.session_file = state.sessionFile
+    end
+end
+
+--- Fetch the backend state and update the status line.
 ---@param session pi.Session
 function M.refresh_state(session)
     session.rpc:send({ type = "get_state" }, function(res)
         if res.success and res.data then
             vim.schedule(function()
+                capture_session_file(session, res.data)
                 session.chat:update_state(res.data)
             end)
         end
@@ -203,6 +216,7 @@ local function refresh_state_and_pin(session)
         if res.success and res.data then
             vim.schedule(function()
                 capture_model_pin(session, res.data)
+                capture_session_file(session, res.data)
                 session.chat:update_state(res.data)
             end)
         end
@@ -985,6 +999,185 @@ local function load_session(session, session_path)
     end
 end
 
+--- Shared renderer for resume-picker rows: date + display name or first message.
+---@param session pi.SessionInfo
+---@return string
+local function format_resume_item(session)
+    local date = session.timestamp:match("^(%d%d%d%d%-%d%d%-%d%d)") or session.timestamp
+    local label = session.name or (session.first_message ~= "" and session.first_message or "(empty)")
+    return date .. "  " .. label
+end
+
+--- Find a live session in another tab backed by the given session file.
+--- Paths stay unknown until the backend's first get_state response, so a
+--- freshly spawned process may not match yet — the guard is a safety net
+--- against the common "resume what's running over there" case, not a ledger.
+---@param session_path string
+---@param exclude_tab pi.TabId? Tab whose own live copy never counts as a conflict (the reopen target).
+---@return pi.Session?
+local function find_live_elsewhere(session_path, exclude_tab)
+    for _, s in ipairs(M.list()) do
+        if s.tab ~= exclude_tab and s.rpc:is_running() and s.session_file == session_path then
+            return s
+        end
+    end
+    return nil
+end
+
+--- Open a past session picked from :PiResume: optionally move to a fresh
+--- tabpage first, create the destination tab's session when needed, then
+--- switch to `session_path`.
+---
+--- If the conversation is still live in another tab, a confirm dialog guards
+--- against spawning a second backend process writing the same session file
+--- (the two copies would diverge).
+---@param session_path string
+---@param opts? pi.SessionCreateOpts
+---@param new_tab? boolean
+local function open_resume_target(session_path, opts, new_tab)
+    local function start()
+        if new_tab then
+            vim.cmd("tabnew")
+        end
+        local session = M.get_or_create(opts)
+        if not session then
+            return
+        end
+        session.chat:show({ loading = true })
+        load_session(session, session_path)
+    end
+
+    -- For an in-place open the destination is the current tab: reopening this
+    -- tab's own live copy is the normal self-switch, so exclude it from the
+    -- conflict check. A new-tab open conflicts with any live copy.
+    local live = find_live_elsewhere(session_path, new_tab and nil or current_tab())
+    if not live then
+        start()
+        return
+    end
+    Dialog.confirm({
+        title = "Session already open",
+        message = "This conversation is still running in another tab. Opening it again spawns a second"
+            .. " process writing the same session file (they will diverge). Continue?",
+    }, function(confirmed)
+        if confirmed then
+            start()
+        end
+    end)
+end
+
+--- Open the resume list through a dedicated telescope picker.
+--- Returns false when telescope is unavailable so the caller falls back to
+--- the generic vim.ui.select flow below.
+---
+--- Keybindings (hinted in the picker title): <CR>/o open in the current tab,
+--- t/<C-t> open in a new tab, <C-x> delete the selected session(s).
+---@param items pi.SessionSelectItem[]
+---@param opts? pi.SessionCreateOpts
+---@return boolean handled
+local function open_with_telescope(items, opts)
+    local ok_telescope = pcall(require, "telescope")
+    if not ok_telescope then
+        return false
+    end
+
+    local themes = require("telescope.themes")
+    local pickers = require("telescope.pickers")
+    local finders = require("telescope.finders")
+    local conf = require("telescope.config").values
+    local actions = require("telescope.actions")
+    local action_state = require("telescope.actions.state")
+
+    ---@param item pi.SessionSelectItem
+    ---@return table telescope entry
+    local function entry_maker(item)
+        return { value = item, display = format_resume_item(item.session), ordinal = format_resume_item(item.session) }
+    end
+
+    pickers
+        .new(themes.get_dropdown({ previewer = false }), {
+            prompt_title = "Resume session",
+            results_title = " <CR>/o open · t/<C-t> new tab · <C-x> delete ",
+            finder = finders.new_table({ results = items, entry_maker = entry_maker }),
+            sorter = conf.generic_sorter(),
+            attach_mappings = function(prompt_bufnr, map)
+                local function open(new_tab)
+                    local selection = action_state.get_selected_entry(prompt_bufnr)
+                    if not selection then
+                        return
+                    end
+                    actions.close(prompt_bufnr)
+                    vim.schedule(function()
+                        open_resume_target(selection.value.file, opts, new_tab)
+                    end)
+                end
+
+                actions.select_default:replace(function()
+                    open(false)
+                end)
+                map("n", "o", function()
+                    open(false)
+                end)
+                map("n", "t", function()
+                    open(true)
+                end)
+                map("n", "<C-t>", function()
+                    open(true)
+                end)
+                map("i", "<C-t>", function()
+                    open(true)
+                end)
+
+                map({ "n", "i" }, "<C-x>", function()
+                    local targets = {} ---@type string[]
+                    for _, entry in ipairs(action_state.get_multi_selection(prompt_bufnr)) do
+                        targets[#targets + 1] = entry.value.file
+                    end
+                    if #targets == 0 then
+                        local selection = action_state.get_selected_entry(prompt_bufnr)
+                        if selection then
+                            targets[1] = selection.value.file
+                        end
+                    end
+                    if #targets == 0 then
+                        return
+                    end
+                    local msg = #targets == 1 and "Delete session?" or (("Delete %d sessions?"):format(#targets))
+                    if vim.fn.confirm(msg, "&Yes\n&No", 2) ~= 1 then
+                        return
+                    end
+                    ---@type table<string, boolean>
+                    local deleted = {}
+                    for _, path in ipairs(targets) do
+                        deleted[path] = true
+                        local ok, err = os.remove(path)
+                        if not ok then
+                            Notify.warn("Failed to delete session: " .. (err or path))
+                        end
+                    end
+                    local remaining = {}
+                    for _, item in ipairs(items) do
+                        if not deleted[item.file] then
+                            remaining[#remaining + 1] = item
+                        end
+                    end
+                    items = remaining
+                    if #remaining == 0 then
+                        actions.close(prompt_bufnr)
+                        Notify.info("No sessions remaining")
+                        return
+                    end
+                    action_state
+                        .get_current_picker(prompt_bufnr)
+                        :refresh(finders.new_table({ results = remaining, entry_maker = entry_maker }))
+                end)
+                return true
+            end,
+        })
+        :find()
+    return true
+end
+
 ---@param current_session_file? string
 ---@return string?
 local function find_continue_session_path(current_session_file)
@@ -1097,18 +1290,22 @@ function M.resume_session(opts)
         }
     end
 
+    -- Telescope gets a purpose-built picker (dedicated keybindings plus a
+    -- fixed key-hint title); every other backend keeps the generic
+    -- vim.ui.select rendering below.
+    if open_with_telescope(items, opts) then
+        return
+    end
+
     vim.ui.select(items, {
         prompt = "Resume session",
         kind = "pi-resume-session",
         -- Pass picker items with a `file` field so backends like snacks.nvim
         -- can preview the raw session file when preview is enabled. Other
         -- vim.ui.select implementations ignore extra fields and render via
-        -- `format_item`.
+        -- `format_item`. Same row rendering as the telescope picker above.
         format_item = function(item)
-            local session = item.session
-            local date = session.timestamp:match("^(%d%d%d%d%-%d%d%-%d%d)") or session.timestamp
-            local label = session.name or (session.first_message ~= "" and session.first_message or "(empty)")
-            return date .. "  " .. label
+            return format_resume_item(item.session)
         end,
         snacks = {
             -- snacks.nvim (if installed) overrides vim.ui.select with its picker.
@@ -1126,10 +1323,30 @@ function M.resume_session(opts)
                 end,
             },
             win = {
-                input = { keys = { ["<C-x>"] = { "delete_session", mode = { "i", "n" }, desc = "Delete session" } } },
-                list = { keys = { ["<C-x>"] = { "delete_session", mode = { "n" }, desc = "Delete session" } } },
+                input = {
+                    keys = {
+                        ["<C-x>"] = { "delete_session", mode = { "i", "n" }, desc = "Delete session" },
+                        ["<C-t>"] = { "resume_new_tab", mode = { "i", "n" }, desc = "Open in new tab" },
+                    },
+                },
+                list = {
+                    keys = {
+                        ["<C-x>"] = { "delete_session", mode = { "n" }, desc = "Delete session" },
+                        ["<C-t>"] = { "resume_new_tab", mode = { "n" }, desc = "Open in new tab" },
+                    },
+                },
             },
             actions = {
+                resume_new_tab = function(picker)
+                    local selected = picker:selected({ fallback = true })
+                    if #selected == 0 then
+                        return
+                    end
+                    picker:close()
+                    vim.schedule(function()
+                        open_resume_target(selected[1].item.file, opts, true)
+                    end)
+                end,
                 delete_session = function(picker)
                     local selected = picker:selected({ fallback = true })
                     if #selected == 0 then
@@ -1169,12 +1386,7 @@ function M.resume_session(opts)
         if not item then
             return
         end
-        local session = M.get_or_create(opts)
-        if not session then
-            return
-        end
-        session.chat:show({ loading = true })
-        load_session(session, item.session.path)
+        open_resume_target(item.file, opts)
     end)
 end
 
