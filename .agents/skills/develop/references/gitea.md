@@ -2,6 +2,8 @@
 
 All Gitea interaction goes through `tea` (`/usr/bin/tea`, 0.15.1, installed via eos-bootstrap `pacman_packages`). **Never hand-roll curl against the API** — labels/state must be set through tea so commands stay reproducible.
 
+**This repo's issue tracker lives exclusively on Gitea (`git.yuez.me/yuez/pi2.nvim`). GitHub is a public mirror only; do not open or leave personal development issues there. If one is accidentally created on GitHub, migrate it here and delete the GitHub copy (see the "Migrate from GitHub" row below).**
+
 ## Login
 
 Done once (token from chezmoi-encrypted `GITEA_TOKEN` in `~/.zshrc.local`):

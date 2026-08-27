@@ -36,7 +36,7 @@ flowchart TD
 
 | Phase | Key rules |
 |-------|-----------|
-| Issue | Body is the spec — never overwrite it. Implementation notes go in **comments**. Labels: type (`rpc`/`original`), priority, review gate. **Gitea is the source of truth for issues; do not create them on GitHub.** If one is accidentally opened on GitHub, recreate it on Gitea and delete the GitHub copy. |
+| Issue | Body is the spec — never overwrite it. Implementation notes go in **comments**. Labels: type (`rpc`/`original`), priority, review gate. **Issues are tracked exclusively on Gitea (`git.yuez.me/yuez/pi2.nvim`); GitHub is a public mirror and must never host personal development issues.** If one is accidentally opened on GitHub, recreate it on Gitea and delete the GitHub copy. |
 | Branch | Create a **git worktree** on `feat/<short-kebab-name>` and develop there — never in the live `lazy/pi2.nvim` checkout. Baseline `make test` green before starting. |
 | Implement | Follow the **standard places** checklist below. Config knobs touch **three** spots in `config.lua` (G19). |
 | Test | Cheapest layer that can observe the behavior. State what was verified and what was not, and end the final report's verification section with a copy-pasteable manual-test nvim command (`PI_DEV_DIR` gate for worktree code — references/testing.md § Verification discipline). |
@@ -45,7 +45,7 @@ flowchart TD
 | Docs gate | Merge 前必须通过 **docs sync gate**：`make docs-links` 绿；逐项核对用户可见变更（commands / keymaps / config / highlight groups / public API / documented behavior）已在**同一变更**里同步到 `README.md` 与 `doc/*.md`；`CHANGELOG.md` 有当日条目。不一致 → 回到 Implement 补齐后重新走 review。详见下方 "Docs sync gate (before merge)"。 |
 | Merge | In the **main checkout**: `git merge --no-ff`, push main, delete remote+local branch, `git worktree remove`. **Verify the CI run for the merge commit is green** (see CI verification below), then close issue. |
 
-Gitea: 所有交互统一使用 `tea` CLI（eos-bootstrap 安装，login `yuez`），**不要**手写 curl 调 API。issue 生命周期命令速查见 `references/gitea.md`。
+Gitea: 所有 issue 交互统一使用 `tea` CLI（eos-bootstrap 安装，login `yuez`），**不要**手写 curl 调 API，也**不要**在 GitHub 上开 issue —— GitHub 只是公开镜像，issue 只在 Gitea。issue 生命周期命令速查见 `references/gitea.md`。如果误开在 GitHub 上，按 `references/gitea.md` 的 "Migrate from GitHub" 迁回并删除。
 
 ## Worktree workflow
 
