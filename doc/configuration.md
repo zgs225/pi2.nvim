@@ -27,6 +27,8 @@ require("pi").setup({
     -- Each entry is either a string (exact ID or "provider/modelId") or a table:
     --   { match = "opus", latest = true }
     --   { match = "gpt-5.3-codex", exact = true } or just "gpt-5.3-codex"
+    -- When unset, :PiSelectModel mirrors pi's own model scope
+    -- (--models / enabledModels) before falling back to all models.
     models = nil,
     -- Spinner shown while the agent is working.
     -- Preset name ("classic"|"robot"), array of frames (strings), or

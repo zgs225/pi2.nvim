@@ -249,7 +249,56 @@ M.check = function()
         end
     end
 
-    -- ── Image compression tools ───────────────────────────────────────
+    -- ── Bundled model-scope bridge extension ────────────────────────────
+    local scope_path = Cli.scoped_models_extension_path()
+    if vim.uv.fs_stat(scope_path) then
+        vim.health.ok("bundled model-scope bridge extension found")
+    else
+        vim.health.warn("bundled model-scope bridge extension not found at " .. scope_path, {
+            "Reinstall pi2.nvim",
+        })
+    end
+
+    -- Version floor: the bridge reads ctx.scopedModels (pi 0.83.0+). Below
+    -- the floor it stays silent and :PiSelectModel falls back to
+    -- config.models / the full list — degraded scope mirroring, no crash.
+    -- Warn (not error): when no --models/enabledModels scoping is configured
+    -- on the pi side this layer is inert anyway.
+    local scope_min = Compat.scoped_models_min_supported
+    if not pi_version then
+        vim.health.warn(
+            "Could not verify pi version against the model-scope bridge requirement (pi >= " .. scope_min .. ")"
+        )
+    else
+        local cmp_scope = Compat.compare_versions(pi_version, scope_min)
+        if cmp_scope == nil then
+            vim.health.warn(
+                "Could not compare pi version `"
+                    .. pi_version
+                    .. "` against the model-scope bridge minimum `"
+                    .. scope_min
+                    .. "`"
+            )
+        elseif cmp_scope < 0 then
+            vim.health.warn(
+                "pi version `" .. pi_version .. "` is older than the model-scope bridge minimum `" .. scope_min .. "`",
+                {
+                    "Upgrade pi to " .. scope_min .. "+ so :PiSelectModel mirrors --models/enabledModels scoping",
+                    "With an older pi, :PiSelectModel ignores backend scoping and lists all models instead (no crash)",
+                }
+            )
+        else
+            vim.health.ok(
+                "pi version `"
+                    .. pi_version
+                    .. "` satisfies the model-scope bridge requirement (pi >= "
+                    .. scope_min
+                    .. ")"
+            )
+        end
+    end
+
+    -- ── Image compression tools ────────────────────────────────────────
     local compress_cfg = Config.options.prompt and Config.options.prompt.image_compress or {}
     if compress_cfg.enable ~= false then
         local ImageCompress = require("pi.image_compress")

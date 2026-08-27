@@ -49,7 +49,8 @@ pi.invoke("/command")         -- invoke a backend slash command programmatically
 
 -- Models
 pi.cycle_model()              -- step to the next model in the configured (or all) list
-pi.select_model()             -- dialog: pick from configured models (or all when no list is set)
+pi.select_model()             -- dialog: pick from configured models, then pi's model scope
+                              -- (--models/enabledModels), then all models
 pi.select_model_all()         -- dialog: pick from every backend-available model
 
 -- Thinking
