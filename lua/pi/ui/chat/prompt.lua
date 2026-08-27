@@ -302,6 +302,33 @@ function Prompt:focus(cb)
     end)
 end
 
+--- Focus the prompt window and enter Insert mode at the very end of the
+--- draft (append semantics, like `A` in the prompt): the cursor moves onto
+--- the last line's trailing edge even for multi-line drafts and regardless
+--- of where it was when the prompt last lost focus.
+---@param cb? fun()
+function Prompt:focus_end(cb)
+    if not self._win or not vim.api.nvim_win_is_valid(self._win) then
+        return
+    end
+    vim.api.nvim_set_current_win(self._win)
+    vim.schedule(function()
+        local buf = self._buf
+        if not buf or not vim.api.nvim_buf_is_valid(buf) then
+            return
+        end
+        -- startinsert! applies to the cursor's line only, so land on the last
+        -- line first; its column (and A's behavior) put insertion past EOL.
+        local lnum = vim.api.nvim_buf_line_count(buf)
+        local line = vim.api.nvim_buf_get_lines(buf, lnum - 1, lnum, false)[1] or ""
+        pcall(vim.api.nvim_win_set_cursor, self._win, { lnum, #line })
+        vim.cmd("startinsert!")
+        if cb then
+            cb()
+        end
+    end)
+end
+
 ---@return string
 function Prompt:text()
     if not self._buf or not vim.api.nvim_buf_is_valid(self._buf) then
