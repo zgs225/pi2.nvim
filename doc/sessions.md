@@ -93,7 +93,7 @@ When you run several sessions across tabs, `:PiSessions` gives you a single dash
 
 The list is a single shared buffer (filetype `pi-sessions`): every tab that opens it gets its own window on the same buffer, so a status change redraws all open views at once. Updates are event-driven (agent start/end, compaction, session creation/teardown, attention requests, name changes) — nothing polls.
 
-Keys inside the list: `<CR>` / `o` jump to that session's tab and open its chat, `r` renames the session under the cursor (same as `:PiSessionName`, without leaving the list), `R` re-fetches session names, `?` toggles a shortcut help overlay, `q` closes the window.
+Keys inside the list: `<CR>` / `o` jump to that session's tab and open its chat, `a` / `i` do the same but drop you straight into Insert mode at the very end of that session's prompt draft (multi-line drafts land past the last line — ready to append), `r` renames the session under the cursor (same as `:PiSessionName`, without leaving the list), `R` re-fetches session names, `?` toggles a shortcut help overlay, `q` closes the window.
 
 By default the window follows the current tab's chat layout (a side split when the chat is in side layout, a centered float when it is in float layout); `mode` pins it to one style, and `auto_open` shows the list whenever the chat opens:
 

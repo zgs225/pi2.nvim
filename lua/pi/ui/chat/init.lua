@@ -509,6 +509,15 @@ function Chat:ensure_shown_and_focus_prompt()
     end)
 end
 
+--- Like ensure_shown_and_focus_prompt(), but enters Insert mode with the
+--- cursor appended past the very end of the draft (multi-line included).
+function Chat:ensure_shown_and_focus_prompt_at_end()
+    self:show()
+    vim.schedule(function()
+        self._prompt:focus_end()
+    end)
+end
+
 function Chat:focus_history()
     local hwin = self._layout:history_win()
     if hwin then

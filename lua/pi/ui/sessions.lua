@@ -622,6 +622,7 @@ end
 ---@type [string, string][]
 local HELP_ENTRIES = {
     { "<CR>, o", "Open the session under the cursor" },
+    { "a, i", "Open the session and type at its prompt's end" },
     { "r", "Rename the session under the cursor" },
     { "R", "Refresh the list" },
     { "q", "Close the list" },
@@ -723,7 +724,7 @@ local function session_for_tab(tab)
     return nil
 end
 
-local function jump_under_cursor()
+local function jump_under_cursor(at_end)
     local lnum = vim.api.nvim_win_get_cursor(0)[1]
     local row = rows[lnum]
     if not row or not vim.api.nvim_tabpage_is_valid(row.tab) then
@@ -734,7 +735,13 @@ local function jump_under_cursor()
         return
     end
     vim.api.nvim_set_current_tabpage(row.tab)
-    session.chat:ensure_shown_and_focus_prompt()
+    if at_end then
+        -- a/i: open the chat AND drop into Insert at the prompt's very end,
+        -- ready to type (append semantics; lands after multi-line drafts).
+        session.chat:ensure_shown_and_focus_prompt_at_end()
+    else
+        session.chat:ensure_shown_and_focus_prompt()
+    end
 end
 
 --- Rename the session under the cursor: prompt for a display name and send it
@@ -787,8 +794,18 @@ local function ensure_buf()
     vim.bo[buf].modifiable = false
 
     local map_opts = { buffer = buf, nowait = true }
-    vim.keymap.set("n", "<CR>", jump_under_cursor, vim.tbl_extend("force", map_opts, { desc = "Open this session" }))
-    vim.keymap.set("n", "o", jump_under_cursor, vim.tbl_extend("force", map_opts, { desc = "Open this session" }))
+    vim.keymap.set("n", "<CR>", function()
+        jump_under_cursor()
+    end, vim.tbl_extend("force", map_opts, { desc = "Open this session" }))
+    vim.keymap.set("n", "o", function()
+        jump_under_cursor()
+    end, vim.tbl_extend("force", map_opts, { desc = "Open this session" }))
+    vim.keymap.set("n", "a", function()
+        jump_under_cursor(true)
+    end, vim.tbl_extend("force", map_opts, { desc = "Open this session and append to its prompt" }))
+    vim.keymap.set("n", "i", function()
+        jump_under_cursor(true)
+    end, vim.tbl_extend("force", map_opts, { desc = "Open this session and append to its prompt" }))
     vim.keymap.set("n", "r", rename_under_cursor, vim.tbl_extend("force", map_opts, { desc = "Rename this session" }))
     vim.keymap.set("n", "R", function()
         name_cache = setmetatable({}, { __mode = "k" })
