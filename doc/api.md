@@ -17,6 +17,7 @@ pi.is_visible()               -- boolean: is the chat shown in the current tab?
 pi.layout()                   -- "side" | "float" | nil
 
 -- Sessions
+pi.new_tab()                  -- open a fresh conversation in a new tabpage (:PiNewTab)
 pi.continue_session(opts?)    -- load the most recent session for the current cwd
 pi.resume_session(opts?)      -- pick a past session for the current cwd
 pi.new_session()              -- start a fresh conversation in the current tab

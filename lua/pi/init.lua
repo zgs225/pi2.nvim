@@ -37,6 +37,11 @@ function M.setup(opts)
     require("pi.paste").setup()
 end
 
+--- Open a fresh session in a new tabpage. Uses `layout.default` from config.
+function M.new_tab()
+    require("pi.sessions.manager").new_tab()
+end
+
 --- Show the chat and focus the prompt. Creates a session if none exists.
 ---@param opts? pi.SessionCreateOpts
 function M.show(opts)

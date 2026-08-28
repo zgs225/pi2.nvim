@@ -31,6 +31,7 @@ There are three ways to open a chat — each honors the usual `layout=side|float
 | Command | Lua | What it does |
 | --- | --- | --- |
 | `:Pi` | `pi.show()` / `pi.toggle()` | Open the chat. If the current tab has no session yet, starts a fresh conversation. |
+| `:PiNewTab` | `pi.new_tab()` | Open a **fresh** conversation in a **new** tabpage (`:tabnew` semantics). Uses `layout.default`; no arguments. |
 | `:PiContinue` | `pi.continue_session()` | Load the **most recent** session for the current cwd. Skips the session currently live in another tab, so you can continue a different one. |
 | `:PiResume` | `pi.resume_session()` | Open a picker listing **all past sessions for the current cwd**, with their display names and timestamps. See [Resume picker](#resume-picker) for its keybindings. |
 

@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-08-28
+
+- **ADDED:** `:PiNewTab` / `pi.new_tab()` — open a fresh π conversation in a new Neovim tabpage (`:tabnew` then show with `layout.default`). No arguments; the current tab's session is left untouched. Issue #97.
+
 ## 2026-08-27
 
 - **ADDED:** `:PiResume` picker keybindings and interaction polish. With telescope.nvim installed the resume list opens as a dedicated dropdown picker (instead of the generic `vim.ui.select` one) with a fixed key-hint title: `<CR>` / `o` open the session in the current tab, `t` / `<C-t>` open it in a new tab, `<C-x>` deletes the selected session(s) (multi-select aware, matching the existing snacks behavior). Plain letters keep working once you leave insert mode; typing in the prompt filters. Without telescope nothing changes (`vim.ui.select` flow); with snacks.nvim `t`/`<C-t>` map to "open in new tab" alongside the existing `<C-x>` delete. Every backend now asks for confirmation when opening a conversation that is still live in another tab — previously a silent double-open spawned two backend processes writing the same session file. Fix: sessions.md's resume row claimed "message counts", which no resume renderer has ever shown — dropped.
