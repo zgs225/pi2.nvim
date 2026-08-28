@@ -56,7 +56,7 @@ When filing an issue, attaching the relevant section of `rpc.log` is by far the 
 
 Each π session owns an underlying `pi --mode rpc` subprocess. One tab = one session = one process. The lifecycle is:
 
-- **Spawned** lazily, the first time you open the chat in a tab (via `:Pi`, `:PiContinue`, `:PiResume`, `pi.toggle()`, etc.). There is no background daemon; nothing runs until you ask for it.
+- **Spawned** lazily, the first time you open the chat in a tab (via `:Pi`, `:PiNewTab`, `:PiContinue`, `:PiResume`, `pi.toggle()`, etc.). There is no background daemon; nothing runs until you ask for it.
 - **Alive** as long as the tab is alive. Hiding the chat (`:PiToggleChat`) or switching away from the tab does **not** stop the process — the session keeps running in the background, and any queued [attention](attention.md) requests keep being tracked.
 - **Torn down** on `TabClosed` for the owning tab, or on `VimLeavePre` for all sessions at once. pi2.nvim sends the appropriate shutdown, waits briefly, and lets the child exit cleanly.
 - **Stopped explicitly** via `:PiStop` / `pi.stop()` — kills the RPC process for the current tab's session immediately and closes the chat windows. Use this when you want to reclaim resources without closing the tab, or to force a clean restart (a subsequent `:Pi` will spawn a fresh process).

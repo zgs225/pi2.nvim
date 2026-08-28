@@ -233,6 +233,7 @@ require("pi").setup({
 | Command | Description |
 | --- | --- |
 | `:Pi [layout=side\|float]` | Open or toggle the chat in the current tab |
+| `:PiNewTab` | Open a fresh session in a new tabpage |
 | `:PiContinue [layout=side\|float]` | Continue the most recent session for the current working directory |
 | `:PiResume [layout=side\|float]` | Pick and resume a past session for the current working directory — with Telescope: `<CR>`/`o` here, `t`/`<C-t>` in a new tab |
 | `:PiToggleChat` | Toggle chat visibility |

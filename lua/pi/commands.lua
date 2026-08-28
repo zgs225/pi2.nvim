@@ -40,6 +40,10 @@ function M.setup()
         Pi.toggle(parse_flags(cmd.args))
     end, { nargs = "*", complete = complete_flags, desc = "Show or toggle π chat" })
 
+    vim.api.nvim_create_user_command("PiNewTab", function()
+        Pi.new_tab()
+    end, { desc = "Open a fresh π session in a new tab" })
+
     vim.api.nvim_create_user_command("PiContinue", function(cmd)
         Pi.continue_session(parse_flags(cmd.args))
     end, { nargs = "*", complete = complete_flags, desc = "Continue last π conversation" })

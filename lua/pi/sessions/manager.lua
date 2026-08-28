@@ -549,6 +549,16 @@ function M.list()
     return result
 end
 
+--- Open a fresh session in a new tabpage (`:tabnew` then show).
+--- Uses `layout.default` from config; no per-invocation layout override.
+function M.new_tab()
+    vim.cmd("tabnew")
+    local session = M.get_or_create()
+    if session then
+        session.chat:ensure_shown_and_focus_prompt()
+    end
+end
+
 --- Get or create a session for the current tab.
 ---@param opts? pi.SessionCreateOpts
 ---@return pi.Session?
