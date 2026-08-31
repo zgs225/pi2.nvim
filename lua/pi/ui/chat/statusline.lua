@@ -4,9 +4,14 @@
 
 --- Component function: receives state, returns either:
 ---   string, string?             — single chunk (text, optional hl)
----   table of {text, hl?} pairs  — multi-chunk with per-chunk highlights
+---   table of {text, hl?, soft?} — multi-chunk: per-chunk highlights; a
+---                                 soft chunk (third field true) is
+---                                 decorative — dropped first when space is
+---                                 tight (used e.g. by the model
+---                                 component's provider suffix)
 ---   nil                         — hidden (component not rendered)
----@alias pi.StatusLineComponentFn fun(state: pi.StatusLineState): string|string[][]|nil, string|nil
+---@alias pi.StatusLineChunk { [1]: string, [2]: string?, [3]: boolean?, [4]: boolean? }
+---@alias pi.StatusLineComponentFn fun(state: pi.StatusLineState): string|pi.StatusLineChunk[]|nil, string|nil
 
 --- Display model for the busy (spinner) component, pushed by ChatHistory.
 ---@class pi.StatusLineBusy
@@ -77,9 +82,9 @@ local function component_config(name)
 end
 
 --- Normalize a component return value into chunks.
----@param result string|string[][]|nil
+---@param result string|pi.StatusLineChunk[]|nil
 ---@param hl string?
----@return string[][]?
+---@return pi.StatusLineChunk[]?
 local function normalize_chunks(result, hl)
     if result == nil then
         return nil
@@ -92,15 +97,15 @@ end
 
 --- Prefix a built-in component's first chunk with its configured icon.
 ---@param name pi.StatusLineBuiltinName
----@param chunks string[][]
----@return string[][]
+---@param chunks pi.StatusLineChunk[]
+---@return pi.StatusLineChunk[]
 local function prepend_icon(name, chunks)
     local icon = component_config(name).icon
     if type(icon) ~= "string" or icon == "" or #chunks == 0 then
         return chunks
     end
     local first = chunks[1][1]
-    chunks[1] = { first == "" and icon or (icon .. " " .. first), chunks[1][2] }
+    chunks[1] = { first == "" and icon or (icon .. " " .. first), chunks[1][2], chunks[1][3] }
     return chunks
 end
 
@@ -209,7 +214,9 @@ end
 
 --- claude-opus-4-6  — or "claude-opus-4-6  [anthropic]" when the provider
 --- component config is "always", or when the model id is ambiguous across
---- providers/endpoints (default "ambiguous" mode).
+--- providers/endpoints (default "ambiguous" mode). The provider suffix is a
+--- soft chunk: on narrow windows it is dropped before the model id or any
+--- other component is truncated.
 function builtin.model(state)
     if not state.model_id then
         return nil
@@ -217,10 +224,16 @@ function builtin.model(state)
     local cfg = component_config("model")
     local mode = cfg.provider
     if mode == "always" and state.model_provider then
-        return state.model_id .. "  [" .. state.model_provider .. "]"
+        return {
+            { state.model_id, nil },
+            { "  [" .. state.model_provider .. "]", nil, true },
+        }
     end
     if (mode == "ambiguous" or mode == nil) and state.model_ambiguity_suffix then
-        return state.model_id .. "  " .. state.model_ambiguity_suffix
+        return {
+            { state.model_id, nil },
+            { "  " .. state.model_ambiguity_suffix, nil, true },
+        }
     end
     return state.model_id
 end
@@ -489,12 +502,12 @@ end
 ---@param items any[]
 ---@param state pi.StatusLineState
 ---@param tab pi.TabId
----@return string[][] chunks  list of {text, hl}
+---@return pi.StatusLineChunk[] chunks  list of {text, hl, soft?, sep?}
 ---@return integer width  total display width
 local function eval_side(items, state, tab)
     -- First pass: evaluate all items into a flat list of tagged entries.
     -- Components produce one or more chunks; separators produce a literal.
-    ---@type { kind: "component"|"separator", chunks: string[][]? }[]
+    ---@type { kind: "component"|"separator", chunks: pi.StatusLineChunk[]? }[]
     local entries = {}
     for _, item in ipairs(items) do
         local fn, builtin_name = resolve_component(item, tab)
@@ -513,7 +526,7 @@ local function eval_side(items, state, tab)
     -- Second pass: collect visible components with separators between them.
     -- Separators only render between two visible components.
     -- When components are hidden, buffer separators and use the last group.
-    ---@type string[][]
+    ---@type pi.StatusLineChunk[]
     local chunks = {}
     local total_width = 0
     local has_prev = false -- a visible component exists before current position
@@ -526,18 +539,18 @@ local function eval_side(items, state, tab)
                 if has_prev then
                     if #pending_seps > 0 then
                         for _, sep in ipairs(pending_seps) do
-                            chunks[#chunks + 1] = { sep, "PiStatusLine" }
+                            chunks[#chunks + 1] = { sep, "PiStatusLine", nil, true }
                             total_width = total_width + vim.fn.strdisplaywidth(sep)
                         end
                     else
                         -- No explicit separator — default single space
-                        chunks[#chunks + 1] = { " ", "PiStatusLine" }
+                        chunks[#chunks + 1] = { " ", "PiStatusLine", nil, true }
                         total_width = total_width + 1
                     end
                 end
                 pending_seps = {}
                 for _, chunk in ipairs(entry.chunks) do
-                    chunks[#chunks + 1] = { chunk[1], chunk[2] or "PiStatusLine" }
+                    chunks[#chunks + 1] = { chunk[1], chunk[2] or "PiStatusLine", chunk[3] }
                     total_width = total_width + vim.fn.strdisplaywidth(chunk[1])
                 end
                 has_prev = true
@@ -557,30 +570,69 @@ local function eval_side(items, state, tab)
 end
 
 --- Truncate a chunk list to at most `avail` display columns, keeping chunk
---- order; the last kept chunk is cut mid-text when needed.
----@param chunks string[][]
+--- order and losing the least important content first:
+---   1. separators that do not fit are skipped, never cut;
+---   2. `soft` chunks (decorative, e.g. the model component's provider
+---      suffix) are dropped entirely before anything else;
+---   3. the first component chunk that does not fit is cut with an
+---      ellipsis "…"; everything after it is dropped.
+---@param chunks pi.StatusLineChunk[]
 ---@param avail integer
----@return string[][] kept
+---@return pi.StatusLineChunk[] kept
 ---@return integer kept_width
 local function truncate_chunks(chunks, avail)
-    local kept_width = 0
-    ---@type string[][]
+    local ellipsis = "…"
+    local ellipsis_width = vim.fn.strdisplaywidth(ellipsis)
+    ---@type pi.StatusLineChunk[]
     local kept = {}
+    local kept_width = 0
+    local function emit(chunk, text)
+        kept[#kept + 1] = { text, chunk[2] }
+        kept_width = kept_width + vim.fn.strdisplaywidth(text)
+    end
+    -- Pass 1: hard chunks in order. Separators that do not fit are skipped;
+    -- the first component chunk that does not fit is ellipsized and stops
+    -- the pass.
     for _, chunk in ipairs(chunks) do
-        local cw = vim.fn.strdisplaywidth(chunk[1])
-        if kept_width + cw <= avail then
-            kept[#kept + 1] = chunk
-            kept_width = kept_width + cw
-        else
-            local remaining = avail - kept_width
-            if remaining > 0 then
-                -- TODO: strcharpart uses char indices, not display width;
-                -- would miscount wide chars (CJK, emoji). Fine for typical
-                -- model names and status values which are ASCII.
-                kept[#kept + 1] = { vim.fn.strcharpart(chunk[1], 0, remaining), chunk[2] }
-                kept_width = kept_width + remaining
+        if not chunk[3] then
+            local cw = vim.fn.strdisplaywidth(chunk[1])
+            if kept_width + cw <= avail then
+                emit(chunk, chunk[1])
+            elseif chunk[4] then
+                -- Separator — skip rather than cut mid-text.
+            else
+                local remaining = avail - kept_width
+                if remaining >= ellipsis_width then
+                    -- Take `remaining - ellipsis_width` display columns.
+                    -- strcharpart counts chars, not display width; shrink the
+                    -- take until the cut + ellipsis actually fits, which
+                    -- keeps CJK/emoji cuts honest.
+                    local take = math.min(vim.fn.strchars(chunk[1]), remaining - ellipsis_width)
+                    while
+                        take > 0
+                        and vim.fn.strdisplaywidth(vim.fn.strcharpart(chunk[1], 0, take)) + ellipsis_width
+                            > remaining
+                    do
+                        take = take - 1
+                    end
+                    if take > 0 then
+                        emit(chunk, vim.fn.strcharpart(chunk[1], 0, take) .. ellipsis)
+                    else
+                        emit(chunk, ellipsis)
+                    end
+                end
+                break
             end
-            break
+        end
+    end
+    -- Pass 2: soft chunks append greedily while they fit entirely (they are
+    -- decorative; a partial one is worse than none).
+    for _, chunk in ipairs(chunks) do
+        if chunk[3] then
+            local cw = vim.fn.strdisplaywidth(chunk[1])
+            if kept_width + cw <= avail then
+                emit(chunk, chunk[1])
+            end
         end
     end
     return kept, kept_width
@@ -608,7 +660,7 @@ function StatusLine:render()
     local right_margin = 1
     local min_gap = 2
 
-    ---@type string[][]
+    ---@type pi.StatusLineChunk[]
     local status_chunks
     if center_width > 0 then
         -- Canvas placement with center priority: the center group is
@@ -697,6 +749,12 @@ function StatusLine:render()
     end
     virt_lines[#virt_lines + 1] = status_chunks
     self._virt_line_count = #virt_lines
+
+    -- virt_lines chunks accept only {text, hl} pairs; strip the internal
+    -- soft/separator flags before handing the row to the extmark.
+    for i, c in ipairs(status_chunks) do
+        status_chunks[i] = { c[1], c[2] }
+    end
 
     local last_line = vim.api.nvim_buf_line_count(self._buf) - 1
     if self._extmark_id then

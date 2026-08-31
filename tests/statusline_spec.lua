@@ -22,6 +22,10 @@ describe("statusline", function()
 
     after_each(function()
         Config.options.statusline = saved_statusline_cfg
+        -- Truncation tests shrink the window via a temporary split; restore
+        -- a single full-width window (no-op when nothing was split).
+        pcall(vim.cmd.silent, "only")
+        vim.api.nvim_win_set_width(0, 80)
         pcall(vim.api.nvim_buf_delete, buf, { force = true })
     end)
 
@@ -231,5 +235,84 @@ describe("statusline", function()
         local text = status_row()
         assert.is_not_nil(text:find("claude-x", 1, true))
         assert.is_nil(text:find("[anthropic]", 1, true))
+    end)
+
+    --- Narrow the current window like a small-screen side layout.
+    --- nvim_win_set_width silently no-ops on the only window in headless
+    --- mode, so a temporary vertical split is required.
+    ---@param width integer
+    local function narrow_window(width)
+        vim.cmd("vsplit")
+        vim.api.nvim_win_set_width(0, width)
+    end
+
+    it("truncation: narrow window drops the soft provider suffix, thinking stays", function()
+        narrow_window(30)
+        sl:update_state({
+            model = { provider = "anthropic", id = "claude-x", reasoning = true },
+            thinkingLevel = "xhigh",
+        })
+        sl:set_model_ambiguity_for("anthropic", "claude-x", "[anthropic]")
+        local text = status_row()
+        assert.is_not_nil(text:find("claude-x", 1, true))
+        assert.is_not_nil(text:find("xhigh", 1, true))
+        assert.is_nil(text:find("[anthropic]", 1, true))
+    end)
+
+    it("truncation: wide window keeps suffix and thinking", function()
+        vim.api.nvim_win_set_width(0, 80)
+        sl:update_state({
+            model = { provider = "anthropic", id = "claude-x", reasoning = true },
+            thinkingLevel = "xhigh",
+        })
+        sl:set_model_ambiguity_for("anthropic", "claude-x", "[anthropic]")
+        local text = status_row()
+        assert.is_not_nil(text:find("claude-x  [anthropic]", 1, true))
+        assert.is_not_nil(text:find("xhigh", 1, true))
+    end)
+
+    it("truncation: narrowest window ellipsizes the model id, thinking drops", function()
+        narrow_window(18)
+        sl:update_state({
+            model = { provider = "anthropic", id = "claude-x", reasoning = true },
+            thinkingLevel = "xhigh",
+        })
+        sl:set_model_ambiguity_for("anthropic", "claude-x", "[anthropic]")
+        local text = status_row()
+        assert.is_not_nil(text:find("…", 1, true))
+        assert.is_nil(text:find("xhigh", 1, true))
+    end)
+
+    it("truncation: separators are skipped, never cut", function()
+        narrow_window(30)
+        Config.options.statusline = vim.tbl_deep_extend("force", {}, saved_statusline_cfg, {
+            components = { model = { icon = false, provider = "never" } },
+            layout = { right = { "model", string.rep("X", 22), "thinking" } },
+        })
+        sl:update_state({
+            model = { provider = "anthropic", id = "claude-x", reasoning = true },
+            thinkingLevel = "xhigh",
+        })
+        local text = status_row()
+        assert.is_not_nil(text:find("claude-x", 1, true))
+        assert.is_not_nil(text:find("xhigh", 1, true))
+        assert.is_nil(text:find("X", 1, true))
+    end)
+
+    it("truncation: custom components can mark soft chunks too", function()
+        narrow_window(30)
+        Config.options.statusline = vim.tbl_deep_extend("force", {}, saved_statusline_cfg, {
+            layout = {
+                left = {
+                    function()
+                        return { { "ab", nil }, { " [soft]", nil, true } }
+                    end,
+                },
+            },
+        })
+        sl:set_busy(busy_model({ elapsed = " 12s" }))
+        local text = status_row()
+        assert.is_not_nil(text:find("ab", 1, true))
+        assert.is_nil(text:find("[soft]", 1, true))
     end)
 end)

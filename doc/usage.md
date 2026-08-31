@@ -490,6 +490,15 @@ local function my_component(state)
 end
 ```
 
+Chunks are `{text, hl}` pairs. A third chunk field can mark a chunk as **soft** — decorative content that is dropped first when the window grows too narrow. The built-in `model` component marks its provider suffix this way, so on a small window the `[provider]` suffix disappears before the model id, the `thinking` value, or anything else is touched. Separators between components are skipped rather than cut mid-text, and the last hard truncation ends with an ellipsis `…`. Custom components can use the soft flag the same way:
+
+```lua
+return {
+    { "claude-x", nil },
+    { "  [anthropic]", "PiStatusLineDim", true }, -- soft: dropped first
+}
+```
+
 The `state` table exposes everything the built-ins see — model info (`state.model_id`, `state.model_provider`, and `state.model_ambiguity_suffix` — the `[provider]` suffix the `model` component appends, non-nil only when the same id is served by several providers or endpoints), thinking level, token totals, cost, context usage, a `state.extensions` map of per-extension status values (populated via the RPC `setStatus` call from extensions), plus the busy/queue status: `state.busy` (spinner display model: `frame`, `text`, `elapsed`, `thinking`), `state.queue_count`, `state.abort_hint`, and `state.aborted_notice`.
 
 Drop a custom component anywhere in the layout array. For example, surfacing a status from an extension:

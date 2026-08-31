@@ -4,6 +4,8 @@
 
 - **ADDED:** statusline `model` component provider disambiguation. When the same model id is served by several providers (or by one provider through several base URLs — custom gateways), the component appends a `[provider]` suffix (e.g. `claude-sonnet-4-5  [openrouter]`, or `[provider@host]` for endpoint-level collisions) so the active provider is always identifiable. New `statusline.components.model.provider` option: `"ambiguous"` (default — suffix only on collision, single-provider setups look unchanged), `"always"` (unconditional suffix), `"never"` (bare id). The statusline state additionally exposes `state.model_provider` and `state.model_ambiguity_suffix` for custom components.
 
+- **FIXED:** statusline truncation on narrow windows — the new `[provider]` suffix could push the `thinking` value off-screen entirely (most visible on small displays), and overflow cuts had no ellipsis (`claude-sonnet-4-5  [openroute`). Truncation now drops content in quality order: separators are skipped rather than cut, **soft** chunks (the provider suffix) vanish first, whole components disappear before the model id, and the final hard cut ends with an ellipsis `…`. Custom components can mark their own chunks soft with a third `true` chunk field.
+
 ## 2026-08-28
 
 - **ADDED:** `:PiNewTab` / `pi.new_tab()` — open a fresh π conversation in a new Neovim tabpage (`:tabnew` then show with `layout.default`). No arguments; the current tab's session is left untouched. Issue #97.
