@@ -199,7 +199,11 @@ require("pi").setup({
     -- ("provider/modelId") and the current main model cannot see images,
     -- attached images are described by this vision-capable model first and
     -- the description replaces the images in the user message (rendered as a
-    -- dedicated block in the history). Any failure fast-fails the submission
+    -- dedicated block in the history). While active, the main model is also
+    -- told via a byte-constant system-prompt note that attached images
+    -- arrive as descriptions and that reading image files returns a
+    -- description, so it answers pasted images and proactively reads
+    -- screenshots. Any failure fast-fails the submission
     -- and restores the prompt text and attachments. Disabled when unset.
     -- Requires pi 0.81.0+ (see doc/usage.md#vision-fallback).
     vision = {
