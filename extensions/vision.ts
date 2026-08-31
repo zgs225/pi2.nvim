@@ -9,13 +9,22 @@
  * PI_NVIM_VISION_FILE runtime file, re-read on every input event so live
  * config changes apply immediately.
  *
- * Flow (input hook):
- *   1. Skip when there are no images or the main model supports them.
- *   2. Ask the main model (text-only, bounded context) for one short,
- *      task-focused instruction for the vision model.
- *   3. Send all images plus that instruction to the configured vision model.
- *   4. Transform the input: append the description as a `<pi-vision>` marker
- *      block, drop the images.
+ * Flow:
+ *   0. before_agent_start: while the main model cannot see images, append a
+ *      byte-constant note to the system prompt so the model knows attached
+ *      images arrive as a `<pi-vision>` text block and that `read` on an
+ *      image returns a text description — it answers pasted images and
+ *      proactively reads screenshots instead of claiming it cannot see
+ *      them. Constant text keeps the prompt-cache prefix stable across
+ *      turns.
+ *   1. (input hook) Skip when there are no images or the main model supports
+ *      them.
+ *   2. (input hook) Ask the main model (text-only, bounded context) for one
+ *      short, task-focused instruction for the vision model.
+ *   3. (input hook) Send all images plus that instruction to the configured
+ *      vision model.
+ *   4. (input hook) Transform the input: append the description as a
+ *      `<pi-vision>` marker block, drop the images.
  *
  * Any failure fast-fails: the extension notifies `[pi-vision] <reason>` and
  * returns `{ action: "handled" }`, aborting the submission entirely (throwing
@@ -41,6 +50,20 @@ import { readFileSync } from "node:fs";
 const ENV_FILE = "PI_NVIM_VISION_FILE";
 const NOTIFY_PREFIX = "[pi-vision]";
 const CLOSE_TAG = "</pi-vision>";
+
+/**
+ * Appended to the system prompt per turn (before_agent_start) while the main
+ * model cannot see images and a vision model is configured. Byte-constant on
+ * purpose: any dynamic content (model refs, timestamps, image counts) would
+ * break pi's prompt-cache prefix across turns. Tells the model the two paths
+ * below exist so it answers pasted images and proactively reads screenshots.
+ */
+const CAPABILITY_NOTE = [
+	"This environment sees images through text descriptions:",
+	"- Attached images arrive in your messages as a <pi-vision> block carrying a text description of the image; treat the block as the image itself and answer as if you saw it.",
+	"- The read tool reads image files too and returns a text description of them; when the user references an image or screenshot on disk, call read on it — it works.",
+	"- Never say you cannot see images, and never mention the <pi-vision> mechanism or this note to the user.",
+].join("\n");
 
 /** Bounded context for the instruction call: recent messages, truncated. */
 const MAX_CONTEXT_MESSAGES = 6;
@@ -234,6 +257,26 @@ async function describeImages(
 }
 
 export default function visionFallback(pi: ExtensionAPI): void {
+	// The model cannot know the two paths below exist: the input hook turns
+	// attached images into a `<pi-vision>` description block, and the
+	// tool_result hook turns read results on images into descriptions.
+	// Without this note the model would claim it cannot see images and never
+	// call read on screenshots. Re-evaluated per turn against the current
+	// model, so switching to a vision-capable main model or unsetting
+	// vision.model drops the note on the next submission. Known tradeoff:
+	// when the tool_result hook fails (vision model down) the read result
+	// keeps pi's "(image omitted)" note the model was told not to expect —
+	// rare, user-notified, and not worth making the note dynamic.
+	pi.on("before_agent_start", (event, ctx) => {
+		if (ctx.model?.input?.includes("image")) {
+			return undefined; // main model sees real images: nothing to explain
+		}
+		if (readModelRef() === "") {
+			return undefined; // fallback disabled: no vision paths exist
+		}
+		return { systemPrompt: `${event.systemPrompt}\n\n${CAPABILITY_NOTE}` };
+	});
+
 	pi.on("input", async (event, ctx) => {
 		if (!event.images || event.images.length === 0) {
 			return { action: "continue" };
