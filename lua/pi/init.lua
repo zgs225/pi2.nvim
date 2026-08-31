@@ -498,7 +498,9 @@ end
 --- Show the current session's stats dashboard (:PiSessionStats): identity,
 --- message counts, token usage (with cache split), per-model cost breakdown
 --- (via get_entries, port of the TUI's getUsageCostBreakdown), cache re-billed
---- waste, and context-window usage with a threshold-colored bar.
+--- waste, extension-recorded usage (custom entries, e.g. vision input-hook
+--- calls, in a separate Extensions section), and context-window usage with a
+--- threshold-colored bar.
 --- Silent no-op without an active session; a failed get_entries degrades to
 --- the session-stats-only view.
 function M.session_stats()
@@ -515,12 +517,13 @@ function M.session_stats()
     local stats ---@type table?
     local breakdown ---@type pi.StatsCostEntry[]?
     local cache_waste ---@type pi.StatsCacheWaste?
+    local extension_usage ---@type pi.StatsExtensionUsage[]?
 
     local function try_show()
-        if stats == nil or breakdown == nil or cache_waste == nil then
+        if stats == nil or breakdown == nil or cache_waste == nil or extension_usage == nil then
             return
         end
-        local rendered = Stats.render_stats(stats, breakdown, cache_waste)
+        local rendered = Stats.render_stats(stats, breakdown, cache_waste, extension_usage)
         vim.schedule(function()
             Dialog.info({
                 title = "Pi Session Stats",
@@ -546,6 +549,7 @@ function M.session_stats()
             local entries = res.success and res.data and res.data.entries or {}
             breakdown = Stats.get_usage_cost_breakdown(entries)
             cache_waste = Stats.compute_cache_waste(entries)
+            extension_usage = Stats.get_extension_usage(entries)
             try_show()
         end)
     end)

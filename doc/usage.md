@@ -359,6 +359,8 @@ While this runs, the history shows a pending preview row (`labels.vision_pending
 
 The fallback also covers the agent itself: when the main model cannot see images and the agent uses the `read` tool on an image (e.g. a screenshot it just took), pi would normally replace the image with an "omitted" note and the agent stalls. The bundled extension replaces that tool result with a vision-model description instead, so the agent reads a successful description. On failure the original note is kept (a tool call cannot be aborted) and you get a `[pi-vision] …` notification. Note `read` renders inline, so the description is visible to the model but not expanded in the history.
 
+Both model calls are **accounted for** in `:PiSessionStats`: the input-hook path persists a custom entry that pi.nvim aggregates under an `Extensions` section (see [Session stats](#session-stats-pisessionstats)), and the `read`-tool path returns the combined usage on the tool result — pi persists it and counts it in footer, `/session` and the session totals, and the cost breakdown shows it as a `vision/<model>` row.
+
 The main model is told about both paths ahead of every turn: while it cannot see images and `vision.model` is set, the extension appends a short, **byte-constant** note to the system prompt. The note states that attached images arrive as a `<pi-vision>` description block (answer as if you saw the image), that `read` on an image file returns a text description (call it on screenshots), and that the model must never claim it cannot see images or mention the mechanism to you — so pasted images get answered directly and screenshots get proactively read. The note is rebuilt per turn: it disappears as soon as the main model supports images or `vision.model` is unset, it survives compaction (the system prompt is not part of the summarized conversation), and because the text is byte-identical on every submission it does not invalidate pi's prompt cache.
 
 The bundled extension and its model reference are injected when the RPC process spawns; the reference itself travels through a runtime file that the extension re-reads on every submission, so a live `require("pi").setup({ vision = { model = ... } })` also applies to chats that are already open.
@@ -534,6 +536,8 @@ Return shapes:
 ## Session stats (`:PiSessionStats`)
 
 `:PiSessionStats` opens a floating dashboard with the current session's numbers, mirroring the TUI's `/session` panel. The data comes from two RPC calls — `get_session_stats` (aggregates) and `get_entries` (the full entry list, used for the per-model cost breakdown) — so it works for any session state, including resumed ones.
+
+Extension-side LLM calls that bypass the agent loop (the bundled vision extension's description calls) are reported through two channels. The `read`-tool path returns its usage on the tool result, which pi itself persists and counts — it lands in the Cost section as a `vision/<model>` row and is part of the header total (the TUI footer and `/session` show it too). The attached-images path records a custom entry that pi never counts itself, so it appears below Cost in an `Extensions` section — `vision/<model>  $0.012 · 45.2k tokens · 3 calls · 5 images` — deliberately kept out of the header total so `Cost` stays exactly comparable to the TUI `/session` panel. Sessions that predate this accounting simply have no such rows.
 
 ```
 ┌─ Pi Session Stats ────────────────────────────────┐
