@@ -113,7 +113,10 @@ require("pi").setup({
             compaction = { icon = false },
             context = { icon = "", warn = 70, error = 90 },
             attention = { icon = "󰵚", counter = false },
-            model = { icon = "󰚩" },
+            -- provider: "ambiguous" (default) appends a [provider] suffix
+            -- when the same model id is served by several providers/endpoints,
+            -- "always" appends it unconditionally, "never" keeps the bare id.
+            model = { icon = "󰚩", provider = "ambiguous" },
             thinking = { icon = "󰟶" },
             queue = { icon = "⏵" },
         },

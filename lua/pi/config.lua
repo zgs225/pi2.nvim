@@ -149,6 +149,10 @@
 ---@field icon? string|false Prefix icon rendered before the component text. Use false to disable.
 ---@field counter? boolean Show the pending attention count next to the icon.
 
+---@class pi.StatusLineModelConfig
+---@field icon? string|false Prefix icon rendered before the component text. Use false to disable.
+---@field provider? "never"|"ambiguous"|"always" Show the provider alongside the model id: "never" hides it, "ambiguous" (default) shows it only when the same model id exists under several providers/endpoints, "always" shows it unconditionally
+
 ---@class pi.StatusLineComponents
 ---@field tokens? pi.StatusLineComponentConfig
 ---@field cache? pi.StatusLineComponentConfig
@@ -156,7 +160,7 @@
 ---@field compaction? pi.StatusLineComponentConfig
 ---@field context? pi.StatusLineContextConfig
 ---@field attention? pi.StatusLineAttentionConfig
----@field model? pi.StatusLineComponentConfig
+---@field model? pi.StatusLineModelConfig
 ---@field thinking? pi.StatusLineComponentConfig
 ---@field queue? pi.StatusLineComponentConfig
 
@@ -374,7 +378,7 @@ local defaults = {
             compaction = { icon = false },
             context = { icon = "", warn = 70, error = 90 },
             attention = { icon = "󰵚", counter = false },
-            model = { icon = "󰚩" },
+            model = { icon = "󰚩", provider = "ambiguous" },
             thinking = { icon = "󰟶" },
             queue = { icon = "⏵" },
         },

@@ -179,4 +179,57 @@ describe("statusline", function()
         assert.is_true(ok)
         assert.are.equal(0, calls)
     end)
+
+    it("model component: bare id until a matching ambiguity suffix is pushed", function()
+        sl:update_state({ model = { provider = "anthropic", id = "claude-x" } })
+        local text = status_row()
+        assert.is_not_nil(text:find("claude-x", 1, true))
+        assert.is_nil(text:find("anthropic", 1, true))
+
+        sl:set_model_ambiguity_for("anthropic", "claude-x", "[anthropic]")
+        text = status_row()
+        assert.is_not_nil(text:find("claude-x  [anthropic]", 1, true))
+    end)
+
+    it("model component: ambiguity push is dropped when the model no longer matches", function()
+        sl:update_state({ model = { provider = "anthropic", id = "claude-x" } })
+        -- Provider mismatch: push computed for another provider's copy.
+        sl:set_model_ambiguity_for("openrouter", "claude-x", "[openrouter]")
+        assert.is_nil(status_row():find("openrouter", 1, true))
+        -- Model switched while the list fetch was in flight: stale id.
+        sl:update_state({ model = { provider = "anthropic", id = "claude-new" } })
+        sl:set_model_ambiguity_for("anthropic", "claude-x", "[anthropic]")
+        local text = status_row()
+        assert.is_nil(text:find("[anthropic]", 1, true))
+        assert.is_not_nil(text:find("claude-new", 1, true))
+    end)
+
+    it("model component: update_state clears a stale suffix from the previous model", function()
+        sl:update_state({ model = { provider = "anthropic", id = "claude-x" } })
+        sl:set_model_ambiguity_for("anthropic", "claude-x", "[anthropic]")
+        sl:update_state({ model = { provider = "openrouter", id = "claude-x" } })
+        local text = status_row()
+        assert.is_not_nil(text:find("claude-x", 1, true))
+        assert.is_nil(text:find("[anthropic]", 1, true))
+    end)
+
+    it("model component: provider=always shows the provider unconditionally", function()
+        Config.options.statusline = vim.tbl_deep_extend("force", {}, saved_statusline_cfg, {
+            components = { model = { provider = "always" } },
+        })
+        sl:update_state({ model = { provider = "anthropic", id = "claude-x" } })
+        local text = status_row()
+        assert.is_not_nil(text:find("claude-x  [anthropic]", 1, true))
+    end)
+
+    it("model component: provider=never hides a pushed ambiguity suffix", function()
+        Config.options.statusline = vim.tbl_deep_extend("force", {}, saved_statusline_cfg, {
+            components = { model = { provider = "never" } },
+        })
+        sl:update_state({ model = { provider = "anthropic", id = "claude-x" } })
+        sl:set_model_ambiguity_for("anthropic", "claude-x", "[anthropic]")
+        local text = status_row()
+        assert.is_not_nil(text:find("claude-x", 1, true))
+        assert.is_nil(text:find("[anthropic]", 1, true))
+    end)
 end)

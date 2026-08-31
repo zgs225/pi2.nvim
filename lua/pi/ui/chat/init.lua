@@ -1488,6 +1488,17 @@ function Chat:update_state(data)
     end
 end
 
+--- Push the provider disambiguation suffix to the statusline model component.
+--- Keyed by provider/id: a suffix computed for a model that is no longer
+--- active is dropped by the statusline. Called by the session manager after
+--- it reconciles the backend model list with the current model.
+---@param provider string
+---@param id string
+---@param suffix string?
+function Chat:set_model_ambiguity_for(provider, id, suffix)
+    self._prompt:statusline():set_model_ambiguity_for(provider, id, suffix)
+end
+
 --- Handle a vision-extension fast-fail: tear down the pending state and
 --- restore the prompt text and attachments so the user can retry.
 ---@param reason string

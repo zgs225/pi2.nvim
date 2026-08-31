@@ -17,6 +17,8 @@
 
 ---@class pi.StatusLineState
 ---@field model_id string?
+---@field model_provider string? Provider of the current model
+---@field model_ambiguity_suffix string? Provider disambiguation suffix (e.g. "[anthropic]") for the statusline model component; non-nil only when the same model id is served by several providers/endpoints. Set asynchronously after update_state by the session manager
 ---@field model_context_window integer?
 ---@field model_reasoning boolean
 ---@field thinking_level string?
@@ -205,12 +207,22 @@ local function attention_component(tab)
     end
 end
 
---- claude-opus-4-6
+--- claude-opus-4-6  — or "claude-opus-4-6  [anthropic]" when the provider
+--- component config is "always", or when the model id is ambiguous across
+--- providers/endpoints (default "ambiguous" mode).
 function builtin.model(state)
-    if state.model_id then
-        return state.model_id
+    if not state.model_id then
+        return nil
     end
-    return nil
+    local cfg = component_config("model")
+    local mode = cfg.provider
+    if mode == "always" and state.model_provider then
+        return state.model_id .. "  [" .. state.model_provider .. "]"
+    end
+    if (mode == "ambiguous" or mode == nil) and state.model_ambiguity_suffix then
+        return state.model_id .. "  " .. state.model_ambiguity_suffix
+    end
+    return state.model_id
 end
 
 --- Busy spinner (⠋ Working… 12s · Thinking) for the center group.
@@ -263,6 +275,8 @@ end
 local function new_state()
     return {
         model_id = nil,
+        model_provider = nil,
+        model_ambiguity_suffix = nil,
         model_context_window = nil,
         model_reasoning = false,
         thinking_level = nil,
@@ -311,17 +325,38 @@ function StatusLine:update_state(data)
     local model = data.model
     if model then
         s.model_id = model.id
+        s.model_provider = model.provider
         s.model_context_window = model.contextWindow
         s.model_reasoning = model.reasoning == true
     else
         s.model_id = nil
+        s.model_provider = nil
         s.model_context_window = nil
         s.model_reasoning = false
     end
+    -- The ambiguity suffix belongs to the previous get_state model; it is
+    -- re-pushed (or cleared) by the session manager once the model list is
+    -- reconciled with the new model.
+    s.model_ambiguity_suffix = nil
     s.thinking_level = data.thinkingLevel
     if data.autoCompactionEnabled ~= nil then
         s.auto_compaction = data.autoCompactionEnabled
     end
+    self:render()
+end
+
+--- Set or clear the provider disambiguation suffix for the current model.
+--- Pushed by the session manager once the backend model list arrives. The
+--- push is keyed by provider/id so a suffix computed for a previous model
+--- (list fetch in flight while the model switched) is silently dropped.
+---@param provider string
+---@param id string
+---@param suffix string?
+function StatusLine:set_model_ambiguity_for(provider, id, suffix)
+    if self._state.model_provider ~= provider or self._state.model_id ~= id then
+        return
+    end
+    self._state.model_ambiguity_suffix = suffix
     self:render()
 end
 

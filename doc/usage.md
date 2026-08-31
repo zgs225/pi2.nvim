@@ -438,7 +438,7 @@ The **center** group is centered in the window and has placement priority: when 
 | `context` | `63.9%/200k` | Current context window usage — percentage + total |
 | `compaction` | 󰏗 | Auto-compaction is enabled — the same icon as the compaction summary label |
 | `attention` | `󰵚` / `󰵚 2` | There's at least one pending attention request |
-| `model` | `claude-opus-4-6` | A model is active |
+| `model` | `claude-opus-4-6` / `claude-opus-4-6  [anthropic]` | A model is active. The `[provider]` suffix appears when the same model id is served by several providers (or by one provider through several base URLs) — see the `provider` option below |
 | `thinking` | `xhigh` / `thinking off` | The current model supports reasoning |
 | `spinner` | `⠋ Working… 12s · Thinking` | The agent is busy. The elapsed figure counts from the start of the run (the first `agent_start`) and keeps counting across mid-run status changes — compaction, retries, and the resumed `agent_start` after compaction — resetting only when the run ends. While the double-<Esc> abort gesture is armed, the hint temporarily replaces the spinner; an `Aborted` confirmation outranks both |
 | `queue` | `⏵ 2` | There are pending steer/follow-up messages |
@@ -454,7 +454,14 @@ statusline = {
     components = {
         -- Every built-in takes an `icon` prefix. Set to `false` to disable.
         compaction = { icon = false },
-        model = { icon = "󰚩" },
+
+        -- `model` can disambiguate providers: with the default
+        -- `provider = "ambiguous"`, a "[provider]" suffix (e.g. "[openrouter]"
+        -- — or "[provider@host]" when one provider serves the id from
+        -- several endpoints) is appended whenever the same model id exists
+        -- under several providers. "always" appends it unconditionally,
+        -- "never" keeps the bare id.
+        model = { icon = "󰚩", provider = "ambiguous" },
 
         -- `context` supports warning / error thresholds as percentages
         -- of the model's context window. When crossed, the value is
@@ -483,7 +490,7 @@ local function my_component(state)
 end
 ```
 
-The `state` table exposes everything the built-ins see — model info, thinking level, token totals, cost, context usage, a `state.extensions` map of per-extension status values (populated via the RPC `setStatus` call from extensions), plus the busy/queue status: `state.busy` (spinner display model: `frame`, `text`, `elapsed`, `thinking`), `state.queue_count`, `state.abort_hint`, and `state.aborted_notice`.
+The `state` table exposes everything the built-ins see — model info (`state.model_id`, `state.model_provider`, and `state.model_ambiguity_suffix` — the `[provider]` suffix the `model` component appends, non-nil only when the same id is served by several providers or endpoints), thinking level, token totals, cost, context usage, a `state.extensions` map of per-extension status values (populated via the RPC `setStatus` call from extensions), plus the busy/queue status: `state.busy` (spinner display model: `frame`, `text`, `elapsed`, `thinking`), `state.queue_count`, `state.abort_hint`, and `state.aborted_notice`.
 
 Drop a custom component anywhere in the layout array. For example, surfacing a status from an extension:
 
