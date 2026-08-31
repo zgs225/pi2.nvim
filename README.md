@@ -311,7 +311,7 @@ Everything below is present in `pi2.nvim` and **not** in upstream `alex35mil/pi.
 **UI & rendering**
 
 - [Redesigned tool & thinking blocks](doc/usage.md#tool-blocks) — fold indicators + indentation, silent success, animated spinners, single-line thinking headers with rolling preview.
-- [Status line in the prompt](doc/usage.md#statusline) — busy spinner with elapsed time, context/cost/token usage, queue count, and abort hints pinned to the prompt window.
+- [Status line in the prompt](doc/usage.md#statusline) — busy spinner with elapsed time, context/cost/token usage, queue count, abort hints, and a provider disambiguation suffix for the active model (same model id served by several providers) pinned to the prompt window.
 - [`render-markdown.nvim` engine](doc/usage.md#markdown-rendering) — the default renderer, with a builtin treesitter fallback.
 
 **Navigation & layout**

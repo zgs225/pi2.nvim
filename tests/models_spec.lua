@@ -134,3 +134,73 @@ describe("models.resolve_select_candidates", function()
         assert.are.same(#all_models, #Models.resolve_select_candidates({}, {}, all_models))
     end)
 end)
+
+describe("models.ambiguity_suffix", function()
+    local Models = require("pi.models")
+
+    it("returns nil for an id served by exactly one provider endpoint", function()
+        -- k3 exists only under kimi-coding, all fixtures have no baseUrl
+        assert.is_nil(Models.ambiguity_suffix({ provider = "kimi-coding", id = "k3" }, all_models))
+    end)
+
+    it("returns [provider] when the id exists under several providers", function()
+        assert.are.equal(
+            "[deepseek]",
+            Models.ambiguity_suffix({ provider = "deepseek", id = "deepseek-v4-flash" }, all_models)
+        )
+        assert.are.equal(
+            "[opencode-go]",
+            Models.ambiguity_suffix({ provider = "opencode-go", id = "deepseek-v4-flash" }, all_models)
+        )
+    end)
+
+    it("returns nil when duplicates share provider and baseUrl (same endpoint)", function()
+        local list = {
+            { provider = "openai", id = "gpt-x", baseUrl = "https://api.openai.com" },
+            { provider = "openai", id = "gpt-x", baseUrl = "https://api.openai.com" },
+        }
+        local suffix =
+            Models.ambiguity_suffix({ provider = "openai", id = "gpt-x", baseUrl = "https://api.openai.com" }, list)
+        assert.is_nil(suffix)
+    end)
+
+    it("labels endpoint-level ambiguity with provider@host", function()
+        local list = {
+            { provider = "openai", id = "gpt-x", baseUrl = "https://api.openai.com" },
+            { provider = "openai", id = "gpt-x", baseUrl = "https://gateway.internal:8080/v1" },
+        }
+        local suffix = Models.ambiguity_suffix(
+            { provider = "openai", id = "gpt-x", baseUrl = "https://gateway.internal:8080/v1" },
+            list
+        )
+        assert.are.equal("[openai@gateway.internal:8080]", suffix)
+    end)
+
+    it("strips scheme, path and default ports from the host label", function()
+        local list = {
+            { provider = "openai", id = "gpt-x", baseUrl = "https://api.openai.com/v1" },
+            { provider = "openai", id = "gpt-x", baseUrl = "http://localhost:11434" },
+        }
+        local suffix =
+            Models.ambiguity_suffix({ provider = "openai", id = "gpt-x", baseUrl = "https://api.openai.com/v1" }, list)
+        assert.are.equal("[openai@api.openai.com]", suffix)
+    end)
+
+    it("falls back to the bare provider when the current baseUrl is missing", function()
+        local list = {
+            { provider = "openai", id = "gpt-x", baseUrl = "https://api.openai.com" },
+            { provider = "openai", id = "gpt-x", baseUrl = "https://gateway.internal" },
+        }
+        assert.are.equal("[openai]", Models.ambiguity_suffix({ provider = "openai", id = "gpt-x" }, list))
+    end)
+
+    it("returns nil when the current model is absent from the list", function()
+        assert.is_nil(Models.ambiguity_suffix({ provider = "nope", id = "ghost" }, all_models))
+    end)
+
+    it("returns nil on unusable input", function()
+        assert.is_nil(Models.ambiguity_suffix(nil, all_models))
+        assert.is_nil(Models.ambiguity_suffix({}, all_models))
+        assert.is_nil(Models.ambiguity_suffix({ provider = "kimi-coding", id = "k3" }, nil))
+    end)
+end)

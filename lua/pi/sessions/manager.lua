@@ -28,6 +28,7 @@
 ---@field changed_files table<string, true> Set of file paths modified by edit/write tools during the current session.
 ---@field _pending_file_change_args? table<string, table> Pending tool args by tool call id for file-changing tools.
 ---@field _compaction_rebuilding? boolean True while compacted messages are being fetched/replayed.
+---@field _models_cache? { fetched_at: integer, list: table[] } Cached get_available_models result for provider-ambiguity detection (TTL-bounded).
 ---@field _compaction_event_queue? pi.RpcEvent[] Events received while compacted messages are being fetched/replayed.
 
 ---@class pi.SessionCreateOpts
@@ -183,6 +184,51 @@ local function capture_session_file(session, state)
     end
 end
 
+--- Seconds the cached get_available_models result stays usable for the
+--- provider-ambiguity check before a refetch.
+local MODEL_LIST_TTL = 60
+
+--- Reconcile the provider-ambiguity suffix shown by the statusline model
+--- component against the backend model list. The list is fetched at most
+--- once per TTL per session and cached; the push is keyed by provider/id so
+--- the statusline drops it when the model switched while the fetch was in
+--- flight. Failure is silent — the suffix just stays nil (bare model id).
+---@param session pi.Session
+---@param state table? get_state response data
+local function refresh_model_ambiguity(session, state)
+    local model = type(state) == "table" and state.model or nil
+    if type(model) ~= "table" or type(model.id) ~= "string" or type(model.provider) ~= "string" then
+        return
+    end
+    local Models = require("pi.models")
+    local cache = session._models_cache
+    if cache and type(cache.list) == "table" and os.time() - cache.fetched_at < MODEL_LIST_TTL then
+        -- Cache usable only when it still covers the current model; a list
+        -- from a different backend config (provider removed) must not decide.
+        local covered = false
+        for _, m in ipairs(cache.list) do
+            if type(m) == "table" and m.id == model.id then
+                covered = true
+                break
+            end
+        end
+        if covered then
+            session.chat:set_model_ambiguity_for(model.provider, model.id, Models.ambiguity_suffix(model, cache.list))
+            return
+        end
+    end
+    session.rpc:send({ type = "get_available_models" }, function(res)
+        vim.schedule(function()
+            local list = res.success and res.data and res.data.models or nil
+            if type(list) ~= "table" then
+                return
+            end
+            session._models_cache = { fetched_at = os.time(), list = list }
+            session.chat:set_model_ambiguity_for(model.provider, model.id, Models.ambiguity_suffix(model, list))
+        end)
+    end)
+end
+
 --- Fetch the backend state and update the status line.
 ---@param session pi.Session
 function M.refresh_state(session)
@@ -191,6 +237,7 @@ function M.refresh_state(session)
             vim.schedule(function()
                 capture_session_file(session, res.data)
                 session.chat:update_state(res.data)
+                refresh_model_ambiguity(session, res.data)
             end)
         end
     end)
@@ -218,6 +265,7 @@ local function refresh_state_and_pin(session)
                 capture_model_pin(session, res.data)
                 capture_session_file(session, res.data)
                 session.chat:update_state(res.data)
+                refresh_model_ambiguity(session, res.data)
             end)
         end
     end)

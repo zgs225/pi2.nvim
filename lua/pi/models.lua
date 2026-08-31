@@ -91,6 +91,83 @@ function M.format_label(model)
     return model.id .. "  [" .. model.provider .. "]"
 end
 
+--- Compact host label from a base URL ("https://api.anthropic.com/v1" ->
+--- "api.anthropic.com"; default ports 443/80 are dropped). nil when the URL
+--- is absent or not parseable.
+---@param base_url string?
+---@return string?
+local function host_of(base_url)
+    if type(base_url) ~= "string" or base_url == "" then
+        return nil
+    end
+    local host = base_url:gsub("^[%w%+%-%._]+://", ""):gsub("/.*$", "")
+    host = host:gsub(":443$", ""):gsub(":80$", "")
+    if host == "" then
+        return nil
+    end
+    return host
+end
+
+--- Provider disambiguation suffix for the statusline model component.
+--- A model id is ambiguous when the backend serves it under >= 2 distinct
+--- providers, or under one provider through >= 2 distinct base URLs (custom
+--- gateways/proxies). Same provider + same baseUrl = the same endpoint, so
+--- duplicate listings never count.
+--- Returns nil when the id is unambiguous, when the current model is not in
+--- the list at all, or when the list is unusable — the caller then shows the
+--- bare id.
+---@param current table backend Model object (.provider, .id, .baseUrl?)
+---@param all_models table[] models from get_available_models
+---@return string? suffix e.g. "[anthropic]" or "[openai@api.example.com]"
+function M.ambiguity_suffix(current, all_models)
+    local id = type(current) == "table" and current.id or nil
+    if type(id) ~= "string" or type(all_models) ~= "table" then
+        return nil
+    end
+    ---@type table<string, true>
+    local providers = {}
+    local urls_by_provider = {} ---@type table<string, table<string, true>>
+    for _, m in ipairs(all_models) do
+        if type(m) == "table" and m.id == id and type(m.provider) == "string" then
+            providers[m.provider] = true
+            local urls = urls_by_provider[m.provider]
+            if not urls then
+                urls = {}
+                urls_by_provider[m.provider] = urls
+            end
+            if type(m.baseUrl) == "string" and m.baseUrl ~= "" then
+                urls[m.baseUrl] = true
+            end
+        end
+    end
+    local provider_count = 0
+    for _ in pairs(providers) do
+        provider_count = provider_count + 1
+    end
+    if provider_count == 0 then
+        -- Current model absent from the list — nothing to disambiguate against.
+        return nil
+    end
+    if provider_count > 1 then
+        return "[" .. current.provider .. "]"
+    end
+    local provider = next(providers)
+    local url_count = 0
+    for _ in pairs(urls_by_provider[provider]) do
+        url_count = url_count + 1
+    end
+    if url_count < 2 then
+        return nil
+    end
+    -- Same provider, several endpoints: label by endpoint host. Without a
+    -- parseable host the bare provider still marks the ambiguity.
+    local host = host_of(current.baseUrl)
+    if host then
+        return "[" .. provider .. "@" .. host .. "]"
+    end
+    return "[" .. provider .. "]"
+end
+
 --- Send set_model RPC and notify on result.
 --- A successful manual switch updates the tab's model pin, so subsequent
 --- `:PiNewSession` in this tab keep this model.
