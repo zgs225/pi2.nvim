@@ -626,6 +626,7 @@ local HELP_ENTRIES = {
     { "r", "Rename the session under the cursor" },
     { "s", "Show this session's stats (:PiSessionStats)" },
     { "c", "Compact this session in the background" },
+    { "d", "Review this session's changed files (:PiDiff)" },
     { "R", "Refresh the list" },
     { "q", "Close the list" },
     { "?", "Toggle this help" },
@@ -818,6 +819,23 @@ local function compact_under_cursor()
     require("pi").compact(nil, session)
 end
 
+--- Open the diff review for the session under the cursor (:PiDiff data — the
+--- combined git diff of the session's changed files), without leaving the
+--- list. Works for any listed session, not just the current tab's, same as
+--- the rename key.
+local function diff_under_cursor()
+    local _, session = row_session_under_cursor()
+    if not session then
+        return
+    end
+    local Notify = require("pi.notify")
+    if not session.rpc:is_running() then
+        Notify.warn("Cannot review diff: the session process is not running")
+        return
+    end
+    require("pi").diff_review(session)
+end
+
 ---@return integer
 local function ensure_buf()
     if buf and vim.api.nvim_buf_is_valid(buf) then
@@ -853,6 +871,12 @@ local function ensure_buf()
         vim.tbl_extend("force", map_opts, { desc = "Show this session's stats" })
     )
     vim.keymap.set("n", "c", compact_under_cursor, vim.tbl_extend("force", map_opts, { desc = "Compact this session" }))
+    vim.keymap.set(
+        "n",
+        "d",
+        diff_under_cursor,
+        vim.tbl_extend("force", map_opts, { desc = "Review this session's diff" })
+    )
     vim.keymap.set("n", "R", function()
         name_cache = setmetatable({}, { __mode = "k" })
         M._render()

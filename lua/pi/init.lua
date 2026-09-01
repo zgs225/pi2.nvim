@@ -243,12 +243,13 @@ function M.sessions()
     require("pi.ui.sessions").toggle()
 end
 
---- Review every file changed by the current session (:PiDiff): a floating
+--- Review every file changed by a session (:PiDiff): a floating
 --- window with the combined `git diff` of the session's changed files.
 --- Untracked files render as full-file additions; <CR>/o jumps to the file
 --- and line under the cursor, q closes.
-function M.diff_review()
-    require("pi.ui.diff_review").open()
+---@param session? pi.Session session whose changed files to review (default: the current tab's)
+function M.diff_review(session)
+    require("pi.ui.diff_review").open(session)
 end
 
 --- Toggle thinking block visibility.
