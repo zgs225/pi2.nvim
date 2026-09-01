@@ -625,6 +625,7 @@ local HELP_ENTRIES = {
     { "a, i", "Open the session and type at its prompt's end" },
     { "r", "Rename the session under the cursor" },
     { "s", "Show this session's stats (:PiSessionStats)" },
+    { "c", "Compact this session in the background" },
     { "R", "Refresh the list" },
     { "q", "Close the list" },
     { "?", "Toggle this help" },
@@ -725,14 +726,21 @@ local function session_for_tab(tab)
     return nil
 end
 
-local function jump_under_cursor(at_end)
+--- Row and session under the cursor. nil, nil when the row is gone, its tab
+--- is no longer valid, or the tab holds no live session.
+---@return pi.SessionsListRow?, pi.Session?
+local function row_session_under_cursor()
     local lnum = vim.api.nvim_win_get_cursor(0)[1]
     local row = rows[lnum]
     if not row or not vim.api.nvim_tabpage_is_valid(row.tab) then
-        return
+        return nil, nil
     end
-    local session = session_for_tab(row.tab)
-    if not session then
+    return row, session_for_tab(row.tab)
+end
+
+local function jump_under_cursor(at_end)
+    local row, session = row_session_under_cursor()
+    if not row or not session then
         return
     end
     vim.api.nvim_set_current_tabpage(row.tab)
@@ -750,12 +758,7 @@ end
 --- current tab's). The backend's session_info_changed event updates the row
 --- via M.on_session_info_changed.
 local function rename_under_cursor()
-    local lnum = vim.api.nvim_win_get_cursor(0)[1]
-    local row = rows[lnum]
-    if not row or not vim.api.nvim_tabpage_is_valid(row.tab) then
-        return
-    end
-    local session = session_for_tab(row.tab)
+    local _, session = row_session_under_cursor()
     if not session then
         return
     end
@@ -785,12 +788,7 @@ end
 --- list). Works for any listed session, not just the current tab's, same as
 --- the rename key.
 local function stats_under_cursor()
-    local lnum = vim.api.nvim_win_get_cursor(0)[1]
-    local row = rows[lnum]
-    if not row or not vim.api.nvim_tabpage_is_valid(row.tab) then
-        return
-    end
-    local session = session_for_tab(row.tab)
+    local _, session = row_session_under_cursor()
     if not session then
         return
     end
@@ -800,6 +798,24 @@ local function stats_under_cursor()
         return
     end
     require("pi").session_stats(session)
+end
+
+--- Compact the session under the cursor: send the compact command straight to
+--- that session's backend, without leaving the list — the compaction runs in
+--- the background and the row's status dot switches to the compacting state.
+--- Works for any listed session, not just the current tab's, same as the
+--- rename key.
+local function compact_under_cursor()
+    local _, session = row_session_under_cursor()
+    if not session then
+        return
+    end
+    local Notify = require("pi.notify")
+    if not session.rpc:is_running() then
+        Notify.warn("Cannot compact: the session process is not running")
+        return
+    end
+    require("pi").compact(nil, session)
 end
 
 ---@return integer
@@ -836,6 +852,7 @@ local function ensure_buf()
         stats_under_cursor,
         vim.tbl_extend("force", map_opts, { desc = "Show this session's stats" })
     )
+    vim.keymap.set("n", "c", compact_under_cursor, vim.tbl_extend("force", map_opts, { desc = "Compact this session" }))
     vim.keymap.set("n", "R", function()
         name_cache = setmetatable({}, { __mode = "k" })
         M._render()

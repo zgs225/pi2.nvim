@@ -67,11 +67,12 @@ describe("session list help overlay", function()
         assert.equals(before, vim.api.nvim_get_current_win())
 
         local text = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
-        for _, key in ipairs({ "<CR>, o", "a, i", "r", "s", "R", "q", "?" }) do
+        for _, key in ipairs({ "<CR>, o", "a, i", "r", "s", "c", "R", "q", "?" }) do
             assert.is_truthy(text:find(key, 1, true), "help should list " .. key)
         end
         assert.is_truthy(text:find("Rename the session under the cursor", 1, true), "help should describe rename")
         assert.is_truthy(text:find("Show this session's stats", 1, true), "help should describe stats")
+        assert.is_truthy(text:find("Compact this session in the background", 1, true), "help should describe compact")
         assert.is_truthy(text:find("Refresh the list", 1, true), "help should describe refresh")
     end)
 

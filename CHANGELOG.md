@@ -2,6 +2,8 @@
 
 ## 2026-09-01
 
+- **ADDED:** sessions-overview key `c` — compact the session under the cursor in the background (`pi.compact(custom_instructions?, session?)`; same as `:PiCompact`, without leaving the list — the row's status dot switches to the compacting state while it runs). Works for any listed session, not just the current tab's; a dead session's row warns instead of doing nothing. Issue #101.
+
 - **ADDED:** sessions-overview key `s` — show the stats dashboard of the session under the cursor (`pi.session_stats(session)`; same data as `:PiSessionStats` — identity, tokens, cost breakdown, cache waste, context — in a dialog float, without leaving the list). Works for any listed session, not just the current tab's, like the rename key; a dead session's row warns instead of doing nothing.
 
 ## 2026-08-31

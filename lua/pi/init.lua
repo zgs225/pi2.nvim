@@ -375,12 +375,18 @@ end
 
 --- Manually compact conversation context.
 ---@param custom_instructions? string optional instructions to guide compaction
-function M.compact(custom_instructions)
+---@param session? pi.Session session to compact (default: the current tab's)
+function M.compact(custom_instructions, session)
     local Notify = require("pi.notify")
-    local session = require("pi.sessions.manager").get()
-    if not session or not session.rpc:is_running() then
-        Notify.warn("No active session")
-        return
+    local Sessions = require("pi.sessions.manager")
+    if session == nil then
+        session = Sessions.get()
+        if not session or not session.rpc:is_running() then
+            Notify.warn("No active session")
+            return
+        end
+    elseif not session.rpc:is_running() then
+        return -- explicit target: silent no-op (the caller owns the warning)
     end
     if session.chat:is_streaming() then
         Notify.warn("Cannot compact while streaming")
