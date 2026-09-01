@@ -495,17 +495,21 @@ function M.toggle_debug()
     require("pi.rpc").toggle_debug()
 end
 
---- Show the current session's stats dashboard (:PiSessionStats): identity,
---- message counts, token usage (with cache split), per-model cost breakdown
---- (via get_entries, port of the TUI's getUsageCostBreakdown), cache re-billed
---- waste, extension-recorded usage (custom entries, e.g. vision input-hook
---- calls, in a separate Extensions section), and context-window usage with a
---- threshold-colored bar.
---- Silent no-op without an active session; a failed get_entries degrades to
---- the session-stats-only view.
-function M.session_stats()
+--- Show a session's stats dashboard (:PiSessionStats, `s` in the sessions
+--- overview): identity, message counts, token usage (with cache split),
+--- per-model cost breakdown (via get_entries, port of the TUI's
+--- getUsageCostBreakdown), cache re-billed waste, extension-recorded usage
+--- (custom entries, e.g. vision input-hook calls, in a separate Extensions
+--- section), and context-window usage with a threshold-colored bar.
+--- Silent no-op without an active session (or when the given session's
+--- process is not running); a failed get_entries degrades to the
+--- session-stats-only view.
+---@param session? pi.Session session to inspect (default: the current tab's)
+function M.session_stats(session)
     local Sessions = require("pi.sessions.manager")
-    local session = Sessions.get()
+    if session == nil then
+        session = Sessions.get()
+    end
     if not session or not session.rpc:is_running() then
         return
     end

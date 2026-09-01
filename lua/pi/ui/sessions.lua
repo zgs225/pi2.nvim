@@ -624,6 +624,7 @@ local HELP_ENTRIES = {
     { "<CR>, o", "Open the session under the cursor" },
     { "a, i", "Open the session and type at its prompt's end" },
     { "r", "Rename the session under the cursor" },
+    { "s", "Show this session's stats (:PiSessionStats)" },
     { "R", "Refresh the list" },
     { "q", "Close the list" },
     { "?", "Toggle this help" },
@@ -779,6 +780,28 @@ local function rename_under_cursor()
     end)
 end
 
+--- Show the stats dashboard for the session under the cursor (:PiSessionStats
+--- data — tokens, cost, context — in a dialog float, without leaving the
+--- list). Works for any listed session, not just the current tab's, same as
+--- the rename key.
+local function stats_under_cursor()
+    local lnum = vim.api.nvim_win_get_cursor(0)[1]
+    local row = rows[lnum]
+    if not row or not vim.api.nvim_tabpage_is_valid(row.tab) then
+        return
+    end
+    local session = session_for_tab(row.tab)
+    if not session then
+        return
+    end
+    local Notify = require("pi.notify")
+    if not session.rpc:is_running() then
+        Notify.warn("Cannot show stats: the session process is not running")
+        return
+    end
+    require("pi").session_stats(session)
+end
+
 ---@return integer
 local function ensure_buf()
     if buf and vim.api.nvim_buf_is_valid(buf) then
@@ -807,6 +830,12 @@ local function ensure_buf()
         jump_under_cursor(true)
     end, vim.tbl_extend("force", map_opts, { desc = "Open this session and append to its prompt" }))
     vim.keymap.set("n", "r", rename_under_cursor, vim.tbl_extend("force", map_opts, { desc = "Rename this session" }))
+    vim.keymap.set(
+        "n",
+        "s",
+        stats_under_cursor,
+        vim.tbl_extend("force", map_opts, { desc = "Show this session's stats" })
+    )
     vim.keymap.set("n", "R", function()
         name_cache = setmetatable({}, { __mode = "k" })
         M._render()
