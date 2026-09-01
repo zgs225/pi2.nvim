@@ -216,4 +216,27 @@ describe("session list stats key", function()
         -- The dead session never received the stats requests.
         assert.is_falsy(vim.tbl_contains(s.sent, "get_session_stats"))
     end)
+
+    it("is a silent no-op when passed an explicit dead session", function()
+        -- Direct pi.session_stats(session) contract: a session whose process
+        -- is not running returns without a dialog, a request, or a warning
+        -- (the list layer owns the user-facing warning).
+        local real_notify = package.loaded["pi.notify"]
+        local warnings = {}
+        package.loaded["pi.notify"] = {
+            warn = function(msg)
+                table.insert(warnings, msg)
+            end,
+        }
+        local s = stats_session({ running = false, tab = vim.api.nvim_get_current_tabpage() })
+        require("pi").session_stats(s)
+        vim.wait(200, function()
+            return false
+        end)
+        package.loaded["pi.notify"] = real_notify
+
+        assert.are.equal(0, #s.sent)
+        assert.are.equal(0, #warnings)
+        assert.is_nil(find_stats_win())
+    end)
 end)
