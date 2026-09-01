@@ -193,6 +193,39 @@ describe("stats.get_usage_cost_breakdown", function()
         assert.are.equal(0.004, result[1].cost)
     end)
 
+    it("sums images across vision-marked tool results per model", function()
+        local entries = {
+            entry("message", {
+                message = {
+                    role = "toolResult",
+                    usage = usage(0, 0, 0, 0, { total = 0.004 }),
+                    details = { piVision = { model = "openrouter/qwen-vl", images = 1 } },
+                },
+            }),
+            entry("message", {
+                message = {
+                    role = "toolResult",
+                    usage = usage(0, 0, 0, 0, { total = 0.005 }),
+                    details = { piVision = { model = "openrouter/qwen-vl", images = 2 } },
+                },
+            }),
+        }
+        local result = Stats.get_usage_cost_breakdown(entries)
+        assert.are.equal(1, #result)
+        assert.are.equal("vision/openrouter/qwen-vl", result[1].key)
+        assert.are.equal(3, result[1].images)
+    end)
+
+    it("leaves the images field absent for non-vision rows", function()
+        local entries = {
+            entry("message", { message = { role = "toolResult", usage = usage(0, 0, 0, 0, { total = 0.004 }) } }),
+            assistant_entry("deepseek", "deepseek-chat", usage(100, 10, 0, 0)),
+        }
+        local result = Stats.get_usage_cost_breakdown(entries)
+        assert.is_nil(result[1].images)
+        assert.is_nil(result[2].images)
+    end)
+
     it("keeps vision-marked tool results out of the Tools/summaries bucket", function()
         local entries = {
             entry("message", {
@@ -569,6 +602,23 @@ describe("stats.render_stats", function()
         assert.are.equal("PiToolHeader", rendered.highlights[ext_i - 1][1].hl)
         assert.are.equal("Comment", rendered.highlights[ext_i][1].hl)
         assert.are.equal(1, #rendered.highlights[ext_i])
+    end)
+
+    it("appends the image count to vision rows in the Cost section", function()
+        local breakdown = {
+            { key = "vision/openrouter/qwen-vl", cost = 0.004, tokens = 1000, images = 1 },
+        }
+        local rendered = Stats.render_stats(SAMPLE_STATS, breakdown, {
+            missedTokens = 0,
+            missedCost = 0,
+            missCount = 0,
+        })
+        assert.is_not_nil(
+            vim.tbl_contains(
+                rendered.lines,
+                "  vision/openrouter/qwen-vl  $0.004 ░░░░░░░░░░ 1% · 1 image"
+            )
+        )
     end)
 
     it("omits the Extensions section without recorded usage", function()

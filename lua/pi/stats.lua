@@ -40,6 +40,7 @@ end
 ---@field key string
 ---@field cost number
 ---@field tokens integer
+---@field images? integer vision-marked tool results' image count (Cost-section suffix)
 
 ---@class pi.StatsExtensionUsage
 ---@field key string
@@ -72,10 +73,11 @@ end
 --- Falls back to the shared bucket when the marker is missing or malformed.
 ---@param message table toolResult message
 ---@return string key
+---@return integer? images image count from details.piVision (vision rows only)
 local function tool_key(message)
     local pi_vision = message.details and message.details.piVision
     if type(pi_vision) == "table" and type(pi_vision.model) == "string" and pi_vision.model ~= "" then
-        return "vision/" .. pi_vision.model
+        return "vision/" .. pi_vision.model, pi_vision.images
     end
     return "Tools/summaries"
 end
@@ -92,6 +94,9 @@ end
 function M.get_usage_cost_breakdown(entries)
     local by_key = {}
     local order = {}
+    --- Image counts from vision-marked tool results (details.piVision.images),
+    --- keyed like the rows so the Cost section can append "· N images".
+    local images_by_key = {}
 
     for _, entry in ipairs(entries) do
         local key
@@ -101,8 +106,12 @@ function M.get_usage_cost_breakdown(entries)
             key = message.provider .. "/" .. (message.responseModel or message.model)
             usage = message.usage
         elseif entry.type == "message" and message and message.role == "toolResult" and message.usage then
-            key = tool_key(message)
+            local images
+            key, images = tool_key(message)
             usage = message.usage
+            if type(images) == "number" and images > 0 then
+                images_by_key[key] = (images_by_key[key] or 0) + images
+            end
         elseif (entry.type == "branch_summary" or entry.type == "compaction") and entry.usage then
             key = "Tools/summaries"
             usage = entry.usage
@@ -121,7 +130,12 @@ function M.get_usage_cost_breakdown(entries)
         local totals = by_key[key]
         local tokens = totals.input + totals.output + totals.cacheRead + totals.cacheWrite
         if totals.cost > 0 or tokens > 0 then
-            result[#result + 1] = { key = key, cost = totals.cost, tokens = tokens }
+            result[#result + 1] = {
+                key = key,
+                cost = totals.cost,
+                tokens = tokens,
+                images = images_by_key[key],
+            }
         end
     end
     table.sort(result, function(a, b)
@@ -439,6 +453,9 @@ function M.render_stats(stats, breakdown, cache_waste, extension_usage)
                     .. " "
                     .. bar
                     .. string.format(" %d%%", math.floor(pct * 100 + 0.5))
+                if entry.images and entry.images > 0 then
+                    line = line .. " · " .. entry.images .. (entry.images == 1 and " image" or " images")
+                end
                 local ranges = { { start_col = 0, end_col = 2 + key_width, hl = "Comment" } }
                 if filled > 0 then
                     ranges[#ranges + 1] = { start_col = bar_start, end_col = bar_start + filled, hl = "PiStatsBar" }

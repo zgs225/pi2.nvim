@@ -428,7 +428,7 @@ export default function visionFallback(pi: ExtensionAPI): void {
 				usage: mergeUsage(event.usage, result.usage),
 				// Marks the usage as the vision model's so pi.nvim can
 				// attribute it to vision/<model> instead of Tools/summaries.
-				details: { ...event.details, piVision: { model: modelRef } },
+				details: { ...event.details, piVision: { model: modelRef, images: images.length } },
 			};
 		} catch (err) {
 			return failSoft(errorMessage(err));
