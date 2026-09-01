@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-09-01
+
+- **ADDED:** sessions-overview key `s` — show the stats dashboard of the session under the cursor (`pi.session_stats(session)`; same data as `:PiSessionStats` — identity, tokens, cost breakdown, cache waste, context — in a dialog float, without leaving the list). Works for any listed session, not just the current tab's, like the rename key; a dead session's row warns instead of doing nothing.
+
 ## 2026-08-31
 
 - **ADDED:** the vision fallback's two LLM calls are now accounted in `:PiSessionStats`. Both calls bypass the agent loop, so they used to be invisible to every usage view. The `read`-tool path now returns the combined usage on the tool result — pi persists it and counts it in footer, `/session` and the RPC session totals, and the cost breakdown re-attributes it from `Tools/summaries` to a `vision/<model>` row (with the image count appended); the attached-images path persists a custom entry (`pi.appendEntry("pi-vision-usage", …)`) that pi.nvim aggregates into a new `Extensions` section below Cost (`vision/<model>  $0.012 · 45.2k tokens · 3 calls`), deliberately kept out of the header total so `Cost` stays exactly comparable to the TUI `/session` panel. Sessions that predate this accounting render unchanged. Issue #100.
