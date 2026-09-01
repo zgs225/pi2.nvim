@@ -625,6 +625,11 @@ local HELP_ENTRIES = {
     { "a, i", "Open the session and type at its prompt's end" },
     { "r", "Rename the session under the cursor" },
     { "s", "Show this session's stats (:PiSessionStats)" },
+    { "c", "Compact this session in the background" },
+    { "d", "Review this session's changed files (:PiDiff)" },
+    { "f", "Fork this session from a past message (:PiFork)" },
+    { "C", "Clone this session (:PiClone)" },
+    { "t", "Navigate this session's tree (:PiTree)" },
     { "R", "Refresh the list" },
     { "q", "Close the list" },
     { "?", "Toggle this help" },
@@ -725,14 +730,21 @@ local function session_for_tab(tab)
     return nil
 end
 
-local function jump_under_cursor(at_end)
+--- Row and session under the cursor. nil, nil when the row is gone, its tab
+--- is no longer valid, or the tab holds no live session.
+---@return pi.SessionsListRow?, pi.Session?
+local function row_session_under_cursor()
     local lnum = vim.api.nvim_win_get_cursor(0)[1]
     local row = rows[lnum]
     if not row or not vim.api.nvim_tabpage_is_valid(row.tab) then
-        return
+        return nil, nil
     end
-    local session = session_for_tab(row.tab)
-    if not session then
+    return row, session_for_tab(row.tab)
+end
+
+local function jump_under_cursor(at_end)
+    local row, session = row_session_under_cursor()
+    if not row or not session then
         return
     end
     vim.api.nvim_set_current_tabpage(row.tab)
@@ -750,12 +762,7 @@ end
 --- current tab's). The backend's session_info_changed event updates the row
 --- via M.on_session_info_changed.
 local function rename_under_cursor()
-    local lnum = vim.api.nvim_win_get_cursor(0)[1]
-    local row = rows[lnum]
-    if not row or not vim.api.nvim_tabpage_is_valid(row.tab) then
-        return
-    end
-    local session = session_for_tab(row.tab)
+    local _, session = row_session_under_cursor()
     if not session then
         return
     end
@@ -785,12 +792,7 @@ end
 --- list). Works for any listed session, not just the current tab's, same as
 --- the rename key.
 local function stats_under_cursor()
-    local lnum = vim.api.nvim_win_get_cursor(0)[1]
-    local row = rows[lnum]
-    if not row or not vim.api.nvim_tabpage_is_valid(row.tab) then
-        return
-    end
-    local session = session_for_tab(row.tab)
+    local _, session = row_session_under_cursor()
     if not session then
         return
     end
@@ -800,6 +802,73 @@ local function stats_under_cursor()
         return
     end
     require("pi").session_stats(session)
+end
+
+--- Compact the session under the cursor: send the compact command straight to
+--- that session's backend, without leaving the list — the compaction runs in
+--- the background and the row's status dot switches to the compacting state.
+--- Works for any listed session, not just the current tab's, same as the
+--- rename key.
+local function compact_under_cursor()
+    local _, session = row_session_under_cursor()
+    if not session then
+        return
+    end
+    local Notify = require("pi.notify")
+    if not session.rpc:is_running() then
+        Notify.warn("Cannot compact: the session process is not running")
+        return
+    end
+    require("pi").compact(nil, session)
+end
+
+--- Open the diff review for the session under the cursor (:PiDiff data — the
+--- combined git diff of the session's changed files), without leaving the
+--- list. Works for any listed session, not just the current tab's, same as
+--- the rename key.
+local function diff_under_cursor()
+    local _, session = row_session_under_cursor()
+    if not session then
+        return
+    end
+    local Notify = require("pi.notify")
+    if not session.rpc:is_running() then
+        Notify.warn("Cannot review diff: the session process is not running")
+        return
+    end
+    require("pi").diff_review(session)
+end
+
+--- Fork / clone / tree actions: jump to the target session's tab first, then
+--- run the module entry — Sessions.get() resolves to the target session, so
+--- the pickers, prefill and streaming guards all run unchanged against it
+--- (the interplay is chat-centered, so being on that session's tab is the
+--- right UX).
+local function fork_under_cursor()
+    local _, session = row_session_under_cursor()
+    if not session then
+        return
+    end
+    jump_under_cursor()
+    require("pi").fork()
+end
+
+local function clone_under_cursor()
+    local _, session = row_session_under_cursor()
+    if not session then
+        return
+    end
+    jump_under_cursor()
+    require("pi").clone()
+end
+
+local function tree_under_cursor()
+    local _, session = row_session_under_cursor()
+    if not session then
+        return
+    end
+    jump_under_cursor()
+    require("pi").tree()
 end
 
 ---@return integer
@@ -835,6 +904,21 @@ local function ensure_buf()
         "s",
         stats_under_cursor,
         vim.tbl_extend("force", map_opts, { desc = "Show this session's stats" })
+    )
+    vim.keymap.set("n", "c", compact_under_cursor, vim.tbl_extend("force", map_opts, { desc = "Compact this session" }))
+    vim.keymap.set(
+        "n",
+        "d",
+        diff_under_cursor,
+        vim.tbl_extend("force", map_opts, { desc = "Review this session's diff" })
+    )
+    vim.keymap.set("n", "f", fork_under_cursor, vim.tbl_extend("force", map_opts, { desc = "Fork this session" }))
+    vim.keymap.set("n", "C", clone_under_cursor, vim.tbl_extend("force", map_opts, { desc = "Clone this session" }))
+    vim.keymap.set(
+        "n",
+        "t",
+        tree_under_cursor,
+        vim.tbl_extend("force", map_opts, { desc = "Navigate this session's tree" })
     )
     vim.keymap.set("n", "R", function()
         name_cache = setmetatable({}, { __mode = "k" })

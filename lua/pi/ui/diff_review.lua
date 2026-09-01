@@ -14,7 +14,6 @@ local M = {}
 local Config = require("pi.config")
 local Ft = require("pi.filetypes")
 local Highlights = require("pi.ui.highlights")
-local Notify = require("pi.notify")
 
 local ns = vim.api.nvim_create_namespace("pi-diff-review")
 
@@ -925,14 +924,18 @@ local function collect(files, session_cwd, done)
     resolve_next()
 end
 
---- Open the diff review for the current session's changed files.
+--- Open the diff review for a session's changed files.
 --- No-op with a warning when there is no session or nothing was changed.
 --- Paths are anchored at the session's cwd and grouped by the git work tree
 --- they actually live in; files outside any work tree are counted and
 --- skipped. Re-opening refreshes.
-function M.open()
+---@param session? pi.Session session whose changed files to review (default: the current tab's)
+function M.open(session)
+    local Notify = require("pi.notify")
     local Sessions = require("pi.sessions.manager")
-    local session = Sessions.get()
+    if session == nil then
+        session = Sessions.get()
+    end
     if not session then
         Notify.warn(":PiDiff — no active session")
         return

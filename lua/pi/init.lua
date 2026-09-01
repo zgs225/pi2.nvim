@@ -243,12 +243,13 @@ function M.sessions()
     require("pi.ui.sessions").toggle()
 end
 
---- Review every file changed by the current session (:PiDiff): a floating
+--- Review every file changed by a session (:PiDiff): a floating
 --- window with the combined `git diff` of the session's changed files.
 --- Untracked files render as full-file additions; <CR>/o jumps to the file
 --- and line under the cursor, q closes.
-function M.diff_review()
-    require("pi.ui.diff_review").open()
+---@param session? pi.Session session whose changed files to review (default: the current tab's)
+function M.diff_review(session)
+    require("pi.ui.diff_review").open(session)
 end
 
 --- Toggle thinking block visibility.
@@ -375,12 +376,18 @@ end
 
 --- Manually compact conversation context.
 ---@param custom_instructions? string optional instructions to guide compaction
-function M.compact(custom_instructions)
+---@param session? pi.Session session to compact (default: the current tab's)
+function M.compact(custom_instructions, session)
     local Notify = require("pi.notify")
-    local session = require("pi.sessions.manager").get()
-    if not session or not session.rpc:is_running() then
-        Notify.warn("No active session")
-        return
+    local Sessions = require("pi.sessions.manager")
+    if session == nil then
+        session = Sessions.get()
+        if not session or not session.rpc:is_running() then
+            Notify.warn("No active session")
+            return
+        end
+    elseif not session.rpc:is_running() then
+        return -- explicit target: silent no-op (the caller owns the warning)
     end
     if session.chat:is_streaming() then
         Notify.warn("Cannot compact while streaming")
