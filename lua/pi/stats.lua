@@ -1,10 +1,13 @@
 --- Session statistics: pure formatting and aggregation for :PiSessionStats.
 ---
 --- Mirrors the TUI's /session info panel: SessionStats from get_session_stats,
---- the per-model cost breakdown (getUsageCostBreakdown over get_entries), and
---- the cache re-billed waste (computeCacheWaste). No UI dependencies — every
---- function here is testable in isolation; the float itself is rendered via
---- dialog.info() with per-line highlight ranges.
+--- the per-model cost breakdown (getUsageCostBreakdown over get_entries), the
+--- cache re-billed waste (computeCacheWaste), and extension-recorded usage
+--- (custom entries from input-hook LLM calls — e.g. the vision extension's
+--- description calls — shown in a separate Extensions section since they are
+--- not part of pi's own totals). No UI dependencies — every function here is
+--- testable in isolation; the float itself is rendered via dialog.info() with
+--- per-line highlight ranges.
 
 local M = {}
 
@@ -37,6 +40,14 @@ end
 ---@field key string
 ---@field cost number
 ---@field tokens integer
+---@field images? integer vision-marked tool results' image count (Cost-section suffix)
+
+---@class pi.StatsExtensionUsage
+---@field key string
+---@field cost number
+---@field tokens integer
+---@field calls integer
+---@field images? integer
 
 ---@class pi.StatsTotals
 ---@field input number
@@ -57,6 +68,20 @@ local function add_usage(totals, usage)
     totals.cost = totals.cost + (cost and cost.total or 0)
 end
 
+--- key for a toolResult whose usage was produced by an extension's nested LLM
+--- call (the bundled vision extension marks its own via details.piVision).
+--- Falls back to the shared bucket when the marker is missing or malformed.
+---@param message table toolResult message
+---@return string key
+---@return integer? images image count from details.piVision (vision rows only)
+local function tool_key(message)
+    local pi_vision = message.details and message.details.piVision
+    if type(pi_vision) == "table" and type(pi_vision.model) == "string" and pi_vision.model ~= "" then
+        return "vision/" .. pi_vision.model, pi_vision.images
+    end
+    return "Tools/summaries"
+end
+
 --- Group attributable usage by model, with tool results, compaction and branch
 --- summaries in a shared bucket. Port of the TUI's getUsageCostBreakdown
 --- (packages/coding-agent/src/core/usage-totals.ts): assistant messages are
@@ -69,6 +94,9 @@ end
 function M.get_usage_cost_breakdown(entries)
     local by_key = {}
     local order = {}
+    --- Image counts from vision-marked tool results (details.piVision.images),
+    --- keyed like the rows so the Cost section can append "· N images".
+    local images_by_key = {}
 
     for _, entry in ipairs(entries) do
         local key
@@ -78,8 +106,12 @@ function M.get_usage_cost_breakdown(entries)
             key = message.provider .. "/" .. (message.responseModel or message.model)
             usage = message.usage
         elseif entry.type == "message" and message and message.role == "toolResult" and message.usage then
-            key = "Tools/summaries"
+            local images
+            key, images = tool_key(message)
             usage = message.usage
+            if type(images) == "number" and images > 0 then
+                images_by_key[key] = (images_by_key[key] or 0) + images
+            end
         elseif (entry.type == "branch_summary" or entry.type == "compaction") and entry.usage then
             key = "Tools/summaries"
             usage = entry.usage
@@ -98,7 +130,12 @@ function M.get_usage_cost_breakdown(entries)
         local totals = by_key[key]
         local tokens = totals.input + totals.output + totals.cacheRead + totals.cacheWrite
         if totals.cost > 0 or tokens > 0 then
-            result[#result + 1] = { key = key, cost = totals.cost, tokens = tokens }
+            result[#result + 1] = {
+                key = key,
+                cost = totals.cost,
+                tokens = tokens,
+                images = images_by_key[key],
+            }
         end
     end
     table.sort(result, function(a, b)
@@ -113,6 +150,67 @@ function M.get_usage_cost_breakdown(entries)
     return result
 end
 
+--- Aggregate usage recorded by extensions via pi.appendEntry custom entries:
+--- extension-side LLM calls that bypass the agent loop (e.g. the vision
+--- extension's input-hook description calls) are never part of pi's own
+--- session totals, so they are reported separately.
+---
+--- Only the bundled vision extension currently records usage, with customType
+--- "pi-vision-usage" and data { model, usage, images }. Keys use "vision/<model>"
+--- so a model's tool-result usage (re-attributed in get_usage_cost_breakdown)
+--- and its custom-entry usage share the same naming. Entries without a usage
+--- payload are skipped; token-only models (cost 0) are still listed.
+---@param entries table[] SessionEntry list from the RPC get_entries response
+---@return pi.StatsExtensionUsage[]
+function M.get_extension_usage(entries)
+    local by_key = {}
+    local order = {}
+
+    for _, entry in ipairs(entries) do
+        if entry.type ~= "custom" or entry.customType ~= "pi-vision-usage" then
+            goto continue
+        end
+        local data = entry.data
+        local usage = type(data) == "table" and data.usage or nil
+        if type(usage) == "table" then
+            local model = data.model
+            local key = "vision/" .. (type(model) == "string" and model ~= "" and model or "unknown")
+            if not by_key[key] then
+                by_key[key] = { input = 0, output = 0, cacheRead = 0, cacheWrite = 0, cost = 0, calls = 0, images = 0 }
+                order[#order + 1] = key
+            end
+            add_usage(by_key[key], usage)
+            by_key[key].calls = by_key[key].calls + 1
+            if type(data.images) == "number" then
+                by_key[key].images = by_key[key].images + data.images
+            end
+        end
+        ::continue::
+    end
+
+    local result = {}
+    for _, key in ipairs(order) do
+        local totals = by_key[key]
+        local tokens = totals.input + totals.output + totals.cacheRead + totals.cacheWrite
+        result[#result + 1] = {
+            key = key,
+            cost = totals.cost,
+            tokens = tokens,
+            calls = totals.calls,
+            images = totals.images,
+        }
+    end
+    table.sort(result, function(a, b)
+        if a.cost ~= b.cost then
+            return a.cost > b.cost
+        end
+        if a.tokens ~= b.tokens then
+            return a.tokens > b.tokens
+        end
+        return a.key < b.key
+    end)
+    return result
+end
 -- ============================================================================
 -- Cache waste (port of the TUI's computeCacheWaste, core/cache-stats.ts)
 -- ============================================================================
@@ -263,11 +361,12 @@ end
 ---@param stats table SessionStats from the RPC get_session_stats response
 ---@param breakdown pi.StatsCostEntry[] cost breakdown (empty when unavailable)
 ---@param cache_waste pi.StatsCacheWaste cache waste totals (all zeros when unavailable)
+---@param extension_usage? pi.StatsExtensionUsage[] extension-recorded usage (nil/empty = no section)
 ---@return pi.StatsRender
-function M.render_stats(stats, breakdown, cache_waste)
+function M.render_stats(stats, breakdown, cache_waste, extension_usage)
     local lines = {}
     local highlights = {}
-
+    extension_usage = extension_usage or {}
     local function add_line(text, ranges)
         local row = #lines
         lines[#lines + 1] = text
@@ -354,6 +453,9 @@ function M.render_stats(stats, breakdown, cache_waste)
                     .. " "
                     .. bar
                     .. string.format(" %d%%", math.floor(pct * 100 + 0.5))
+                if entry.images and entry.images > 0 then
+                    line = line .. " · " .. entry.images .. (entry.images == 1 and " image" or " images")
+                end
                 local ranges = { { start_col = 0, end_col = 2 + key_width, hl = "Comment" } }
                 if filled > 0 then
                     ranges[#ranges + 1] = { start_col = bar_start, end_col = bar_start + filled, hl = "PiStatsBar" }
@@ -371,6 +473,35 @@ function M.render_stats(stats, breakdown, cache_waste)
                 text = "  Cache re-billed  " .. detail
             end
             add_line(text, { { start_col = 0, end_col = 2 + #"Cache re-billed", hl = "Comment" } })
+        end
+    end
+
+    -- Extensions: usage input-hook extensions recorded via custom entries. It
+    -- bypasses the agent loop, so it is NOT part of stats.cost above (the
+    -- header stays exactly comparable to the TUI /session panel); shown as a
+    -- separate section without bars. Cost 0 rows (token-only models) still
+    -- appear so the calls are visible.
+    if #extension_usage > 0 then
+        section("Extensions")
+        local key_width = 0
+        for _, entry in ipairs(extension_usage) do
+            key_width = math.max(key_width, math.min(#entry.key, MAX_KEY_WIDTH))
+        end
+        for _, entry in ipairs(extension_usage) do
+            local key = truncate(entry.key, MAX_KEY_WIDTH)
+            local calls = entry.calls == 1 and "1 call" or (entry.calls .. " calls")
+            local detail = string.format("$%.3f", entry.cost)
+                .. " · "
+                .. M.format_tokens(entry.tokens)
+                .. " tokens · "
+                .. calls
+            if entry.images and entry.images > 0 then
+                detail = detail .. " · " .. entry.images .. (entry.images == 1 and " image" or " images")
+            end
+            add_line(
+                "  " .. key .. string.rep(" ", key_width - #key) .. "  " .. detail,
+                { { start_col = 0, end_col = 2 + key_width, hl = "Comment" } }
+            )
         end
     end
 

@@ -26,6 +26,14 @@
  *   4. (input hook) Transform the input: append the description as a
  *      `<pi-vision>` marker block, drop the images.
  *
+ * Usage accounting: both LLM calls bypass the agent loop, so on their own
+ * they leave no usage in the session. After a successful describe, the input
+ * hook persists a custom entry (`pi.appendEntry("pi-vision-usage", …)`) that
+ * pi.nvim's :PiSessionStats aggregates into an "Extensions" section; the
+ * tool_result hook instead returns the combined usage on the tool result,
+ * which pi itself persists and counts in footer, /session and session totals
+ * (0.81.0+).
+ *
  * Any failure fast-fails: the extension notifies `[pi-vision] <reason>` and
  * returns `{ action: "handled" }`, aborting the submission entirely (throwing
  * would not abort — pi's runner catches handler errors and continues with the
@@ -40,6 +48,7 @@ import type {
 	Model,
 	Provider,
 	SimpleStreamOptions,
+	Usage,
 } from "@earendil-works/pi-ai";
 import { readFileSync } from "node:fs";
 /**
@@ -50,6 +59,34 @@ import { readFileSync } from "node:fs";
 const ENV_FILE = "PI_NVIM_VISION_FILE";
 const NOTIFY_PREFIX = "[pi-vision]";
 const CLOSE_TAG = "</pi-vision>";
+/** customType of the appendEntry record for input-hook vision usage. */
+const USAGE_CUSTOM_TYPE = "pi-vision-usage";
+
+/** Merge Usage payloads (the two LLM calls of one describe pass) into one. */
+function mergeUsage(...usages: Array<Usage | undefined>): Usage {
+	const merged: Usage = {
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 0,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
+	for (const usage of usages) {
+		if (!usage) continue;
+		merged.input += usage.input;
+		merged.output += usage.output;
+		merged.cacheRead += usage.cacheRead;
+		merged.cacheWrite += usage.cacheWrite;
+		merged.totalTokens += usage.totalTokens;
+		merged.cost.input += usage.cost.input;
+		merged.cost.output += usage.cost.output;
+		merged.cost.cacheRead += usage.cost.cacheRead;
+		merged.cost.cacheWrite += usage.cost.cacheWrite;
+		merged.cost.total += usage.cost.total;
+	}
+	return merged;
+}
 
 /**
  * Appended to the system prompt per turn (before_agent_start) while the main
@@ -230,7 +267,7 @@ async function describeImages(
 	visionModel: Model<any>,
 	images: ImageContent[],
 	nextText: string,
-): Promise<string> {
+): Promise<{ text: string; usage: Usage }> {
 	if (!ctx.model) {
 		throw new Error("no current model available to generate the description instruction");
 	}
@@ -253,7 +290,10 @@ async function describeImages(
 		{ messages: [{ role: "user", content, timestamp: Date.now() }] },
 		{ maxTokens: DESCRIPTION_MAX_TOKENS },
 	);
-	return assertCompleted(reply, "vision model call failed");
+	return {
+		text: assertCompleted(reply, "vision model call failed"),
+		usage: mergeUsage(instructionReply.usage, reply.usage),
+	};
 }
 
 export default function visionFallback(pi: ExtensionAPI): void {
@@ -307,10 +347,20 @@ export default function visionFallback(pi: ExtensionAPI): void {
 
 		// 1) + 2) instruction (main model) and description (vision model).
 		let description: string;
+		let usage: Usage | undefined;
 		try {
-			description = await describeImages(ctx, visionModel, event.images, event.text);
+			const result = await describeImages(ctx, visionModel, event.images, event.text);
+			description = result.text;
+			usage = result.usage;
 		} catch (err) {
 			return fail(errorMessage(err));
+		}
+
+		// 3) Record the usage: input-hook LLM calls bypass the agent loop, so
+		// persist a custom entry for pi.nvim's :PiSessionStats ("Extensions"
+		// section; never sent to the LLM, not part of pi's own totals).
+		if (usage) {
+			pi.appendEntry(USAGE_CUSTOM_TYPE, { model: modelRef, usage, images: event.images.length });
 		}
 
 		const separator = event.text.trim() !== "" ? "\n\n" : "";
@@ -362,15 +412,23 @@ export default function visionFallback(pi: ExtensionAPI): void {
 		const rawPath = (event.input as { path?: unknown }).path;
 		const where = typeof rawPath === "string" ? `the image file ${rawPath}` : "an image";
 		try {
-			const description = await describeImages(
+			const result = await describeImages(
 				ctx,
 				visionModel,
 				images,
 				`The agent just used the read tool on ${where}; describe it for the agent's ongoing task.`,
 			);
 			return {
-				content: [{ type: "text", text: `[Image described by ${modelRef}]\n${description}` }],
+				content: [{ type: "text", text: `[Image described by ${modelRef}]\n${result.text}` }],
 				isError: false,
+				// Pi persists the usage on the tool result and counts it in
+				// footer, /session and RPC session totals (0.81.0+). Merged
+				// with any usage an earlier handler recorded — handlers chain,
+				// and returning `usage` replaces rather than merges.
+				usage: mergeUsage(event.usage, result.usage),
+				// Marks the usage as the vision model's so pi.nvim can
+				// attribute it to vision/<model> instead of Tools/summaries.
+				details: { ...event.details, piVision: { model: modelRef, images: images.length } },
 			};
 		} catch (err) {
 			return failSoft(errorMessage(err));

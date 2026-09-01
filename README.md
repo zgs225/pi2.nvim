@@ -247,7 +247,7 @@ require("pi").setup({
 | `:PiFork` | Start a new session from a past user message (rewind and re-ask) |
 | `:PiClone` | Duplicate the current session branch into a new session file |
 | `:PiSessions` | Toggle the live sessions overview (all active sessions: name + busy/idle/attention) |
-| `:PiSessionStats` | Show the session stats dashboard: messages, tokens (with cache split), per-model cost breakdown, cache re-billed waste, context usage |
+| `:PiSessionStats` | Show the session stats dashboard: messages, tokens (with cache split), per-model cost breakdown, cache re-billed waste, context usage — plus the vision extension's own usage (`Extensions` section) |
 | `:PiDiff` | Review the git diff of every file changed by the current session in one panel: file list + diff, grouped per git work tree |
 | `:PiToggleStartupDetails` | Toggle the startup block between compact and expanded |
 | `:PiToggleThinking` | Show or hide thinking blocks |

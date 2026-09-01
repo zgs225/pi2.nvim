@@ -72,6 +72,19 @@ local function assistant_entry(provider, model, usage_data, response_model)
     })
 end
 
+--- Custom entry as persisted by the bundled vision extension (input-hook
+--- description calls: customType "pi-vision-usage", data { model, usage, images }).
+---@param model string
+---@param usage_data table
+---@param images? integer
+---@return table
+local function vision_custom_entry(model, usage_data, images)
+    return entry("custom", {
+        customType = "pi-vision-usage",
+        data = { model = model, usage = usage_data, images = images or 0 },
+    })
+end
+
 local SAMPLE_STATS = {
     sessionFile = "/home/user/.local/share/pi/sessions/abc123.jsonl",
     sessionId = "abc123",
@@ -164,6 +177,89 @@ describe("stats.get_usage_cost_breakdown", function()
         assert.are.equal(0.012, result[1].cost)
     end)
 
+    it("attributes tool results with vision details to vision/<model>", function()
+        local entries = {
+            entry("message", {
+                message = {
+                    role = "toolResult",
+                    usage = usage(0, 0, 0, 0, { total = 0.004 }),
+                    details = { piVision = { model = "openrouter/qwen-vl" } },
+                },
+            }),
+        }
+        local result = Stats.get_usage_cost_breakdown(entries)
+        assert.are.equal(1, #result)
+        assert.are.equal("vision/openrouter/qwen-vl", result[1].key)
+        assert.are.equal(0.004, result[1].cost)
+    end)
+
+    it("sums images across vision-marked tool results per model", function()
+        local entries = {
+            entry("message", {
+                message = {
+                    role = "toolResult",
+                    usage = usage(0, 0, 0, 0, { total = 0.004 }),
+                    details = { piVision = { model = "openrouter/qwen-vl", images = 1 } },
+                },
+            }),
+            entry("message", {
+                message = {
+                    role = "toolResult",
+                    usage = usage(0, 0, 0, 0, { total = 0.005 }),
+                    details = { piVision = { model = "openrouter/qwen-vl", images = 2 } },
+                },
+            }),
+        }
+        local result = Stats.get_usage_cost_breakdown(entries)
+        assert.are.equal(1, #result)
+        assert.are.equal("vision/openrouter/qwen-vl", result[1].key)
+        assert.are.equal(3, result[1].images)
+    end)
+
+    it("leaves the images field absent for non-vision rows", function()
+        local entries = {
+            entry("message", { message = { role = "toolResult", usage = usage(0, 0, 0, 0, { total = 0.004 }) } }),
+            assistant_entry("deepseek", "deepseek-chat", usage(100, 10, 0, 0)),
+        }
+        local result = Stats.get_usage_cost_breakdown(entries)
+        assert.is_nil(result[1].images)
+        assert.is_nil(result[2].images)
+    end)
+
+    it("keeps vision-marked tool results out of the Tools/summaries bucket", function()
+        local entries = {
+            entry("message", {
+                message = {
+                    role = "toolResult",
+                    usage = usage(0, 0, 0, 0, { total = 0.006 }),
+                    details = { piVision = { model = "openrouter/qwen-vl" } },
+                },
+            }),
+            entry("message", { message = { role = "toolResult", usage = usage(0, 0, 0, 0, { total = 0.004 }) } }),
+        }
+        local result = Stats.get_usage_cost_breakdown(entries)
+        assert.are.equal(2, #result)
+        assert.are.equal("vision/openrouter/qwen-vl", result[1].key)
+        assert.are.equal(0.006, result[1].cost)
+        assert.are.equal("Tools/summaries", result[2].key)
+        assert.are.equal(0.004, result[2].cost)
+    end)
+
+    it("falls back to Tools/summaries for malformed vision details", function()
+        local entries = {
+            entry("message", {
+                message = {
+                    role = "toolResult",
+                    usage = usage(0, 0, 0, 0, { total = 0.004 }),
+                    details = { piVision = {} },
+                },
+            }),
+        }
+        local result = Stats.get_usage_cost_breakdown(entries)
+        assert.are.equal(1, #result)
+        assert.are.equal("Tools/summaries", result[1].key)
+    end)
+
     it("ignores user messages and tool results without usage", function()
         local entries = {
             entry("message", { message = { role = "user", content = "hi" } }),
@@ -193,6 +289,51 @@ describe("stats.get_usage_cost_breakdown", function()
         assert.are.equal(8000, result[1].tokens)
         assert.are.equal("free/model-b", result[2].key)
         assert.are.equal(2000, result[2].tokens)
+    end)
+end)
+
+describe("stats.get_extension_usage", function()
+    it("aggregates pi-vision-usage custom entries per model, counting calls and images", function()
+        local entries = {
+            vision_custom_entry("openrouter/qwen-vl", usage(1000, 200, 0, 0, { total = 0.01 }), 2),
+            vision_custom_entry("openrouter/qwen-vl", usage(500, 100, 0, 0, { total = 0.005 }), 3),
+            vision_custom_entry("openai/gpt-4o", usage(2000, 300, 0, 0, { total = 0.02 }), 1),
+        }
+        local result = Stats.get_extension_usage(entries)
+        assert.are.equal(2, #result)
+        -- highest cost first
+        assert.are.equal("vision/openai/gpt-4o", result[1].key)
+        assert.are.equal(0.02, result[1].cost)
+        assert.are.equal(2300, result[1].tokens)
+        assert.are.equal(1, result[1].calls)
+        assert.are.equal(1, result[1].images)
+        assert.are.equal("vision/openrouter/qwen-vl", result[2].key)
+        assert.are.equal(0.015, result[2].cost)
+        assert.are.equal(1800, result[2].tokens)
+        assert.are.equal(2, result[2].calls)
+        assert.are.equal(5, result[2].images)
+    end)
+
+    it("lists token-only (cost 0) vision usage", function()
+        local entries = {
+            vision_custom_entry("free/llava", usage(5000, 0, 0, 0, { total = 0 })),
+        }
+        local result = Stats.get_extension_usage(entries)
+        assert.are.equal(1, #result)
+        assert.are.equal("vision/free/llava", result[1].key)
+        assert.are.equal(0, result[1].cost)
+        assert.are.equal(5000, result[1].tokens)
+        assert.are.equal(1, result[1].calls)
+    end)
+
+    it("ignores other custom entries and entries without a usage payload", function()
+        local entries = {
+            entry("custom", { customType = "other-extension", data = { usage = usage(1, 1, 0, 0) } }),
+            entry("custom", { customType = "pi-vision-usage" }),
+            entry("custom", { customType = "pi-vision-usage", data = { model = "openrouter/qwen-vl" } }),
+            entry("custom", { customType = "pi-vision-usage", data = { usage = "not-a-table" } }),
+        }
+        assert.are.equal(0, #Stats.get_extension_usage(entries))
     end)
 end)
 
@@ -419,6 +560,77 @@ describe("stats.render_stats", function()
         })
         assert.are.equal("  Cache re-billed  12k tokens, 2 misses", rendered.lines[15])
     end)
+
+    it("renders an Extensions section between Cost and Context", function()
+        local rendered = Stats.render_stats(SAMPLE_STATS, SAMPLE_BREAKDOWN, {
+            missedTokens = 0,
+            missedCost = 0,
+            missCount = 0,
+        }, {
+            { key = "vision/openrouter/qwen-vl", cost = 0.012, tokens = 12345, calls = 3, images = 5 },
+            { key = "vision/free/llava", cost = 0, tokens = 5000, calls = 1, images = 0 },
+        })
+        local lines = rendered.lines
+        local function find(text)
+            for i, line in ipairs(lines) do
+                if line == text then
+                    return i
+                end
+            end
+            return nil
+        end
+        local cost_i = find("Cost  $0.450")
+        local ext_i = find("Extensions")
+        local ctx_i = find("Context")
+        assert.is_not_nil(cost_i)
+        assert.is_not_nil(ext_i)
+        assert.is_not_nil(ctx_i)
+        assert.is_true(cost_i < ext_i and ext_i < ctx_i)
+        -- Rows: aligned key, cost · tokens · calls (images suffix when > 0).
+        local kw = math.max(#"vision/openrouter/qwen-vl", #"vision/free/llava")
+        local row1 = "  vision/openrouter/qwen-vl"
+            .. string.rep(" ", kw - #"vision/openrouter/qwen-vl")
+            .. "  $0.012 · 12k tokens · 3 calls · 5 images"
+        local row2 = "  vision/free/llava"
+            .. string.rep(" ", kw - #"vision/free/llava")
+            .. "  $0.000 · 5.0k tokens · 1 call"
+        assert.is_not_nil(find(row1))
+        assert.is_not_nil(find(row2))
+        -- Labels dimmed, section title in the tool-header highlight, no bars.
+        -- highlights are keyed by 0-based row; line ext_i (1-based) is row
+        -- ext_i - 1, the first row below it is ext_i.
+        assert.are.equal("PiToolHeader", rendered.highlights[ext_i - 1][1].hl)
+        assert.are.equal("Comment", rendered.highlights[ext_i][1].hl)
+        assert.are.equal(1, #rendered.highlights[ext_i])
+    end)
+
+    it("appends the image count to vision rows in the Cost section", function()
+        local breakdown = {
+            { key = "vision/openrouter/qwen-vl", cost = 0.004, tokens = 1000, images = 1 },
+        }
+        local rendered = Stats.render_stats(SAMPLE_STATS, breakdown, {
+            missedTokens = 0,
+            missedCost = 0,
+            missCount = 0,
+        })
+        assert.is_not_nil(
+            vim.tbl_contains(
+                rendered.lines,
+                "  vision/openrouter/qwen-vl  $0.004 ░░░░░░░░░░ 1% · 1 image"
+            )
+        )
+    end)
+
+    it("omits the Extensions section without recorded usage", function()
+        local rendered = Stats.render_stats(SAMPLE_STATS, SAMPLE_BREAKDOWN, {
+            missedTokens = 0,
+            missedCost = 0,
+            missCount = 0,
+        })
+        for _, line in ipairs(rendered.lines) do
+            assert.is_nil(line:find("^Extensions", 1))
+        end
+    end)
 end)
 
 -- ============================================================================
@@ -591,6 +803,37 @@ describe("session stats command", function()
         -- No per-model rows, no bars.
         assert.is_false(vim.tbl_contains(opts.lines, "  deepseek/deepseek-chat  $0.030"))
         assert.are.equal(0, #notes)
+    end)
+
+    it("renders the Extensions section from recorded custom usage", function()
+        responders.get_entries = function()
+            return {
+                type = "response",
+                success = true,
+                data = {
+                    leafId = nil,
+                    entries = {
+                        vision_custom_entry("openrouter/qwen-vl", usage(1000, 200, 0, 0, { total = 0.01 }), 2),
+                    },
+                },
+            }
+        end
+        local session = Sessions.get_or_create()
+        assert.is_not_nil(session)
+        wait_or_fail(function()
+            return #sent > 0
+        end, "initial get_commands was not sent")
+
+        Pi.session_stats()
+        wait_or_fail(function()
+            return #dialog_infos > 0
+        end, "dialog was not rendered")
+
+        local opts = dialog_infos[1]
+        assert.is_not_nil(vim.tbl_contains(opts.lines, "Extensions"))
+        assert.is_not_nil(
+            vim.tbl_contains(opts.lines, "  vision/openrouter/qwen-vl  $0.010 · 1.2k tokens · 1 call · 2 images")
+        )
     end)
 
     it("notifies and skips the dialog when get_session_stats fails", function()
