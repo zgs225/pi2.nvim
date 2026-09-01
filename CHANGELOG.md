@@ -2,6 +2,8 @@
 
 ## 2026-09-01
 
+- **ADDED:** sessions-overview keys `f` / `C` / `t` — fork, clone, or tree-navigate the session under the cursor (same flows as `:PiFork` / `:PiClone` / `:PiTree`). The list jumps to that session's tab first, so the existing pickers, prefill and streaming guards all run against the right session unchanged. Issue #101.
+
 - **ADDED:** sessions-overview key `d` — open the diff review of the session under the cursor (`pi.diff_review(session?)`; the same panel as `:PiDiff` — each changed file's combined git diff in a floating window, without leaving the list). Uses that session's own `changed_files`/cwd and stays in the current tab. A dead session's row, or a session with no changed files, warns instead. Issue #101.
 
 - **ADDED:** sessions-overview key `c` — compact the session under the cursor in the background (`pi.compact(custom_instructions?, session?)`; same as `:PiCompact`, without leaving the list — the row's status dot switches to the compacting state while it runs). Works for any listed session, not just the current tab's; a dead session's row warns instead of doing nothing. Issue #101.

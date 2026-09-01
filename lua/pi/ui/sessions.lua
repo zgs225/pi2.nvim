@@ -627,6 +627,9 @@ local HELP_ENTRIES = {
     { "s", "Show this session's stats (:PiSessionStats)" },
     { "c", "Compact this session in the background" },
     { "d", "Review this session's changed files (:PiDiff)" },
+    { "f", "Fork this session from a past message (:PiFork)" },
+    { "C", "Clone this session (:PiClone)" },
+    { "t", "Navigate this session's tree (:PiTree)" },
     { "R", "Refresh the list" },
     { "q", "Close the list" },
     { "?", "Toggle this help" },
@@ -836,6 +839,38 @@ local function diff_under_cursor()
     require("pi").diff_review(session)
 end
 
+--- Fork / clone / tree actions: jump to the target session's tab first, then
+--- run the module entry — Sessions.get() resolves to the target session, so
+--- the pickers, prefill and streaming guards all run unchanged against it
+--- (the interplay is chat-centered, so being on that session's tab is the
+--- right UX).
+local function fork_under_cursor()
+    local _, session = row_session_under_cursor()
+    if not session then
+        return
+    end
+    jump_under_cursor()
+    require("pi").fork()
+end
+
+local function clone_under_cursor()
+    local _, session = row_session_under_cursor()
+    if not session then
+        return
+    end
+    jump_under_cursor()
+    require("pi").clone()
+end
+
+local function tree_under_cursor()
+    local _, session = row_session_under_cursor()
+    if not session then
+        return
+    end
+    jump_under_cursor()
+    require("pi").tree()
+end
+
 ---@return integer
 local function ensure_buf()
     if buf and vim.api.nvim_buf_is_valid(buf) then
@@ -876,6 +911,14 @@ local function ensure_buf()
         "d",
         diff_under_cursor,
         vim.tbl_extend("force", map_opts, { desc = "Review this session's diff" })
+    )
+    vim.keymap.set("n", "f", fork_under_cursor, vim.tbl_extend("force", map_opts, { desc = "Fork this session" }))
+    vim.keymap.set("n", "C", clone_under_cursor, vim.tbl_extend("force", map_opts, { desc = "Clone this session" }))
+    vim.keymap.set(
+        "n",
+        "t",
+        tree_under_cursor,
+        vim.tbl_extend("force", map_opts, { desc = "Navigate this session's tree" })
     )
     vim.keymap.set("n", "R", function()
         name_cache = setmetatable({}, { __mode = "k" })
