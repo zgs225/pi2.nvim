@@ -4,7 +4,7 @@
 
 ## One chat per tab
 
-pi2.nvim keeps **one live session per Neovim tabpage**. Two different tabs give you two independent conversations with their own history, prompt buffer, attachments, model, and thinking level. Closing the tab tears the session down, and nothing bleeds across tabs. This is the natural unit of work in Neovim, and it maps cleanly to "one agent per task" — e.g. one tab for an exploratory refactor and another for feature implementation, each with their own context.
+pi2.nvim keeps **one live chat UI per Neovim tabpage**, bound to a session process. Two different tabs give you two independent conversations with their own history, prompt buffer, attachments, model, and thinking level. Closing a tab **detaches** the chat UI but leaves the backing RPC process running in the background (explicit `:PiStop` or Neovim exit still tears processes down). Sub-sessions spawned from a parent also run as detached background processes until you switch to them or close them explicitly.
 
 Each session owns an underlying `pi --mode rpc` subprocess (one tab = one session = one process). The process lifecycle and how to stop/abort it are covered in [Health & debugging → Process lifecycle](troubleshooting.md#process-lifecycle).
 
@@ -33,7 +33,7 @@ There are three ways to open a chat — each honors the usual `layout=side|float
 | `:Pi` | `pi.show()` / `pi.toggle()` | Open the chat. If the current tab has no session yet, starts a fresh conversation. |
 | `:PiNewTab` | `pi.new_tab()` | Open a **fresh** conversation in a **new** tabpage (`:tabnew` semantics). Uses `layout.default`; no arguments. |
 | `:PiContinue` | `pi.continue_session()` | Load the **most recent** session for the current cwd. Skips the session currently live in another tab, so you can continue a different one. |
-| `:PiResume` | `pi.resume_session()` | Open a picker listing **all past sessions for the current cwd**, with their display names and timestamps. See [Resume picker](#resume-picker) for its keybindings. |
+| `:PiResume` | `pi.resume_session()` | Open a picker listing **past top-level sessions for the current cwd** (sub-sessions are excluded — use `:PiSubSwitch` to reopen a child). See [Resume picker](#resume-picker) for its keybindings. |
 
 ### Resume picker
 
@@ -53,13 +53,36 @@ And mid-session management:
 
 | Command | Lua | What it does |
 | --- | --- | --- |
-| `:PiNewSession` | `pi.new_session()` | Discard the current session in this tab and start a fresh one. Extensions can cancel this via the `session_before_switch` hook (e.g. to warn about unsaved draft state). |
+| `:PiNewSession` | `pi.new_session()` | Discard the current session in this tab and start a fresh one. When viewing a sub-session, switches back to the parent first. Sub-session rows from the previous conversation are hidden in `:PiSessions` (press `H` or use `:PiSubSwitch` to recall them). Extensions can cancel this via the `session_before_switch` hook (e.g. to warn about unsaved draft state). |
 | `:PiTree` | `pi.tree()` | Navigate the session tree: jump back to any past conversation point, optionally summarizing the abandoned branch. See [Session tree navigation](#session-tree-navigation-pitree). |
 | `:PiFork` | `pi.fork()` | Start a new session from a past user message. See [Fork and clone](#fork-and-clone). |
 | `:PiClone` | `pi.clone()` | Duplicate the current branch into a new session file. See [Fork and clone](#fork-and-clone). |
 | `:PiSessions` | `pi.sessions()` | Toggle the live overview of all active sessions (name + busy/idle/attention). See [Sessions overview](#sessions-overview-pisessions). |
 | `:PiSessionName [name]` | `pi.set_session_name(name?)` | Set a human-readable display name for the current session. Without an argument, opens an input dialog prefilled with the current name. Names appear in the `:PiResume` picker so you can identify long-running conversations at a glance. |
 | `:PiStop` | `pi.stop()` | Tear down the current session entirely, killing the backing `pi --mode rpc` process. Different from `:PiToggleChat`, which just hides the windows while the session keeps running. |
+| `:PiSubNew` | `pi.sub_new()` | Spawn a background sub-session with a task prompt (inherits model/thinking by default). |
+| `:PiSubSwitch` | `pi.sub_switch()` | Picker to switch the current tab's chat to a child sub-session (including dormant). |
+| `:PiSubParent` | `pi.sub_parent()` | Return from a child sub-session view to the parent. |
+| `:PiSubClose` | `pi.sub_close()` | Close the current sub-session's RPC process (session file retained). |
+
+## Sub-sessions
+
+A parent session can run **sub-sessions** in parallel — each child is an independent `pi --mode rpc` process with its own session file, model, and thinking level. Relationships and bookkeeping live in `<agent_dir>/sessions/<encoded-cwd>/.pi2-subsessions.json`; message content stays in each child's JSONL (the authoritative store).
+
+| Command | What it does |
+| --- | --- |
+| `:PiSubNew` | Prompt for a task; spawn a child in the background. |
+| `:PiSubSwitch` | Pick a child (active or dormant) and bind the current tab's chat to it. |
+| `:PiSubParent` / `gp` in history | Switch back to the parent; breadcrumb `◂ 父：…` shows while viewing a child. |
+| `:PiSubClose` | Close the current sub-session's RPC process (session file retained). |
+
+While viewing a child, `:PiNewSession` / `pi.new_session()` or a bare `/new` in the prompt (e.g. `<C-g>n` in a typical setup) **returns to the parent first**, then starts a fresh parent conversation — same as running `/new` on the parent. Prior-conversation sub-session rows are hidden in `:PiSessions` (press `H` or use `:PiSubSwitch` to recall them).
+
+When a user-spawned child finishes, its last assistant message is injected into the parent as `[子会话「name」已完成] …` (skipped for Agent-spawned children — they receive a synchronous tool result instead). Configure via `subagent.*` in [Configuration](configuration.md).
+
+Parent Agent tools are provided by the bundled `extensions/subagent.ts` extension when `subagent.enabled` is true. See [Extensions](extensions.md#bundled-sub-agent-extension-extensionssubagentts).
+
+**Agent workflow:** `list_subagents` to discover children → `dispatch_subagents` for all work (single item or parallel batch). Use `wait: true` on dispatch for one-shot results, or `poll_subagents` / `wait_subagents` with the returned `batch_id`. `stop_subagents` to close processes. Failure policy defaults to **collect_errors**.
 
 ## Session tree navigation (:PiTree)
 
@@ -100,15 +123,17 @@ Both operations are refused while the agent is streaming, and both can be **canc
 
 ## Sessions overview (:PiSessions)
 
-When you run several sessions across tabs, `:PiSessions` gives you a single dashboard of everything that is live. It lists **active sessions only** (one per Neovim tab, in tabline order) with:
+When you run several sessions across tabs, `:PiSessions` gives you a single dashboard of everything that is live. It lists **active tab sessions** in tabline order, with **indented child rows** underneath each parent for its **active or unread** sub-sessions. Closed (`dormant`), settled agent workers, and acknowledged completions are hidden from this list to keep it clean — recall them with `:PiSubSwitch` (all manifest children, including dormant). The Agent's `list_subagents` tool still sees every child for reuse via `dispatch_subagents({ target, message })`.
 
-- a single **status dot** at the left edge, colored and animated per state: blinking yellow while the agent works (in a background tab), slow-blinking in the compaction color while compacting, steady warning color when the session needs your attention, blinking green when a turn finished while you were in another tab, blinking red when the last turn errored (both consumed — back to idle — when you enter the tab), steady dim when idle, steady error color if the process died,
+- a single **status dot** at the left edge, colored and animated per state: blinking yellow while the agent works (in a background tab), slow-blinking in the compaction color while compacting, steady warning color when the session needs your attention, blinking green when a turn finished while you were in another tab, blinking red when the last turn errored (both consumed — back to idle — when you enter the tab), steady dim when idle, steady error color if the process died. **Sub-session child rows** do not use the green done blink — completion is announced in the parent chat; acknowledged rows are removed from the list (`H` recalls hidden ones).
 - the **session name** right after the dot: the backend session name (`:PiSessionName`), falling back to the first user message, then `(unnamed)`,
 - the **current session** marked on the dot itself: the dot of the tab you're looking at renders in the agent color — steady when idle, blinking while busy (same rhythm as the other dots, keeping the agent color) — while background sessions blink yellow while working. Each tab's view marks its own session and the marker follows tab switches — no extra text or UI elements.
 
 The list is a single shared buffer (filetype `pi-sessions`): every tab that opens it gets its own window on the same buffer, so a status change redraws all open views at once. Updates are event-driven (agent start/end, compaction, session creation/teardown, attention requests, name changes) — nothing polls.
 
-Keys inside the list: `<CR>` / `o` jump to that session's tab and open its chat, `a` / `i` do the same but drop you straight into Insert mode at the very end of that session's prompt draft (multi-line drafts land past the last line — ready to append), `r` renames the session under the cursor (same as `:PiSessionName`, without leaving the list), `s` shows the session's stats dashboard under the cursor (same data as `:PiSessionStats` — tokens, cost, context — in a dialog float, without leaving the list), `c` compacts the session under the cursor in the background (same as `:PiCompact` — the row's status dot switches to the compacting state while it runs, no tab switch), `d` opens the diff review of the session's changed files under the cursor (same panel as `:PiDiff` — the combined git diff in a floating window, without leaving the list), `f` / `C` / `t` fork, clone, or tree-navigate the session under the cursor (same flows as `:PiFork` / `:PiClone` / `:PiTree` — the list jumps to that session's tab first, so the pickers, prefill and streaming guards all run against the right session), `R` re-fetches session names, `?` toggles a shortcut help overlay, `q` closes the window.
+Keys inside the list: `<CR>` / `o` jump to that session's tab and open its chat (on a child row: bind the tab's chat to that sub-session), `a` / `i` do the same but drop you straight into Insert mode at the very end of that session's prompt draft (multi-line drafts land past the last line — ready to append), `r` renames the session under the cursor (same as `:PiSessionName`, without leaving the list), `s` shows the session's stats dashboard under the cursor (same data as `:PiSessionStats` — tokens, cost, context — in a dialog float, without leaving the list), `c` compacts the session under the cursor in the background (same as `:PiCompact` — the row's status dot switches to the compacting state while it runs, no tab switch), `d` opens the diff review of the session's changed files under the cursor (same panel as `:PiDiff` — the combined git diff in a floating window, without leaving the list), `f` / `C` / `t` fork, clone, or tree-navigate the session under the cursor (same flows as `:PiFork` / `:PiClone` / `:PiTree` — the list jumps to that session's tab first, so the pickers, prefill and streaming guards all run against the right session), `p` previews a sub-session's recent messages in a read-only float (no tab switch), `x` closes a sub-session's RPC process, `H` toggles hidden sub-session rows (dormant / settled), `R` re-fetches session names, `?` toggles a shortcut help overlay, `q` closes the window.
+
+Sub-session child rows are sorted **newest first** by `created_at`, with the session id as a stable tiebreaker so refresh does not reshuffle them.
 
 By default the window follows the current tab's chat layout (a side split when the chat is in side layout, a centered float when it is in float layout); `mode` pins it to one style, and `auto_open` shows the list whenever the chat opens:
 

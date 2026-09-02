@@ -46,6 +46,12 @@ pi.abort_retry()              -- cancel the auto-retry backoff ("Retrying…" st
                               -- takes effect while the core is between retry attempts
 pi.stop()                     -- kill the RPC process and close the chat for the current tab
 
+-- Sub-sessions
+pi.sub_new()                  -- spawn a background sub-session (:PiSubNew)
+pi.sub_switch()               -- picker to switch to a child sub-session
+pi.sub_parent()               -- return to parent session from child view
+pi.sub_close()                -- close current sub-session process (file retained)
+
 -- Prompt input
 pi.send_mention(args?, opts?) -- insert an @-mention for the current buffer / selection
 pi.attach_image(path)         -- queue an image file as an attachment

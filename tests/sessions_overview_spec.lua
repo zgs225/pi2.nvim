@@ -15,6 +15,10 @@ local function fake_session(opts)
             is_running = function()
                 return opts.running ~= false
             end,
+            stop = function() end,
+            send = function()
+                return true
+            end,
         },
         chat = {
             is_streaming = function()
@@ -90,6 +94,16 @@ describe("sessions overview", function()
         it("is idle otherwise", function()
             assert.are.equal("idle", SessionList.status_of(fake_session()))
         end)
+
+        it("reflects detached sub-session agent activity", function()
+            local detached = fake_session()
+            detached.chat = nil
+            detached._detached_busy = true
+            assert.are.equal("busy", SessionList.status_of(detached))
+            detached._detached_busy = false
+            detached._detached_compacting = true
+            assert.are.equal("compacting", SessionList.status_of(detached))
+        end)
     end)
 
     describe("dot_hl", function()
@@ -128,6 +142,42 @@ describe("sessions overview", function()
                 "PiSessionsListExited",
                 SessionList.dot_hl({ status = "exited", attention = 1, done = true, error = true }, 0)
             )
+        end)
+
+        it("follows the sub-session active/inactive matrix", function()
+            local function child(opts)
+                return vim.tbl_extend("force", { depth = 1, attention = 0 }, opts or {})
+            end
+
+            -- 1. active busy -> blink (blue overlay applied by current-tab marker)
+            local active_busy = child({ status = "busy", is_current_view = true })
+            assert.are.equal("PiSessionsListBusy", SessionList.dot_hl(active_busy, 0))
+            assert.are.equal("PiSessionsListDotDim", SessionList.dot_hl(active_busy, 1))
+
+            -- 2. active idle -> steady gray base (blue overlay steady)
+            local active_idle = child({ status = "idle", is_current_view = true })
+            assert.are.equal("PiSessionsListIdle", SessionList.dot_hl(active_idle, 0))
+            assert.are.equal("PiSessionsListIdle", SessionList.dot_hl(active_idle, 1))
+
+            -- 3. inactive busy -> blink yellow
+            local inactive_busy = child({ status = "busy", is_current_view = false })
+            assert.are.equal("PiSessionsListBusy", SessionList.dot_hl(inactive_busy, 0))
+            assert.are.equal("PiSessionsListDotDim", SessionList.dot_hl(inactive_busy, 1))
+
+            -- 4. inactive idle -> steady gray
+            local inactive_idle = child({ status = "idle", is_current_view = false })
+            assert.are.equal("PiSessionsListIdle", SessionList.dot_hl(inactive_idle, 0))
+            assert.are.equal("PiSessionsListIdle", SessionList.dot_hl(inactive_idle, 1))
+
+            -- 5. active error -> steady red
+            local active_err = child({ status = "idle", is_current_view = true, error = true })
+            assert.are.equal("PiSessionsListError", SessionList.dot_hl(active_err, 0))
+            assert.are.equal("PiSessionsListError", SessionList.dot_hl(active_err, 1))
+
+            -- 6. inactive error -> blink red
+            local inactive_err = child({ status = "idle", is_current_view = false, error = true })
+            assert.are.equal("PiSessionsListError", SessionList.dot_hl(inactive_err, 0))
+            assert.are.equal("PiSessionsListDotDim", SessionList.dot_hl(inactive_err, 1))
         end)
     end)
 
@@ -277,6 +327,214 @@ describe("sessions overview", function()
             assert.is_false(rows[2].error)
             assert.is_false(rows[1].done)
             assert.is_nil(rows[2].name)
+        end)
+
+        it("shows the parent row and all siblings when viewing a child", function()
+            local Sessions = require("pi.sessions.manager")
+            local Manifest = require("pi.subsessions.manifest")
+            local orig_children = Manifest.children_of
+            Manifest.children_of = function(parent_id)
+                if parent_id ~= "parent-uuid" then
+                    return {}
+                end
+                return {
+                    { _id = "child-a", name = "Alpha", status = "active", parent_id = "parent-uuid", config = {} },
+                    { _id = "child-b", name = "Beta", status = "completed", parent_id = "parent-uuid", config = {} },
+                }
+            end
+
+            local parent = fake_session({ tab = 42 })
+            parent.id = "parent-uuid"
+            Sessions._register_for_test(parent)
+
+            local child = fake_session({ tab = 42 })
+            child.id = "child-a"
+            child.view_parent_id = "parent-uuid"
+
+            local rows = SessionList.build_rows({ child }, function()
+                return 0
+            end, function(s)
+                return s.id == "parent-uuid" and "Parent chat" or "child"
+            end)
+
+            Manifest.children_of = orig_children
+            Sessions._reset()
+
+            assert.are.equal(3, #rows)
+            assert.are.equal(0, rows[1].depth)
+            assert.are.equal("Parent chat", rows[1].name)
+            assert.is_true(rows[1].is_tree_parent)
+            assert.is_false(rows[1].is_current_view)
+            assert.are.equal(1, rows[2].depth)
+            assert.is_true(rows[2].is_current_view)
+            assert.are.equal("child-a", rows[2].child_id)
+            assert.are.equal(1, rows[3].depth)
+            assert.is_false(rows[3].is_current_view)
+        end)
+
+        it("hides dormant children from the sessions list by default", function()
+            local Manifest = require("pi.subsessions.manifest")
+            local orig_children = Manifest.children_of
+            Manifest.children_of = function(parent_id)
+                if parent_id ~= "parent-uuid" then
+                    return {}
+                end
+                return {
+                    { _id = "child-live", name = "Live", status = "active", parent_id = "parent-uuid", config = {} },
+                    { _id = "child-sleep", name = "Sleeping", status = "dormant", parent_id = "parent-uuid", config = {} },
+                }
+            end
+
+            local parent = fake_session({ tab = 42 })
+            parent.id = "parent-uuid"
+            local rows = SessionList.build_rows({ parent }, function()
+                return 0
+            end, function()
+                return "parent"
+            end)
+
+            Manifest.children_of = orig_children
+
+            assert.are.equal(2, #rows)
+            assert.are.equal("child-live", rows[2].child_id)
+        end)
+
+        it("shows hidden sub-sessions when H toggle is on", function()
+            local Manifest = require("pi.subsessions.manifest")
+            local orig_children = Manifest.children_of
+            Manifest.children_of = function(parent_id)
+                if parent_id ~= "parent-uuid" then
+                    return {}
+                end
+                return {
+                    { _id = "child-live", name = "Live", status = "active", parent_id = "parent-uuid", config = {} },
+                    { _id = "child-sleep", name = "Sleeping", status = "dormant", parent_id = "parent-uuid", config = {} },
+                }
+            end
+
+            local parent = fake_session({ tab = 42 })
+            parent.id = "parent-uuid"
+            SessionList.toggle_show_hidden_children()
+            local rows = SessionList.build_rows({ parent }, function()
+                return 0
+            end, function()
+                return "parent"
+            end)
+            SessionList.toggle_show_hidden_children()
+
+            Manifest.children_of = orig_children
+
+            assert.are.equal(3, #rows)
+            assert.are.equal("child-sleep", rows[3].child_id)
+        end)
+
+        it("hides prior-conversation children after on_parent_new_conversation", function()
+            local Manifest = require("pi.subsessions.manifest")
+            local Subsessions = require("pi.subsessions")
+            local orig_children = Manifest.children_of
+            Manifest.children_of = function(lineage_id)
+                if lineage_id ~= "parent-uuid" then
+                    return {}
+                end
+                return {
+                    {
+                        _id = "child-old",
+                        name = "Old worker",
+                        status = "active",
+                        parent_id = "parent-uuid",
+                        parent_epoch = 0,
+                        config = {},
+                    },
+                    {
+                        _id = "child-new",
+                        name = "New worker",
+                        status = "active",
+                        parent_id = "parent-uuid",
+                        parent_epoch = 1,
+                        config = {},
+                    },
+                }
+            end
+
+            local parent = fake_session({ tab = 42 })
+            parent.id = "parent-uuid"
+            parent.lineage_id = "parent-uuid"
+            parent.conversation_epoch = 1
+
+            local rows = SessionList.build_rows({ parent }, function()
+                return 0
+            end, function()
+                return "parent"
+            end)
+
+            Manifest.children_of = orig_children
+
+            assert.are.equal(2, #rows)
+            assert.are.equal("child-new", rows[2].child_id)
+        end)
+
+        it("never blinks green for completed sub-session child rows", function()
+            local Manifest = require("pi.subsessions.manifest")
+            local orig_children = Manifest.children_of
+            Manifest.children_of = function()
+                return {
+                    {
+                        _id = "child-done",
+                        name = "Done child",
+                        status = "completed",
+                        reported = false,
+                        parent_id = "parent-uuid",
+                        config = {},
+                    },
+                }
+            end
+
+            local parent = fake_session({ tab = 42 })
+            parent.id = "parent-uuid"
+            local rows = SessionList.build_rows({ parent }, function()
+                return 0
+            end, function()
+                return "parent"
+            end)
+
+            Manifest.children_of = orig_children
+            assert.are.equal(2, #rows)
+            assert.is_false(rows[2].done)
+        end)
+
+        it("hides acknowledged reported children from the list", function()
+            local Manifest = require("pi.subsessions.manifest")
+            local orig_children = Manifest.children_of
+            Manifest.children_of = function(lineage_id)
+                if lineage_id ~= "parent-uuid" then
+                    return {}
+                end
+                return {
+                    {
+                        _id = "child-reported",
+                        name = "Reported child",
+                        status = "completed",
+                        reported = true,
+                        parent_id = "parent-uuid",
+                        config = {},
+                    },
+                }
+            end
+
+            local parent = fake_session({ tab = 42 })
+            parent.id = "parent-uuid"
+            parent.lineage_id = "parent-uuid"
+
+            SessionList.acknowledge_reported_children(parent)
+
+            local rows = SessionList.build_rows({ parent }, function()
+                return 0
+            end, function()
+                return "parent"
+            end)
+
+            Manifest.children_of = orig_children
+            assert.are.equal(1, #rows)
         end)
     end)
 
@@ -689,6 +947,135 @@ describe("sessions overview", function()
                 assert.is_nil(marker_match(win))
                 assert.are.equal("PiSessionsListDotDim", dot_extmark_hl(bufnr, 1))
             end)
+        end)
+
+        it("blinks the current marker for an active busy sub-session", function()
+            local tab = vim.api.nvim_get_current_tabpage()
+            local parent = fetchable_session({ tab = tab })
+            parent.id = "parent-id"
+            local child = fetchable_session({ tab = tab, streaming = true })
+            child.id = "child-id"
+            child.view_parent_id = "parent-id"
+
+            local Manifest = require("pi.subsessions.manifest")
+            local orig_children = Manifest.children_of
+            Manifest.children_of = function(parent_id)
+                if parent_id ~= "parent-id" then
+                    return {}
+                end
+                return {
+                    {
+                        _id = "child-id",
+                        name = "Child task",
+                        status = "active",
+                        parent_id = "parent-id",
+                        config = {},
+                    },
+                }
+            end
+
+            local real_manager = package.loaded["pi.sessions.manager"]
+            package.loaded["pi.sessions.manager"] = {
+                list = function()
+                    return { child }
+                end,
+                get_by_id = function(id)
+                    if id == "parent-id" then
+                        return parent
+                    end
+                    if id == "child-id" then
+                        return child
+                    end
+                end,
+                get = function()
+                    return nil
+                end,
+            }
+
+            local ok, err = pcall(function()
+                SessionList.open()
+                local win = vim.api.nvim_get_current_win()
+                SessionList._set_blink_tick(0)
+                SessionList._render()
+                assert.is_not_nil(marker_match(win))
+                SessionList._set_blink_tick(1)
+                SessionList._render()
+                assert.is_nil(marker_match(win))
+            end)
+
+            package.loaded["pi.sessions.manager"] = real_manager
+            Manifest.children_of = orig_children
+            pcall(SessionList.close)
+            SessionList._reset()
+            if not ok then
+                error(err)
+            end
+        end)
+
+        it("keeps the current marker steady for an active idle sub-session", function()
+            local tab = vim.api.nvim_get_current_tabpage()
+            local parent = fetchable_session({ tab = tab })
+            parent.id = "parent-id"
+            local child = fetchable_session({ tab = tab })
+            child.id = "child-id"
+            child.view_parent_id = "parent-id"
+
+            local Manifest = require("pi.subsessions.manifest")
+            local orig_children = Manifest.children_of
+            Manifest.children_of = function(parent_id)
+                if parent_id ~= "parent-id" then
+                    return {}
+                end
+                return {
+                    {
+                        _id = "child-id",
+                        name = "Child task",
+                        status = "active",
+                        parent_id = "parent-id",
+                        config = {},
+                    },
+                }
+            end
+
+            local real_manager = package.loaded["pi.sessions.manager"]
+            package.loaded["pi.sessions.manager"] = {
+                list = function()
+                    return { child }
+                end,
+                get_by_id = function(id)
+                    if id == "parent-id" then
+                        return parent
+                    end
+                    if id == "child-id" then
+                        return child
+                    end
+                end,
+                get = function()
+                    return nil
+                end,
+            }
+
+            local ok, err = pcall(function()
+                SessionList.open()
+                SessionList._set_blink_tick(0)
+                SessionList._render()
+                local win = vim.api.nvim_get_current_win()
+                local m = marker_match(win)
+                assert.is_not_nil(m, "expected current-tab marker on child row")
+                assert.are.equal(2, m.pos1[1], "marker should be on the child row (line 2)")
+                assert.is_true(m.pos1[2] > 2, "child row dot is indented past the parent column")
+                SessionList._set_blink_tick(1)
+                SessionList._render()
+                assert.is_not_nil(marker_match(win), "idle active child keeps a steady blue marker")
+            end)
+
+            package.loaded["pi.sessions.manager"] = real_manager
+            Manifest.children_of = orig_children
+            pcall(SessionList.close)
+            SessionList._reset()
+            if not ok then
+                error(err)
+            end
         end)
     end)
 

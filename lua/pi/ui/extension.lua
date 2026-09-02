@@ -111,6 +111,20 @@ function M.handle(session, msg)
     end
 
     -- Dialog methods (expect a response)
+    if method == "select" and msg.title == "__pi_subagent__" then
+        local payload = type(msg.options) == "table" and msg.options[1] or nil
+        vim.schedule(function()
+            require("pi.subsessions").handle_host(session, payload or "", function(result)
+                session.rpc:send({
+                    type = "extension_ui_response",
+                    id = msg.id,
+                    value = type(result) == "table" and vim.json.encode(result) or nil,
+                    cancelled = result == nil,
+                })
+            end)
+        end)
+        return
+    end
     if method == "select" or method == "confirm" or method == "input" or method == "editor" then
         Attention.present(session, msg)
         return

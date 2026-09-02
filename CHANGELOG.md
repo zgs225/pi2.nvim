@@ -1,5 +1,23 @@
 # Changelog
 
+## 2026-09-02
+
+- **FIXED:** Sub-session switch — loading a child session file no longer clears `view_parent_id`, so `:PiSessions` keeps the parent tree and `:PiSubParent` works after entering a child.
+
+- **CHANGED:** Sub-session rows in `:PiSessions` no longer blink green on completion (parent chat carries the notification). Failed children still blink red; switching to the parent tab or entering a child still acknowledges completed rows for list hiding.
+
+- **CHANGED:** `:PiSessions` sub-session rows — hide closed (`dormant`), settled workers, acknowledged completions, and prior-conversation children after `/new`; press `H` to toggle hidden rows; stable sort by `created_at` then id. `:PiSubSwitch` and `list_subagents` list every manifest child for the tab lineage. `:PiResume` / `:PiContinue` exclude sub-sessions and rebind lineage so child rows follow the resumed parent. Config: `subagent.sessions_list.*`.
+
+- **CHANGED:** Sub-agent tool rendering — localized short labels (`子·派发` / `sub·dispatch`, auto from `title.lang`), MD-outline icon family, manifest names instead of UUIDs (truncated ids), `inline_status` summaries; `dispatch_subagents` block mode when `items > 1` or `wait: false`.
+
+- **CHANGED:** Sub-agent tools consolidated — removed `spawn_subagent`, `message_subagent`, and `stop_subagent`. Use `dispatch_subagents` (optional `wait: true`) for all spawn/message work; `stop_subagents({ targets })` to stop children. Seven tools remain: observe (`list_subagents`, `read_subagent`, `list_batches`) + act (`dispatch_subagents`, `poll_subagents`, `wait_subagents`, `stop_subagents`).
+
+- **CHANGED:** Sub-agent batch concurrency — `dispatch_subagents` / `poll_subagents` / `wait_subagents` / `list_batches` for parallel fan-out (mixed spawn + message), persistent `.pi2-sub-batches.json`, `run_generation` on children, default `collect_errors` failure policy. `:PiAbort` cancels running batches for the parent. Config: `subagent.max_batch_size`, `batch_timeout_ms`, `batch_ttl_hours`.
+
+- **ADDED:** Sub-sessions (子会话) — spawn parallel child conversations with independent model/thinking config, each backed by its own RPC process and session file. Parent can observe children via `:PiSessions` tree rows, switch with `:PiSubSwitch` / `<CR>` on a child row, preview with `p`, close with `x` / `:PiSubClose`, and return with `:PiSubParent` / `gp`. Manifest (`.pi2-subsessions.json`) persists parent/child relationships; dormant children can be revived. Parent Agent tools via bundled `extensions/subagent.ts` (`spawn_subagent`, `list_subagents`, `read_subagent`, `message_subagent`, `stop_subagent`). Completion reports inject into the parent when a user-spawned child settles. Issue #102.
+
+- **CHANGED:** Session registry refactor (P0) — sessions are indexed by id with detachable tab UI; closing a tab detaches the chat without killing the RPC process (`:PiStop` / Neovim exit still tear down processes). `pinned_model` extended to `pinned_config` (includes `thinking_level`). Issue #102.
+
 ## 2026-09-01
 
 - **ADDED:** sessions-overview keys `f` / `C` / `t` — fork, clone, or tree-navigate the session under the cursor (same flows as `:PiFork` / `:PiClone` / `:PiTree`). The list jumps to that session's tab first, so the existing pickers, prefill and streaming guards all run against the right session unchanged. Issue #101.

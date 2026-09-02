@@ -336,12 +336,14 @@ function Rpc:_dispatch(msg)
 end
 
 ---@return boolean
-function Rpc:start()
+---@param opts? { subagent?: boolean }
+function Rpc:start(opts)
+    opts = opts or {}
     if self._job_id then
         return true
     end
     self._stdout_parts = {}
-    local cmd = Cli.command()
+    local cmd = Cli.command({ subagent = opts.subagent })
     -- The bundled vision extension reads its configured model from this
     -- runtime file on every input event (config.setup keeps it published).
     -- The auto-title extension reads its options from PI_NVIM_TITLE_FILE on

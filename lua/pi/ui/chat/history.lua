@@ -2485,12 +2485,14 @@ function History:on_tool_start(tool_name, tool_call_id, tool_input)
         self._needs_breathing_line = false
         local icon = Tools.get_tool_icon(tool_name)
         local renderer = Tools.get_renderer(tool_name)
+        local use_inline = Tools.is_inline(renderer, tool_input)
+        local display_name = Tools.tool_display_name(tool_name, tool_input)
 
-        -- Inline tools render as a single line: indent + icon + tool_name + detail
-        if renderer.inline then
+        -- Inline tools render as a single line: indent + icon + display_name + detail
+        if use_inline then
             local detail = renderer.inline_text and renderer.inline_text(tool_input) or nil
             local indent = Tools.GLYPHS.INDENT
-            local line = indent .. icon .. " " .. tool_name .. (detail and ("  " .. detail) or "")
+            local line = indent .. icon .. " " .. display_name .. (detail and ("  " .. detail) or "")
 
             -- Skip blank line between consecutive inline tools
             local need_gap = not self._last_was_inline
@@ -2507,12 +2509,12 @@ function History:on_tool_start(tool_name, tool_call_id, tool_input)
             })
             -- Tool name
             local name_extmark = vim.api.nvim_buf_set_extmark(self._buf, ns, row, icon_start + #icon, {
-                end_col = icon_start + #icon + 1 + #tool_name,
+                end_col = icon_start + #icon + 1 + #display_name,
                 hl_group = "PiToolHeader",
             })
             -- Detail (path etc.) in subdued color
             if detail then
-                local detail_start = icon_start + #icon + 1 + #tool_name + 2
+                local detail_start = icon_start + #icon + 1 + #display_name + 2
                 vim.api.nvim_buf_set_extmark(self._buf, ns, row, detail_start, {
                     end_col = #line,
                     hl_group = "PiToolCall",
@@ -2539,7 +2541,7 @@ function History:on_tool_start(tool_name, tool_call_id, tool_input)
 
         -- Standard multi-line tool block
         local fold = Tools.GLYPHS.FOLD_OPEN
-        local header = fold .. icon .. " " .. tool_name
+        local header = fold .. icon .. " " .. display_name
 
         local last_line = vim.api.nvim_buf_line_count(self._buf) - 1
         local cur = vim.api.nvim_buf_get_lines(self._buf, last_line, last_line + 1, false)[1] or ""
@@ -2635,6 +2637,7 @@ function History:on_tool_end(tool_name, tool_call_id, result, is_error)
             -- Update icon + name color
             local icon = Tools.get_tool_icon(tool_name)
             local indent = Tools.GLYPHS.INDENT
+            local display_name = Tools.tool_display_name(tool_name, block.tool_input)
             local pos = vim.api.nvim_buf_get_extmark_by_id(self._buf, ns, block.icon_extmark, {})
             if not pos[1] then
                 return
@@ -2648,7 +2651,7 @@ function History:on_tool_end(tool_name, tool_call_id, result, is_error)
             if block.name_extmark then
                 local name_pos = vim.api.nvim_buf_get_extmark_by_id(self._buf, ns, block.name_extmark, {})
                 if name_pos[1] then
-                    local name_end = #indent + #icon + 1 + #tool_name
+                    local name_end = #indent + #icon + 1 + #display_name
                     vim.api.nvim_buf_set_extmark(self._buf, ns, name_pos[1], #indent + #icon, {
                         id = block.name_extmark,
                         end_col = name_end,

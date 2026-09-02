@@ -15,19 +15,34 @@ local M = {}
 local Config = require("pi.config")
 local Ft = require("pi.filetypes")
 local Highlights = require("pi.ui.highlights")
+local ChildFilter = require("pi.subsessions.sessions_list")
 
 local ns = vim.api.nvim_create_namespace("pi-sessions-list")
+
+--- When true, :PiSessions shows filtered-out sub-session rows (dormant, settled, etc.).
+local show_hidden_children = false
 
 ---@alias pi.SessionsListStatus "busy"|"compacting"|"idle"|"exited"
 
 ---@class pi.SessionsListRow
----@field tab pi.TabId
+---@field tab? pi.TabId
+---@field session_id? string
+---@field child_id? string Manifest child id when no live session
+---@field depth integer 0 = parent tab row, 1 = sub-session
 ---@field status pi.SessionsListStatus
 ---@field attention integer pending attention request count
 ---@field done boolean last turn finished while the user was elsewhere
 ---@field error boolean last turn failed and the user hasn't seen it yet
 ---@field name string? display name (nil while still fetching)
 ---@field title_generating boolean backend auto-title generation in progress
+---@field subtitle? string model · thinking badge for sub-rows
+---@field dormant? boolean process not running (disk only)
+---@field unread_report? boolean completion report not yet seen
+---@field session? pi.Session live session reference when available
+---@field is_current_view? boolean row is the tab's focused session (parent or child)
+---@field is_tree_parent? boolean parent row shown while viewing a child in the tab
+---@field marker_col? integer 1-based byte column of the status dot (for current-tab marker)
+---@field marker_len? integer byte length of the status dot glyph
 
 ---@type integer? shared list buffer
 local buf = nil
@@ -59,22 +74,71 @@ function M.status_of(session)
     if not session.rpc:is_running() then
         return "exited"
     end
-    if session.chat:is_compacting() then
+    if session.chat then
+        if session.chat:is_compacting() then
+            return "compacting"
+        end
+        if session.chat:is_streaming() then
+            return "busy"
+        end
+        return "idle"
+    end
+    if session._detached_compacting then
         return "compacting"
     end
-    if session.chat:is_streaming() then
+    if session._detached_busy then
         return "busy"
     end
     return "idle"
 end
 
+---@param row pi.SessionsListRow
+---@return boolean
+local function is_child_row(row)
+    return row.depth ~= nil and row.depth > 0
+end
+
+--- Status dot colors for sub-session rows (depth > 0).
+--- Active (`is_current_view`) uses the current-tab blue overlay in
+--- `refresh_current_markers`; this function supplies the buffer-level base.
+---@param row pi.SessionsListRow
+---@param tick integer
+---@return string
+local function child_dot_hl(row, tick)
+    local active = row.is_current_view == true
+
+    if row.status == "exited" or row.dormant then
+        return "PiSessionsListIdle"
+    end
+    if row.error then
+        if active then
+            return "PiSessionsListError"
+        end
+        return tick % 2 == 0 and "PiSessionsListError" or "PiSessionsListDotDim"
+    end
+    if row.done then
+        if active then
+            return "PiSessionsListDone"
+        end
+        return tick % 2 == 0 and "PiSessionsListDone" or "PiSessionsListDotDim"
+    end
+    if row.status == "busy" or row.status == "compacting" then
+        return tick % 2 == 0 and "PiSessionsListBusy" or "PiSessionsListDotDim"
+    end
+    return "PiSessionsListIdle"
+end
+
 --- Highlight group of a row's status dot at a given animation tick.
 --- Busy blinks every tick, compacting at half speed; attention, idle and
 --- exited are steady (their color alone carries the state).
+--- Sub-session rows follow a separate active/inactive matrix; see child_dot_hl.
 ---@param row pi.SessionsListRow
 ---@param tick integer
 ---@return string
 function M.dot_hl(row, tick)
+    if is_child_row(row) then
+        return child_dot_hl(row, tick)
+    end
     if row.status == "exited" then
         return "PiSessionsListExited"
     end
@@ -131,28 +195,216 @@ end
 ---@return string line
 ---@return integer[][] chunks
 function M.format_line(row, tick)
-    local indent = " "
-    local dot = "●"
+    local indent = row.depth and row.depth > 0 and "  " or " "
+    local branch = row.depth and row.depth > 0 and "└─ " or ""
+    local dot = row.dormant and "◌" or "●"
     local name = row.name or "…"
     local pending = row.name == nil
-    -- While the backend generates a title, animate the provisional label
-    -- (pending placeholder or "(unnamed)"). Once a real name shows — the
-    -- generated title arriving via session_info_changed — the spinner
-    -- disappears immediately, even if the "generating" status is still set
-    -- for a tick: the label transition is a single change, not two.
+    local subtitle = row.subtitle and (" · " .. row.subtitle) or ""
+    local unread = row.unread_report and " ✉" or ""
     local provisional = pending or name == "(unnamed)"
     local spinner = row.title_generating and provisional and M.spinner_frame(tick)
-    local line = indent .. dot .. " " .. (spinner and spinner .. " " or "") .. name
-    local dot_start = #indent
+    local line = indent .. branch .. dot .. " " .. (spinner and spinner .. " " or "") .. name .. subtitle .. unread
+    local prefix = indent .. branch
+    local dot_start = #prefix
     local name_start = dot_start + #dot + 1 + (spinner and #spinner + 1 or 0)
     local chunks = {
         { dot_start, dot_start + #dot, M.dot_hl(row, tick) },
-        { name_start, name_start + #name, pending and "PiSessionsListPending" or "Normal" },
+        { name_start, name_start + #name + #subtitle + #unread, pending and "PiSessionsListPending" or "Normal" },
     }
     if spinner then
         table.insert(chunks, 2, { name_start - #spinner - 1, name_start - 1, "PiSessionsListSpinner" })
     end
     return line, chunks
+end
+
+--- Child rows whose completion green blink was acknowledged by the user.
+---@type table<string, true>
+local child_completion_seen = {}
+
+--- Acknowledge a sub-session's completion notification (stops the green blink).
+---@param child_id string
+function M.mark_child_completion_seen(child_id)
+    if type(child_id) ~= "string" or child_id == "" then
+        return
+    end
+    if not child_completion_seen[child_id] then
+        child_completion_seen[child_id] = true
+        M.request_refresh()
+    end
+end
+
+--- Acknowledge completed sub-sessions whose report was already injected into the parent.
+--- Called on TabEnter while viewing the parent (mirrors parent `clear_flags` for children).
+---@param parent pi.Session
+function M.acknowledge_reported_children(parent)
+    if not parent then
+        return
+    end
+    local Manifest = require("pi.subsessions.manifest")
+    local lineage = Manifest.lineage_for_session(parent)
+    if lineage == "" then
+        return
+    end
+    local changed = false
+    for _, entry in ipairs(Manifest.children_of(lineage)) do
+        local child_id = entry._id
+        if entry.status == "completed" and entry.reported and type(child_id) == "string" and child_id ~= "" then
+            if not child_completion_seen[child_id] then
+                child_completion_seen[child_id] = true
+                changed = true
+            end
+        end
+    end
+    if changed then
+        M.request_refresh()
+    end
+end
+
+--- Acknowledge reported children when `parent` is the focused session on the current tab.
+---@param parent pi.Session?
+function M.acknowledge_reported_children_for_current_tab(parent)
+    if not parent or parent.view_parent_id then
+        return
+    end
+    local tab = parent.attached_tab
+    if not tab or tab ~= vim.api.nvim_get_current_tabpage() then
+        return
+    end
+    M.acknowledge_reported_children(parent)
+end
+
+---@param out pi.SessionsListRow[]
+---@param entry pi.SubsessionManifestEntry
+---@param tab pi.TabId
+---@param opts { is_current_view?: boolean }
+local function append_child_row(out, entry, tab, opts)
+    local Sessions = require("pi.sessions.manager")
+    local child_id = entry._id
+    local child = child_id and Sessions.get_by_id(child_id)
+    local cfg = entry.config or {}
+    local model = cfg.model
+    local subtitle = model and (model.id .. (cfg.thinking_level and (" · " .. cfg.thinking_level) or "")) or ""
+    local dormant = entry.status == "dormant" or (child and not child.rpc:is_running())
+    out[#out + 1] = {
+        tab = tab,
+        child_id = child_id,
+        session_id = child_id,
+        depth = 1,
+        status = dormant and "exited" or (child and M.status_of(child) or "idle"),
+        attention = 0,
+        -- Sub-session rows never use the parent-style green "done" blink; completion is
+        -- surfaced in the parent chat instead. `child_completion_seen` only controls list visibility.
+        done = false,
+        error = entry.status == "failed",
+        name = entry.name,
+        title_generating = false,
+        subtitle = subtitle,
+        dormant = dormant,
+        unread_report = entry.status == "completed" and not entry.reported,
+        session = child,
+        is_current_view = opts.is_current_view == true,
+    }
+end
+
+---@return pi.SessionsListChildFilterCtx
+local function child_filter_ctx()
+    local Sessions = require("pi.sessions.manager")
+    return {
+        completion_seen = function(id)
+            return child_completion_seen[id] == true
+        end,
+        process_running = function(id)
+            local child = Sessions.get_by_id(id)
+            return child ~= nil and child.rpc:is_running()
+        end,
+    }
+end
+
+--- Append manifest child rows that pass the sessions-list visibility filter.
+---@param out pi.SessionsListRow[]
+---@param parent_sess pi.Session?
+---@param tab pi.TabId
+---@param current_child_id? string
+local function append_visible_children(out, parent_sess, tab, current_child_id)
+    if not parent_sess then
+        return
+    end
+    local Manifest = require("pi.subsessions.manifest")
+    local lineage = Manifest.lineage_for_session(parent_sess)
+    if lineage == "" then
+        return
+    end
+    local epoch = parent_sess.conversation_epoch or 0
+    local ctx = child_filter_ctx()
+    for _, entry in ipairs(Manifest.children_of(lineage)) do
+        local child_id = entry._id
+        local is_current = type(current_child_id) == "string" and child_id == current_child_id
+        local same_epoch = (entry.parent_epoch or 0) == epoch
+        local visible = is_current
+            or show_hidden_children
+            or (same_epoch and ChildFilter.child_visible(entry, ctx))
+        if visible then
+            append_child_row(out, entry, tab, { is_current_view = is_current })
+        end
+    end
+end
+
+--- Toggle whether hidden sub-session rows are shown in :PiSessions.
+---@return boolean new_state
+function M.toggle_show_hidden_children()
+    show_hidden_children = not show_hidden_children
+    M.request_refresh()
+    return show_hidden_children
+end
+
+---@return boolean
+function M.show_hidden_children()
+    return show_hidden_children
+end
+
+--- Build a parent (depth 0) row for a live session process.
+---@param out pi.SessionsListRow[]
+---@param session pi.Session
+---@param tab pi.TabId
+---@param opts { is_current_view?: boolean, is_tree_parent?: boolean, name?: string? }
+local function append_parent_row(out, session, tab, opts, attention_count, name_of, flags_of, generating_of)
+    local sid = session.id
+    local f = flags_of and flags_of(session) or nil
+    out[#out + 1] = {
+        tab = tab,
+        session_id = sid,
+        depth = 0,
+        status = M.status_of(session),
+        attention = attention_count(session.tab or 0) or 0,
+        done = f ~= nil and f.done == true,
+        error = f ~= nil and f.error == true,
+        name = opts.name or name_of(session),
+        title_generating = generating_of ~= nil and generating_of(session) == true,
+        session = session,
+        is_current_view = opts.is_current_view == true,
+        is_tree_parent = opts.is_tree_parent == true,
+    }
+end
+
+--- Fallback display name for a detached parent process (no tab chat).
+---@param session pi.Session
+---@return string?
+local function name_from_session_file(session)
+    if type(session.session_file) ~= "string" or session.session_file == "" then
+        return nil
+    end
+    local info = require("pi.sessions.history").parse(session.session_file)
+    if not info then
+        return nil
+    end
+    if info.name and info.name ~= "" then
+        return info.name
+    end
+    if info.first_message and info.first_message ~= "" then
+        return info.first_message
+    end
+    return nil
 end
 
 --- Build display rows from live sessions.
@@ -163,19 +415,28 @@ end
 ---@param generating_of? fun(session: pi.Session): boolean
 ---@return pi.SessionsListRow[]
 function M.build_rows(sessions, attention_count, name_of, flags_of, generating_of)
+    local Sessions = require("pi.sessions.manager")
     ---@type pi.SessionsListRow[]
     local out = {}
     for _, session in ipairs(sessions) do
-        local f = flags_of and flags_of(session) or nil
-        out[#out + 1] = {
-            tab = session.tab,
-            status = M.status_of(session),
-            attention = attention_count(session.tab) or 0,
-            done = f ~= nil and f.done == true,
-            error = f ~= nil and f.error == true,
-            name = name_of(session),
-            title_generating = generating_of ~= nil and generating_of(session) == true,
-        }
+        local tab = session.tab
+        local root_id = session.view_parent_id or session.id
+        local in_child_view = session.view_parent_id ~= nil
+
+        if in_child_view and root_id then
+            local parent_sess = Sessions.get_by_id(root_id)
+            if parent_sess then
+                append_parent_row(out, parent_sess, tab, {
+                    is_current_view = false,
+                    is_tree_parent = true,
+                    name = name_of(parent_sess) or name_from_session_file(parent_sess),
+                }, attention_count, name_of, flags_of, generating_of)
+            end
+            append_visible_children(out, parent_sess, tab, session.id)
+        else
+            append_parent_row(out, session, tab, { is_current_view = true }, attention_count, name_of, flags_of, generating_of)
+            append_visible_children(out, session, tab, nil)
+        end
     end
     return out
 end
@@ -389,7 +650,15 @@ local spinner_timer = nil
 ---@return boolean whether any row animates (busy/compacting/done/error)
 local function has_animated_row()
     for _, row in ipairs(rows) do
-        if row.status == "busy" or row.status == "compacting" or row.done or row.error then
+        if is_child_row(row) then
+            if row.is_current_view then
+                if row.status == "busy" or row.status == "compacting" then
+                    return true
+                end
+            elseif row.error or row.done or row.status == "busy" or row.status == "compacting" then
+                return true
+            end
+        elseif row.status == "busy" or row.status == "compacting" or row.done or row.error then
             return true
         end
     end
@@ -514,6 +783,8 @@ function M._render()
         local line, chunks = M.format_line(row, blink_tick)
         lines[i] = line
         line_chunks[i] = chunks
+        row.marker_col = chunks[1][1] + 1
+        row.marker_len = chunks[1][2] - chunks[1][1]
     end
     if #lines == 0 then
         lines = { "  (no active sessions)" }
@@ -546,9 +817,9 @@ function M._render()
 
     -- Kick off the initial name fetch only; resolved entries (including
     -- empty "(unnamed)" ones) are re-checked on lifecycle hooks, not redraws.
-    for _, session in ipairs(sessions) do
-        if name_cache[session] == nil then
-            fetch_name(session)
+    for _, row in ipairs(rows) do
+        if row.session and name_cache[row.session] == nil then
+            fetch_name(row.session)
         end
     end
 
@@ -572,24 +843,19 @@ refresh_current_markers = function()
         current_matches[win] = nil
         if vim.api.nvim_win_is_valid(win) then
             for lnum, row in ipairs(rows) do
-                if row.tab == tab then
-                    -- Current-tab marker: the dot of the tab's own session
-                    -- renders in the agent color, overriding the buffer-level
-                    -- state color. Steady while idle; while busy it blinks
-                    -- with the tick (the dim phase falls through to the
-                    -- buffer-level PiSessionsListDotDim, so the agent color
-                    -- stays the only color). Attention/done/error/exited keep
-                    -- their own colors.
-                    local markable = (row.status == "idle" or row.status == "busy")
+                if row.tab == tab and row.is_current_view then
+                    -- Current-tab marker: blue overlay on the focused session dot
+                    -- (parent or child). Steady while idle; blinks while busy.
+                    local markable = (row.status == "idle" or row.status == "busy" or row.status == "compacting")
                         and row.attention == 0
                         and not row.done
                         and not row.error
-                    local marker_on = row.status ~= "busy" or blink_tick % 2 == 0
+                    local marker_on = row.status == "idle" or blink_tick % 2 == 0
                     if markable and marker_on then
-                        -- matchaddpos has no window arg on this Neovim; run it
-                        -- in the window's context.
+                        local col = row.marker_col or 2
+                        local len = row.marker_len or 1
                         local ok, id = pcall(vim.api.nvim_win_call, win, function()
-                            return vim.fn.matchaddpos("PiSessionsListCurrent", { { lnum, 2, 3 } }, 20)
+                            return vim.fn.matchaddpos("PiSessionsListCurrent", { { lnum, col, len } }, 20)
                         end)
                         if ok then
                             current_matches[win] = id
@@ -630,6 +896,9 @@ local HELP_ENTRIES = {
     { "f", "Fork this session from a past message (:PiFork)" },
     { "C", "Clone this session (:PiClone)" },
     { "t", "Navigate this session's tree (:PiTree)" },
+    { "p", "Preview sub-session messages (read-only)" },
+    { "x", "Close sub-session process (:PiSubClose)" },
+    { "H", "Toggle hidden / prior-conversation sub-sessions" },
     { "R", "Refresh the list" },
     { "q", "Close the list" },
     { "?", "Toggle this help" },
@@ -736,21 +1005,70 @@ end
 local function row_session_under_cursor()
     local lnum = vim.api.nvim_win_get_cursor(0)[1]
     local row = rows[lnum]
-    if not row or not vim.api.nvim_tabpage_is_valid(row.tab) then
+    if not row then
         return nil, nil
     end
-    return row, session_for_tab(row.tab)
+    if row.session then
+        return row, row.session
+    end
+    if row.tab and vim.api.nvim_tabpage_is_valid(row.tab) then
+        return row, session_for_tab(row.tab)
+    end
+    return row, nil
 end
 
 local function jump_under_cursor(at_end)
     local row, session = row_session_under_cursor()
-    if not row or not session then
+    if not row then
+        return
+    end
+    local Subsessions = require("pi.subsessions")
+    local Sessions = require("pi.sessions.manager")
+    local target_tab = row.tab or vim.api.nvim_get_current_tabpage()
+
+    if row.is_tree_parent and row.session then
+        if vim.api.nvim_get_current_tabpage() ~= target_tab then
+            vim.api.nvim_set_current_tabpage(target_tab)
+        end
+        Subsessions.switch_to_parent(function(ok, err)
+            if ok then
+                local parent = Sessions.get_for_tab(target_tab)
+                if parent and parent.chat then
+                    if at_end then
+                        parent.chat:ensure_shown_and_focus_prompt_at_end()
+                    else
+                        parent.chat:ensure_shown_and_focus_prompt()
+                    end
+                end
+            elseif err then
+                require("pi.notify").error(err)
+            end
+        end)
+        return
+    end
+
+    if row.depth and row.depth > 0 and row.child_id then
+        Subsessions.switch_to(row.child_id, function(ok, err)
+            if ok then
+                local child = Sessions.get_for_tab(target_tab)
+                if child and child.chat then
+                    if at_end then
+                        child.chat:ensure_shown_and_focus_prompt_at_end()
+                    else
+                        child.chat:ensure_shown_and_focus_prompt()
+                    end
+                end
+            elseif err then
+                require("pi.notify").error(err)
+            end
+        end, { tab = target_tab })
+        return
+    end
+    if not row.tab or not session then
         return
     end
     vim.api.nvim_set_current_tabpage(row.tab)
     if at_end then
-        -- a/i: open the chat AND drop into Insert at the prompt's very end,
-        -- ready to type (append semantics; lands after multi-line drafts).
         session.chat:ensure_shown_and_focus_prompt_at_end()
     else
         session.chat:ensure_shown_and_focus_prompt()
@@ -920,6 +1238,22 @@ local function ensure_buf()
         tree_under_cursor,
         vim.tbl_extend("force", map_opts, { desc = "Navigate this session's tree" })
     )
+    vim.keymap.set("n", "p", function()
+        local row = rows[vim.api.nvim_win_get_cursor(0)[1]]
+        if row and row.child_id then
+            require("pi.subsessions").preview(row.child_id)
+        end
+    end, vim.tbl_extend("force", map_opts, { desc = "Preview sub-session" }))
+    vim.keymap.set("n", "x", function()
+        local row = rows[vim.api.nvim_win_get_cursor(0)[1]]
+        if row and row.child_id then
+            require("pi.subsessions").close(row.child_id)
+        end
+    end, vim.tbl_extend("force", map_opts, { desc = "Close sub-session process" }))
+    vim.keymap.set("n", "H", function()
+        M.toggle_show_hidden_children()
+        M._render()
+    end, vim.tbl_extend("force", map_opts, { desc = "Toggle hidden sub-sessions" }))
     vim.keymap.set("n", "R", function()
         name_cache = setmetatable({}, { __mode = "k" })
         M._render()
@@ -1064,6 +1398,7 @@ end
 
 --- Close the sessions list window in the current tab (no-op when absent).
 function M.close()
+    show_hidden_children = false
     local tab = current_tab()
     local win = win_for(tab)
     if not win then
@@ -1127,6 +1462,7 @@ function M._reset()
     rows = {}
     name_cache = setmetatable({}, { __mode = "k" })
     refresh_scheduled = false
+    child_completion_seen = {}
 end
 
 return M

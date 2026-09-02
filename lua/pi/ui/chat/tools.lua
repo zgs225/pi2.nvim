@@ -1,6 +1,7 @@
 --- Tool call rendering for chat history.
 
 local Render = require("pi.ui.render")
+local SubToolUi = require("pi.subsessions.tool_ui")
 
 local M = {}
 
@@ -34,6 +35,14 @@ local TOOL_ICONS = {
     source_check = nf(0xF0565), -- nf-md-shield-check
     get_search_content = nf(0xF0866), -- nf-md-database-search
     vision = nf(0xF0208), -- nf-md-eye (vision-fallback description block)
+    -- Sub-agent family (Material Design outline set)
+    list_subagents = nf(0xF0D0B), -- nf-md-account-group-outline
+    read_subagent = nf(0xF0229), -- nf-md-file-eye-outline
+    list_batches = nf(0xF0CB8), -- nf-md-format-list-numbered
+    dispatch_subagents = nf(0xF0E6F), -- nf-md-source-branch
+    poll_subagents = nf(0xF051C), -- nf-md-progress-clock
+    wait_subagents = nf(0xF0955), -- nf-md-clock-check-outline
+    stop_subagents = nf(0xF0680), -- nf-md-stop-circle-outline
 }
 
 --- Get the nerd font icon for a tool name.
@@ -43,11 +52,52 @@ function M.get_tool_icon(tool_name)
     return TOOL_ICONS[tool_name] or require("pi.config").options.labels.tool
 end
 
+---@param renderer pi.ToolRenderer
+---@param args? table
+---@return boolean
+function M.is_inline(renderer, args)
+    local inline = renderer.inline
+    if inline == nil then
+        return false
+    end
+    if type(inline) == "function" then
+        return inline(args) == true
+    end
+    return inline == true
+end
+
+---@param tool_name string
+---@param args? table
+---@return string
+function M.tool_display_name(tool_name, args)
+    local renderer = M.get_renderer(tool_name)
+    if renderer and renderer.display_name then
+        local name = renderer.display_name(args)
+        if type(name) == "string" and name ~= "" then
+            return name
+        end
+    end
+    if SubToolUi.is_subagent_tool(tool_name) then
+        return SubToolUi.display_name(tool_name)
+    end
+    return tool_name
+end
+
 ---@param text string?
 ---@return string
 function M.sanitize_text(text)
-    local sanitized = (text or ""):gsub("%z", "␀")
-    return sanitized
+    if type(text) ~= "string" then
+        text = text == nil and "" or tostring(text)
+    end
+    return text:gsub("%z", "␀")
+end
+
+--- Collapse newlines for single-line buffer rows (nvim_buf_set_lines rejects `\n` in one item).
+---@param text string?
+---@return string
+function M.flatten_line(text)
+    text = M.sanitize_text(text)
+    return (text:gsub("[\r\n]+", " "):gsub("%s+", " "))
 end
 
 ---@param result? table
@@ -171,7 +221,7 @@ end
 ---@param insert_at? integer  when set, insert at this row instead of appending
 ---@return integer? next_insert_at  advanced insertion cursor (nil when appending)
 local function render_body_line(history, text, hl_group, insert_at)
-    text = M.sanitize_text(text)
+    text = M.flatten_line(text)
     local start
     if insert_at then
         start, insert_at = history:_insert_lines(insert_at, { text })
@@ -762,7 +812,8 @@ end
 ---@field on_end? fun(history: pi.ChatHistory, args: table?, result: table?, is_error: boolean?, insert_at: integer?): integer?
 ---@field input_visible? integer  lines to show when collapsed (default: show all)
 ---@field output_visible? integer lines to show when collapsed (default: show all)
----@field inline? boolean  render as a single line (no header/footer)
+---@field inline? boolean|fun(args: table?): boolean  render as a single line (no header/footer)
+---@field display_name? fun(args: table?): string?  user-facing tool label (defaults to RPC tool name)
 ---@field inline_text? fun(args: table?): string?  text to show after tool name
 ---@field inline_status? fun(result: table?, is_error: boolean?): string?  extra text next to status icon
 
@@ -1052,6 +1103,178 @@ local renderers = {
             end
         end,
         on_end = render_result_output,
+    },
+    list_subagents = {
+        inline = true,
+        display_name = function()
+            return SubToolUi.display_name("list_subagents")
+        end,
+        inline_status = function(result)
+            return SubToolUi.list_subagents_status(SubToolUi.result_details(result))
+        end,
+    },
+    read_subagent = {
+        inline = true,
+        display_name = function()
+            return SubToolUi.display_name("read_subagent")
+        end,
+        inline_text = function(args)
+            if not args or type(args.target) ~= "string" then
+                return nil
+            end
+            return SubToolUi.child_name(args.target) or SubToolUi.short_id(args.target)
+        end,
+        inline_status = function(result)
+            local details = SubToolUi.result_details(result)
+            local lines = details and details.lines
+            if type(lines) == "table" then
+                local lang = SubToolUi.resolve_lang()
+                if lang == "zh" then
+                    return ("(%d 行)"):format(#lines)
+                end
+                return ("(%d lines)"):format(#lines)
+            end
+            local text = extract_result_text(result)
+            if text then
+                local n = select(2, text:gsub("\n", "\n")) + 1
+                local lang = SubToolUi.resolve_lang()
+                if lang == "zh" then
+                    return ("(%d 行)"):format(n)
+                end
+                return ("(%d lines)"):format(n)
+            end
+        end,
+    },
+    dispatch_subagents = {
+        inline = function(args)
+            return SubToolUi.dispatch_inline(args)
+        end,
+        display_name = function()
+            return SubToolUi.display_name("dispatch_subagents")
+        end,
+        inline_text = function(args)
+            if SubToolUi.dispatch_inline(args) then
+                return args and args.items and SubToolUi.item_label(args.items[1])
+            end
+            return SubToolUi.dispatch_header_detail(args)
+        end,
+        inline_status = function(result)
+            return SubToolUi.batch_status_text(SubToolUi.result_details(result))
+        end,
+        input_visible = 0,
+        output_visible = 3,
+        on_start = function(history, args)
+            if SubToolUi.dispatch_inline(args) or type(args) ~= "table" or type(args.items) ~= "table" then
+                return
+            end
+            for i, item in ipairs(args.items) do
+                local prefix = i == #args.items and "  └─ " or "  ├─ "
+                local ref = type(item.ref) == "string" and item.ref ~= "" and ("[%s] "):format(item.ref) or ""
+                render_body_line(history, prefix .. ref .. SubToolUi.item_label(item))
+            end
+        end,
+        on_end = function(history, args, result, is_error, insert_at)
+            if SubToolUi.dispatch_inline(args) then
+                return insert_at
+            end
+            local details = SubToolUi.result_details(result)
+            if not details then
+                return insert_at
+            end
+            local status = SubToolUi.batch_status_text(details)
+            if status then
+                insert_at = render_body_line(history, "status: " .. status, nil, insert_at)
+            end
+            if type(details.items) == "table" then
+                for _, item in ipairs(details.items) do
+                    local mark = item.status == "ok" and "✓" or (item.status == "failed" and "✗" or "·")
+                    local label = type(item.ref) == "string" and item.ref ~= "" and item.ref
+                        or SubToolUi.item_label(item)
+                    local line = ("  %s %s"):format(mark, label)
+                    if type(item.output) == "string" and item.output ~= "" then
+                        line = line .. " — " .. M.flatten_line(item.output:sub(1, 80))
+                    elseif type(item.error) == "string" and item.error ~= "" then
+                        line = line .. " — " .. M.flatten_line(item.error:sub(1, 80))
+                    end
+                    insert_at = render_body_line(history, line, nil, insert_at)
+                end
+            end
+            return insert_at
+        end,
+    },
+    poll_subagents = {
+        inline = true,
+        display_name = function()
+            return SubToolUi.display_name("poll_subagents")
+        end,
+        inline_text = function(args)
+            if not args or type(args.batch_id) ~= "string" then
+                return nil
+            end
+            return "batch " .. (SubToolUi.short_id(args.batch_id) or args.batch_id)
+        end,
+        inline_status = function(result)
+            return SubToolUi.batch_status_text(SubToolUi.result_details(result))
+        end,
+    },
+    wait_subagents = {
+        inline = true,
+        display_name = function()
+            return SubToolUi.display_name("wait_subagents")
+        end,
+        inline_text = function(args)
+            if not args or type(args.batch_id) ~= "string" then
+                return nil
+            end
+            return "batch " .. (SubToolUi.short_id(args.batch_id) or args.batch_id)
+        end,
+        inline_status = function(result)
+            return SubToolUi.batch_status_text(SubToolUi.result_details(result))
+        end,
+    },
+    list_batches = {
+        inline = true,
+        display_name = function()
+            return SubToolUi.display_name("list_batches")
+        end,
+        inline_status = function(result)
+            return SubToolUi.list_batches_status(SubToolUi.result_details(result))
+        end,
+    },
+    stop_subagents = {
+        inline = true,
+        display_name = function()
+            return SubToolUi.display_name("stop_subagents")
+        end,
+        inline_text = function(args)
+            if type(args) ~= "table" or type(args.targets) ~= "table" or #args.targets == 0 then
+                return nil
+            end
+            local names = {}
+            for _, id in ipairs(args.targets) do
+                names[#names + 1] = SubToolUi.child_name(id) or SubToolUi.short_id(id) or id
+            end
+            local joined = table.concat(names, ", ")
+            if #joined > 60 then
+                joined = joined:sub(1, 57) .. "…"
+            end
+            return joined
+        end,
+        inline_status = function(result, is_error)
+            if is_error then
+                return nil
+            end
+            local details = SubToolUi.result_details(result)
+            local n = details and details.stopped
+            if type(n) ~= "number" then
+                return nil
+            end
+            local lang = SubToolUi.resolve_lang()
+            if lang == "zh" then
+                return ("已停止 %d"):format(n)
+            end
+            return ("stopped %d"):format(n)
+        end,
     },
 }
 

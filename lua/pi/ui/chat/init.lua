@@ -119,6 +119,42 @@ function Chat.new(tab, mode, agent)
     return self
 end
 
+--- Rebind this chat UI to a different RPC agent (session process switch).
+---@param agent pi.ChatAgent
+function Chat:bind_agent(agent)
+    self._agent = agent
+end
+
+--- Show a breadcrumb when viewing a sub-session (`◂ 父：…`).
+---@param label string
+---@param parent_id string
+function Chat:set_subsession_breadcrumb(label, parent_id)
+    self._subsession_parent_id = parent_id
+    self._subsession_breadcrumb = "◂ 父：" .. label
+    self:_update_subsession_breadcrumb()
+end
+
+function Chat:clear_subsession_breadcrumb()
+    self._subsession_parent_id = nil
+    self._subsession_breadcrumb = nil
+    self:_update_subsession_breadcrumb()
+end
+
+function Chat:_update_subsession_breadcrumb()
+    local hwin = self._layout:history_win()
+    if not hwin or not vim.api.nvim_win_is_valid(hwin) then
+        return
+    end
+    if self._subsession_breadcrumb then
+        vim.wo[hwin].winbar = "%#PiChatHistoryWinbar#%=%#PiSessionsListBusy# "
+            .. self._subsession_breadcrumb
+            .. " %#PiChatHistoryWinbar#%="
+    else
+        local title = Config.options.panels.history.title
+        vim.wo[hwin].winbar = "%#PiChatHistoryWinbar#%=%#PiChatHistoryWinbar# " .. title .. " %#PiChatHistoryWinbar#%="
+    end
+end
+
 function Chat:_set_keymaps()
     if self._keymaps_set then
         return
@@ -327,6 +363,10 @@ function Chat:_set_keymaps()
     vim.keymap.set("n", "gf", function()
         self:goto_path_at_cursor()
     end, { buffer = hbuf, desc = "π: open file under cursor" })
+
+    vim.keymap.set("n", "gp", function()
+        require("pi.subsessions").switch_to_parent(function() end)
+    end, { buffer = hbuf, desc = "π: return to parent session" })
 
     -- Zen toggle key — permanent on the prompt buffer.
     -- Enters zen when inactive, exits when active.
@@ -966,6 +1006,14 @@ function Chat:_send_message(queue_type)
             self:_send_bash(text, command, exclude)
             return
         end
+    end
+
+    -- A bare "/new" starts a fresh parent conversation locally (mirrors the
+    -- TUI's /new). In a sub-session view this returns to the parent first.
+    if vim.trim(text) == "/new" then
+        self._prompt:clear_text()
+        require("pi").new_session()
+        return
     end
 
     -- A bare "/tree" opens the session-tree navigator locally instead of

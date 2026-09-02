@@ -161,6 +161,22 @@ function M.setup()
     vim.api.nvim_create_user_command("PiToggleDebug", function()
         Pi.toggle_debug()
     end, { desc = "Toggle π RPC debug logging" })
+
+    vim.api.nvim_create_user_command("PiSubNew", function()
+        Pi.sub_new()
+    end, { desc = "Spawn a sub-session with a task prompt" })
+
+    vim.api.nvim_create_user_command("PiSubSwitch", function()
+        Pi.sub_switch()
+    end, { desc = "Switch to a sub-session of the current conversation" })
+
+    vim.api.nvim_create_user_command("PiSubParent", function()
+        Pi.sub_parent()
+    end, { desc = "Return to the parent session" })
+
+    vim.api.nvim_create_user_command("PiSubClose", function()
+        Pi.sub_close()
+    end, { desc = "Close the current sub-session process (file retained)" })
 end
 
 return M

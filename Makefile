@@ -1,6 +1,7 @@
 # pi.nvim development helpers.
 #
 #   make test    — run the plenary unit test suite (hermetic, -u tests/minimal_init.lua)
+#   make e2e     — run headless end-to-end scripts (tests/*_e2e.lua)
 #   make smoke   — headless end-to-end smoke check (loads the user config, opens the chat)
 #   make format  — reformat lua/ and tests/ in place with stylua
 #   make style   — check formatting only (stylua --check); non-zero exit on drift, for CI/hooks
@@ -16,11 +17,17 @@ MIN_INIT := tests/minimal_init.lua
 STYLUA_BIN ?= stylua
 LUA_LS_BIN ?= lua-language-server
 
-.PHONY: test smoke format style lint docs-links
+.PHONY: test smoke format style lint docs-links e2e
 
 test:
 	PLENARY_PATH=$(PLENARY_PATH) $(NVIM_BIN) --headless -u $(MIN_INIT) \
 		-c "lua require('plenary.test_harness').test_directory('tests', { minimal_init = '$(MIN_INIT)' })"
+
+e2e:
+	@for f in tests/*_e2e.lua; do \
+		echo "e2e: $$f"; \
+		$(NVIM_BIN) --headless -u $(MIN_INIT) -l $$f || exit 1; \
+	done
 
 smoke:
 	$(NVIM_BIN) --headless -u $(HOME)/.config/nvim/init.lua -l /tmp/pi_smoke.lua

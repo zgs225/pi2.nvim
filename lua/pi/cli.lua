@@ -123,8 +123,19 @@ function M.scoped_models_extension_path()
     return plugin_root() .. "/extensions/scoped-models.ts"
 end
 
+--- Absolute path to the bundled sub-agent extension (parent sessions only).
+---@return string
+function M.subagent_extension_path()
+    return plugin_root() .. "/extensions/subagent.ts"
+end
+
+---@class pi.CliCommandOpts
+---@field subagent? boolean Inject subagent.ts when enabled (default: follow config).
+
+---@param opts? pi.CliCommandOpts
 ---@return string[]
-function M.command()
+function M.command(opts)
+    opts = opts or {}
     local cmd = { M.bin() }
     vim.list_extend(cmd, M.args())
     -- Inject the bundled extension that bridges session-tree navigation
@@ -165,6 +176,14 @@ function M.command()
     if vim.fn.filereadable(scope_ext) == 1 then
         cmd[#cmd + 1] = "--extension"
         cmd[#cmd + 1] = scope_ext
+    end
+    local subagent = Config.options.subagent or {}
+    if opts.subagent ~= false and subagent.enabled ~= false then
+        local sub_ext = M.subagent_extension_path()
+        if vim.fn.filereadable(sub_ext) == 1 then
+            cmd[#cmd + 1] = "--extension"
+            cmd[#cmd + 1] = sub_ext
+        end
     end
     cmd[#cmd + 1] = "--mode"
     cmd[#cmd + 1] = "rpc"

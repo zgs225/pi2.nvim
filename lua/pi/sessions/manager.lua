@@ -15,12 +15,25 @@
 ---@field provider string
 ---@field id string
 
+---@class pi.PinnedConfig
+---@field model pi.ModelRef Model chosen in this session. Reapplied after `new_session` so model switches made in other sessions (which core persists to global settings) don't leak into this tab's next conversation.
+---@field thinking_level? string Thinking level pinned for this session.
+
 ---@class pi.Session
----@field tab pi.TabId
+---@field id string Session id from backend (`sessionId`) or JSONL header; temporary ids use the `tmp-` prefix until the backend reports the real id.
+---@field attached_tab? pi.TabId Tab currently displaying this session (`nil` when detached or running in the background).
+---@field tab? pi.TabId Alias for `attached_tab` (backward compatibility).
 ---@field rpc pi.Rpc
----@field chat pi.Chat
+---@field chat? pi.Chat UI bound to this session while `attached_tab` is set; `nil` when detached.
 ---@field attention pi.SessionAttention
----@field pinned_model? pi.ModelRef Model chosen in this tab. Reapplied after `new_session` so model switches made in other sessions (which core persists to global settings) don't leak into this tab's next conversation.
+---@field pinned_config? pi.PinnedConfig Per-session model/thinking pin.
+---@field pinned_model? pi.ModelRef Deprecated alias for `pinned_config.model`; kept in sync by `update_pinned_config`.
+---@field parent_id? string Parent session id when this is a sub-session process.
+---@field view_parent_id? string Parent id for breadcrumb navigation while viewing a child in the tab UI.
+---@field lineage_id? string Stable parent key for sub-session manifest rows across /new and id migration.
+---@field conversation_epoch? integer Incremented on each /new in this tab; sub-sessions tag their parent_epoch.
+---@field _detached_busy? boolean Agent running on a detached process (no chat UI).
+---@field _detached_compacting? boolean Compaction running on a detached process.
 ---@field session_file? string Backend-reported session file path (from get_state responses). Lets the resume picker detect "still open in another tab" without extra RPC round-trips.
 ---@field startup_announcements table<string, pi.StartupAnnouncement> Extension startup data (keys ending with `:startup`) shown in the system preamble. Process-level: persists across session switches.
 ---@field system_errors pi.SystemErrorEntry[]
@@ -54,6 +67,9 @@ local CommandsCache = require("pi.cache.commands")
 ---@param session pi.Session
 ---@param commands? pi.SlashCommand[]
 local function show_startup_block(session, commands)
+    if not session.chat then
+        return
+    end
     local sections = Startup.build_startup_sections(session, commands)
     session.chat:show_startup_block({ sections = sections, errors = session.system_errors })
 end
@@ -66,12 +82,150 @@ local function fetch_commands_and_show_startup_block(session)
     end)
 end
 
----@type table<pi.TabId, pi.Session>
-local sessions = {}
+--- All live sessions keyed by session id (including detached/background processes).
+---@type table<string, pi.Session>
+local registry = {}
+
+--- Chat UI instance per Neovim tabpage (view layer; rebindable across sessions).
+---@type table<pi.TabId, pi.Chat>
+local tab_chats = {}
+
+--- Which session id each tab's chat is currently bound to.
+---@type table<pi.TabId, string>
+local tab_session_id = {}
+
+--- Monotonic counter for temporary session ids before the backend reports `sessionId`.
+local next_temp_id = 0
+
+--- Load a session file into an existing RPC process (defined below).
+---@type fun(session: pi.Session, session_path: string)
+local load_session
 
 ---@return pi.TabId
 local function current_tab()
     return vim.api.nvim_get_current_tabpage()
+end
+
+---@return string
+local function alloc_temp_session_id()
+    next_temp_id = next_temp_id + 1
+    return ("tmp-%d"):format(next_temp_id)
+end
+
+--- Keep `pinned_model` in sync with `pinned_config.model` for callers not yet migrated.
+---@param session pi.Session
+---@param opts { model?: pi.ModelRef, thinking_level?: string }
+function M.update_pinned_config(session, opts)
+    if not opts.model and not opts.thinking_level then
+        return
+    end
+    session.pinned_config = session.pinned_config or {}
+    if opts.model then
+        session.pinned_config.model = opts.model
+        session.pinned_model = opts.model
+    end
+    if opts.thinking_level then
+        session.pinned_config.thinking_level = opts.thinking_level
+    end
+end
+
+---@param session pi.Session
+---@param new_id string
+local function migrate_session_id(session, new_id)
+    if session.id == new_id then
+        return
+    end
+    local old_id = session.id
+    session.id = new_id
+    registry[new_id] = session
+    if old_id and registry[old_id] == session then
+        registry[old_id] = nil
+    end
+    if session.attached_tab and tab_session_id[session.attached_tab] == old_id then
+        tab_session_id[session.attached_tab] = new_id
+    end
+    require("pi.subsessions.manifest").bind_session_lineage(session, new_id)
+end
+
+---@param rpc pi.Rpc
+---@return pi.ChatAgent
+local function make_agent(rpc)
+    return {
+        send = function(msg, callback)
+            return rpc:send(msg, callback)
+        end,
+    }
+end
+
+--- Bind a tab's chat UI to a session process. Detaches any prior bindings on
+--- either side without stopping RPC processes.
+---@param session pi.Session
+---@param chat pi.Chat
+---@param tab pi.TabId
+local function bind_chat_to_session(session, chat, tab)
+    local prev_id = tab_session_id[tab]
+    if prev_id and prev_id ~= session.id then
+        local prev = registry[prev_id]
+        if prev and prev.attached_tab == tab then
+            prev.attached_tab = nil
+            prev.tab = nil
+            prev.chat = nil
+        end
+    end
+
+    if session.attached_tab and session.attached_tab ~= tab then
+        local prev_tab = session.attached_tab
+        if tab_session_id[prev_tab] == session.id then
+            tab_session_id[prev_tab] = nil
+        end
+    end
+
+    chat:bind_agent(make_agent(session.rpc))
+    session.chat = chat
+    session.attached_tab = tab
+    session.tab = tab
+    tab_chats[tab] = chat
+    tab_session_id[tab] = session.id
+end
+
+--- Detach a tab's chat from its session without stopping the backend process.
+---@param tab pi.TabId
+local function detach_tab(tab)
+    local session_id = tab_session_id[tab]
+    if session_id then
+        local session = registry[session_id]
+        if session and session.attached_tab == tab then
+            Attention.clear_session(session)
+            session.attached_tab = nil
+            session.tab = nil
+            session.chat = nil
+        end
+        tab_session_id[tab] = nil
+    end
+
+    local chat = tab_chats[tab]
+    if chat then
+        chat:hide()
+        chat:clear()
+        tab_chats[tab] = nil
+    end
+end
+
+---@param session pi.Session
+---@param state table? get_state response data
+local function capture_session_id(session, state)
+    if type(state) ~= "table" then
+        return
+    end
+    local id = state.sessionId
+    if (not id or id == "") and type(state.sessionFile) == "string" and state.sessionFile ~= "" then
+        local info = require("pi.sessions.history").parse(state.sessionFile)
+        id = info and info.id
+    end
+    if type(id) ~= "string" or id == "" then
+        return
+    end
+    migrate_session_id(session, id)
 end
 
 --- Events we've reviewed and deliberately choose not to handle.
@@ -213,7 +367,9 @@ local function refresh_model_ambiguity(session, state)
             end
         end
         if covered then
-            session.chat:set_model_ambiguity_for(model.provider, model.id, Models.ambiguity_suffix(model, cache.list))
+            if session.chat then
+                session.chat:set_model_ambiguity_for(model.provider, model.id, Models.ambiguity_suffix(model, cache.list))
+            end
             return
         end
     end
@@ -224,7 +380,9 @@ local function refresh_model_ambiguity(session, state)
                 return
             end
             session._models_cache = { fetched_at = os.time(), list = list }
-            session.chat:set_model_ambiguity_for(model.provider, model.id, Models.ambiguity_suffix(model, list))
+            if session.chat then
+                session.chat:set_model_ambiguity_for(model.provider, model.id, Models.ambiguity_suffix(model, list))
+            end
         end)
     end)
 end
@@ -235,25 +393,35 @@ function M.refresh_state(session)
     session.rpc:send({ type = "get_state" }, function(res)
         if res.success and res.data then
             vim.schedule(function()
+                capture_session_id(session, res.data)
                 capture_session_file(session, res.data)
-                session.chat:update_state(res.data)
-                refresh_model_ambiguity(session, res.data)
+                if session.chat then
+                    session.chat:update_state(res.data)
+                    refresh_model_ambiguity(session, res.data)
+                end
             end)
         end
     end)
 end
 
---- Capture the backend's current model as this tab's pinned model.
+--- Capture the backend's current model/thinking as this session's pinned config.
 ---@param session pi.Session
 ---@param state table? get_state response data
-local function capture_model_pin(session, state)
-    local model = type(state) == "table" and state.model or nil
+local function capture_config_pin(session, state)
+    if type(state) ~= "table" then
+        return
+    end
+    local model = state.model
+    local thinking = state.thinkingLevel
     if type(model) == "table" and type(model.provider) == "string" and type(model.id) == "string" then
-        session.pinned_model = { provider = model.provider, id = model.id }
+        M.update_pinned_config(session, {
+            model = { provider = model.provider, id = model.id },
+            thinking_level = type(thinking) == "string" and thinking or nil,
+        })
     end
 end
 
---- Fetch current state, update the status line, and (re)capture the model pin.
+--- Fetch current state, update the status line, and (re)capture the config pin.
 --- Used where the backend's model is authoritative for this tab: session
 --- creation (core resolves it from global settings) and session resume
 --- (core restores it from the session file).
@@ -262,32 +430,55 @@ local function refresh_state_and_pin(session)
     session.rpc:send({ type = "get_state" }, function(res)
         if res.success and res.data then
             vim.schedule(function()
-                capture_model_pin(session, res.data)
+                capture_config_pin(session, res.data)
+                capture_session_id(session, res.data)
                 capture_session_file(session, res.data)
-                session.chat:update_state(res.data)
-                refresh_model_ambiguity(session, res.data)
+                if session.chat then
+                    session.chat:update_state(res.data)
+                    refresh_model_ambiguity(session, res.data)
+                end
             end)
         end
     end)
 end
 
---- Re-apply the tab's pinned model after a `new_session`.
+--- Re-apply the session's pinned config after a `new_session`.
 --- Core resolves a fresh session's model from global settings — i.e. the last
 --- model selected in *any* session — so without this, another tab's model
 --- switch would leak into this tab's next conversation. On failure the pinned
---- model is no longer usable (auth revoked, model gone): fall back silently
+--- config is no longer usable (auth revoked, model gone): fall back silently
 --- and resync the pin to the model core chose.
 ---@param session pi.Session
-local function reapply_pinned_model(session)
-    local pin = session.pinned_model
-    if not pin then
+local function reapply_pinned_config(session)
+    local pin = session.pinned_config
+    if not pin or not pin.model then
         refresh_state_and_pin(session)
         return
     end
-    local sent = session.rpc:send({ type = "set_model", provider = pin.provider, modelId = pin.id }, function(res)
+
+    local function after_model()
+        if pin.thinking_level then
+            local sent_level = session.rpc:send({ type = "set_thinking_level", level = pin.thinking_level }, function(res)
+                vim.schedule(function()
+                    if res.success then
+                        M.refresh_state(session)
+                    else
+                        refresh_state_and_pin(session)
+                    end
+                end)
+            end)
+            if not sent_level then
+                refresh_state_and_pin(session)
+            end
+        else
+            M.refresh_state(session)
+        end
+    end
+
+    local sent = session.rpc:send({ type = "set_model", provider = pin.model.provider, modelId = pin.model.id }, function(res)
         vim.schedule(function()
             if res.success then
-                M.refresh_state(session)
+                after_model()
             else
                 refresh_state_and_pin(session)
             end
@@ -311,6 +502,31 @@ function M.handle_event(session, msg)
 
     if sessions_list_events[t] then
         require("pi.ui.sessions").request_refresh()
+    end
+
+    if not chat then
+        local SessionList = require("pi.ui.sessions")
+        if t == "agent_start" then
+            session._detached_busy = true
+            SessionList.on_agent_start(session)
+        elseif t == "agent_end" then
+            session._detached_busy = false
+            SessionList.on_agent_end(session)
+        elseif t == "agent_settled" then
+            session._detached_busy = false
+            if session.parent_id then
+                require("pi.subsessions").on_child_settled(session)
+            end
+        elseif t == "compaction_start" or t == "auto_compaction_start" then
+            session._detached_compacting = true
+        elseif t == "compaction_end" or t == "auto_compaction_end" then
+            session._detached_compacting = false
+        elseif t == "_process_exit" and session.id then
+            session._detached_busy = false
+            session._detached_compacting = false
+            registry[session.id] = nil
+        end
+        return true
     end
 
     -- NOTE: This compaction-specific rebuild gate should become a small
@@ -338,7 +554,12 @@ function M.handle_event(session, msg)
         -- no retry, compaction retry, or queued continuation remains. The
         -- compaction/retry branches above restore state piecemeal; this is the
         -- final fallback that converges any leftover spinner.
-        chat:set_status(nil)
+        if chat then
+            chat:set_status(nil)
+        end
+        if session.parent_id then
+            require("pi.subsessions").on_child_settled(session)
+        end
     elseif t == "message_update" then
         local event = msg.assistantMessageEvent
         if event then
@@ -545,8 +766,15 @@ finish_compaction_rebuild = function(session, flush_queue, will_retry)
     local queued = session._compaction_event_queue or {}
     session._compaction_event_queue = {}
     session._compaction_rebuilding = false
-    session.chat:set_compacting(false)
-    restore_active_agent_status(session.chat)
+    local chat = session.chat
+    if not chat then
+        for _, queued_msg in ipairs(queued) do
+            M.handle_event(session, queued_msg)
+        end
+        return
+    end
+    chat:set_compacting(false)
+    restore_active_agent_status(chat)
     if flush_queue ~= false then
         session.chat:flush_compaction_queue(will_retry == true)
     end
@@ -567,11 +795,21 @@ end
 --- Get the session for the current tab. Returns nil if none exists.
 ---@return pi.Session?
 function M.get()
-    local tab = current_tab()
-    return sessions[tab]
+    return M.get_for_tab(current_tab())
 end
 
---- List all active sessions in tabline order.
+--- Get the session bound to a tabpage. Returns nil if none exists.
+---@param tab pi.TabId
+---@return pi.Session?
+function M.get_for_tab(tab)
+    local session_id = tab_session_id[tab]
+    if session_id then
+        return registry[session_id]
+    end
+    return nil
+end
+
+--- List sessions currently attached to a tab, in tabline order.
 ---
 --- Tabpage handles reflect creation order, not position: a tab created while
 --- tab 1 is current lands between tabs 1 and 2, and :tabmove reorders tabs
@@ -586,15 +824,137 @@ function M.list()
     end
     ---@type pi.Session[]
     local result = {}
-    for _, session in pairs(sessions) do
-        result[#result + 1] = session
+    for _, session in pairs(registry) do
+        if session.attached_tab then
+            result[#result + 1] = session
+        end
     end
     table.sort(result, function(a, b)
-        -- A session whose tab was just closed can linger until the scheduled
-        -- cleanup runs; sort it last instead of crashing on a missing rank.
-        return (rank[a.tab] or math.huge) < (rank[b.tab] or math.huge)
+        return (rank[a.attached_tab] or math.huge) < (rank[b.attached_tab] or math.huge)
     end)
     return result
+end
+
+--- All live sessions in the registry (attached and detached).
+---@return pi.Session[]
+function M.list_all()
+    ---@type pi.Session[]
+    local result = {}
+    for _, session in pairs(registry) do
+        result[#result + 1] = session
+    end
+    return result
+end
+
+--- Look up a session by id.
+---@param id string
+---@return pi.Session?
+function M.get_by_id(id)
+    return registry[id]
+end
+
+--- Find a live session whose manifest lineage matches `lineage_id`.
+--- Manifest child rows store `parent_id` as lineage, not necessarily the current registry id.
+---@param lineage_id string
+---@return pi.Session?
+function M.find_by_lineage(lineage_id)
+    if type(lineage_id) ~= "string" or lineage_id == "" then
+        return nil
+    end
+    local Manifest = require("pi.subsessions.manifest")
+    local target = Manifest.resolve_lineage(lineage_id) or lineage_id
+    local direct = registry[lineage_id] or registry[target]
+    if direct then
+        return direct
+    end
+    for _, session in pairs(registry) do
+        if Manifest.lineage_for_session(session) == target then
+            return session
+        end
+    end
+    return nil
+end
+
+--- Bind a tab's chat UI to a session process (for sub-session switching in later phases).
+---@param session pi.Session
+---@param chat pi.Chat
+---@param tab pi.TabId
+function M.bind_chat(session, chat, tab)
+    bind_chat_to_session(session, chat, tab)
+    require("pi.ui.sessions").request_refresh()
+end
+
+--- Migrate or assign a session's registry id.
+---@param session pi.Session
+---@param id string
+function M.ensure_id(session, id)
+    migrate_session_id(session, id)
+end
+
+--- Create a background session process without binding a tab chat UI.
+---@param tab pi.TabId RPC job identity (usually the parent's tab).
+---@param opts? { subagent?: boolean }
+---@return pi.Session?
+function M.create_detached(tab, opts)
+    opts = opts or {}
+    local rpc = Rpc.new(tab)
+    if not rpc:start({ subagent = opts.subagent }) then
+        return nil
+    end
+
+    ---@type pi.Session
+    local session = {
+        id = alloc_temp_session_id(),
+        rpc = rpc,
+        attention = { pending = {} },
+        startup_announcements = {},
+        system_errors = {},
+        cwd = vim.fn.getcwd(),
+        changed_files = {},
+    }
+
+    registry[session.id] = session
+
+    rpc:set_handler(function(msg)
+        M.handle_event(session, msg)
+    end)
+
+    refresh_state_and_pin(session)
+    require("pi.ui.sessions").request_refresh()
+    return session
+end
+
+--- Stop a session process and remove it from the registry.
+---@param session pi.Session
+function M.close_session(session)
+    if session.attached_tab then
+        detach_tab(session.attached_tab)
+    end
+    Attention.clear_session(session)
+    session.rpc:stop()
+    if session.id then
+        registry[session.id] = nil
+    end
+    require("pi.ui.sessions").request_refresh()
+end
+
+---@class pi.LoadSessionOpts
+---@field rebind_parent_context? boolean Reset lineage/view state for :PiResume (default true). Set false for sub-session switches.
+
+--- Load a session file into an existing session (exported for sub-session switching).
+---@param session pi.Session
+---@param session_path string
+---@param callback? fun(ok: boolean)
+---@param opts? pi.LoadSessionOpts
+function M.load_session_path(session, session_path, callback, opts)
+    load_session(session, session_path, opts)
+    if callback then
+        -- load_session is async; invoke callback after get_messages path completes.
+        -- Callers that need strict ordering should wait on RPC; for switch we fire-and-forget ok=true.
+        vim.schedule(function()
+            callback(true)
+        end)
+    end
 end
 
 --- Open a fresh session in a new tabpage (`:tabnew` then show).
@@ -615,9 +975,12 @@ function M.get_or_create(opts)
 
     local tab = current_tab()
 
-    local session = sessions[tab]
-    if session then
-        return session
+    local bound_id = tab_session_id[tab]
+    if bound_id then
+        local existing = registry[bound_id]
+        if existing and existing.rpc:is_running() then
+            return existing
+        end
     end
 
     local rpc = Rpc.new(tab)
@@ -629,26 +992,26 @@ function M.get_or_create(opts)
 
     local layout = opts.layout or Config.resolve_default_layout_mode()
 
-    ---@type pi.ChatAgent
-    local agent = {
-        send = function(msg, callback)
-            return rpc:send(msg, callback)
-        end,
-    }
-
-    local chat = Chat.new(tab, layout, agent)
+    local chat = tab_chats[tab]
+    if not chat then
+        chat = Chat.new(tab, layout, make_agent(rpc))
+    else
+        chat:bind_agent(make_agent(rpc))
+    end
 
     ---@type pi.Session
-    session = {
-        tab = tab,
+    local session = {
+        id = alloc_temp_session_id(),
         rpc = rpc,
-        chat = chat,
         attention = { pending = {} },
         startup_announcements = {},
         system_errors = {},
         cwd = vim.fn.getcwd(),
         changed_files = {},
     }
+
+    registry[session.id] = session
+    bind_chat_to_session(session, chat, tab)
 
     -- Prompt history is scoped per workspace: anchor it to the session cwd.
     chat:set_cwd(session.cwd)
@@ -657,39 +1020,40 @@ function M.get_or_create(opts)
         M.handle_event(session, msg)
     end)
 
-    sessions[tab] = session
     require("pi.ui.sessions").request_refresh()
 
     -- Fetch available /commands for completion, highlighting, and system info
     fetch_commands_and_show_startup_block(session)
 
     -- Fetch initial state for status line (model, thinking level) and
-    -- capture the initial model pin.
+    -- capture the initial config pin.
     refresh_state_and_pin(session)
 
     return session
 end
 
---- Remove and clean up a session for the current tab.
+--- Stop the current tab's session process and detach its chat.
 function M.stop()
     local tab = current_tab()
-    local session = sessions[tab]
+    local session_id = tab_session_id[tab]
+    if not session_id then
+        return
+    end
+    local session = registry[session_id]
     if not session then
         return
     end
 
     Attention.clear_session(session)
     session.rpc:stop()
-    session.chat:hide()
-    session.chat:clear()
-
-    sessions[tab] = nil
+    detach_tab(tab)
+    registry[session_id] = nil
     require("pi.ui.sessions").request_refresh()
 end
 
 ---@param session pi.Session
 local function start_new_session(session)
-    if sessions[session.tab] ~= session or not session.rpc:is_running() then
+    if not session.attached_tab or tab_session_id[session.attached_tab] ~= session.id or not session.rpc:is_running() then
         return
     end
 
@@ -716,6 +1080,7 @@ local function start_new_session(session)
                     return
                 end
                 Attention.end_session_transition(session, true)
+                require("pi.subsessions").on_parent_new_conversation(session)
                 require("pi.ui.sessions").invalidate(session)
                 require("pi.ui.sessions").clear_flags(session)
                 require("pi.ui.sessions").request_refresh()
@@ -724,8 +1089,9 @@ local function start_new_session(session)
                 session.changed_files = {}
                 session._pending_file_change_args = nil
                 session.chat:clear()
-                reapply_pinned_model(session)
+                reapply_pinned_config(session)
                 fetch_commands_and_show_startup_block(session)
+                M.refresh_state(session)
             end)
         end)
         if not sent_new then
@@ -739,13 +1105,9 @@ local function start_new_session(session)
     end
 end
 
---- Start a new conversation in the current tab's session.
-function M.new_session()
-    local session = M.get()
-    if not session or not session.rpc:is_running() then
-        return
-    end
-
+--- Run `start_new_session` on `session`, prompting when the agent is streaming.
+---@param session pi.Session
+local function new_session_with_confirm(session)
     if not session.chat:is_streaming() then
         start_new_session(session)
         return
@@ -760,6 +1122,32 @@ function M.new_session()
         end
         start_new_session(session)
     end)
+end
+
+--- Start a new conversation in the current tab's session.
+function M.new_session()
+    local session = M.get()
+    if not session or not session.rpc:is_running() then
+        return
+    end
+
+    if session.view_parent_id then
+        require("pi.subsessions").switch_to_parent(function(ok, err)
+            if not ok then
+                Notify.error(err or "failed to switch to parent session")
+                return
+            end
+            local parent = M.get()
+            if not parent or not parent.rpc:is_running() then
+                Notify.error("parent session not running")
+                return
+            end
+            new_session_with_confirm(parent)
+        end, { for_new_session = true })
+        return
+    end
+
+    new_session_with_confirm(session)
 end
 
 --- Replay messages from get_messages response into chat.
@@ -987,7 +1375,9 @@ end
 --- Load a session by path: switch_session -> clear chat -> get_messages -> replay.
 ---@param session pi.Session
 ---@param session_path string
-local function load_session(session, session_path)
+---@param opts? pi.LoadSessionOpts
+function load_session(session, session_path, opts)
+    opts = opts or {}
     Attention.begin_session_transition(session)
 
     local sent_switch = session.rpc:send({ type = "switch_session", sessionPath = session_path }, function(msg)
@@ -1008,6 +1398,9 @@ local function load_session(session, session_path)
         end
 
         Attention.end_session_transition(session, true)
+        if opts.rebind_parent_context ~= false then
+            require("pi.subsessions").on_parent_resumed(session, session_path)
+        end
         require("pi.ui.sessions").invalidate(session)
         require("pi.ui.sessions").clear_flags(session)
         require("pi.ui.sessions").request_refresh()
@@ -1016,6 +1409,9 @@ local function load_session(session, session_path)
         refresh_state_and_pin(session)
 
         vim.schedule(function()
+            if not session.chat then
+                return
+            end
             session.changed_files = {}
             session._pending_file_change_args = nil
             session.chat:clear()
@@ -1024,6 +1420,9 @@ local function load_session(session, session_path)
 
         local sent_messages = session.rpc:send({ type = "get_messages" }, function(res)
             vim.schedule(function()
+                if not session.chat then
+                    return
+                end
                 session.chat:clear_placeholder()
                 if not res.success then
                     local err = res.error or "Failed to load session messages"
@@ -1044,6 +1443,9 @@ local function load_session(session, session_path)
         end)
         if not sent_messages then
             vim.schedule(function()
+                if not session.chat then
+                    return
+                end
                 session.chat:clear()
                 Notify.error("Failed to load session messages")
                 session.chat:on_error("Failed to load session messages", { pad_top = true, pad_bottom = true })
@@ -1074,8 +1476,8 @@ end
 ---@param exclude_tab pi.TabId? Tab whose own live copy never counts as a conflict (the reopen target).
 ---@return pi.Session?
 local function find_live_elsewhere(session_path, exclude_tab)
-    for _, s in ipairs(M.list()) do
-        if s.tab ~= exclude_tab and s.rpc:is_running() and s.session_file == session_path then
+    for _, s in pairs(registry) do
+        if s.attached_tab ~= exclude_tab and s.rpc:is_running() and s.session_file == session_path then
             return s
         end
     end
@@ -1244,11 +1646,25 @@ local function open_with_telescope(items, opts)
     return true
 end
 
+---@param sessions pi.SessionInfo[]
+---@return pi.SessionInfo[]
+local function filter_top_level_sessions(sessions)
+    local Manifest = require("pi.subsessions.manifest")
+    ---@type pi.SessionInfo[]
+    local out = {}
+    for _, session in ipairs(sessions) do
+        if not Manifest.is_child_session(session.id) then
+            out[#out + 1] = session
+        end
+    end
+    return out
+end
+
 ---@param current_session_file? string
 ---@return string?
 local function find_continue_session_path(current_session_file)
     local History = require("pi.sessions.history")
-    local sessions_list = History.list()
+    local sessions_list = filter_top_level_sessions(History.list())
     for _, session in ipairs(sessions_list) do
         if session.path ~= current_session_file then
             return session.path
@@ -1337,7 +1753,7 @@ end
 ---@param opts? pi.SessionCreateOpts
 function M.resume_session(opts)
     local History = require("pi.sessions.history")
-    local sessions_list = History.list()
+    local sessions_list = filter_top_level_sessions(History.list())
     if #sessions_list == 0 then
         Notify.info("No sessions found")
         return
@@ -1456,21 +1872,52 @@ function M.resume_session(opts)
     end)
 end
 
---- Clean up sessions for closed tabs.
+--- Detach closed tabs without stopping their backend processes.
 function M.cleanup()
     ---@type table<pi.TabId, boolean>
     local valid_tabs = {}
     for _, t in ipairs(vim.api.nvim_list_tabpages()) do
         valid_tabs[t] = true
     end
-    for tab, session in pairs(sessions) do
+    local detached = false
+    for tab in pairs(tab_session_id) do
         if not valid_tabs[tab] then
-            Attention.clear_session(session)
-            session.rpc:stop()
-            sessions[tab] = nil
-            require("pi.ui.sessions").request_refresh()
+            detach_tab(tab)
+            detached = true
         end
     end
+    for tab in pairs(tab_chats) do
+        if not valid_tabs[tab] then
+            detach_tab(tab)
+            detached = true
+        end
+    end
+    if detached then
+        require("pi.ui.sessions").request_refresh()
+    end
+end
+
+--- Test-only: insert a session into the registry (for bind/detach specs).
+---@param session pi.Session
+function M._register_for_test(session)
+    registry[session.id] = session
+end
+
+--- Test-only reset: stop all sessions and clear registry state.
+function M._reset()
+    for id, session in pairs(registry) do
+        if session.rpc:is_running() then
+            session.rpc:stop()
+        end
+        registry[id] = nil
+    end
+    for tab in pairs(tab_chats) do
+        tab_chats[tab] = nil
+    end
+    for tab in pairs(tab_session_id) do
+        tab_session_id[tab] = nil
+    end
+    next_temp_id = 0
 end
 
 --- Set up the TabClosed autocmd (called once from init.setup).
@@ -1490,13 +1937,18 @@ function M.setup_autocmds()
             local session = M.get()
             if session then
                 require("pi.ui.sessions").clear_flags(session)
+                if session.view_parent_id and session.id then
+                    require("pi.ui.sessions").mark_child_completion_seen(session.id)
+                else
+                    require("pi.ui.sessions").acknowledge_reported_children(session)
+                end
             end
         end,
     })
 
     vim.api.nvim_create_autocmd("VimLeavePre", {
         callback = function()
-            for _, session in pairs(sessions) do
+            for _, session in pairs(registry) do
                 Attention.clear_session(session)
                 session.rpc:stop()
             end
@@ -1505,8 +1957,8 @@ function M.setup_autocmds()
 
     vim.api.nvim_create_autocmd("VimResized", {
         callback = function()
-            for _, session in pairs(sessions) do
-                if session.chat:is_visible() then
+            for _, session in pairs(registry) do
+                if session.chat and session.chat:is_visible() then
                     session.chat:on_resize()
                 end
             end

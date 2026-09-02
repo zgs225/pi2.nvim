@@ -35,6 +35,9 @@ function M.setup(opts)
     require("pi.commands").setup()
     require("pi.ui.winfix").setup()
     require("pi.paste").setup()
+    pcall(function()
+        require("pi.subsessions").rebuild_statuses()
+    end)
 end
 
 --- Open a fresh session in a new tabpage. Uses `layout.default` from config.
@@ -145,8 +148,14 @@ end
 
 --- Abort the current agent operation.
 function M.abort()
-    local session = require("pi.sessions.manager").get()
+    local Sessions = require("pi.sessions.manager")
+    local session = Sessions.get()
     if session and session.rpc:is_running() then
+        if session.id then
+            pcall(function()
+                require("pi.subsessions.batch").cancel_for_parent(session.id)
+            end)
+        end
         require("pi.attention").clear_session(session)
         session.rpc:send({ type = "abort" })
     end
@@ -661,6 +670,22 @@ function M.changed_files()
         return {}
     end
     return vim.tbl_keys(session.changed_files)
+end
+
+function M.sub_new()
+    require("pi.subsessions").sub_new()
+end
+
+function M.sub_switch()
+    require("pi.subsessions").sub_switch()
+end
+
+function M.sub_parent()
+    require("pi.subsessions").sub_parent()
+end
+
+function M.sub_close()
+    require("pi.subsessions").sub_close()
 end
 
 return M

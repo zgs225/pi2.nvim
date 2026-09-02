@@ -117,8 +117,7 @@ local function settle_tabs(first_tab)
         vim.api.nvim_set_current_tabpage(first_tab)
     end
     vim.cmd("silent! tabonly!")
-    Sessions.cleanup()
-    Sessions.stop()
+    Sessions._reset()
 end
 
 local function restore_stub(first_tab)
@@ -501,5 +500,39 @@ describe("pi resume picker", function()
                     and find_after(base_ct, "switch_session") ~= nil
             end, "<C-t> did not open a new tab")
         end)
+    end)
+
+    it("excludes sub-sessions registered in the manifest", function()
+        local Manifest = require("pi.subsessions.manifest")
+        local orig_is_child = Manifest.is_child_session
+        Manifest.is_child_session = function(id)
+            return id == "child-session-id"
+        end
+
+        History.list = function()
+            return {
+                {
+                    path = T_TARGET,
+                    id = "parent-session-id",
+                    name = "parent",
+                    timestamp = "2025-06-01T10:00:00.000Z",
+                    first_message = "parent ask",
+                },
+                {
+                    path = T_OTHER,
+                    id = "child-session-id",
+                    name = "child worker",
+                    timestamp = "2025-06-02T11:00:00.000Z",
+                    first_message = "child task",
+                },
+            }
+        end
+
+        Sessions.resume_session()
+        local call = last_select_call("pi-resume-session")
+        Manifest.is_child_session = orig_is_child
+
+        assert.equals(1, #call.items)
+        assert.equals("parent-session-id", call.items[1].session.id)
     end)
 end)

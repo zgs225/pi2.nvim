@@ -268,6 +268,23 @@
 ---@field map_command? fun(cmd: table, ctx: pi.RpcAdapterContext): table? Map or drop outbound RPC commands.
 ---@field map_event? fun(msg: table, ctx: pi.RpcAdapterContext): table? Map or drop inbound RPC events.
 
+---@class pi.SubagentConfig
+---@field enabled? boolean Inject subagent.ts extension (default true)
+---@field max_children? integer Max concurrent sub-sessions per parent (default 5)
+---@field report_mode? "last_message" Report mode when sub-session completes (default "last_message")
+---@field default_config? "inherit"|"default" Sub-session model/thinking default (default "inherit")
+---@field read_tail? integer Default projection tail for read_subagent (default 50)
+---@field max_batch_size? integer Max items per dispatch_subagents batch (default 5)
+---@field batch_timeout_ms? integer Default wait_subagents timeout (default 300000)
+---@field batch_ttl_hours? integer Hours to retain completed batch records (default 24)
+---@field show_full_ids? boolean Show full UUIDs in sub-agent tool rows (default false; truncated)
+---@field sessions_list? pi.SubagentSessionsListConfig
+
+---@class pi.SubagentSessionsListConfig
+---@field show_dormant? boolean Show closed (dormant) children in :PiSessions (default false; use :PiSubSwitch)
+---@field show_completed? "all"|"unread"|"none" Completed children in :PiSessions (default "unread")
+---@field show_failed? "all"|"unread"|"none" Failed children in :PiSessions (default "unread")
+
 ---@class pi.Options
 ---@field cli pi.CliConfig
 ---@field rpc pi.RpcConfig
@@ -289,6 +306,7 @@
 ---@field quickfix pi.QuickfixConfig
 ---@field abort pi.AbortConfig
 ---@field tree pi.TreeConfig
+---@field subagent pi.SubagentConfig
 ---@field vision pi.VisionConfig
 ---@field title pi.TitleConfig
 ---@field sessions_list pi.SessionsListConfig
@@ -421,6 +439,21 @@ local defaults = {
     },
     tree = {
         enabled = true,
+    },
+    subagent = {
+        enabled = true,
+        max_children = 5,
+        report_mode = "last_message",
+        default_config = "inherit",
+        read_tail = 50,
+        max_batch_size = 5,
+        batch_timeout_ms = 300000,
+        batch_ttl_hours = 24,
+        sessions_list = {
+            show_dormant = false,
+            show_completed = "unread",
+            show_failed = "unread",
+        },
     },
     vision = {},
     title = {

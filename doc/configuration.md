@@ -195,6 +195,26 @@ require("pi").setup({
         enabled = true,
     },
 
+    -- Sub-sessions (子会话). When enabled (default), injects extensions/subagent.ts
+    -- into parent RPC processes so the Agent can spawn and steer child sessions.
+    -- Children run as detached background processes with their own session files.
+    subagent = {
+        enabled = true,
+        max_children = 5,           -- concurrent active children per parent
+        report_mode = "last_message", -- completion report uses child's last assistant output
+        default_config = "inherit",   -- "inherit" parent model/thinking, or "default"
+        read_tail = 50,               -- default projection lines for read_subagent
+        max_batch_size = 5,           -- max items per dispatch_subagents batch
+        batch_timeout_ms = 300000,    -- default wait_subagents timeout (5 min)
+        batch_ttl_hours = 24,         -- retain completed batch records (hours)
+        show_full_ids = false,        -- show full UUIDs in sub-agent tool rows (default: truncated …suffix)
+        sessions_list = {
+            show_dormant = false,     -- show closed children in :PiSessions (default: use :PiSubSwitch)
+            show_completed = "unread", -- "all" | "unread" | "none" — unread hides agent workers + acknowledged user completions
+            show_failed = "unread",   -- "all" | "unread" | "none"
+        },
+    },
+
     -- Vision fallback for non-vision main models. When `model` is set
     -- ("provider/modelId") and the current main model cannot see images,
     -- attached images are described by this vision-capable model first and

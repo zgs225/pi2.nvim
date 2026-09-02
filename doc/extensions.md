@@ -199,3 +199,22 @@ require("pi").setup({
 ```
 
 </details>
+
+## Bundled sub-agent extension (`extensions/subagent.ts`)
+
+When `subagent.enabled` is true (default), pi2.nvim injects `extensions/subagent.ts` into **parent** RPC processes (child sub-session processes omit it). The extension registers Agent-callable tools:
+
+| Tool | Role |
+| --- | --- |
+| `list_subagents` | Read manifest; list children of the current session |
+| `read_subagent` | Project tail of a child's JSONL (observation, no host round-trip) |
+| `list_batches` | List dispatch batches for the current parent session |
+| `dispatch_subagents` | Fan out parallel work (mixed `{ task }` spawn + `{ target, message }` reuse); optional `wait: true` blocks until done |
+| `poll_subagents` | Poll batch progress by `batch_id` (idempotent) |
+| `wait_subagents` | Block until a batch reaches a terminal state |
+| `stop_subagents` | Close one or more child RPC processes (`targets: string[]`) |
+
+**Chat rendering:** sub-agent tools use localized short labels (`子·派发` / `sub·dispatch`, from `title.lang` or your UI locale), Material Design outline nerd-font icons, and manifest **names** for child targets (same source as `:PiSessions` child rows; UUIDs truncate to `…suffix` unless `subagent.show_full_ids` is true). `dispatch_subagents` renders as a **block** when `items` has more than one entry or `wait` is not `true`; a single item with `wait: true` stays **inline** like `read` or `bash`.
+
+Action tools tunnel through a silent `ctx.ui.select` with title `__pi_subagent__`, handled in `lua/pi/ui/extension.lua` without showing a picker. See [Sessions → Sub-sessions](sessions.md#sub-sessions).
+
