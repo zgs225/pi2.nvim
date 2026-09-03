@@ -206,10 +206,10 @@ When `subagent.enabled` is true (default), pi2.nvim injects `extensions/subagent
 
 | Tool | Role |
 | --- | --- |
-| `list_subagents` | Read manifest; list children of the current session |
+| `list_subagents` | Read manifest; list children of the current session (including dormant / settled) |
 | `read_subagent` | Project tail of a child's JSONL (observation, no host round-trip) |
 | `list_batches` | List dispatch batches for the current parent session |
-| `dispatch_subagents` | Fan out parallel work (mixed `{ task }` spawn + `{ target, message }` reuse); optional `wait: true` blocks until done |
+| `dispatch_subagents` | Fan out parallel work (mixed `{ task }` spawn + `{ target, message }` reuse). Dormant/settled ids still work — the host revives the process. Optional `wait: true` blocks until done. |
 | `poll_subagents` | Poll batch progress by `batch_id` (idempotent) |
 | `wait_subagents` | Block until a batch reaches a terminal state |
 | `stop_subagents` | Close one or more child RPC processes (`targets: string[]`) |

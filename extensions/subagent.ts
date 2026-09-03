@@ -4,6 +4,10 @@
  * Observation tools (list/read) read the manifest + JSONL directly from disk.
  * Action tools tunnel through a silent host select (`__pi_subagent__`)
  * handled by lua/pi/ui/extension.lua.
+ *
+ * Do not inject a live child inventory into the system prompt or `context`
+ * event: that text changes with status and would bust the prompt-cache prefix
+ * (see extensions/vision.ts CAPABILITY_NOTE). list_subagents is the live source.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -43,8 +47,9 @@ function loadManifest(): Record<string, any> {
 	}
 }
 
-function sessionId(pi: ExtensionAPI): string | undefined {
-	return (pi as { getSessionId?: () => string }).getSessionId?.();
+function parentSessionId(ctx: ExtensionContext): string | undefined {
+	const id = ctx.sessionManager.getSessionId();
+	return typeof id === "string" && id !== "" ? id : undefined;
 }
 
 function resolveLineage(sessionId: string, manifest: Record<string, any>): string {
@@ -136,7 +141,10 @@ const DispatchItemSchema = Type.Union([
 	}),
 	Type.Object({
 		ref: Type.Optional(Type.String()),
-		target: Type.String({ description: "Existing sub-agent id from list_subagents" }),
+		target: Type.String({
+			description:
+				"Existing sub-agent UUID from list_subagents. Reuse dormant/completed/failed/interrupted children too; the host revives the process. Do not spawn a new child only because status is not active.",
+		}),
 		message: Type.String(),
 	}),
 ]);
@@ -146,10 +154,10 @@ export default function subagentBridge(pi: ExtensionAPI) {
 		name: "list_subagents",
 		label: "List Sub-agents",
 		description:
-			"List sub-agents owned by the current parent session. Call before dispatch_subagents to reuse an existing child. Returns { subagents: [{ id, name, status, ... }] }; use id (UUID) as target — not the display name.",
+			"List sub-agents owned by the current parent session, including dormant, completed, failed, and interrupted children. Call this before dispatch_subagents when continuing prior work. Returns { subagents: [{ id, name, status, ... }] }. Use id (UUID) as target — not the display name. Closed (dormant) children remain reusable.",
 		parameters: Type.Object({}),
-		async execute(_toolCallId, _params, _signal, _onUpdate, _ctx) {
-			const parent = sessionId(pi);
+		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
+			const parent = parentSessionId(ctx);
 			if (!parent) return toolResult({ subagents: [] });
 			const manifest = loadManifest();
 			const lineage = resolveLineage(parent, manifest);
@@ -188,7 +196,7 @@ export default function subagentBridge(pi: ExtensionAPI) {
 		name: "dispatch_subagents",
 		label: "Dispatch Sub-agents",
 		description:
-			"Run one or more sub-agent tasks in parallel. Each item is either { task } (spawn new) or { target, message } (reuse existing id from list_subagents). Returns batch_id; use poll_subagents or set wait:true to collect results. Default failure policy: collect_errors.",
+			"Run one or more sub-agent tasks in parallel. Each item is either { task } (spawn a new child) or { target, message } (reuse an existing id from list_subagents). Prefer { target, message } when list_subagents already has a matching child — dormant/completed/failed/interrupted ids still work; the host revives the process. Do not spawn a new child only because status is not active. Returns batch_id; use poll_subagents or set wait:true to collect results. Default failure policy: collect_errors.",
 		parameters: Type.Object({
 			items: Type.Array(DispatchItemSchema),
 			wait: Type.Optional(

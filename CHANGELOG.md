@@ -2,6 +2,7 @@
 
 ## 2026-09-03
 
+- **FIXED:** `list_subagents` used `pi.getSessionId()`, which `ExtensionAPI` does not provide, so it always returned `[]`. After reopening a parent the Agent therefore spawned a new child instead of reusing a dormant one. It now reads `ctx.sessionManager.getSessionId()`. Tool descriptions tell the model dormant/settled ids are reusable via `{ target, message }` (the host revives). A live child inventory is **not** injected into the system prompt / `context` event — that text changes with status and would bust the prompt-cache prefix.
 - **FIXED:** Pasting into the prompt no longer inserts literal `^[[106;5u` (Kitty CSI-u Ctrl+J) or the xterm `^[[27;5;106~` / Shift+Enter `^[[13;2u` encodings in place of newlines. Streamed paste chunks that split a sequence are rejoined. Image-paste interception is unchanged and still prompt-only.
 - **FIXED:** `wait_subagents` no longer hangs after a sub-session finishes if encoding or sending the host `extension_ui_response` throws — the wait callback is retried until it succeeds (or the timeout payload can be delivered), and unencodable snapshots fall back to a small error JSON instead of leaving pi's `select` pending.
 - **FIXED:** The "Agent finished" completion notification no longer fires while replaying history (parent ↔ sub-session switch, compaction rebuild, tree reload) or when the chat / `:PiSessions` list already has focus.
