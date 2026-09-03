@@ -200,7 +200,7 @@ require("pi").setup({
     -- Children run as detached background processes with their own session files.
     subagent = {
         enabled = true,
-        max_children = 5,           -- concurrent active children per parent
+        max_children = 5,           -- concurrent active children per parent lineage
         report_mode = "last_message", -- completion report uses child's last assistant output
         default_config = "inherit",   -- "inherit" parent model/thinking, or "default"
         read_tail = 50,               -- default projection lines for read_subagent

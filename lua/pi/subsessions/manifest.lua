@@ -22,6 +22,15 @@ local MANIFEST_FILE = ".pi2-subsessions.json"
 
 local LINEAGE_KEY = "__lineage__"
 
+---@type table<string, any>?
+local cache = nil
+---@type string?
+local cache_path = nil
+
+--- In-flight spawn reservations per lineage (not yet upserted as active).
+---@type table<string, integer>
+local occupy = {}
+
 ---@param manifest table<string, any>
 ---@return table<string, string>
 local function lineage_map(manifest)
@@ -37,26 +46,50 @@ end
 local function is_child_entry_key(id)
     return type(id) == "string" and id ~= "" and not id:match("^__")
 end
+
+--- True when `id` is a child row key (not metadata like `__lineage__`).
+---@param id string
+---@return boolean
+function M.is_entry_id(id)
+    return is_child_entry_key(id)
+end
+
 ---@return string
 function M.path()
     return History.get_sessions_dir() .. "/" .. MANIFEST_FILE
 end
 
+--- Drop the in-memory cache and spawn reservations (tests / path overrides).
+function M._reset()
+    cache = nil
+    cache_path = nil
+    occupy = {}
+end
+
 ---@return table<string, pi.SubsessionManifestEntry>
 function M.load()
     local path = M.path()
+    if cache ~= nil and cache_path == path then
+        return cache
+    end
     local file = io.open(path, "r")
     if not file then
-        return {}
+        cache = {}
+        cache_path = path
+        return cache
     end
     local content = file:read("*a")
     file:close()
     if type(content) ~= "string" or content == "" then
-        return {}
+        cache = {}
+        cache_path = path
+        return cache
     end
     local ok, data = pcall(vim.json.decode, content)
     if ok and type(data) == "table" then
-        return data
+        cache = data
+        cache_path = path
+        return cache
     end
     return {}
 end
@@ -65,6 +98,8 @@ end
 ---@return boolean
 function M.save(manifest)
     local path = M.path()
+    cache = manifest
+    cache_path = path
     local dir = vim.fn.fnamemodify(path, ":h")
     if vim.fn.isdirectory(dir) == 0 then
         vim.fn.mkdir(dir, "p")
@@ -201,6 +236,62 @@ end
 ---@return string
 function M.iso_now()
     return os.date("!%Y-%m-%dT%H:%M:%SZ")
+end
+
+---@param parent_id string Lineage id.
+---@return integer
+function M.count_active_children(parent_id)
+    local manifest = M.load()
+    local n = 0
+    for id, entry in pairs(manifest) do
+        if
+            is_child_entry_key(id)
+            and type(entry) == "table"
+            and entry.parent_id == parent_id
+            and entry.status == "active"
+        then
+            n = n + 1
+        end
+    end
+    return n
+end
+
+---@param lineage_id string
+---@return integer
+function M.pending_spawns(lineage_id)
+    return occupy[lineage_id] or 0
+end
+
+--- Active children plus in-flight spawns for a lineage.
+---@param lineage_id string
+---@return integer
+function M.spawn_occupancy(lineage_id)
+    return M.count_active_children(lineage_id) + M.pending_spawns(lineage_id)
+end
+
+--- Reserve one spawn slot. Call `release_spawn` after upsert or on failure.
+---@param lineage_id string
+---@param max_children integer
+---@return boolean
+function M.try_reserve_spawn(lineage_id, max_children)
+    if type(lineage_id) ~= "string" or lineage_id == "" then
+        return false
+    end
+    if M.spawn_occupancy(lineage_id) >= max_children then
+        return false
+    end
+    occupy[lineage_id] = (occupy[lineage_id] or 0) + 1
+    return true
+end
+
+---@param lineage_id string
+function M.release_spawn(lineage_id)
+    local n = occupy[lineage_id] or 0
+    if n <= 1 then
+        occupy[lineage_id] = nil
+    else
+        occupy[lineage_id] = n - 1
+    end
 end
 
 return M

@@ -9,6 +9,7 @@ describe("subsessions handle_host", function()
     local real_get_by_id = Sessions.get_by_id
     local real_spawn
     local real_close
+    local real_manifest_path
     local batch_tmp
     local manifest_tmp
 
@@ -16,34 +17,44 @@ describe("subsessions handle_host", function()
         batch_tmp = vim.fn.tempname() .. "-batches.json"
         manifest_tmp = vim.fn.tempname() .. "-manifest.json"
         Batch._set_path(batch_tmp)
+        real_manifest_path = Manifest.path
         Manifest.path = function()
             return manifest_tmp
         end
+        Manifest._reset()
         real_spawn = Subsessions.spawn
     end)
 
     after_each(function()
         Sessions.get_by_id = real_get_by_id
         Subsessions.spawn = real_spawn
+        if real_close then
+            Subsessions.close = real_close
+        end
         Batch._reset()
+        Manifest.path = real_manifest_path
+        Manifest._reset()
         os.remove(batch_tmp)
         os.remove(manifest_tmp)
     end)
 
-    it("stop_subagents closes each target", function()
+    it("stop_subagents counts only processes that were running", function()
         local closed = {}
+        real_close = Subsessions.close
         Subsessions.close = function(id)
             closed[#closed + 1] = id
+            return id == "a"
         end
         local parent = { id = "parent-1" }
         local res = Subsessions.handle_host(parent, vim.json.encode({
             action = "stop_subagents",
-            params = { targets = { "a", "b" } },
+            params = { targets = { "a", "b", "" } },
         }))
         assert.is_true(res.ok)
-        assert.are.equal(2, res.stopped)
+        assert.are.equal(1, res.stopped)
         assert.are.equal("a", closed[1])
         assert.are.equal("b", closed[2])
+        assert.are.equal(2, #closed)
     end)
 
     it("dispatch_subagents with wait returns completed batch", function()

@@ -153,7 +153,9 @@ function M.abort()
     if session and session.rpc:is_running() then
         if session.id then
             pcall(function()
-                require("pi.subsessions.batch").cancel_for_parent(session.id)
+                local Manifest = require("pi.subsessions.manifest")
+                local lineage = Manifest.lineage_for_session(session)
+                require("pi.subsessions.batch").cancel_for_parent(lineage ~= "" and lineage or session.id)
             end)
         end
         require("pi.attention").clear_session(session)

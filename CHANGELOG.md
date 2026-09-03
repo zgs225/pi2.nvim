@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-09-03
+
+- **FIXED:** `:PiSubNew` completion reports — `bump_generation` no longer marks user-spawned children as Agent workers, so the parent still receives the completion prompt and `:PiSessions` keeps unread user rows.
+- **FIXED:** `wait_subagents` / `Batch.wait` now invoke their callback once when the poll tick races a settle notification.
+- **FIXED:** Sub-agent batches are keyed by parent **lineage** (survives `/new` and session-id migration); `:PiAbort` cancels those batches; `load_session_path` reports `false` when `switch_session` fails.
+- **FIXED:** Parallel `spawn` cannot slip past `max_children` (in-flight reservations); Neovim restart status rebuild uses structured JSONL instead of projected-text matching and no longer mutates `__lineage__`.
+- **CHANGED:** `stop_subagents` `stopped` counts processes that were actually running; `:PiSubClose` recognizes a child view via `view_parent_id`; completion reports follow `title.lang` / UI locale.
+
 ## 2026-09-02
 
 - **FIXED:** Sub-session switch — loading a child session file no longer clears `view_parent_id`, so `:PiSessions` keeps the parent tree and `:PiSubParent` works after entering a child.

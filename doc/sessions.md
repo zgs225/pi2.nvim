@@ -67,7 +67,7 @@ And mid-session management:
 
 ## Sub-sessions
 
-A parent session can run **sub-sessions** in parallel — each child is an independent `pi --mode rpc` process with its own session file, model, and thinking level. Relationships and bookkeeping live in `<agent_dir>/sessions/<encoded-cwd>/.pi2-subsessions.json`; message content stays in each child's JSONL (the authoritative store).
+A parent session can run **sub-sessions** in parallel — each child is an independent `pi --mode rpc` process with its own session file, model, and thinking level. Relationships and bookkeeping live in `<agent_dir>/sessions/<encoded-cwd>/.pi2-subsessions.json`; message content stays in each child's JSONL (the authoritative store). Child processes are **detached from the tab**, same as a parent after `:tabclose`: closing the parent tab does not stop running sub-sessions. Stop them with `:PiSubClose` / `x` in `:PiSessions`, `stop_subagents`, `:PiAbort` (cancels the parent's running batches), or by quitting Neovim.
 
 | Command | What it does |
 | --- | --- |
@@ -78,7 +78,7 @@ A parent session can run **sub-sessions** in parallel — each child is an indep
 
 While viewing a child, `:PiNewSession` / `pi.new_session()` or a bare `/new` in the prompt (e.g. `<C-g>n` in a typical setup) **returns to the parent first**, then starts a fresh parent conversation — same as running `/new` on the parent. Prior-conversation sub-session rows are hidden in `:PiSessions` (press `H` or use `:PiSubSwitch` to recall them).
 
-When a user-spawned child finishes, its last assistant message is injected into the parent as `[子会话「name」已完成] …` (skipped for Agent-spawned children — they receive a synchronous tool result instead). Configure via `subagent.*` in [Configuration](configuration.md).
+When a user-spawned child finishes, its last assistant message is injected into the parent as `[子会话「name」已完成] …` or `[Sub-session "name" completed] …` (language follows `title.lang` / UI locale). Agent-spawned children skip this injection — they receive a synchronous tool result instead. Configure via `subagent.*` in [Configuration](configuration.md).
 
 Parent Agent tools are provided by the bundled `extensions/subagent.ts` extension when `subagent.enabled` is true. See [Extensions](extensions.md#bundled-sub-agent-extension-extensionssubagentts).
 

@@ -39,19 +39,6 @@ local function resolve_child_config(parent, opts)
     return nil
 end
 
----@param parent_id string
----@return integer
-local function count_active_children(parent_id)
-    local manifest = Manifest.load()
-    local n = 0
-    for _, entry in pairs(manifest) do
-        if entry.parent_id == parent_id and entry.status == "active" then
-            n = n + 1
-        end
-    end
-    return n
-end
-
 ---@param session pi.Session
 ---@param config pi.PinnedConfig?
 ---@param callback fun(ok: boolean)
@@ -157,16 +144,29 @@ function M.spawn(parent, opts, callback)
             return
         end
 
-        local max = subcfg.max_children or 5
+        Manifest.bind_session_lineage(parent, parent_id)
         local lineage_id = Manifest.lineage_for_session(parent)
-        if count_active_children(lineage_id) >= max then
+        if lineage_id == "" then
+            lineage_id = parent_id
+        end
+
+        local max = subcfg.max_children or 5
+        if not Manifest.try_reserve_spawn(lineage_id, max) then
             callback(nil, ("max %d concurrent sub-sessions"):format(max))
             return
+        end
+        local held = true
+        local function unreserve()
+            if held then
+                held = false
+                Manifest.release_spawn(lineage_id)
+            end
         end
 
         local tab = parent.attached_tab or vim.api.nvim_get_current_tabpage()
         local child = Sessions.create_detached(tab, { subagent = false })
         if not child then
+            unreserve()
             callback(nil, "failed to start sub-session process")
             return
         end
@@ -191,9 +191,10 @@ function M.spawn(parent, opts, callback)
                 created_at = Manifest.iso_now(),
                 last_active_at = Manifest.iso_now(),
                 agent_spawned = opts.agent_spawned == true,
+                run_generation = 1,
             })
+            unreserve()
             apply_config(child, config, function()
-                Batch.bump_generation(session_id)
                 send_task(child, opts.task, function(ok)
                     if ok then
                         require("pi.ui.sessions").request_refresh()
@@ -211,12 +212,14 @@ function M.spawn(parent, opts, callback)
         child.rpc:send({ type = "get_state" }, function(res)
             vim.schedule(function()
                 if not res.success or not res.data then
+                    unreserve()
                     Sessions.close_session(child)
                     callback(nil, "failed to capture sub-session state")
                     return
                 end
                 local sid = res.data.sessionId
                 if type(sid) ~= "string" or sid == "" then
+                    unreserve()
                     Sessions.close_session(child)
                     callback(nil, "backend did not report session id")
                     return
@@ -325,16 +328,20 @@ end
 --- Close sub-session process (file retained).
 ---@param child_id string
 ---@param callback? fun(ok: boolean)
+---@return boolean stopped True when a running RPC process was stopped.
 function M.close(child_id, callback)
+    local stopped = false
     local child = Sessions.get_by_id(child_id)
     if child and child.rpc:is_running() then
         Sessions.close_session(child)
+        stopped = true
     end
     Manifest.patch(child_id, { status = "dormant", last_active_at = Manifest.iso_now() })
     require("pi.ui.sessions").request_refresh()
     if callback then
         callback(true)
     end
+    return stopped
 end
 
 --- Revive a dormant sub-session (spawn process + switch_session).
@@ -389,15 +396,16 @@ function M.on_child_settled(child)
     local path = child.session_file or Read.find_path(child.id)
     local report = path and Read.last_assistant_message(path) or nil
     local parent = Sessions.find_by_lineage(entry.parent_id)
+    local claimed = Batch.on_child_settled(child.id)
 
-    -- Agent tool path: update manifest only; batch/dispatch reads the report via host tunnel.
-    if entry.agent_spawned then
+    -- Agent tool path or a running batch item: skip parent prompt injection.
+    if entry.agent_spawned or claimed then
+        local status = entry.status == "failed" and "failed" or "completed"
         Manifest.patch(child.id, {
-            status = "completed",
+            status = status,
             last_report = report,
             last_active_at = Manifest.iso_now(),
         })
-        Batch.on_child_settled(child.id)
         after_completed(parent)
         return
     end
@@ -424,7 +432,7 @@ function M.on_child_settled(child)
         after_completed(parent)
         return
     end
-    local msg = ("[子会话「%s」已完成] %s"):format(entry.name, report)
+    local msg = require("pi.subsessions.tool_ui").completion_report(entry.name, report)
     parent.rpc:send({ type = "prompt", message = msg }, function(res)
         vim.schedule(function()
             if res.success then
@@ -451,27 +459,28 @@ end
 function M.rebuild_statuses()
     local manifest = Manifest.load()
     for id, entry in pairs(manifest) do
-        local path = Read.find_path(id)
-        if not path then
-            if entry.status == "active" then
-                entry.status = "dormant"
+        if Manifest.is_entry_id(id) and type(entry) == "table" and entry.parent_id ~= nil then
+            local path = Read.find_path(id)
+            if not path then
+                if entry.status == "active" then
+                    entry.status = "dormant"
+                end
+            else
+                entry.last_active_at = os.date("!%Y-%m-%dT%H:%M:%SZ", vim.fn.getftime(path))
+                local inferred = Read.infer_run_status(path)
+                if inferred == "completed" then
+                    entry.status = "completed"
+                elseif inferred == "interrupted" then
+                    entry.status = "interrupted"
+                end
+                if Sessions.get_by_id(id) and Sessions.get_by_id(id).rpc:is_running() then
+                    entry.status = "active"
+                elseif entry.status == "active" then
+                    entry.status = "dormant"
+                end
             end
-        else
-            entry.last_active_at = os.date("!%Y-%m-%dT%H:%M:%SZ", vim.fn.getftime(path))
-            local tail = Read.project_tail(path, 3)
-            local last = tail[#tail] or ""
-            if last:find("assistant:", 1, true) then
-                entry.status = "completed"
-            elseif last:find("tool", 1, true) then
-                entry.status = "interrupted"
-            end
-            if Sessions.get_by_id(id) and Sessions.get_by_id(id).rpc:is_running() then
-                entry.status = "active"
-            elseif entry.status == "active" then
-                entry.status = "dormant"
-            end
+            manifest[id] = entry
         end
-        manifest[id] = entry
     end
     Manifest.save(manifest)
     pcall(function()
@@ -564,14 +573,17 @@ function M.handle_host(parent, payload, on_done)
             return result
         end
         if not on_done and type(parent.id) == "string" and parent.id ~= "" then
-            return finish({ batches = Batch.list_for_parent(parent.id) })
+            local lineage = Manifest.lineage_for_session(parent)
+            return finish({ batches = Batch.list_for_parent(lineage ~= "" and lineage or parent.id) })
         end
         with_parent_id(parent, function(parent_id)
             if parent_id == "" then
                 finish({ batches = {} })
                 return
             end
-            finish({ batches = Batch.list_for_parent(parent_id) })
+            Manifest.bind_session_lineage(parent, parent_id)
+            local lineage = Manifest.lineage_for_session(parent)
+            finish({ batches = Batch.list_for_parent(lineage ~= "" and lineage or parent_id) })
         end)
         return
     end
@@ -587,12 +599,15 @@ function M.handle_host(parent, payload, on_done)
             end
             return
         end
+        local stopped = 0
         for _, target in ipairs(targets) do
             if type(target) == "string" and target ~= "" then
-                M.close(target)
+                if M.close(target) then
+                    stopped = stopped + 1
+                end
             end
         end
-        local result = { ok = true, stopped = #targets }
+        local result = { ok = true, stopped = stopped }
         if on_done then
             on_done(result)
         else
@@ -692,12 +707,20 @@ end
 
 function M.sub_close()
     local current = Sessions.get()
-    if not current or not current.parent_id then
+    if not current then
+        Notify.warn("No active session")
+        return
+    end
+    local in_child_view = current.view_parent_id ~= nil
+    local is_child = current.parent_id ~= nil or Manifest.is_child_session(current.id)
+    if not in_child_view and not is_child then
         Notify.warn("Current session is not a sub-session")
         return
     end
     M.close(current.id)
-    M.switch_to_parent(function() end)
+    if in_child_view then
+        M.switch_to_parent(function() end)
+    end
 end
 
 --- Preview sub-session in a float (for :PiSessions `p` key).

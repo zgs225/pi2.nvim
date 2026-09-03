@@ -67,10 +67,12 @@ poll_res = Subsessions.handle_host(parent, host_payload)
 assert(poll_res and poll_res.status == "completed", "poll should be completed after settle")
 
 local waited = false
+local wait_calls = 0
 Subsessions.handle_host(parent, vim.json.encode({
     action = "wait_subagents",
     params = { batch_id = batch_id, timeout_ms = 3000 },
 }), function(res)
+    wait_calls = wait_calls + 1
     waited = res.status == "completed"
 end)
 
@@ -78,6 +80,8 @@ vim.wait(2000, function()
     return waited
 end)
 assert(waited, "wait_subagents did not complete")
+vim.wait(80)
+assert(wait_calls == 1, "wait_subagents callback fired " .. tostring(wait_calls) .. " times")
 
 local list_res = Subsessions.handle_host(parent, vim.json.encode({ action = "list_batches", params = {} }))
 assert(list_res and type(list_res.batches) == "table" and #list_res.batches >= 1, "list_batches failed")

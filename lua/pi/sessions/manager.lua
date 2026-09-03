@@ -947,14 +947,7 @@ end
 ---@param callback? fun(ok: boolean)
 ---@param opts? pi.LoadSessionOpts
 function M.load_session_path(session, session_path, callback, opts)
-    load_session(session, session_path, opts)
-    if callback then
-        -- load_session is async; invoke callback after get_messages path completes.
-        -- Callers that need strict ordering should wait on RPC; for switch we fire-and-forget ok=true.
-        vim.schedule(function()
-            callback(true)
-        end)
-    end
+    load_session(session, session_path, opts, callback)
 end
 
 --- Open a fresh session in a new tabpage (`:tabnew` then show).
@@ -1376,9 +1369,18 @@ end
 ---@param session pi.Session
 ---@param session_path string
 ---@param opts? pi.LoadSessionOpts
-function load_session(session, session_path, opts)
+---@param callback? fun(ok: boolean) Invoked after switch_session succeeds or fails.
+function load_session(session, session_path, opts, callback)
     opts = opts or {}
     Attention.begin_session_transition(session)
+
+    local function done(ok)
+        if callback then
+            vim.schedule(function()
+                callback(ok)
+            end)
+        end
+    end
 
     local sent_switch = session.rpc:send({ type = "switch_session", sessionPath = session_path }, function(msg)
         local data = msg.data or {}
@@ -1387,6 +1389,7 @@ function load_session(session, session_path, opts)
                 Attention.end_session_transition(session, false)
                 Notify.error(msg.error or "Failed to switch session")
             end)
+            done(false)
             return
         end
         if data.cancelled then
@@ -1394,6 +1397,7 @@ function load_session(session, session_path, opts)
                 Attention.end_session_transition(session, false)
                 Notify.warn("Session switch was cancelled")
             end)
+            done(false)
             return
         end
 
@@ -1407,6 +1411,7 @@ function load_session(session, session_path, opts)
         -- The resumed session's model was restored from its session file by
         -- core; adopt it as this tab's pin.
         refresh_state_and_pin(session)
+        done(true)
 
         vim.schedule(function()
             if not session.chat then
@@ -1456,6 +1461,7 @@ function load_session(session, session_path, opts)
 
     if not sent_switch then
         Attention.end_session_transition(session, false)
+        done(false)
     end
 end
 

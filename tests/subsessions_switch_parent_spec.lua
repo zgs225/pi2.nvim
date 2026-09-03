@@ -65,4 +65,51 @@ describe("switch_to_parent for_new_session", function()
 
         Sessions.load_session_path = orig_load
     end)
+
+    it("sub_close treats view_parent_id as a child view without parent_id", function()
+        local tab = vim.api.nvim_get_current_tabpage()
+        local closed
+        local switched = false
+        local orig_close = Subsessions.close
+        local orig_switch = Subsessions.switch_to_parent
+        Subsessions.close = function(id)
+            closed = id
+            return true
+        end
+        Subsessions.switch_to_parent = function(cb)
+            switched = true
+            if cb then
+                cb(true)
+            end
+        end
+
+        local chat = {
+            bind_agent = function() end,
+            clear_subsession_breadcrumb = function() end,
+            clear = function() end,
+        }
+        local child = {
+            id = "child-id",
+            view_parent_id = "parent-id",
+            attached_tab = tab,
+            tab = tab,
+            chat = chat,
+            rpc = {
+                is_running = function()
+                    return true
+                end,
+                stop = function() end,
+            },
+        }
+        Sessions._register_for_test(child)
+        Sessions.bind_chat(child, chat, tab)
+
+        Subsessions.sub_close()
+
+        assert.are.equal("child-id", closed)
+        assert.is_true(switched)
+
+        Subsessions.close = orig_close
+        Subsessions.switch_to_parent = orig_switch
+    end)
 end)

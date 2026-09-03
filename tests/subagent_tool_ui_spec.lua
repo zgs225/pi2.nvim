@@ -54,6 +54,13 @@ describe("subagent tool_ui", function()
         assert.is_false(SubToolUi.dispatch_inline({ items = { { task = "x" } }, wait = false }))
     end)
 
+    it("formats completion reports in zh and en", function()
+        Config.setup({ title = { lang = "zh" } })
+        assert.are.equal("[子会话「w」已完成] done", SubToolUi.completion_report("w", "done"))
+        Config.setup({ title = { lang = "en" } })
+        assert.are.equal('[Sub-session "w" completed] done', SubToolUi.completion_report("w", "done"))
+    end)
+
     it("resolve_lang does not error when title.lang is unset", function()
         Config.setup({ title = {} })
         assert.has_no.errors(function()

@@ -124,6 +124,29 @@ function M.last_assistant_message(path)
     return nil
 end
 
+--- Infer a child's run status from the last meaningful JSONL entry.
+---@param path string
+---@return "completed"|"interrupted"|nil
+function M.infer_run_status(path)
+    local entries = read_jsonl(path)
+    for i = #entries, 1, -1 do
+        local entry = entries[i]
+        local t = entry.type
+        local msg = entry.message
+        if t == "message" and type(msg) == "table" then
+            if msg.role == "assistant" then
+                return "completed"
+            end
+            if msg.role == "toolUse" or msg.role == "toolResult" then
+                return "interrupted"
+            end
+        elseif t == "tool_use" or t == "tool_result" then
+            return "interrupted"
+        end
+    end
+    return nil
+end
+
 ---@param session_id string
 ---@return string?
 function M.find_path(session_id)

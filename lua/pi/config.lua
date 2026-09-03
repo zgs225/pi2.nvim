@@ -270,7 +270,7 @@
 
 ---@class pi.SubagentConfig
 ---@field enabled? boolean Inject subagent.ts extension (default true)
----@field max_children? integer Max concurrent sub-sessions per parent (default 5)
+---@field max_children? integer Max concurrent sub-sessions per parent lineage (default 5)
 ---@field report_mode? "last_message" Report mode when sub-session completes (default "last_message")
 ---@field default_config? "inherit"|"default" Sub-session model/thinking default (default "inherit")
 ---@field read_tail? integer Default projection tail for read_subagent (default 50)

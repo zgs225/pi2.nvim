@@ -12,6 +12,11 @@ local BATCH_FILE = ".pi2-sub-batches.json"
 ---@type string?
 local path_override = nil
 
+---@type table<string, pi.SubsessionBatch>?
+local cache = nil
+---@type string?
+local cache_path = nil
+
 ---@type table<string, fun(result: table)[]>
 local waiters = {}
 
@@ -40,10 +45,14 @@ local waiters = {}
 ---@param path string
 function M._set_path(path)
     path_override = path
+    cache = nil
+    cache_path = nil
 end
 
 function M._reset()
     path_override = nil
+    cache = nil
+    cache_path = nil
     waiters = {}
 end
 
@@ -58,18 +67,28 @@ end
 
 ---@return table<string, pi.SubsessionBatch>
 function M.load()
-    local file = io.open(M.path(), "r")
+    local path = M.path()
+    if cache ~= nil and cache_path == path then
+        return cache
+    end
+    local file = io.open(path, "r")
     if not file then
-        return {}
+        cache = {}
+        cache_path = path
+        return cache
     end
     local content = file:read("*a")
     file:close()
     if type(content) ~= "string" or content == "" then
-        return {}
+        cache = {}
+        cache_path = path
+        return cache
     end
     local ok, data = pcall(vim.json.decode, content)
     if ok and type(data) == "table" then
-        return data
+        cache = data
+        cache_path = path
+        return cache
     end
     return {}
 end
@@ -78,6 +97,8 @@ end
 ---@return boolean
 local function save(batches)
     local path = M.path()
+    cache = batches
+    cache_path = path
     local dir = vim.fn.fnamemodify(path, ":h")
     if vim.fn.isdirectory(dir) == 0 then
         vim.fn.mkdir(dir, "p")
@@ -94,6 +115,12 @@ local function save(batches)
         os.remove(tmp)
     end
     return ok == true
+end
+
+---@param status? string
+---@return boolean
+local function is_terminal_status(status)
+    return status == "completed" or status == "partial" or status == "failed" or status == "cancelled"
 end
 
 ---@param id string
@@ -180,11 +207,7 @@ local function notify_waiters(batch_id)
     if not batch then
         return
     end
-    local terminal = batch.status == "completed"
-        or batch.status == "partial"
-        or batch.status == "failed"
-        or batch.status == "cancelled"
-    if not terminal then
+    if not is_terminal_status(batch.status) then
         return
     end
     local cbs = waiters[batch_id]
@@ -209,7 +232,6 @@ function M.bump_generation(child_id)
         run_generation = gen,
         status = "active",
         last_active_at = Manifest.iso_now(),
-        agent_spawned = true,
     })
     return gen
 end
@@ -285,19 +307,21 @@ function M.complete_item(batch_id, ref, ok, opts)
 end
 
 ---@param child_id string
+---@return boolean claimed True when this settle completed a running batch item.
 function M.on_child_settled(child_id)
     local entry = Manifest.load()[child_id]
     if not entry then
-        return
+        return false
     end
     local gen = entry.run_generation
     if type(gen) ~= "number" then
-        return
+        return false
     end
     local batches = M.load()
     local path = Read.find_path(child_id)
     local output = path and Read.last_assistant_message(path) or ""
     local failed = entry.status == "failed"
+    local claimed = false
     for batch_id, batch in pairs(batches) do
         if batch.status == "running" or batch.status == "pending" then
             for _, item in ipairs(batch.items) do
@@ -307,10 +331,12 @@ function M.on_child_settled(child_id)
                         output = failed and nil or output,
                         error = failed and "sub-session failed" or nil,
                     })
+                    claimed = true
                 end
             end
         end
     end
+    return claimed
 end
 
 ---@param parent pi.Session
@@ -363,19 +389,6 @@ local function normalize_item(raw, index)
         }, nil
     end
     return nil, ("item %d: need task or (target + message)"):format(index)
-end
-
----@param parent_id string
----@return integer
-local function count_active_children(parent_id)
-    local manifest = Manifest.load()
-    local n = 0
-    for _, entry in pairs(manifest) do
-        if entry.parent_id == parent_id and entry.status == "active" then
-            n = n + 1
-        end
-    end
-    return n
 end
 
 ---@param batch pi.SubsessionBatch
@@ -519,8 +532,14 @@ function M.dispatch(parent, opts, callback)
                 new_spawns = new_spawns + 1
             end
         end
+        Manifest.bind_session_lineage(parent, parent_id)
+        local lineage_id = Manifest.lineage_for_session(parent)
+        if lineage_id == "" then
+            lineage_id = parent_id
+        end
+
         local max_children = subcfg.max_children or 5
-        if count_active_children(parent_id) + new_spawns > max_children then
+        if Manifest.spawn_occupancy(lineage_id) + new_spawns > max_children then
             callback({ error = ("would exceed max %d concurrent sub-sessions"):format(max_children) })
             return
         end
@@ -528,7 +547,7 @@ function M.dispatch(parent, opts, callback)
         ---@type pi.SubsessionBatch
         local batch = {
             id = new_id(),
-            parent_id = parent_id,
+            parent_id = lineage_id,
             status = "running",
             created_at = Manifest.iso_now(),
             updated_at = Manifest.iso_now(),
@@ -553,14 +572,16 @@ function M.poll(batch_id)
     return M.snapshot(batch)
 end
 
----@param parent_id string
+---@param parent_id string Session id or lineage id.
 ---@return table[]
 function M.list_for_parent(parent_id)
+    local lineage = Manifest.resolve_lineage(parent_id) or parent_id
     local batches = M.load()
     ---@type table[]
     local out = {}
     for _, batch in pairs(batches) do
-        if batch.parent_id == parent_id then
+        local batch_lineage = Manifest.resolve_lineage(batch.parent_id) or batch.parent_id
+        if batch_lineage == lineage then
             out[#out + 1] = M.snapshot(batch)
         end
     end
@@ -578,23 +599,47 @@ function M.wait(batch_id, callback, opts)
     local timeout_ms = opts.timeout_ms or (Config.options.subagent or {}).batch_timeout_ms or 300000
     local interval_ms = opts.interval_ms or 200
     local started = vim.uv.hrtime() / 1e6
+    local settled = false
 
-    local function tick()
-        local snap = M.poll(batch_id)
-        if not snap then
-            callback({ error = "batch not found" })
+    local function finish(result)
+        if settled then
             return
         end
-        local terminal = snap.status == "completed"
-            or snap.status == "partial"
-            or snap.status == "failed"
-            or snap.status == "cancelled"
-        if terminal then
-            callback(snap)
+        settled = true
+        local cbs = waiters[batch_id]
+        if cbs then
+            for i = #cbs, 1, -1 do
+                if cbs[i] == finish then
+                    table.remove(cbs, i)
+                end
+            end
+            if #cbs == 0 then
+                waiters[batch_id] = nil
+            end
+        end
+        callback(result)
+    end
+
+    local function tick()
+        if settled then
+            return
+        end
+        local snap = M.poll(batch_id)
+        if not snap then
+            finish({ error = "batch not found" })
+            return
+        end
+        if is_terminal_status(snap.status) then
+            finish(snap)
             return
         end
         if (vim.uv.hrtime() / 1e6 - started) >= timeout_ms then
-            callback({ error = "timeout waiting for batch", batch_id = batch_id, status = snap.status, summary = snap.summary })
+            finish({
+                error = "timeout waiting for batch",
+                batch_id = batch_id,
+                status = snap.status,
+                summary = snap.summary,
+            })
             return
         end
         vim.defer_fn(tick, interval_ms)
@@ -602,19 +647,15 @@ function M.wait(batch_id, callback, opts)
 
     local batch = M.get(batch_id)
     if not batch then
-        callback({ error = "batch not found" })
+        finish({ error = "batch not found" })
         return
     end
-    local terminal = batch.status == "completed"
-        or batch.status == "partial"
-        or batch.status == "failed"
-        or batch.status == "cancelled"
-    if terminal then
-        callback(M.snapshot(batch))
+    if is_terminal_status(batch.status) then
+        finish(M.snapshot(batch))
         return
     end
     waiters[batch_id] = waiters[batch_id] or {}
-    table.insert(waiters[batch_id], callback)
+    table.insert(waiters[batch_id], finish)
     vim.defer_fn(tick, interval_ms)
 end
 
@@ -625,7 +666,7 @@ function M.cancel(batch_id)
     if not batch then
         return false
     end
-    if batch.status == "completed" or batch.status == "partial" or batch.status == "failed" or batch.status == "cancelled" then
+    if is_terminal_status(batch.status) then
         return true
     end
     batch.status = "cancelled"
@@ -648,11 +689,13 @@ function M.cancel(batch_id)
     return true
 end
 
----@param parent_id string
+---@param parent_id string Session id or lineage id.
 function M.cancel_for_parent(parent_id)
+    local lineage = Manifest.resolve_lineage(parent_id) or parent_id
     local batches = M.load()
     for id, batch in pairs(batches) do
-        if batch.parent_id == parent_id and batch.status == "running" then
+        local batch_lineage = Manifest.resolve_lineage(batch.parent_id) or batch.parent_id
+        if batch_lineage == lineage and (batch.status == "running" or batch.status == "pending") then
             M.cancel(id)
         end
     end

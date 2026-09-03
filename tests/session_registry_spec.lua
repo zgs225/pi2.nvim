@@ -325,4 +325,43 @@ describe("session registry (P0)", function()
 
         History.parse = real_parse
     end)
+
+    it("load_session_path callback is false when switch_session fails", function()
+        ---@type pi.Session
+        local session = {
+            id = "load-fail",
+            rpc = {
+                is_running = function()
+                    return true
+                end,
+                stop = function() end,
+                send = function(_, cmd, cb)
+                    if cmd.type == "switch_session" and cb then
+                        cb({ success = false, error = "nope" })
+                    end
+                    return true
+                end,
+            },
+            chat = {
+                clear = function() end,
+                show_loading = function() end,
+                clear_placeholder = function() end,
+                ensure_shown_and_focus_prompt = function() end,
+                on_error = function() end,
+            },
+            attention = { pending = {} },
+            startup_announcements = {},
+            system_errors = {},
+            changed_files = {},
+        }
+        Sessions._register_for_test(session)
+
+        local loaded
+        Sessions.load_session_path(session, "/tmp/missing.jsonl", function(ok)
+            loaded = ok
+        end)
+        assert.is_true(vim.wait(3000, function()
+            return loaded == false
+        end, 10), "callback should report switch failure")
+    end)
 end)

@@ -262,6 +262,17 @@ function M.list_batches_status(details)
     return ("(%d batches, %d running)"):format(#details.batches, running)
 end
 
+--- Completion report injected into the parent chat (user-spawned children).
+---@param name string
+---@param report string
+---@return string
+function M.completion_report(name, report)
+    if M.resolve_lang() == "zh" then
+        return ("[子会话「%s」已完成] %s"):format(name, report)
+    end
+    return ('[Sub-session "%s" completed] %s'):format(name, report)
+end
+
 --- dispatch uses inline rendering only for a single item with wait:true.
 ---@param args? table
 ---@return boolean
