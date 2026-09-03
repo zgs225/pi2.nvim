@@ -7,11 +7,11 @@ Extensions can ask the user for input mid-turn — selects, confirms, free-form 
 When a request arrives, pi2.nvim decides between showing it immediately and queueing it:
 
 - **Immediate** — if the current tab's π prompt is focused _and_ has no draft text, the request is dispatched right away. This is the common case while you're actively working with the agent: confirmations, selects, and diffs just pop up as soon as they're needed.
-- **Queued** — otherwise (you're editing another file, you have draft text in the prompt, you're in a different tab, etc.), the request is added to a per-session queue, an attention indicator lights up in the statusline, and a notification appears so you don't lose track of it. The agent stays blocked on that request regardless.
+- **Queued** — otherwise (you're editing another file, you have draft text in the prompt, you're in a different tab, or the session is running detached in the background while viewing a sub-session), the request is added to a per-session queue, an attention indicator lights up in the statusline, and a notification appears so you don't lose track of it. The agent stays blocked on that request regardless. Requests for detached background sessions survive tab detachment as long as their backend process is running.
 
 Queued requests can be opened on demand with:
 
-- `:PiAttention` — open the oldest queued request across all tabs, switching to its tab if needed.
+- `:PiAttention` — open the oldest queued request across all tabs, switching to its tab if attached.
 - `pi.attention()` — same thing from Lua.
 
 Both are no-ops when there's nothing queued.
@@ -67,7 +67,7 @@ vim.api.nvim_create_autocmd("User", {
     pattern = "PiAttentionRequested",
     callback = function(event)
         local data = event.data
-        -- data.tab, data.kind ("diff"|"select"|"confirm"|"input"|"editor"),
+        -- data.tab (nil for detached background sessions), data.kind ("diff"|"select"|"confirm"|"input"|"editor"),
         -- data.tab_count, data.total_count
     end,
 })

@@ -205,10 +205,7 @@ local function capture_detached_run_state(session)
     if type(verb) == "string" and verb ~= "" then
         session._busy_verb = verb
     end
-    if (chat.is_streaming and chat:is_streaming())
-        or session._detached_retrying
-        or session._detached_compacting
-    then
+    if (chat.is_streaming and chat:is_streaming()) or session._detached_retrying or session._detached_compacting then
         session._detached_busy = true
         if type(session._busy_started_at) ~= "number" then
             session._busy_started_at = math.floor(vim.uv.hrtime() / 1e9)
@@ -255,7 +252,9 @@ local function detach_tab(tab)
     if session_id then
         local session = registry[session_id]
         if session and session.attached_tab == tab then
-            Attention.clear_session(session)
+            if not (session.rpc and session.rpc:is_running()) then
+                Attention.clear_session(session)
+            end
             session.attached_tab = nil
             session.tab = nil
             session.chat = nil
@@ -581,42 +580,12 @@ function M.handle_event(session, msg)
         require("pi.ui.sessions").request_refresh()
     end
 
-    if not chat then
-        local SessionList = require("pi.ui.sessions")
-        if t == "agent_start" then
-            mark_run_start(session)
-            session._detached_retrying = false
-            SessionList.on_agent_start(session)
-        elseif t == "agent_end" then
-            SessionList.on_agent_end(session)
-        elseif t == "agent_settled" then
-            mark_run_end(session)
-            if session.parent_id then
-                require("pi.subsessions").on_child_settled(session)
-            end
-        elseif t == "compaction_start" or t == "auto_compaction_start" then
-            session._detached_compacting = true
-        elseif t == "compaction_end" or t == "auto_compaction_end" then
-            session._detached_compacting = false
-        elseif t == "auto_retry_start" then
-            session._detached_retrying = true
-            mark_run_start(session)
-        elseif t == "auto_retry_end" then
-            session._detached_retrying = false
-            if msg.success == false then
-                mark_run_end(session)
-            end
-        elseif t == "_process_exit" and session.id then
-            mark_run_end(session)
-            registry[session.id] = nil
-        end
-        return true
-    end
+    local is_subagent_host = (t == "extension_ui_request" and msg.method == "select" and msg.title == "__pi_subagent__")
 
     -- Buffer inbound events while a get_messages replay is in flight
-    -- (compaction rebuild or live view-switch). `response` is excluded so
-    -- RPC callbacks still fire.
-    if (session._compaction_rebuilding or session._view_rebuilding) and t ~= "response" then
+    -- (compaction rebuild or live view-switch). `response` and subagent host
+    -- requests are excluded so RPC callbacks and subagent tunnel still fire.
+    if (session._compaction_rebuilding or session._view_rebuilding) and t ~= "response" and not is_subagent_host then
         if t == "_process_exit" then
             if session._compaction_rebuilding and finish_compaction_rebuild then
                 finish_compaction_rebuild(session, false)
@@ -639,40 +608,49 @@ function M.handle_event(session, msg)
     if t == "agent_start" then
         mark_run_start(session)
         session._detached_retrying = false
-        chat:on_agent_start(nil, session._busy_started_at)
-        session._busy_verb = chat:active_verb()
         require("pi.ui.sessions").on_agent_start(session)
+        if chat then
+            chat:on_agent_start(nil, session._busy_started_at)
+            session._busy_verb = chat:active_verb()
+        end
     elseif t == "agent_end" then
-        chat:on_agent_end()
         require("pi.ui.sessions").on_agent_end(session)
         CommandsCache.refresh(session.rpc)
         M.refresh_state(session)
+        if chat then
+            chat:on_agent_end()
+        end
     elseif t == "agent_settled" then
         -- Authoritative end of the session-level run: pi emits this only after
         -- no retry, compaction retry, or queued continuation remains. The
         -- compaction/retry branches above restore state piecemeal; this is the
         -- final fallback that converges any leftover spinner.
         mark_run_end(session)
-        chat:set_status(nil)
         if session.parent_id then
             require("pi.subsessions").on_child_settled(session)
+        end
+        if chat then
+            chat:set_status(nil)
         end
     elseif t == "message_update" then
         local event = msg.assistantMessageEvent
         if event then
-            if event.type == "thinking_start" then
-                chat:on_thinking_start()
-            elseif event.type == "thinking_delta" then
-                chat:on_thinking_delta(event.delta or "")
-            elseif event.type == "thinking_end" then
-                chat:on_thinking_end()
-            elseif event.type == "text_delta" then
-                chat:on_thinking_end() -- no-op if not thinking
-                chat:on_text_delta(event.delta or "")
-            elseif event.type == "toolcall_end" then
+            if event.type == "toolcall_end" then
                 local tool_call = event.toolCall
                 if type(tool_call) == "table" then
                     stash_file_tool_args(session, tool_call.name, tool_call.id, tool_call.arguments)
+                end
+            end
+            if chat then
+                if event.type == "thinking_start" then
+                    chat:on_thinking_start()
+                elseif event.type == "thinking_delta" then
+                    chat:on_thinking_delta(event.delta or "")
+                elseif event.type == "thinking_end" then
+                    chat:on_thinking_end()
+                elseif event.type == "text_delta" then
+                    chat:on_thinking_end() -- no-op if not thinking
+                    chat:on_text_delta(event.delta or "")
                 end
                 -- NOTE: Other sub-events stay intentionally ignored:
                 --   toolcall_start/delta — we render on tool_execution_start.
@@ -682,16 +660,20 @@ function M.handle_event(session, msg)
         end
     elseif t == "tool_execution_start" then
         local args = normalize_tool_args(msg.args) or msg.args
-        chat:on_tool_start(msg.toolName or "tool", msg.toolCallId, args)
         -- Stash args for file-changing tools; tool_execution_end doesn't carry args.
         stash_file_tool_args(session, msg.toolName, msg.toolCallId, args)
-        -- Stash search-tool args so the quickfix list can be titled with the pattern.
-        require("pi.quickfix").on_tool_start(msg.toolName, msg.toolCallId, args)
+        if chat then
+            chat:on_tool_start(msg.toolName or "tool", msg.toolCallId, args)
+            -- Stash search-tool args so the quickfix list can be titled with the pattern.
+            require("pi.quickfix").on_tool_start(msg.toolName, msg.toolCallId, args)
+        end
     elseif t == "tool_execution_end" then
-        chat:on_tool_end(msg.toolName or "tool", msg.toolCallId, msg.result, msg.isError)
-        vim.schedule(function()
-            require("pi.quickfix").on_tool_end(msg.toolName, msg.toolCallId, msg.result, msg.isError)
-        end)
+        if chat then
+            chat:on_tool_end(msg.toolName or "tool", msg.toolCallId, msg.result, msg.isError)
+            vim.schedule(function()
+                require("pi.quickfix").on_tool_end(msg.toolName, msg.toolCallId, msg.result, msg.isError)
+            end)
+        end
         if session._pending_file_change_args and not msg.isError then
             local args = session._pending_file_change_args[msg.toolCallId]
             track_changed_file(session, args)
@@ -704,50 +686,62 @@ function M.handle_event(session, msg)
             end
         end
     elseif t == "compaction_start" or t == "auto_compaction_start" then
-        chat:set_compacting(true)
         session._detached_compacting = true
-        set_chat_status(session, { type = "compaction" })
+        if chat then
+            chat:set_compacting(true)
+            set_chat_status(session, { type = "compaction" })
+        end
     elseif t == "compaction_end" or t == "auto_compaction_end" then
         session._detached_compacting = false
-        if msg.aborted then
-            chat:set_compacting(false)
-            restore_active_agent_status(session)
-            chat:on_error("Compaction cancelled", { pad_top = true, pad_bottom = true })
-            chat:flush_compaction_queue(msg.willRetry == true)
-        elseif type(msg.errorMessage) == "string" and msg.errorMessage ~= "" then
+        if type(msg.errorMessage) == "string" and msg.errorMessage ~= "" then
             require("pi.ui.sessions").mark_error(session)
-            chat:set_compacting(false)
-            restore_active_agent_status(session)
-            chat:on_error(msg.errorMessage, { pad_top = true, pad_bottom = true })
-            chat:flush_compaction_queue(msg.willRetry == true)
-        elseif type(msg.result) == "table" and rebuild_after_compaction then
-            rebuild_after_compaction(session, msg.result, msg.willRetry == true)
-        else
-            chat:set_compacting(false)
-            restore_active_agent_status(session)
-            chat:flush_compaction_queue(msg.willRetry == true)
+        end
+        if chat then
+            if msg.aborted then
+                chat:set_compacting(false)
+                restore_active_agent_status(session)
+                chat:on_error("Compaction cancelled", { pad_top = true, pad_bottom = true })
+                chat:flush_compaction_queue(msg.willRetry == true)
+            elseif type(msg.errorMessage) == "string" and msg.errorMessage ~= "" then
+                chat:set_compacting(false)
+                restore_active_agent_status(session)
+                chat:on_error(msg.errorMessage, { pad_top = true, pad_bottom = true })
+                chat:flush_compaction_queue(msg.willRetry == true)
+            elseif type(msg.result) == "table" and rebuild_after_compaction then
+                rebuild_after_compaction(session, msg.result, msg.willRetry == true)
+            else
+                chat:set_compacting(false)
+                restore_active_agent_status(session)
+                chat:flush_compaction_queue(msg.willRetry == true)
+            end
         end
     elseif t == "auto_retry_start" then
-        chat:set_retrying(true)
         session._detached_retrying = true
         mark_run_start(session)
-        set_chat_status(session, { type = "agent", text = "Retrying…" })
+        if chat then
+            chat:set_retrying(true)
+            set_chat_status(session, { type = "agent", text = "Retrying…" })
+        end
     elseif t == "auto_retry_end" then
-        chat:set_retrying(false)
         session._detached_retrying = false
         if msg.success == false then
             require("pi.ui.sessions").mark_error(session)
             mark_run_end(session)
-            chat:set_status(nil)
-            chat:on_error(
-                "Retry failed after "
-                    .. tostring(msg.attempt or 0)
-                    .. " attempts: "
-                    .. (msg.finalError or "Unknown error"),
-                { pad_top = true, pad_bottom = true }
-            )
-        else
-            restore_active_agent_status(session)
+        end
+        if chat then
+            chat:set_retrying(false)
+            if msg.success == false then
+                chat:set_status(nil)
+                chat:on_error(
+                    "Retry failed after "
+                        .. tostring(msg.attempt or 0)
+                        .. " attempts: "
+                        .. (msg.finalError or "Unknown error"),
+                    { pad_top = true, pad_bottom = true }
+                )
+            else
+                restore_active_agent_status(session)
+            end
         end
     elseif t == "summarization_retry_scheduled" then
         -- Transient error while generating a compaction or branch summary.
@@ -770,7 +764,7 @@ function M.handle_event(session, msg)
             end)
         end
     elseif t == "summarization_retry_attempt_start" then
-        if msg.source == "branchSummary" then
+        if chat and msg.source == "branchSummary" then
             -- navigateTree summarization runs while the agent is idle: show a
             -- lightweight busy state. Compaction-source retries keep the
             -- existing compaction status untouched.
@@ -779,7 +773,7 @@ function M.handle_event(session, msg)
     elseif t == "summarization_retry_finished" then
         -- Retry loop ended. During compaction, compaction_end restores the
         -- status; only the branchSummary state (agent idle) needs settling.
-        if not chat:is_compacting() then
+        if chat and not chat:is_compacting() then
             restore_active_agent_status(session)
         end
     elseif t == "extension_ui_request" then
@@ -798,40 +792,54 @@ function M.handle_event(session, msg)
             .. extension_event
             .. "):\n"
             .. error_message
+        session.system_errors = session.system_errors or {}
         session.system_errors[#session.system_errors + 1] = {
             message = formatted,
             timestamp = os.time() * 1000,
         }
-        chat:on_system_error(formatted, { pad_top = true, pad_bottom = true })
+        if chat then
+            chat:on_system_error(formatted, { pad_top = true, pad_bottom = true })
+        end
     elseif t == "_stderr" then
         if type(msg.message) == "string" and msg.message ~= "" then
+            session.system_errors = session.system_errors or {}
             session.system_errors[#session.system_errors + 1] = {
                 message = msg.message --[[@as string]],
                 timestamp = os.time() * 1000,
             }
-            chat:on_system_error(msg.message --[[@as string]], { pad_top = true, pad_bottom = true })
+            if chat then
+                chat:on_system_error(msg.message --[[@as string]], { pad_top = true, pad_bottom = true })
+            end
         end
     elseif t == "_process_exit" then
         mark_run_end(session)
-        vim.schedule(function()
-            chat:set_status(nil)
-            if Config.options.debug and msg.code ~= 0 and msg.code ~= 143 then
-                print("Process exited with code " .. (msg.code or "-"))
-            end
-        end)
+        if session.id then
+            registry[session.id] = nil
+        end
+        if chat then
+            vim.schedule(function()
+                chat:set_status(nil)
+                if Config.options.debug and msg.code ~= 0 and msg.code ~= 143 then
+                    print("Process exited with code " .. (msg.code or "-"))
+                end
+            end)
+        end
     elseif t == "response" then
         -- Normally handled by rpc:send() one-shot callbacks. Late error
         -- responses (e.g. async prompt failures like auth errors) arrive
         -- after the initial success response already consumed the callback.
-        if msg.success == false and type(msg.error) == "string" then
+        if msg.success == false then
             require("pi.ui.sessions").mark_error(session)
-            chat:on_error(msg.error, { pad_top = true, pad_bottom = true })
+            if chat and type(msg.error) == "string" then
+                chat:on_error(msg.error, { pad_top = true, pad_bottom = true })
+            end
         end
         return false
     elseif t == "message_start" then
-        chat:on_message_start(msg)
+        if chat then
+            chat:on_message_start(msg)
+        end
     elseif t == "message_end" then
-        chat:on_message_end(msg)
         require("pi.ui.sessions").on_message_end(session)
         local message = msg.message
         if type(message) == "table" and message.stopReason == "error" then
@@ -847,12 +855,21 @@ function M.handle_event(session, msg)
                 session._pending_file_change_args[tool_call_id] = nil
             end
         end
+        if chat then
+            chat:on_message_end(msg)
+        end
     elseif t == "tool_execution_update" then
-        chat:on_tool_update(msg.toolName or "tool", msg.toolCallId, msg)
+        if chat then
+            chat:on_tool_update(msg.toolName or "tool", msg.toolCallId, msg)
+        end
     elseif t == "queue_update" then
-        chat:on_queue_update(msg)
+        if chat then
+            chat:on_queue_update(msg)
+        end
     elseif t == "bash_execution_update" then
-        chat:on_bash_update(msg.id, msg.delta or "")
+        if chat then
+            chat:on_bash_update(msg.id, msg.delta or "")
+        end
     elseif ignored_events[t] then
         return true
     else
@@ -1446,12 +1463,16 @@ end
 rebuild_after_compaction = function(session, _result, will_retry)
     session._compaction_rebuilding = true
     session._compaction_event_queue = {}
-    if will_retry then
+    if will_retry and session.chat then
         session.chat:flush_compaction_queue(true)
     end
 
     local sent = session.rpc:send({ type = "get_messages" }, function(res)
         vim.schedule(function()
+            if not session.chat then
+                finish_compaction_rebuild(session, not will_retry, will_retry)
+                return
+            end
             if not res.success then
                 local err = res.error or "Failed to load compacted session messages"
                 Notify.error(err)

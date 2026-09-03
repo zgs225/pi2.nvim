@@ -53,7 +53,7 @@ function M.handle(session, msg)
         if msg.notifyType == "error" and type(message) == "string" then
             vision_reason = Vision.parse_notify(message)
         end
-        if vision_reason then
+        if vision_reason and session.chat then
             session.chat:_on_vision_failure(vision_reason)
             return
         end
@@ -74,7 +74,9 @@ function M.handle(session, msg)
         local key = msg.statusKey
         local value = msg.statusText -- nil clears
         if type(key) == "string" then
-            session.chat:set_extension_status(key, value)
+            if session.chat then
+                session.chat:set_extension_status(key, value)
+            end
             -- The auto-title extension toggles "pi-title" while it generates
             -- a session name; keep the :PiSessions overview in sync (spinner
             -- on/off) without repainting for unrelated keys.
@@ -114,10 +116,12 @@ function M.handle(session, msg)
 
             -- list() may be stale if the initial fetch hasn't completed yet;
             -- fetch_commands_and_show_startup_block will re-render once it does.
-            session.chat:show_startup_block({
-                sections = Startup.build_startup_sections(session, CommandsCache.list()),
-                errors = session.system_errors,
-            })
+            if session.chat then
+                session.chat:show_startup_block({
+                    sections = Startup.build_startup_sections(session, CommandsCache.list()),
+                    errors = session.system_errors,
+                })
+            end
             return
         end
 
@@ -128,7 +132,7 @@ function M.handle(session, msg)
             if not ok then
                 Notify.error("on_widget error: " .. tostring(result))
             elseif result then
-                if result.target == "history" and result.block == "custom" then
+                if session.chat and result and result.target == "history" and result.block == "custom" then
                     session.chat:append_custom_block(result)
                 end
             end
@@ -144,11 +148,12 @@ function M.handle(session, msg)
     if method == "select" and msg.title == "__pi_subagent__" then
         local payload = type(msg.options) == "table" and msg.options[1] or nil
         vim.schedule(function()
-            require("pi.subsessions").handle_host(session, payload or "", function(result)
-                if not session.rpc:send(M._select_response(msg.id, result)) then
-                    error("failed to send subagent host response")
-                end
+            local ok, err = pcall(require("pi.subsessions").handle_host, session, payload or "", function(result)
+                session.rpc:send(M._select_response(msg.id, result))
             end)
+            if not ok then
+                session.rpc:send(M._select_response(msg.id, { error = tostring(err) }))
+            end
         end)
         return
     end

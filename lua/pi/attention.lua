@@ -37,7 +37,14 @@ local reschedule_timer
 
 ---@return pi.Session[]
 local function sessions()
-    return require("pi.sessions.manager").list()
+    local ok, manager = pcall(require, "pi.sessions.manager")
+    if not ok or not manager then
+        return {}
+    end
+    if manager.list_all then
+        return manager.list_all()
+    end
+    return manager.list()
 end
 
 ---@return integer
@@ -65,7 +72,7 @@ local function request_redraw()
         pcall(vim.cmd, "redrawtabline")
         require("pi.ui.sessions").request_refresh()
         local session = require("pi.sessions.manager").get()
-        if session then
+        if session and session.chat then
             session.chat:render_statusline()
             session.chat:refresh_prompt_attention()
         end
@@ -134,7 +141,7 @@ local function is_stale(session, entry, now)
     if not session.rpc:is_running() then
         return true
     end
-    if not vim.api.nvim_tabpage_is_valid(session.tab) then
+    if session.tab ~= nil and not vim.api.nvim_tabpage_is_valid(session.tab) then
         return true
     end
     return entry.expires_at ~= nil and now >= entry.expires_at
@@ -168,14 +175,16 @@ local function build_state(current_tab)
         for _, entry in ipairs(pending_entries(session)) do
             if is_visible(session, entry, now) then
                 state.total_count = state.total_count + 1
-                local tab_state = state.tabs[session.tab]
-                if not tab_state then
-                    tab_state = {
-                        count = 0,
-                    }
-                    state.tabs[session.tab] = tab_state
+                if session.tab ~= nil then
+                    local tab_state = state.tabs[session.tab]
+                    if not tab_state then
+                        tab_state = {
+                            count = 0,
+                        }
+                        state.tabs[session.tab] = tab_state
+                    end
+                    tab_state.count = tab_state.count + 1
                 end
-                tab_state.count = tab_state.count + 1
             end
         end
     end
@@ -189,7 +198,7 @@ end
 ---@param entry pi.AttentionEntry
 local function emit_requested(session, entry)
     local state = build_state(session.tab)
-    local tab_state = state.tabs[session.tab] or { count = 0 }
+    local tab_state = (session.tab and state.tabs[session.tab]) or { count = 0 }
     pcall(vim.api.nvim_exec_autocmds, "User", {
         pattern = "PiAttentionRequested",
         modeline = false,
@@ -218,14 +227,17 @@ local function kind_label(kind)
 end
 
 --- Build the persistent notification id for a tab.
----@param tab pi.TabId
+---@param tab? pi.TabId|0
 ---@return string
 local function attention_notification_id(tab)
+    if not tab or tab == 0 then
+        return "pi-attention-background"
+    end
     return "pi-attention-" .. tostring(tab)
 end
 
 --- Show a persistent attention notification for a tab.
----@param tab pi.TabId
+---@param tab? pi.TabId|0
 ---@param msg string
 ---@param level integer vim.log.levels.*
 function M.notify(tab, msg, level)
@@ -251,7 +263,7 @@ function M.should_notify_on_completion(chat)
 end
 
 --- Dismiss the persistent attention notification for a tab.
----@param tab pi.TabId
+---@param tab? pi.TabId|0
 function M.dismiss_notification(tab)
     local ok, snacks = pcall(require, "snacks")
     if ok and snacks and snacks.notifier and snacks.notifier.hide then
@@ -262,9 +274,16 @@ end
 ---@param session pi.Session
 ---@param entry pi.AttentionEntry
 local function notify_pending(session, entry)
-    local suffix = session.tab == vim.api.nvim_get_current_tabpage() and "" or " in another tab"
+    local suffix
+    if session.tab == nil then
+        suffix = " (background)"
+    elseif session.tab == vim.api.nvim_get_current_tabpage() then
+        suffix = ""
+    else
+        suffix = " in another tab"
+    end
     M.notify(
-        session.tab,
+        session.tab or 0,
         "Agent needs " .. kind_label(entry.kind) .. suffix .. " — run :PiAttention",
         vim.log.levels.WARN
     )
@@ -511,6 +530,9 @@ prune_stale_queue = function()
     end
 end
 
+M.prune_stale_queue = prune_stale_queue
+M._prune_stale_queue = prune_stale_queue
+
 --- Present a blocking extension UI request immediately only when the π
 --- prompt has focus and there is no draft; otherwise queue it for later.
 ---@param session pi.Session
@@ -522,7 +544,7 @@ function M.present(session, msg)
         return false
     end
 
-    if session.chat:has_prompt_focus() and not session.chat:has_draft() then
+    if session.chat and session.chat:has_prompt_focus() and not session.chat:has_draft() then
         if not entry.open() then
             notify_expired(entry.kind)
         end
@@ -599,8 +621,10 @@ local function open_pending_entry(session, index, entry, opts)
         return false, true
     end
 
-    if opts and opts.switch_tab and session.tab ~= vim.api.nvim_get_current_tabpage() then
-        vim.api.nvim_set_current_tabpage(session.tab)
+    if opts and opts.switch_tab and session.tab and session.tab ~= vim.api.nvim_get_current_tabpage() then
+        if vim.api.nvim_tabpage_is_valid(session.tab) then
+            vim.api.nvim_set_current_tabpage(session.tab)
+        end
     end
 
     if entry.open() then
@@ -637,6 +661,7 @@ end
 ---@return boolean opened
 function M.open_next()
     M.dismiss_notification(resolve_tab(nil))
+    M.dismiss_notification(0)
     prune_stale_queue()
 
     local expired = false
