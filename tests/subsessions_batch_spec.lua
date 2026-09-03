@@ -36,7 +36,7 @@ describe("subsession batch", function()
         Manifest._reset()
     end)
 
-  it("dispatch fans out items and completes via on_child_settled", function()
+    it("dispatch fans out items and completes via on_child_settled", function()
         Subsessions.spawn = function(_parent, opts, callback)
             local id = "child-" .. (opts.name or "x")
             Manifest.upsert(id, {
@@ -53,15 +53,22 @@ describe("subsession batch", function()
             })
             callback({
                 id = id,
-                rpc = { is_running = function()
-                    return true
-                end },
+                rpc = {
+                    is_running = function()
+                        return true
+                    end,
+                },
             }, nil)
         end
 
-        local parent = { id = "parent-1", rpc = { is_running = function()
-            return true
-        end } }
+        local parent = {
+            id = "parent-1",
+            rpc = {
+                is_running = function()
+                    return true
+                end,
+            },
+        }
         local done = false
         local batch_id
         Batch.dispatch(parent, {
@@ -111,9 +118,14 @@ describe("subsession batch", function()
             callback({ id = id }, nil)
         end
 
-        local parent = { id = "parent-1", rpc = { is_running = function()
-            return true
-        end } }
+        local parent = {
+            id = "parent-1",
+            rpc = {
+                is_running = function()
+                    return true
+                end,
+            },
+        }
         local batch_id
         Batch.dispatch(parent, {
             items = {
@@ -160,9 +172,14 @@ describe("subsession batch", function()
             callback({ id = id }, nil)
         end
 
-        local parent = { id = "parent-1", rpc = { is_running = function()
-            return true
-        end } }
+        local parent = {
+            id = "parent-1",
+            rpc = {
+                is_running = function()
+                    return true
+                end,
+            },
+        }
         local batch_id
         Batch.dispatch(parent, {
             items = {
@@ -204,9 +221,14 @@ describe("subsession batch", function()
             callback({ id = "child-w" }, nil)
         end
 
-        local parent = { id = "parent-1", rpc = { is_running = function()
-            return true
-        end } }
+        local parent = {
+            id = "parent-1",
+            rpc = {
+                is_running = function()
+                    return true
+                end,
+            },
+        }
         local batch_id
         Batch.dispatch(parent, { items = { { task = "x" } } }, function(res)
             batch_id = res.batch_id
@@ -249,9 +271,14 @@ describe("subsession batch", function()
             callback({ id = "child-once" }, nil)
         end
 
-        local parent = { id = "parent-1", rpc = { is_running = function()
-            return true
-        end } }
+        local parent = {
+            id = "parent-1",
+            rpc = {
+                is_running = function()
+                    return true
+                end,
+            },
+        }
         local batch_id
         Batch.dispatch(parent, { items = { { task = "x" } } }, function(res)
             batch_id = res.batch_id
@@ -278,6 +305,61 @@ describe("subsession batch", function()
         assert.equals(1, calls)
     end)
 
+    it("wait retries after the settle callback throws so timeout is not consumed", function()
+        Subsessions.spawn = function(_parent, opts, callback)
+            Manifest.upsert("child-retry", {
+                parent_id = "parent-1",
+                name = "w",
+                task_prompt = opts.task,
+                config = {},
+                status = "active",
+                reported = false,
+                created_at = Manifest.iso_now(),
+                last_active_at = Manifest.iso_now(),
+                agent_spawned = true,
+                run_generation = 1,
+            })
+            callback({ id = "child-retry" }, nil)
+        end
+
+        local parent = {
+            id = "parent-1",
+            rpc = {
+                is_running = function()
+                    return true
+                end,
+            },
+        }
+        local batch_id
+        Batch.dispatch(parent, { items = { { task = "x" } } }, function(res)
+            batch_id = res.batch_id
+        end)
+
+        vim.wait(1000, function()
+            local snap = Batch.poll(batch_id)
+            return snap and snap.items[1] and snap.items[1].status == "running"
+        end, 20)
+
+        local calls = 0
+        local recovered = false
+        Batch.wait(batch_id, function(res)
+            calls = calls + 1
+            if calls == 1 then
+                error("simulated encode/send failure")
+            end
+            recovered = res.status == "completed"
+        end, { timeout_ms = 2000, interval_ms = 10 })
+
+        Manifest.patch("child-retry", { status = "completed" })
+        Batch.on_child_settled("child-retry")
+
+        vim.wait(1000, function()
+            return recovered
+        end)
+        assert.is_true(recovered, "wait must retry after the first callback throws")
+        assert.is_true(calls >= 2)
+    end)
+
     it("bump_generation does not mark the child as agent_spawned", function()
         Manifest.upsert("child-user", {
             parent_id = "parent-1",
@@ -301,9 +383,11 @@ describe("subsession batch", function()
         local parent = {
             id = "session-new",
             lineage_id = "lineage-old",
-            rpc = { is_running = function()
-                return true
-            end },
+            rpc = {
+                is_running = function()
+                    return true
+                end,
+            },
         }
         Manifest.bind_session_lineage(parent, "session-new")
         Subsessions.spawn = function(_parent, opts, callback)

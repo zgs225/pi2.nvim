@@ -259,7 +259,10 @@ local function maybe_cancel_siblings(batch, failed_ref)
     end
     local Subsessions = require("pi.subsessions")
     for _, item in ipairs(batch.items) do
-        if item.ref ~= failed_ref and (item.status == "queued" or item.status == "spawning" or item.status == "running") then
+        if
+            item.ref ~= failed_ref
+            and (item.status == "queued" or item.status == "spawning" or item.status == "running")
+        then
             item.status = "cancelled"
             item.error = "cancelled: sibling failed"
             if item.target then
@@ -325,8 +328,11 @@ function M.on_child_settled(child_id)
     for batch_id, batch in pairs(batches) do
         if batch.status == "running" or batch.status == "pending" then
             for _, item in ipairs(batch.items) do
-                if item.target == child_id and item.generation == gen
-                    and (item.status == "running" or item.status == "spawning") then
+                if
+                    item.target == child_id
+                    and item.generation == gen
+                    and (item.status == "running" or item.status == "spawning")
+                then
                     M.complete_item(batch_id, item.ref, not failed, {
                         output = failed and nil or output,
                         error = failed and "sub-session failed" or nil,
@@ -378,7 +384,8 @@ local function normalize_item(raw, index)
             model = raw.model,
             thinking_level = raw.thinking_level,
             status = "queued",
-        }, nil
+        },
+            nil
     end
     if type(raw.target) == "string" and raw.target ~= "" and type(raw.message) == "string" then
         return {
@@ -386,7 +393,8 @@ local function normalize_item(raw, index)
             target = raw.target,
             message = raw.message,
             status = "queued",
-        }, nil
+        },
+            nil
     end
     return nil, ("item %d: need task or (target + message)"):format(index)
 end
@@ -601,9 +609,15 @@ function M.wait(batch_id, callback, opts)
     local started = vim.uv.hrtime() / 1e6
     local settled = false
 
+    ---@param result table
+    ---@return boolean settled_now
     local function finish(result)
         if settled then
-            return
+            return true
+        end
+        local ok = pcall(callback, result)
+        if not ok then
+            return false
         end
         settled = true
         local cbs = waiters[batch_id]
@@ -617,7 +631,7 @@ function M.wait(batch_id, callback, opts)
                 waiters[batch_id] = nil
             end
         end
-        callback(result)
+        return true
     end
 
     local function tick()
@@ -626,33 +640,37 @@ function M.wait(batch_id, callback, opts)
         end
         local snap = M.poll(batch_id)
         if not snap then
-            finish({ error = "batch not found" })
-            return
-        end
-        if is_terminal_status(snap.status) then
-            finish(snap)
-            return
-        end
-        if (vim.uv.hrtime() / 1e6 - started) >= timeout_ms then
-            finish({
-                error = "timeout waiting for batch",
-                batch_id = batch_id,
-                status = snap.status,
-                summary = snap.summary,
-            })
-            return
+            if finish({ error = "batch not found" }) then
+                return
+            end
+        elseif is_terminal_status(snap.status) then
+            if finish(snap) then
+                return
+            end
+        elseif (vim.uv.hrtime() / 1e6 - started) >= timeout_ms then
+            if
+                finish({
+                    error = "timeout waiting for batch",
+                    batch_id = batch_id,
+                    status = snap.status,
+                    summary = snap.summary,
+                })
+            then
+                return
+            end
         end
         vim.defer_fn(tick, interval_ms)
     end
 
     local batch = M.get(batch_id)
     if not batch then
-        finish({ error = "batch not found" })
-        return
-    end
-    if is_terminal_status(batch.status) then
-        finish(M.snapshot(batch))
-        return
+        if finish({ error = "batch not found" }) then
+            return
+        end
+    elseif is_terminal_status(batch.status) then
+        if finish(M.snapshot(batch)) then
+            return
+        end
     end
     waiters[batch_id] = waiters[batch_id] or {}
     table.insert(waiters[batch_id], finish)
@@ -713,7 +731,8 @@ function M.rebuild()
         if ts then
             local y, m, d = ts:match("^(%d+)%-(%d+)%-(%d+)$")
             if y and m and d then
-                local age_h = (now - os.time({ year = tonumber(y), month = tonumber(m), day = tonumber(d), hour = 0 })) / 3600
+                local age_h = (now - os.time({ year = tonumber(y), month = tonumber(m), day = tonumber(d), hour = 0 }))
+                    / 3600
                 if age_h > ttl_hours and batch.status ~= "running" then
                     batches[id] = nil
                     changed = true

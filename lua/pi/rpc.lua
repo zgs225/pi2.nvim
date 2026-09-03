@@ -407,7 +407,22 @@ function Rpc:send(cmd, callback)
         self._pending[cmd.id] = callback
     end
     log("outgoing", cmd)
-    vim.fn.chansend(self._job_id, vim.json.encode(cmd) .. "\n")
+    local ok, payload = pcall(vim.json.encode, cmd)
+    if not ok then
+        if callback then
+            self._pending[cmd.id] = nil
+        end
+        Notify.error("Failed to encode RPC command: " .. tostring(payload))
+        return false
+    end
+    local sent_ok, n = pcall(vim.fn.chansend, self._job_id, payload .. "\n")
+    if not sent_ok or n == 0 then
+        if callback then
+            self._pending[cmd.id] = nil
+        end
+        Notify.error("Failed to send RPC command" .. (sent_ok and "" or (": " .. tostring(n))))
+        return false
+    end
     return true
 end
 

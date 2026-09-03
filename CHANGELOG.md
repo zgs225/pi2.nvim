@@ -2,6 +2,7 @@
 
 ## 2026-09-03
 
+- **FIXED:** `wait_subagents` no longer hangs after a sub-session finishes if encoding or sending the host `extension_ui_response` throws — the wait callback is retried until it succeeds (or the timeout payload can be delivered), and unencodable snapshots fall back to a small error JSON instead of leaving pi's `select` pending.
 - **FIXED:** The "Agent finished" completion notification no longer fires while replaying history (parent ↔ sub-session switch, compaction rebuild, tree reload) or when the chat / `:PiSessions` list already has focus.
 - **FIXED:** Switching to a still-running parent/child session no longer restarts the statusline spinner elapsed clock; it continues from that run's first `agent_start` (busy lasts until `agent_settled`, including retry backoff).
 - **FIXED:** Auto session titles no longer come back empty on reasoning models that keep thinking after `thinking: disabled` (e.g. CommandCode DeepSeek V4 Flash). Title generation now prefers `streamSimple` with `reasoning: "off"` and a 1024-token floor so the answer is not truncated by reasoning; display length is still capped by `title.max_chars`.

@@ -52,6 +52,10 @@ tail -f ~/.local/state/nvim/log/pi/*/rpc.log
 
 When filing an issue, attaching the relevant section of `rpc.log` is by far the most useful thing you can include.
 
+## Sub-agent wait stuck after children finish
+
+`wait_subagents` / `dispatch_subagents({ wait = true })` blocks the parent pi process on a host `select` until Neovim replies with `extension_ui_response`. If that reply is dropped (encode/send failure), the parent stays busy even though the child row looks idle and `.pi2-sub-batches.json` already says `completed`. Abort the parent (`:PiAbort`) and retry the wait. With `debug = true` or `:PiToggleDebug`, `rpc.log` should show the `extension_ui_response` (or `Failed to encode RPC command` / `Failed to send RPC command`).
+
 ## Process lifecycle
 
 Each π session owns an underlying `pi --mode rpc` subprocess. One tab = one session = one process. The lifecycle is:

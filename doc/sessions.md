@@ -84,7 +84,7 @@ When a user-spawned child finishes, its last assistant message is injected into 
 
 Parent Agent tools are provided by the bundled `extensions/subagent.ts` extension when `subagent.enabled` is true. See [Extensions](extensions.md#bundled-sub-agent-extension-extensionssubagentts).
 
-**Agent workflow:** `list_subagents` to discover children → `dispatch_subagents` for all work (single item or parallel batch). Use `wait: true` on dispatch for one-shot results, or `poll_subagents` / `wait_subagents` with the returned `batch_id`. `stop_subagents` to close processes. Failure policy defaults to **collect_errors**.
+**Agent workflow:** `list_subagents` to discover children → `dispatch_subagents` for all work (single item or parallel batch). Use `wait: true` on dispatch for one-shot results, or `poll_subagents` / `wait_subagents` with the returned `batch_id`. `stop_subagents` to close processes. Failure policy defaults to **collect_errors**. If the parent stays busy after children have finished, see [Troubleshooting → Sub-agent wait stuck](troubleshooting.md#sub-agent-wait-stuck-after-children-finish).
 
 ## Session tree navigation (:PiTree)
 

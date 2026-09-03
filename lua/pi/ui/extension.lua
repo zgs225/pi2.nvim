@@ -9,6 +9,36 @@ local Config = require("pi.config")
 local Startup = require("pi.startup")
 local CommandsCache = require("pi.cache.commands")
 
+--- Encode a host-select reply. Never throws: unencodable tables become a small error object.
+---@param id string?
+---@param result any
+---@return pi.RpcCommand
+function M._select_response(id, result)
+    ---@type pi.RpcCommand
+    local cmd = {
+        type = "extension_ui_response",
+        id = id,
+    }
+    if result == nil then
+        cmd.cancelled = true
+        return cmd
+    end
+    if type(result) ~= "table" then
+        cmd.value = tostring(result)
+        return cmd
+    end
+    local ok, encoded = pcall(vim.json.encode, result)
+    if ok then
+        cmd.value = encoded
+        return cmd
+    end
+    cmd.value = vim.json.encode({
+        error = "failed to encode host result",
+        detail = tostring(encoded),
+    })
+    return cmd
+end
+
 ---@param session pi.Session
 ---@param msg pi.RpcEvent
 function M.handle(session, msg)
@@ -115,12 +145,9 @@ function M.handle(session, msg)
         local payload = type(msg.options) == "table" and msg.options[1] or nil
         vim.schedule(function()
             require("pi.subsessions").handle_host(session, payload or "", function(result)
-                session.rpc:send({
-                    type = "extension_ui_response",
-                    id = msg.id,
-                    value = type(result) == "table" and vim.json.encode(result) or nil,
-                    cancelled = result == nil,
-                })
+                if not session.rpc:send(M._select_response(msg.id, result)) then
+                    error("failed to send subagent host response")
+                end
             end)
         end)
         return
