@@ -10,6 +10,57 @@ local Read = require("pi.subsessions.read")
 local Batch = require("pi.subsessions.batch")
 local Sessions = require("pi.sessions.manager")
 
+---@param a string?
+---@param b string?
+---@return boolean
+local function same_resolved_path(a, b)
+    if type(a) ~= "string" or a == "" or type(b) ~= "string" or b == "" then
+        return false
+    end
+    return vim.fn.resolve(a) == vim.fn.resolve(b)
+end
+
+--- True when this RPC process already has `path` open — UI switch must not
+--- send `switch_session` (pi always aborts the agent first).
+--- A live process that has not yet reported `session_file` is treated as already
+--- on the right file: `switch_session` would abort a just-spawned child.
+---@param session pi.Session
+---@param path string?
+---@return boolean
+local function process_has_session_file(session, path)
+    if not session.rpc:is_running() then
+        return false
+    end
+    if not path or path == "" then
+        return true
+    end
+    if type(session.session_file) ~= "string" or session.session_file == "" then
+        return true
+    end
+    return same_resolved_path(session.session_file, path)
+end
+
+--- Rebuild the bound chat from a live process, or `switch_session` when the
+--- process is on a different file (revive / empty session vs disk).
+---@param session pi.Session
+---@param path string?
+---@param callback fun(ok: boolean, err?: string)
+local function reattach_or_load(session, path, callback)
+    if process_has_session_file(session, path) then
+        Sessions.reattach_view(session, function(ok)
+            callback(ok, ok and nil or "failed to rebuild session view")
+        end)
+        return
+    end
+    if path then
+        Sessions.load_session_path(session, path, function(ok)
+            callback(ok, ok and nil or "failed to load session")
+        end, { rebind_parent_context = false })
+        return
+    end
+    callback(true)
+end
+
 ---@class pi.SubsessionSpawnOpts
 ---@field task string
 ---@field name? string
@@ -225,6 +276,9 @@ function M.spawn(parent, opts, callback)
                     return
                 end
                 Sessions.ensure_id(child, sid)
+                if type(res.data.sessionFile) == "string" and res.data.sessionFile ~= "" then
+                    child.session_file = res.data.sessionFile
+                end
                 register_and_run(sid)
             end)
         end)
@@ -278,14 +332,9 @@ function M._bind_and_load(current, child, tab, chat, callback)
     local parent_name = parent_sess.session_file and require("pi.sessions.history").parse(parent_sess.session_file)
     local label = parent_name and parent_name.name or "parent"
     chat:set_subsession_breadcrumb(label, root_parent_id)
-    local path = child.session_file or Read.find_path(child.id)
-    if path then
-        Sessions.load_session_path(child, path, function(ok)
-            callback(ok, ok and nil or "failed to load sub-session")
-        end, { rebind_parent_context = false })
-    else
-        callback(true)
-    end
+    local disk_path = Read.find_path(child.id)
+    local path = disk_path or child.session_file
+    reattach_or_load(child, path, callback)
 end
 
 --- Switch current tab back to the parent session.
@@ -317,12 +366,9 @@ function M.switch_to_parent(callback, opts)
         callback(true)
         return
     end
-    local path = parent.session_file
-    if path then
-        Sessions.load_session_path(parent, path, callback)
-    else
-        callback(true)
-    end
+    local disk_path = Read.find_path(parent.id)
+    local path = disk_path or parent.session_file
+    reattach_or_load(parent, path, callback)
 end
 
 --- Close sub-session process (file retained).
@@ -635,15 +681,18 @@ function M.sub_new()
         if not task or task == "" then
             return
         end
-        Dialog.input({ title = "Sub-session name (optional)", default = task:sub(1, 40), kind = "pi-sub-new-name" }, function(name)
-            M.spawn(parent, { task = task, name = name ~= "" and name or nil }, function(child, err)
-                if child then
-                    Notify.info("Sub-session started: " .. (name or task:sub(1, 40)))
-                else
-                    Notify.error(err or "failed to spawn sub-session")
-                end
-            end)
-        end)
+        Dialog.input(
+            { title = "Sub-session name (optional)", default = task:sub(1, 40), kind = "pi-sub-new-name" },
+            function(name)
+                M.spawn(parent, { task = task, name = name ~= "" and name or nil }, function(child, err)
+                    if child then
+                        Notify.info("Sub-session started: " .. (name or task:sub(1, 40)))
+                    else
+                        Notify.error(err or "failed to spawn sub-session")
+                    end
+                end)
+            end
+        )
     end)
 end
 

@@ -41,8 +41,10 @@
 ---@field changed_files table<string, true> Set of file paths modified by edit/write tools during the current session.
 ---@field _pending_file_change_args? table<string, table> Pending tool args by tool call id for file-changing tools.
 ---@field _compaction_rebuilding? boolean True while compacted messages are being fetched/replayed.
+---@field _view_rebuilding? boolean True while the tab UI is being rebound to this live session (no switch_session).
 ---@field _models_cache? { fetched_at: integer, list: table[] } Cached get_available_models result for provider-ambiguity detection (TTL-bounded).
 ---@field _compaction_event_queue? pi.RpcEvent[] Events received while compacted messages are being fetched/replayed.
+---@field _view_event_queue? pi.RpcEvent[] Events received while a live view-switch is fetching/replaying messages.
 
 ---@class pi.SessionCreateOpts
 ---@field layout? pi.LayoutMode
@@ -157,6 +159,18 @@ local function make_agent(rpc)
     }
 end
 
+--- Remember whether a session was mid-run when its chat was unbound, so a
+--- later view-switch can restore the spinner without aborting the agent.
+---@param session pi.Session
+local function capture_detached_run_state(session)
+    local chat = session.chat
+    if not chat then
+        return
+    end
+    session._detached_busy = (chat.is_streaming and chat:is_streaming()) or false
+    session._detached_compacting = (chat.is_compacting and chat:is_compacting()) or false
+end
+
 --- Bind a tab's chat UI to a session process. Detaches any prior bindings on
 --- either side without stopping RPC processes.
 ---@param session pi.Session
@@ -167,6 +181,7 @@ local function bind_chat_to_session(session, chat, tab)
     if prev_id and prev_id ~= session.id then
         local prev = registry[prev_id]
         if prev and prev.attached_tab == tab then
+            capture_detached_run_state(prev)
             prev.attached_tab = nil
             prev.tab = nil
             prev.chat = nil
@@ -260,6 +275,9 @@ local rebuild_after_compaction
 
 ---@type fun(session: pi.Session, flush_queue?: boolean, will_retry?: boolean)?
 local finish_compaction_rebuild
+
+---@type fun(session: pi.Session)?
+local finish_view_rebuild
 
 ---@param chat pi.Chat
 local function restore_active_agent_status(chat)
@@ -368,7 +386,11 @@ local function refresh_model_ambiguity(session, state)
         end
         if covered then
             if session.chat then
-                session.chat:set_model_ambiguity_for(model.provider, model.id, Models.ambiguity_suffix(model, cache.list))
+                session.chat:set_model_ambiguity_for(
+                    model.provider,
+                    model.id,
+                    Models.ambiguity_suffix(model, cache.list)
+                )
             end
             return
         end
@@ -458,15 +480,18 @@ local function reapply_pinned_config(session)
 
     local function after_model()
         if pin.thinking_level then
-            local sent_level = session.rpc:send({ type = "set_thinking_level", level = pin.thinking_level }, function(res)
-                vim.schedule(function()
-                    if res.success then
-                        M.refresh_state(session)
-                    else
-                        refresh_state_and_pin(session)
-                    end
-                end)
-            end)
+            local sent_level = session.rpc:send(
+                { type = "set_thinking_level", level = pin.thinking_level },
+                function(res)
+                    vim.schedule(function()
+                        if res.success then
+                            M.refresh_state(session)
+                        else
+                            refresh_state_and_pin(session)
+                        end
+                    end)
+                end
+            )
             if not sent_level then
                 refresh_state_and_pin(session)
             end
@@ -475,15 +500,18 @@ local function reapply_pinned_config(session)
         end
     end
 
-    local sent = session.rpc:send({ type = "set_model", provider = pin.model.provider, modelId = pin.model.id }, function(res)
-        vim.schedule(function()
-            if res.success then
-                after_model()
-            else
-                refresh_state_and_pin(session)
-            end
-        end)
-    end)
+    local sent = session.rpc:send(
+        { type = "set_model", provider = pin.model.provider, modelId = pin.model.id },
+        function(res)
+            vim.schedule(function()
+                if res.success then
+                    after_model()
+                else
+                    refresh_state_and_pin(session)
+                end
+            end)
+        end
+    )
     if not sent then
         refresh_state_and_pin(session)
     end
@@ -529,14 +557,25 @@ function M.handle_event(session, msg)
         return true
     end
 
-    -- NOTE: This compaction-specific rebuild gate should become a small
-    -- transaction helper if other session rebuild flows need event buffering.
-    if session._compaction_rebuilding and t ~= "response" then
-        if t == "_process_exit" and finish_compaction_rebuild then
-            finish_compaction_rebuild(session, false)
+    -- Buffer inbound events while a get_messages replay is in flight
+    -- (compaction rebuild or live view-switch). `response` is excluded so
+    -- RPC callbacks still fire.
+    if (session._compaction_rebuilding or session._view_rebuilding) and t ~= "response" then
+        if t == "_process_exit" then
+            if session._compaction_rebuilding and finish_compaction_rebuild then
+                finish_compaction_rebuild(session, false)
+            end
+            if session._view_rebuilding and finish_view_rebuild then
+                finish_view_rebuild(session)
+            end
         else
-            session._compaction_event_queue = session._compaction_event_queue or {}
-            session._compaction_event_queue[#session._compaction_event_queue + 1] = msg
+            if session._view_rebuilding then
+                session._view_event_queue = session._view_event_queue or {}
+                session._view_event_queue[#session._view_event_queue + 1] = msg
+            else
+                session._compaction_event_queue = session._compaction_event_queue or {}
+                session._compaction_event_queue[#session._compaction_event_queue + 1] = msg
+            end
             return true
         end
     end
@@ -786,6 +825,53 @@ finish_compaction_rebuild = function(session, flush_queue, will_retry)
                 active_queue[#active_queue + 1] = queued[j]
             end
             session._compaction_event_queue = active_queue
+            return
+        end
+        M.handle_event(session, queued_msg)
+    end
+end
+
+---@param session pi.Session
+local function restore_view_run_state(session)
+    local chat = session.chat
+    if not chat then
+        return
+    end
+    if session._detached_compacting then
+        chat:set_compacting(true)
+        chat:set_status({ type = "compaction" })
+    elseif session._detached_busy then
+        if not chat:is_streaming() then
+            chat:on_agent_start()
+        else
+            restore_active_agent_status(chat)
+        end
+    else
+        restore_active_agent_status(chat)
+    end
+end
+
+--- Drain events buffered during a live view-switch rebuild.
+---@param session pi.Session
+finish_view_rebuild = function(session)
+    local queued = session._view_event_queue or {}
+    session._view_event_queue = {}
+    session._view_rebuilding = false
+    restore_view_run_state(session)
+
+    for i, queued_msg in ipairs(queued) do
+        if session._view_rebuilding or session._compaction_rebuilding then
+            local dest
+            if session._view_rebuilding then
+                dest = session._view_event_queue or {}
+                session._view_event_queue = dest
+            else
+                dest = session._compaction_event_queue or {}
+                session._compaction_event_queue = dest
+            end
+            for j = i, #queued do
+                dest[#dest + 1] = queued[j]
+            end
             return
         end
         M.handle_event(session, queued_msg)
@@ -1046,7 +1132,11 @@ end
 
 ---@param session pi.Session
 local function start_new_session(session)
-    if not session.attached_tab or tab_session_id[session.attached_tab] ~= session.id or not session.rpc:is_running() then
+    if
+        not session.attached_tab
+        or tab_session_id[session.attached_tab] ~= session.id
+        or not session.rpc:is_running()
+    then
         return
     end
 
@@ -1365,6 +1455,83 @@ function M.reload_messages(session)
     end
 end
 
+--- Rebind the tab UI to a live session without `switch_session` (which would abort
+--- the agent). Mirrors compaction rebuild: queue inbound events, get_messages,
+--- clear + replay, flush the queue, restore busy/compacting status.
+---@param session pi.Session
+---@param callback? fun(ok: boolean)
+function M.reattach_view(session, callback)
+    ---@param ok boolean
+    local function done(ok)
+        if callback then
+            vim.schedule(function()
+                callback(ok)
+            end)
+        end
+    end
+
+    session._view_rebuilding = true
+    session._view_event_queue = session._view_event_queue or {}
+
+    local chat = session.chat
+    if not chat then
+        finish_view_rebuild(session)
+        done(true)
+        return
+    end
+
+    session.changed_files = {}
+    session._pending_file_change_args = nil
+    chat:clear()
+    chat:show_loading()
+
+    local sent = session.rpc:send({ type = "get_messages" }, function(res)
+        vim.schedule(function()
+            if not session._view_rebuilding then
+                done(false)
+                return
+            end
+            local bound = session.chat
+            if not bound then
+                finish_view_rebuild(session)
+                done(false)
+                return
+            end
+            bound:clear_placeholder()
+            if not res.success then
+                local err = res.error or "Failed to load session messages"
+                Notify.error(err)
+                bound:on_error(err, { pad_top = true, pad_bottom = true })
+                finish_view_rebuild(session)
+                bound:ensure_shown_and_focus_prompt()
+                done(false)
+                return
+            end
+
+            local messages = (res.data or {}).messages or {}
+            show_startup_block(session, CommandsCache.list())
+            replay_messages(session, messages)
+            M.refresh_state(session)
+            vim.schedule(function()
+                finish_view_rebuild(session)
+                if session.chat then
+                    session.chat:ensure_shown_and_focus_prompt()
+                end
+                done(true)
+            end)
+        end)
+    end)
+    if not sent then
+        finish_view_rebuild(session)
+        Notify.error("Failed to load session messages")
+        if session.chat then
+            session.chat:on_error("Failed to load session messages", { pad_top = true, pad_bottom = true })
+            session.chat:ensure_shown_and_focus_prompt()
+        end
+        done(false)
+    end
+end
+
 --- Load a session by path: switch_session -> clear chat -> get_messages -> replay.
 ---@param session pi.Session
 ---@param session_path string
@@ -1402,6 +1569,7 @@ function load_session(session, session_path, opts, callback)
         end
 
         Attention.end_session_transition(session, true)
+        session.session_file = session_path
         if opts.rebind_parent_context ~= false then
             require("pi.subsessions").on_parent_resumed(session, session_path)
         end
@@ -1412,6 +1580,13 @@ function load_session(session, session_path, opts, callback)
         -- core; adopt it as this tab's pin.
         refresh_state_and_pin(session)
         done(true)
+
+        -- Revive (and other headless loads) switch the file before the chat is
+        -- bound; the caller rebuilds via reattach_view. Sending get_messages
+        -- here would race that rebuild once bind_chat lands.
+        if not session.chat then
+            return
+        end
 
         vim.schedule(function()
             if not session.chat then

@@ -2,6 +2,7 @@
 
 ## 2026-09-03
 
+- **FIXED:** Switching parent ↔ child or sibling children no longer aborts the target agent (`switch_session` is skipped when the process already has that session file). Revive still loads via `switch_session`.
 - **FIXED:** `:PiSubNew` completion reports — `bump_generation` no longer marks user-spawned children as Agent workers, so the parent still receives the completion prompt and `:PiSessions` keeps unread user rows.
 - **FIXED:** `wait_subagents` / `Batch.wait` now invoke their callback once when the poll tick races a settle notification.
 - **FIXED:** Sub-agent batches are keyed by parent **lineage** (survives `/new` and session-id migration); `:PiAbort` cancels those batches; `load_session_path` reports `false` when `switch_session` fails.
