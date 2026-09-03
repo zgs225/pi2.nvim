@@ -148,6 +148,78 @@ describe("pi.paste", function()
             assert.is_true(result)
             assert.is_true(orig_called)
             assert.equals(0, attach_calls)
+            assert.equals(0, clip_queries)
+        end)
+
+        it("rewrites CSI-u Ctrl+J to newlines in a prompt paste", function()
+            stub_img_clip({ clip_cmd = "pngpaste", is_image = false })
+            vim.bo[buf].filetype = Ft.prompt
+            local got
+            local handler = Paste._make_handler(function(lines, _)
+                got = lines
+                return true
+            end)
+            handler({ "aaa\27[106;5u\27[106;5ubbb" }, -1)
+            assert.same({ "aaa", "", "bbb" }, got)
+            assert.equals(0, attach_calls)
+        end)
+
+        it("rewrites CSI-u across streamed chunks", function()
+            stub_img_clip({ clip_cmd = "pngpaste", is_image = true })
+            vim.bo[buf].filetype = Ft.prompt
+            local got = {}
+            local handler = Paste._make_handler(function(lines, phase)
+                got[#got + 1] = { vim.deepcopy(lines), phase }
+                return true
+            end)
+            handler({ "aaa\27[10" }, 1)
+            handler({ "6;5ubbb" }, 3)
+            assert.same({ "aaa" }, got[1][1])
+            assert.same({ "", "bbb" }, got[2][1])
+            assert.equals(0, attach_calls)
+            assert.equals(0, clip_queries)
+        end)
+
+        it("does not rewrite CSI-u outside a prompt buffer", function()
+            stub_img_clip({ clip_cmd = "pngpaste", is_image = true })
+            vim.bo[buf].filetype = "lua"
+            local got
+            local handler = Paste._make_handler(function(lines, _)
+                got = lines
+                return true
+            end)
+            handler({ "aaa\27[106;5ubbb" }, -1)
+            assert.same({ "aaa\27[106;5ubbb" }, got)
+            assert.equals(0, clip_queries)
+        end)
+    end)
+
+    describe("_rewrite_newline_aliases", function()
+        it("turns Kitty CSI-u Ctrl+J into a newline", function()
+            local out, pending = Paste._rewrite_newline_aliases({ "aaa\27[106;5ubbb" }, "")
+            assert.same({ "aaa", "bbb" }, out)
+            assert.equals("", pending)
+        end)
+
+        it("turns xterm modifyOtherKeys Ctrl+J into a newline", function()
+            local out, pending = Paste._rewrite_newline_aliases({ "aaa\27[27;5;106~bbb" }, "")
+            assert.same({ "aaa", "bbb" }, out)
+            assert.equals("", pending)
+        end)
+
+        it("turns Kitty CSI-u Shift+Enter into a newline", function()
+            local out, pending = Paste._rewrite_newline_aliases({ "hello\27[13;2uworld" }, "")
+            assert.same({ "hello", "world" }, out)
+            assert.equals("", pending)
+        end)
+
+        it("holds an incomplete CSI tail for the next chunk", function()
+            local a, p1 = Paste._rewrite_newline_aliases({ "aaa\27[10" }, "")
+            assert.same({ "aaa" }, a)
+            assert.equals("\27[10", p1)
+            local b, p2 = Paste._rewrite_newline_aliases({ "6;5ubbb" }, p1)
+            assert.same({ "", "bbb" }, b)
+            assert.equals("", p2)
         end)
     end)
 

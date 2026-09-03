@@ -2,6 +2,8 @@
 
 ## 2026-09-03
 
+- **FIXED:** Pasting into the prompt no longer inserts literal `^[[106;5u` (Kitty CSI-u Ctrl+J) or the xterm `^[[27;5;106~` / Shift+Enter `^[[13;2u` encodings in place of newlines. Streamed paste chunks that split a sequence are rejoined. Image-paste interception is unchanged and still prompt-only.
+
 - **FIXED:** Auto session titles no longer come back empty on reasoning models that keep thinking after `thinking: disabled` (e.g. CommandCode DeepSeek V4 Flash). Title generation now prefers `streamSimple` with `reasoning: "off"` and a 1024-token floor so the answer is not truncated by reasoning; display length is still capped by `title.max_chars`.
 
 ## 2026-09-01
