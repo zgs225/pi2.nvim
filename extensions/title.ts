@@ -45,6 +45,14 @@ const STATUS_GENERATING = "generating";
 
 /** Defaults when the runtime file is absent (e.g. pi run outside pi.nvim). */
 const DEFAULT_MAX_CHARS = 40;
+/**
+ * Floor for the title completion's maxTokens. Display length is still
+ * enforced by clampTitle(maxChars); this budget has to cover models that
+ * keep emitting reasoning even after the adapter sends thinking:disabled
+ * (CommandCode DeepSeek V4 Flash was measured to fill 40 tokens with
+ * reasoning and return no text content).
+ */
+const TITLE_MIN_TOKENS = 1024;
 
 interface TitleConfig {
 	enabled: boolean;
@@ -77,10 +85,14 @@ function readConfig(): TitleConfig {
 }
 
 /**
- * One-shot completion across pi versions: newer releases expose
- * ModelRegistry.complete(); older ones only expose providers, so fall back
- * to provider.streamSimple() and await the stream result. Mirrors
- * extensions/vision.ts.
+ * One-shot completion that honors SimpleStreamOptions (including reasoning).
+ *
+ * ModelRegistry.complete() in pi 0.84 is typed as SimpleStreamOptions but
+ * calls runtime.complete() → provider.stream(), which only understands
+ * reasoningEffort. `reasoning: "off"` is dropped. Prefer
+ * provider.streamSimple() so the simple-options adapter maps it; inject
+ * auth because that path skips ModelRuntime.prepareRequest(). Fall back to
+ * registry.complete() only when streamSimple is unavailable.
  */
 interface RegistryLike {
 	complete?: (
@@ -91,7 +103,13 @@ interface RegistryLike {
 	getProvider: (id: string) => Provider | undefined;
 	find?: (provider: string, modelId: string) => Model<any> | undefined;
 	getApiKeyAndHeaders: (model: Model<any>) => Promise<
-		| { ok: true; apiKey?: string; headers?: Record<string, string>; baseUrl?: string }
+		| {
+				ok: true;
+				apiKey?: string;
+				headers?: Record<string, string>;
+				baseUrl?: string;
+				env?: Record<string, string>;
+		  }
 		| { ok: false; error: string }
 	>;
 }
@@ -102,22 +120,30 @@ async function completeModel(
 	context: Context,
 	options: SimpleStreamOptions,
 ): Promise<AssistantMessage> {
+	const provider =
+		typeof registry.getProvider === "function" ? registry.getProvider(model.provider) : undefined;
+	if (provider && typeof provider.streamSimple === "function") {
+		const merged: SimpleStreamOptions = { ...options };
+		let requestModel = model;
+		if (typeof registry.getApiKeyAndHeaders === "function") {
+			const auth = await registry.getApiKeyAndHeaders(model);
+			if (auth && auth.ok === false) {
+				throw new Error(auth.error);
+			}
+			if (auth?.ok) {
+				if (auth.apiKey) merged.apiKey = auth.apiKey;
+				if (auth.headers) merged.headers = { ...auth.headers, ...(merged.headers ?? {}) };
+				if (auth.env) merged.env = { ...auth.env, ...(merged.env ?? {}) };
+				// stream() reads model.baseUrl, not options.baseUrl.
+				if (auth.baseUrl) requestModel = { ...model, baseUrl: auth.baseUrl };
+			}
+		}
+		return await provider.streamSimple(requestModel, context, merged).result();
+	}
 	if (typeof registry.complete === "function") {
 		return registry.complete(model, context, options);
 	}
-	const provider = registry.getProvider(model.provider);
-	if (!provider) {
-		throw new Error(`no provider available for "${model.provider}"`);
-	}
-	const merged: SimpleStreamOptions = { ...options };
-	const auth = await registry.getApiKeyAndHeaders(model);
-	if (auth?.ok) {
-		if (auth.apiKey) merged.apiKey = auth.apiKey;
-		if (auth.baseUrl) merged.baseUrl = auth.baseUrl;
-		if (auth.headers) merged.headers = { ...auth.headers, ...(merged.headers ?? {}) };
-	}
-	const stream = provider.streamSimple(model, context, merged);
-	return await stream.result();
+	throw new Error(`no provider available for "${model.provider}"`);
 }
 
 /** Text content of a session message entry, images/tool calls dropped. */
@@ -225,9 +251,13 @@ async function generateTitle(pi: ExtensionAPI, ctx: {
 		ctx.modelRegistry,
 		model,
 		{ messages: [{ role: "user", content: prompt, timestamp: Date.now() }] },
-		// Conservative token cap for the character budget; the code-side
-		// clamp is the final guarantee.
-		{ temperature: 0, maxTokens: Math.max(20, Math.ceil(cfg.maxChars * 2)) },
+		{
+			temperature: 0,
+			maxTokens: Math.max(TITLE_MIN_TOKENS, Math.ceil(cfg.maxChars * 2)),
+			// SimpleStreamOptions.reasoning is typed without "off"; streamSimple
+			// still accepts it and maps it to reasoningEffort: undefined.
+			reasoning: "off",
+		} as SimpleStreamOptions,
 	);
 	if (reply.stopReason === "error" || reply.stopReason === "aborted") {
 		throw new Error(`title generation failed: ${reply.errorMessage ?? reply.stopReason}`);
