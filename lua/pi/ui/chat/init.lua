@@ -617,6 +617,11 @@ function Chat:is_streaming()
     return self._streaming
 end
 
+---@return boolean
+function Chat:is_retrying()
+    return self._retrying == true
+end
+
 --- Track the core's auto-retry backoff state. While retrying, the double-<Esc>
 --- abort gesture stays live (arming on the first press) even though nothing is
 --- streaming; the second press then sends abort_retry instead of abort.
@@ -1213,8 +1218,25 @@ function Chat:active_verb()
 end
 
 ---@param status pi.Status?
-function Chat:set_status(status)
-    self._history:set_status(status)
+---@param start_time? number Busy-clock start (`vim.uv.hrtime()/1e9`); used on idle→busy.
+function Chat:set_status(status, start_time)
+    self._history:set_status(status, start_time)
+end
+
+--- Re-arm the spinner after a view-switch rebuild without opening a new turn.
+---@param verb? string
+---@param start_time? number
+function Chat:restore_busy(verb, start_time)
+    self._streaming = true
+    self._retrying = false
+    if type(verb) == "string" and verb ~= "" then
+        self._active_verb = verb
+    elseif not self._active_verb then
+        local verbs = Config.random_verbs()
+        self._active_verb = verbs[1]
+        self._done_verb = verbs[2]
+    end
+    self:set_status({ type = "agent", text = self._active_verb .. "…" }, start_time)
 end
 
 ---@param msg string
@@ -1247,7 +1269,8 @@ function Chat:set_replaying(replaying)
 end
 
 ---@param timestamp? number
-function Chat:on_agent_start(timestamp)
+---@param start_time? number Session run clock; keeps elapsed continuous across view-switch restore.
+function Chat:on_agent_start(timestamp, start_time)
     self._streaming = true
     -- The retry backoff is over: this is a real streaming run again, so the
     -- abort gesture must target the run (abort), not the backoff (abort_retry).
@@ -1261,7 +1284,7 @@ function Chat:on_agent_start(timestamp)
     local verbs = Config.random_verbs()
     self._active_verb = verbs[1]
     self._done_verb = verbs[2]
-    self:set_status({ type = "agent", text = verbs[1] .. "…" })
+    self:set_status({ type = "agent", text = verbs[1] .. "…" }, start_time)
 end
 
 function Chat:_ensure_assistant_block_open()

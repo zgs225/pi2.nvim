@@ -18,6 +18,7 @@ local function stub_chat()
         clear = function(self)
             self._streaming = false
             self._compacting = false
+            self._retrying = false
         end,
         show_loading = function() end,
         clear_placeholder = function() end,
@@ -44,14 +45,36 @@ local function stub_chat()
         is_compacting = function(self)
             return self._compacting == true
         end,
+        is_retrying = function(self)
+            return self._retrying == true
+        end,
+        set_retrying = function(self, value)
+            self._retrying = value
+        end,
         set_compacting = function(self, value)
             self._compacting = value
         end,
-        active_verb = function()
-            return nil
+        active_verb = function(self)
+            return self._active_verb
         end,
-        set_status = function(self, status)
+        restore_busy = function(self, verb, start_time)
+            self._streaming = true
+            self.restore_busy_calls = (self.restore_busy_calls or 0) + 1
+            if type(verb) == "string" and verb ~= "" then
+                self._active_verb = verb
+            else
+                self._active_verb = self._active_verb or "Working"
+            end
+            self.status = { type = "agent", text = self._active_verb .. "…" }
+            self.status_start_time = start_time
+        end,
+        set_status = function(self, status, start_time)
             self.status = status
+            if start_time ~= nil then
+                self.status_start_time = start_time
+            elseif status == nil then
+                self.status_start_time = nil
+            end
         end,
         add_user_message = function() end,
         add_vision_block = function() end,
@@ -452,6 +475,73 @@ describe("subsession view-switch without abort", function()
             "reattach_view should finish and flush the queue"
         )
         assert.are.equal("hi", chat.deltas)
-        assert.is_true((chat.agent_starts or 0) >= 1)
+        assert.is_true((chat.restore_busy_calls or 0) >= 1)
+        assert.are.equal(0, chat.agent_starts or 0)
+    end)
+
+    it("restores spinner elapsed from the session run clock, not switch time", function()
+        local started = math.floor(vim.uv.hrtime() / 1e9) - 30
+        local parent, child = register_parent_child({
+            detached_busy = true,
+        })
+        child._busy_started_at = started
+        child._busy_verb = "Working"
+        Sessions.bind_chat(parent, chat, tab)
+
+        local ok
+        Subsessions.switch_to("child-id", function(result)
+            ok = result
+        end)
+        flush_get_messages(child.rpc)
+        assert.is_true(vim.wait(3000, function()
+            return ok == true
+        end, 10))
+
+        assert.are.equal(started, chat.status_start_time)
+        assert.are.equal("Working…", chat.status and chat.status.text)
+        assert.are.equal(0, chat.agent_starts or 0)
+        assert.is_true((chat.restore_busy_calls or 0) >= 1)
+    end)
+
+    it("keeps the run clock across detached agent_end until agent_settled", function()
+        local _, child = register_parent_child()
+        Sessions.handle_event(child, { type = "agent_start" })
+        local started = child._busy_started_at
+        assert.is_true(child._detached_busy)
+        assert.is_not_nil(started)
+
+        Sessions.handle_event(child, { type = "agent_end" })
+        assert.is_true(child._detached_busy)
+        assert.are.equal(started, child._busy_started_at)
+
+        Sessions.handle_event(child, { type = "auto_retry_start" })
+        assert.is_true(child._detached_retrying)
+        assert.are.equal(started, child._busy_started_at)
+
+        Sessions.handle_event(child, { type = "agent_settled" })
+        assert.is_not_true(child._detached_busy)
+        assert.is_nil(child._busy_started_at)
+        assert.is_not_true(child._detached_retrying)
+    end)
+
+    it("restores Retrying status when switching to a child in backoff", function()
+        local parent, child = register_parent_child({ detached_busy = true })
+        child._detached_retrying = true
+        child._busy_started_at = math.floor(vim.uv.hrtime() / 1e9) - 12
+        Sessions.bind_chat(parent, chat, tab)
+
+        local ok
+        Subsessions.switch_to("child-id", function(result)
+            ok = result
+        end)
+        flush_get_messages(child.rpc)
+        assert.is_true(vim.wait(3000, function()
+            return ok == true
+        end, 10))
+
+        assert.is_true(chat._retrying)
+        assert.are.equal("Retrying…", chat.status and chat.status.text)
+        assert.are.equal(child._busy_started_at, chat.status_start_time)
+        assert.are.equal(0, chat.restore_busy_calls or 0)
     end)
 end)

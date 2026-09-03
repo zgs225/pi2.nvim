@@ -139,4 +139,12 @@ describe("spinner elapsed timing", function()
         local busy = last_busy(models)
         assert.are.equal("Working…", busy.text)
     end)
+
+    it("uses an explicit start_time on idle→busy instead of now", function()
+        local h, models = setup()
+        clock = 80
+        h:set_status({ type = "agent", text = "Working…" }, 50)
+        pump()
+        assert.are.equal(" 30s", last_busy(models).elapsed)
+    end)
 end)

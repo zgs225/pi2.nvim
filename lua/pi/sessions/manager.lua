@@ -32,8 +32,11 @@
 ---@field view_parent_id? string Parent id for breadcrumb navigation while viewing a child in the tab UI.
 ---@field lineage_id? string Stable parent key for sub-session manifest rows across /new and id migration.
 ---@field conversation_epoch? integer Incremented on each /new in this tab; sub-sessions tag their parent_epoch.
----@field _detached_busy? boolean Agent running on a detached process (no chat UI).
----@field _detached_compacting? boolean Compaction running on a detached process.
+---@field _detached_busy? boolean Session-level run is active until `agent_settled` (also when a chat is bound).
+---@field _detached_compacting? boolean Compaction running (detached or captured on unbind).
+---@field _detached_retrying? boolean Auto-retry backoff (detached or captured on unbind).
+---@field _busy_started_at? integer Run clock (`vim.uv.hrtime()/1e9`); first `agent_start` of the run.
+---@field _busy_verb? string Active-verb snapshot for view-switch restore.
 ---@field session_file? string Backend-reported session file path (from get_state responses). Lets the resume picker detect "still open in another tab" without extra RPC round-trips.
 ---@field startup_announcements table<string, pi.StartupAnnouncement> Extension startup data (keys ending with `:startup`) shown in the system preamble. Process-level: persists across session switches.
 ---@field system_errors pi.SystemErrorEntry[]
@@ -159,16 +162,58 @@ local function make_agent(rpc)
     }
 end
 
---- Remember whether a session was mid-run when its chat was unbound, so a
---- later view-switch can restore the spinner without aborting the agent.
+--- Pin the run clock on first `agent_start`; later starts (retry, post-compaction) keep it.
+---@param session pi.Session
+local function mark_run_start(session)
+    if type(session._busy_started_at) ~= "number" then
+        session._busy_started_at = math.floor(vim.uv.hrtime() / 1e9)
+    end
+    session._detached_busy = true
+end
+
+--- Authoritative end of the session-level run (`agent_settled` / process exit).
+---@param session pi.Session
+local function mark_run_end(session)
+    session._busy_started_at = nil
+    session._detached_busy = false
+    session._detached_compacting = false
+    session._detached_retrying = false
+    session._busy_verb = nil
+end
+
+---@param session pi.Session
+---@param status pi.Status?
+local function set_chat_status(session, status)
+    local chat = session.chat
+    if not chat then
+        return
+    end
+    chat:set_status(status, session._busy_started_at)
+end
+
+--- Remember compacting/retry/verb when unbinding. Busy + clock stay on the
+--- session (event-driven); do not clear them from chat streaming state.
 ---@param session pi.Session
 local function capture_detached_run_state(session)
     local chat = session.chat
     if not chat then
         return
     end
-    session._detached_busy = (chat.is_streaming and chat:is_streaming()) or false
     session._detached_compacting = (chat.is_compacting and chat:is_compacting()) or false
+    session._detached_retrying = (chat.is_retrying and chat:is_retrying()) or false
+    local verb = chat.active_verb and chat:active_verb() or nil
+    if type(verb) == "string" and verb ~= "" then
+        session._busy_verb = verb
+    end
+    if (chat.is_streaming and chat:is_streaming())
+        or session._detached_retrying
+        or session._detached_compacting
+    then
+        session._detached_busy = true
+        if type(session._busy_started_at) ~= "number" then
+            session._busy_started_at = math.floor(vim.uv.hrtime() / 1e9)
+        end
+    end
 end
 
 --- Bind a tab's chat UI to a session process. Detaches any prior bindings on
@@ -279,13 +324,17 @@ local finish_compaction_rebuild
 ---@type fun(session: pi.Session)?
 local finish_view_rebuild
 
----@param chat pi.Chat
-local function restore_active_agent_status(chat)
+---@param session pi.Session
+local function restore_active_agent_status(session)
+    local chat = session.chat
+    if not chat then
+        return
+    end
     -- Compaction/retry cleanup can fire after agent_end (between turns).
     -- Only restore the spinner if an agent loop is still active.
-    local active_verb = chat:active_verb()
+    local active_verb = chat:active_verb() or session._busy_verb
     if active_verb then
-        chat:set_status({ type = "agent", text = active_verb .. "…" })
+        chat:set_status({ type = "agent", text = active_verb .. "…" }, session._busy_started_at)
     else
         chat:set_status(nil)
     end
@@ -535,13 +584,13 @@ function M.handle_event(session, msg)
     if not chat then
         local SessionList = require("pi.ui.sessions")
         if t == "agent_start" then
-            session._detached_busy = true
+            mark_run_start(session)
+            session._detached_retrying = false
             SessionList.on_agent_start(session)
         elseif t == "agent_end" then
-            session._detached_busy = false
             SessionList.on_agent_end(session)
         elseif t == "agent_settled" then
-            session._detached_busy = false
+            mark_run_end(session)
             if session.parent_id then
                 require("pi.subsessions").on_child_settled(session)
             end
@@ -549,9 +598,16 @@ function M.handle_event(session, msg)
             session._detached_compacting = true
         elseif t == "compaction_end" or t == "auto_compaction_end" then
             session._detached_compacting = false
+        elseif t == "auto_retry_start" then
+            session._detached_retrying = true
+            mark_run_start(session)
+        elseif t == "auto_retry_end" then
+            session._detached_retrying = false
+            if msg.success == false then
+                mark_run_end(session)
+            end
         elseif t == "_process_exit" and session.id then
-            session._detached_busy = false
-            session._detached_compacting = false
+            mark_run_end(session)
             registry[session.id] = nil
         end
         return true
@@ -581,7 +637,10 @@ function M.handle_event(session, msg)
     end
 
     if t == "agent_start" then
-        chat:on_agent_start()
+        mark_run_start(session)
+        session._detached_retrying = false
+        chat:on_agent_start(nil, session._busy_started_at)
+        session._busy_verb = chat:active_verb()
         require("pi.ui.sessions").on_agent_start(session)
     elseif t == "agent_end" then
         chat:on_agent_end()
@@ -593,9 +652,8 @@ function M.handle_event(session, msg)
         -- no retry, compaction retry, or queued continuation remains. The
         -- compaction/retry branches above restore state piecemeal; this is the
         -- final fallback that converges any leftover spinner.
-        if chat then
-            chat:set_status(nil)
-        end
+        mark_run_end(session)
+        chat:set_status(nil)
         if session.parent_id then
             require("pi.subsessions").on_child_settled(session)
         end
@@ -647,33 +705,39 @@ function M.handle_event(session, msg)
         end
     elseif t == "compaction_start" or t == "auto_compaction_start" then
         chat:set_compacting(true)
-        chat:set_status({ type = "compaction" })
+        session._detached_compacting = true
+        set_chat_status(session, { type = "compaction" })
     elseif t == "compaction_end" or t == "auto_compaction_end" then
+        session._detached_compacting = false
         if msg.aborted then
             chat:set_compacting(false)
-            restore_active_agent_status(chat)
+            restore_active_agent_status(session)
             chat:on_error("Compaction cancelled", { pad_top = true, pad_bottom = true })
             chat:flush_compaction_queue(msg.willRetry == true)
         elseif type(msg.errorMessage) == "string" and msg.errorMessage ~= "" then
             require("pi.ui.sessions").mark_error(session)
             chat:set_compacting(false)
-            restore_active_agent_status(chat)
+            restore_active_agent_status(session)
             chat:on_error(msg.errorMessage, { pad_top = true, pad_bottom = true })
             chat:flush_compaction_queue(msg.willRetry == true)
         elseif type(msg.result) == "table" and rebuild_after_compaction then
             rebuild_after_compaction(session, msg.result, msg.willRetry == true)
         else
             chat:set_compacting(false)
-            restore_active_agent_status(chat)
+            restore_active_agent_status(session)
             chat:flush_compaction_queue(msg.willRetry == true)
         end
     elseif t == "auto_retry_start" then
         chat:set_retrying(true)
-        chat:set_status({ type = "agent", text = "Retrying…" })
+        session._detached_retrying = true
+        mark_run_start(session)
+        set_chat_status(session, { type = "agent", text = "Retrying…" })
     elseif t == "auto_retry_end" then
         chat:set_retrying(false)
+        session._detached_retrying = false
         if msg.success == false then
             require("pi.ui.sessions").mark_error(session)
+            mark_run_end(session)
             chat:set_status(nil)
             chat:on_error(
                 "Retry failed after "
@@ -683,7 +747,7 @@ function M.handle_event(session, msg)
                 { pad_top = true, pad_bottom = true }
             )
         else
-            restore_active_agent_status(chat)
+            restore_active_agent_status(session)
         end
     elseif t == "summarization_retry_scheduled" then
         -- Transient error while generating a compaction or branch summary.
@@ -716,7 +780,7 @@ function M.handle_event(session, msg)
         -- Retry loop ended. During compaction, compaction_end restores the
         -- status; only the branchSummary state (agent idle) needs settling.
         if not chat:is_compacting() then
-            restore_active_agent_status(chat)
+            restore_active_agent_status(session)
         end
     elseif t == "extension_ui_request" then
         vim.schedule(function()
@@ -748,6 +812,7 @@ function M.handle_event(session, msg)
             chat:on_system_error(msg.message --[[@as string]], { pad_top = true, pad_bottom = true })
         end
     elseif t == "_process_exit" then
+        mark_run_end(session)
         vim.schedule(function()
             chat:set_status(nil)
             if Config.options.debug and msg.code ~= 0 and msg.code ~= 143 then
@@ -813,7 +878,7 @@ finish_compaction_rebuild = function(session, flush_queue, will_retry)
         return
     end
     chat:set_compacting(false)
-    restore_active_agent_status(chat)
+    restore_active_agent_status(session)
     if flush_queue ~= false then
         session.chat:flush_compaction_queue(will_retry == true)
     end
@@ -837,17 +902,17 @@ local function restore_view_run_state(session)
     if not chat then
         return
     end
+    local start_time = session._busy_started_at
     if session._detached_compacting then
         chat:set_compacting(true)
-        chat:set_status({ type = "compaction" })
+        chat:set_status({ type = "compaction" }, start_time)
+    elseif session._detached_retrying then
+        chat:set_retrying(true)
+        chat:set_status({ type = "agent", text = "Retrying…" }, start_time)
     elseif session._detached_busy then
-        if not chat:is_streaming() then
-            chat:on_agent_start()
-        else
-            restore_active_agent_status(chat)
-        end
+        chat:restore_busy(session._busy_verb, start_time)
     else
-        restore_active_agent_status(chat)
+        restore_active_agent_status(session)
     end
 end
 

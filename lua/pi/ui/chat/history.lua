@@ -1375,7 +1375,8 @@ end
 ---@alias pi.Status { type: "agent", text: string } | { type: "compaction" } | { type: "summary", text: string }
 
 ---@param status pi.Status?
-function History:set_status(status)
+---@param start_time? number Existing run clock (`vim.uv.hrtime()/1e9`); idle→busy uses this instead of now.
+function History:set_status(status, start_time)
     vim.schedule(function()
         if not self._buf or not vim.api.nvim_buf_is_valid(self._buf) then
             return
@@ -1407,7 +1408,11 @@ function History:set_status(status)
         self._status_text = text
         if text then
             if not was_busy then
-                self._status_start_time = math.floor(vim.uv.hrtime() / 1e9)
+                if type(start_time) == "number" then
+                    self._status_start_time = start_time
+                else
+                    self._status_start_time = math.floor(vim.uv.hrtime() / 1e9)
+                end
             end
         else
             self._status_start_time = nil

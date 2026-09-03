@@ -76,7 +76,7 @@ A parent session can run **sub-sessions** in parallel — each child is an indep
 | `:PiSubParent` / `gp` in history | Switch back to the parent; breadcrumb `◂ 父：…` shows while viewing a child. |
 | `:PiSubClose` | Close the current sub-session's RPC process (session file retained). |
 
-Switching parent ↔ child or sibling children **rebinds the tab UI** and rebuilds history from `get_messages`. It does **not** send RPC `switch_session` when the target process already has that session file open, so a running agent on the target is not aborted. Dormant children are revived in a new process, which still loads the file via `switch_session`.
+Switching parent ↔ child or sibling children **rebinds the tab UI** and rebuilds history from `get_messages`. It does **not** send RPC `switch_session` when the target process already has that session file open, so a running agent on the target is not aborted. The statusline spinner elapsed time continues from that session's first `agent_start` for the current run (it does not restart when you switch). Dormant children are revived in a new process, which still loads the file via `switch_session`.
 
 While viewing a child, `:PiNewSession` / `pi.new_session()` or a bare `/new` in the prompt (e.g. `<C-g>n` in a typical setup) **returns to the parent first**, then starts a fresh parent conversation — same as running `/new` on the parent. Prior-conversation sub-session rows are hidden in `:PiSessions` (press `H` or use `:PiSubSwitch` to recall them).
 
