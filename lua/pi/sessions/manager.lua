@@ -331,7 +331,7 @@ local function restore_active_agent_status(session)
     end
     -- Compaction/retry cleanup can fire after agent_end (between turns).
     -- Only restore the spinner if an agent loop is still active.
-    local active_verb = chat:active_verb() or session._busy_verb
+    local active_verb = chat:active_verb()
     if active_verb then
         chat:set_status({ type = "agent", text = active_verb .. "…" }, session._busy_started_at)
     else

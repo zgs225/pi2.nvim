@@ -151,51 +151,68 @@ local function apply_config(session, config, callback)
     end
     local function after_model()
         if config.thinking_level then
-            session.rpc:send({ type = "set_thinking_level", level = config.thinking_level }, function(res)
-                if res.success then
-                    callback(true)
-                else
-                    callback(false, res.error or "failed to set thinking level")
+            local sent_tl = session.rpc:send(
+                { type = "set_thinking_level", level = config.thinking_level },
+                function(res)
+                    if res.success then
+                        callback(true)
+                    else
+                        local tl_err = (type(res.error) == "string" and res.error ~= "") and res.error
+                            or "failed to set thinking level"
+                        callback(false, tl_err)
+                    end
                 end
-            end)
+            )
+            if not sent_tl then
+                callback(false, "failed to send thinking level command")
+            end
         else
             callback(true)
         end
     end
-    session.rpc:send({ type = "set_model", provider = config.model.provider, modelId = config.model.id }, function(res)
-        if res.success then
-            Sessions.update_pinned_config(session, {
-                model = config.model,
-                thinking_level = config.thinking_level,
-            })
-            after_model()
-        else
-            local base_err = res.error
-            if type(base_err) ~= "string" or base_err == "" then
-                base_err = string.format("Model not found: %s/%s", config.model.provider, config.model.id)
-            end
-            local sent = session.rpc:send({ type = "get_available_models" }, function(models_res)
-                local models_list = models_res.success and models_res.data and models_res.data.models
-                local formatted = format_available_models(models_list, config.model.provider)
-                local full_err = (formatted and formatted ~= "")
-                        and string.format("%s. Available models: [%s]", base_err, formatted)
-                    or base_err
-                callback(false, full_err)
-            end)
-            if not sent then
-                callback(false, base_err)
+    local sent_model = session.rpc:send(
+        { type = "set_model", provider = config.model.provider, modelId = config.model.id },
+        function(res)
+            if res.success then
+                Sessions.update_pinned_config(session, {
+                    model = config.model,
+                    thinking_level = config.thinking_level,
+                })
+                after_model()
+            else
+                local base_err = res.error
+                if type(base_err) ~= "string" or base_err == "" then
+                    base_err = string.format("Model not found: %s/%s", config.model.provider, config.model.id)
+                end
+                local sent = session.rpc:send({ type = "get_available_models" }, function(models_res)
+                    local models_list = models_res.success and models_res.data and models_res.data.models
+                    local formatted = format_available_models(models_list, config.model.provider)
+                    local full_err = (formatted and formatted ~= "")
+                            and string.format("%s. Available models: [%s]", base_err, formatted)
+                        or base_err
+                    callback(false, full_err)
+                end)
+                if not sent then
+                    callback(false, base_err)
+                end
             end
         end
-    end)
+    )
+    if not sent_model then
+        callback(false, "failed to send model command")
+    end
 end
 
 ---@param session pi.Session
 ---@param task string
 ---@param callback fun(ok: boolean)
 local function send_task(session, task, callback)
-    session.rpc:send({ type = "prompt", message = task }, function(res)
+    local sent = session.rpc:send({ type = "prompt", message = task }, function(res)
         callback(res.success == true)
     end)
+    if not sent then
+        callback(false)
+    end
 end
 
 ---@param parent pi.Session
@@ -316,7 +333,7 @@ function M.spawn(parent, opts, callback)
             unreserve()
             apply_config(child, config, function(ok, config_err)
                 if not ok then
-                    Manifest.patch(session_id, { status = "failed" })
+                    Manifest.patch(session_id, { status = "failed", last_active_at = Manifest.iso_now() })
                     Sessions.close_session(child)
                     require("pi.ui.sessions").request_refresh()
                     callback(nil, config_err or "failed to apply sub-session config")
@@ -327,7 +344,7 @@ function M.spawn(parent, opts, callback)
                         require("pi.ui.sessions").request_refresh()
                         callback(child, nil)
                     else
-                        Manifest.patch(session_id, { status = "failed" })
+                        Manifest.patch(session_id, { status = "failed", last_active_at = Manifest.iso_now() })
                         Sessions.close_session(child)
                         callback(nil, "failed to send task to sub-session")
                     end
@@ -877,6 +894,7 @@ function M.preview(child_id)
     })
 end
 
+--- Test-only: exported for unit tests.
 M._format_available_models = format_available_models
 
 return M
