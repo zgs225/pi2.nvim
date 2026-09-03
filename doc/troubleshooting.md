@@ -80,6 +80,7 @@ A rough triage checklist for common symptoms:
 | Session doesn't continue with `:PiContinue` | Are you in the same cwd as when the session was started? Sessions are cwd-scoped — see [Sessions](sessions.md). |
 | Statusline component shows stale data | The statusline is pushed from RPC events; if they stopped flowing, `rpc.log` will show the gap. |
 | Unhandled event warning | pi2.nvim doesn't yet know about a new event type the backend is sending. Please [open an issue](https://github.com/zgs225/pi2.nvim/issues) with the event name and a snippet of `rpc.log`. |
+| Prompt paste shows `^[[106;5u` instead of a line break | The terminal pasted Ctrl+J as Kitty CSI-u (or `^[[27;5;106~` / `^[[13;2u`) instead of LF. π rewrites those sequences in the prompt paste handler. Type a newline with `<S-CR>` (or `<C-j>`); `<CR>` still submits. |
 | `:PiTree` shows "Failed to decode RPC message: Found too many nested data structures" | The `get_tree` response for a very long session (roughly 500+ messages) is deeper than Neovim's built-in JSON decoder allows. See [Deep RPC payloads](#deep-rpc-payloads) below. |
 
 ## Deep RPC payloads

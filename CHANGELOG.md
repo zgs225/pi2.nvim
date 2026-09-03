@@ -2,6 +2,7 @@
 
 ## 2026-09-03
 
+- **FIXED:** Pasting into the prompt no longer inserts literal `^[[106;5u` (Kitty CSI-u Ctrl+J) or the xterm `^[[27;5;106~` / Shift+Enter `^[[13;2u` encodings in place of newlines. Streamed paste chunks that split a sequence are rejoined. Image-paste interception is unchanged and still prompt-only.
 - **FIXED:** `wait_subagents` no longer hangs after a sub-session finishes if encoding or sending the host `extension_ui_response` throws — the wait callback is retried until it succeeds (or the timeout payload can be delivered), and unencodable snapshots fall back to a small error JSON instead of leaving pi's `select` pending.
 - **FIXED:** The "Agent finished" completion notification no longer fires while replaying history (parent ↔ sub-session switch, compaction rebuild, tree reload) or when the chat / `:PiSessions` list already has focus.
 - **FIXED:** Switching to a still-running parent/child session no longer restarts the statusline spinner elapsed clock; it continues from that run's first `agent_start` (busy lasts until `agent_settled`, including retry backoff).
