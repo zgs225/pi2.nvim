@@ -9,12 +9,17 @@
 --- the global footprint minimal — paste in the rest of the editor behaves
 --- exactly as if π were not loaded.
 ---
---- Inside a prompt buffer a single-call paste (-1) is inspected:
----   1. a dropped image file path (GUI drag-and-drop hands us the path as text)
----      is attached directly;
----   2. otherwise, if the system clipboard currently holds an image, the image
+--- Inside a prompt buffer:
+---   1. Kitty CSI-u / xterm modifyOtherKeys encodings of Ctrl+J (and Shift+Enter)
+---      are rewritten to real newlines. Some terminals paste LF as those sequences
+---      instead of `\n`, which would otherwise show up as literal `^[[106;5u`.
+---      Streamed chunks (phase 1/2/3) keep an incomplete CSI tail across calls.
+---   2. A single-call paste (-1) is then inspected for a dropped image file path
+---      (GUI drag-and-drop hands us the path as text) and attached directly;
+---   3. otherwise, if the system clipboard currently holds an image, the image
 ---      is attached (via |Pi.paste_image()|) and the text paste is cancelled.
---- Any other paste is delegated to the original handler unchanged.
+--- Any other paste is delegated to the original handler unchanged. Image attach
+--- still runs only on phase -1; streamed text is rewritten then passed through.
 ---
 --- The paste channel only ever carries text (the terminal/GUI does not hand
 --- Neovim the clipboard image bytes), so the clipboard image is detected by
@@ -36,6 +41,61 @@ local IMAGE_EXTS = { png = true, jpg = true, jpeg = true, gif = true, webp = tru
 --- tabs (each with its own prompt) coexist.
 ---@type table<integer, pi.ChatAttachments>
 local prompts = {}
+
+--- Incomplete CSI tail held between streamed paste chunks (prompt only).
+local paste_pending = ""
+
+--- Terminal encodings of "newline" that some pastes deliver as text instead of LF.
+--- Kitty CSI-u Ctrl+J, xterm modifyOtherKeys Ctrl+J, Kitty CSI-u Shift+Enter.
+local NEWLINE_ALIAS_PATTERNS = {
+    "\27%[106;5u",
+    "\27%[27;5;106~",
+    "\27%[13;2u",
+}
+
+--- True when `frag` looks like an unfinished CSI we might complete in the next chunk.
+---@param frag string
+---@return boolean
+local function is_incomplete_csi(frag)
+    if frag == "\27" then
+        return true
+    end
+    -- Started a CSI (ESC [ digits/semicolons) but not yet the terminator u/~.
+    return frag:match("^\27%[[%d;]*$") ~= nil
+end
+
+--- Rewrite newline-alias CSI sequences in a paste chunk.
+---
+--- `pending` is an incomplete ESC sequence from the previous streamed chunk
+--- (empty for a complete chunk). On return, `pending` is the new incomplete
+--- tail, or `""` when the chunk ended on a complete sequence.
+---@param lines string[]
+---@param pending string
+---@return string[] rewritten
+---@return string pending
+function M._rewrite_newline_aliases(lines, pending)
+    pending = pending or ""
+    local joined = pending .. table.concat(lines, "\n")
+    local keep = 0
+    local tail = joined:sub(-32)
+    local esc = tail:find("\27[^\27]*$")
+    if esc then
+        local frag = tail:sub(esc)
+        if is_incomplete_csi(frag) then
+            keep = #frag
+        end
+    end
+    local complete = joined
+    local next_pending = ""
+    if keep > 0 then
+        complete = joined:sub(1, #joined - keep)
+        next_pending = joined:sub(#joined - keep + 1)
+    end
+    for _, pat in ipairs(NEWLINE_ALIAS_PATTERNS) do
+        complete = complete:gsub(pat, "\n")
+    end
+    return vim.split(complete, "\n", { plain = true }), next_pending
+end
 
 --- Register a prompt buffer so pasted image file paths attach to it.
 ---@param buf integer
@@ -95,20 +155,33 @@ end
 ---@return fun(lines: string[], phase: integer): boolean
 function M._make_handler(orig)
     return function(lines, phase)
-        -- Streamed pastes (phase 1/2/3) are never ours: delegate immediately.
-        if phase ~= -1 then
-            return orig(lines, phase)
-        end
-
         local buf = vim.api.nvim_get_current_buf()
         -- Scope guarantee: anything outside a π prompt buffer is a pure
-        -- pass-through — no clipboard query, no fs_stat, no π logic at all.
+        -- pass-through — no CSI rewrite, no clipboard query, no fs_stat.
         if vim.bo[buf].filetype ~= Ft.prompt then
             return orig(lines, phase)
         end
 
+        -- First / only chunk of a paste: drop any leftover CSI tail.
+        if phase == 1 or phase == -1 then
+            paste_pending = ""
+        end
+        local rewritten
+        rewritten, paste_pending = M._rewrite_newline_aliases(lines, paste_pending)
+        if phase == 3 or phase == -1 then
+            if paste_pending ~= "" then
+                rewritten[#rewritten] = (rewritten[#rewritten] or "") .. paste_pending
+                paste_pending = ""
+            end
+        end
+
+        -- Streamed pastes (phase 1/2/3): rewritten text only, never image attach.
+        if phase ~= -1 then
+            return orig(rewritten, phase)
+        end
+
         -- Single-line paste into a prompt: first try a dropped image file path.
-        if #lines == 1 and try_attach_dropped_image(buf, lines[1] or "") then
+        if #rewritten == 1 and try_attach_dropped_image(buf, rewritten[1] or "") then
             return true -- cancel the text paste; the image is attached
         end
 
@@ -122,7 +195,7 @@ function M._make_handler(orig)
             return false -- cancel the (text) paste
         end
 
-        return orig(lines, phase)
+        return orig(rewritten, phase)
     end
 end
 
@@ -153,6 +226,7 @@ end
 function M._reset()
     installed = false
     prompts = {}
+    paste_pending = ""
 end
 
 return M
