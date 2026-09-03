@@ -1399,11 +1399,9 @@ function Chat:on_agent_end()
         self:_show_aborted_notice()
     end
 
-    if not self:has_prompt_focus() then
-        local attention_config = Config.options.attention
-        if attention_config and attention_config.notify_on_completion then
-            Attention.notify(self._tab, "Agent finished - waiting for your input", vim.log.levels.INFO)
-        end
+    local attention_config = Config.options.attention
+    if attention_config and attention_config.notify_on_completion and Attention.should_notify_on_completion(self) then
+        Attention.notify(self._tab, "Agent finished - waiting for your input", vim.log.levels.INFO)
     end
 end
 

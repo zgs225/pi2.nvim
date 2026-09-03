@@ -159,7 +159,8 @@ require("pi").setup({
         -- current tab's prompt is refocused and empty.
         -- If false, needs :PiAttention command to pull what's pending.
         auto_open_on_prompt_focus = true,
-        -- Notify when the agent finishes a turn and the prompt is not focused.
+        -- Notify when the agent finishes a turn, unless history is being
+        -- replayed or the user is already looking at this chat / :PiSessions.
         notify_on_completion = true,
     },
 

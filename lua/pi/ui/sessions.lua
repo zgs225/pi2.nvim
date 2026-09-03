@@ -1410,6 +1410,25 @@ function M.close()
     end
 end
 
+--- True when the current window is a `:PiSessions` list.
+---@return boolean
+function M.has_focus()
+    local win = vim.api.nvim_get_current_win()
+    if not vim.api.nvim_win_is_valid(win) then
+        return false
+    end
+    for _, list_win in pairs(wins) do
+        if list_win == win then
+            return true
+        end
+    end
+    local b = vim.api.nvim_win_get_buf(win)
+    if buf and vim.api.nvim_buf_is_valid(buf) and b == buf then
+        return true
+    end
+    return vim.bo[b].filetype == Ft.sessions
+end
+
 --- Toggle the sessions list in the current tab.
 function M.toggle()
     if win_for(current_tab()) then

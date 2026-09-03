@@ -170,7 +170,7 @@
 
 ---@class pi.UiAttentionConfig
 ---@field auto_open_on_prompt_focus boolean Automatically open the next pending attention request for the current tab when the prompt gains focus and has no draft.
----@field notify_on_completion boolean Show an info notification when the agent finishes a turn and the prompt does not have focus.
+---@field notify_on_completion boolean Show an info notification when the agent finishes a turn, unless history is being replayed or the user is already looking at this chat / :PiSessions.
 
 ---@class pi.ReloadConfig
 ---@field mode? "silent"|"notify"|false How to handle open buffers when pi modifies their file. "silent": reload unmodified buffers silently, skip modified ones. "notify": same as silent but also show a notification listing reloaded and skipped files. false: disabled. Default: "silent"

@@ -232,6 +232,24 @@ function M.notify(tab, msg, level)
     Notify.dispatch(msg, level, { id = attention_notification_id(tab), timeout = 0 })
 end
 
+--- Whether the "agent finished" toast should fire for this chat.
+--- Skipped while replaying history, or when the user is already looking at
+--- this chat (history/prompt/attachments) or the :PiSessions list.
+---@param chat pi.Chat
+---@return boolean
+function M.should_notify_on_completion(chat)
+    if chat._history and chat._history._replaying then
+        return false
+    end
+    if chat.has_focus and chat:has_focus() then
+        return false
+    end
+    if require("pi.ui.sessions").has_focus() then
+        return false
+    end
+    return true
+end
+
 --- Dismiss the persistent attention notification for a tab.
 ---@param tab pi.TabId
 function M.dismiss_notification(tab)

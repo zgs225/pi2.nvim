@@ -34,11 +34,17 @@ With auto-open disabled, you drain the queue explicitly with `:PiAttention`.
 
 ## Completion notification
 
-`attention.notify_on_completion` (default `true`) shows an info notification when the agent finishes a turn and the π prompt isn't focused:
+`attention.notify_on_completion` (default `true`) shows an info notification when the agent finishes a turn **and you are not already looking at π**:
 
 > Agent finished - waiting for your input
 
-Handy if you are working on something else, either code or talk with another agent in a neighbor tab, while the agent is working and want a heads-up when it's done. Disable with `attention.notify_on_completion = false`.
+It does **not** fire when:
+
+- history is being replayed (parent ↔ sub-session switch, compaction rebuild, `:PiTree` reload, resume)
+- this tab's chat has focus (history, prompt, or attachments)
+- the `:PiSessions` list has focus
+
+Handy if you are working on something else — another buffer, or another agent in a neighbor tab — and want a heads-up when this one is done. Disable with `attention.notify_on_completion = false`.
 
 ## Querying the queue
 
