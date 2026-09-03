@@ -341,9 +341,7 @@ local function append_visible_children(out, parent_sess, tab, current_child_id)
         local child_id = entry._id
         local is_current = type(current_child_id) == "string" and child_id == current_child_id
         local same_epoch = (entry.parent_epoch or 0) == epoch
-        local visible = is_current
-            or show_hidden_children
-            or (same_epoch and ChildFilter.child_visible(entry, ctx))
+        local visible = is_current or show_hidden_children or (same_epoch and ChildFilter.child_visible(entry, ctx))
         if visible then
             append_child_row(out, entry, tab, { is_current_view = is_current })
         end
@@ -434,7 +432,16 @@ function M.build_rows(sessions, attention_count, name_of, flags_of, generating_o
             end
             append_visible_children(out, parent_sess, tab, session.id)
         else
-            append_parent_row(out, session, tab, { is_current_view = true }, attention_count, name_of, flags_of, generating_of)
+            append_parent_row(
+                out,
+                session,
+                tab,
+                { is_current_view = true },
+                attention_count,
+                name_of,
+                flags_of,
+                generating_of
+            )
             append_visible_children(out, session, tab, nil)
         end
     end

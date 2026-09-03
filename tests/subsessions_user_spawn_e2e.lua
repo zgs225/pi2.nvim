@@ -92,10 +92,13 @@ local ok, err = pcall(function()
         },
     })
 
-    assert(vim.wait(3000, function()
-        local entry = Manifest.load()["user-child"]
-        return entry and entry.reported == true
-    end, 10), "user-spawned child should inject a parent report")
+    assert(
+        vim.wait(3000, function()
+            local entry = Manifest.load()["user-child"]
+            return entry and entry.reported == true
+        end, 10),
+        "user-spawned child should inject a parent report"
+    )
 
     assert(type(prompted) == "string", "parent prompt missing")
     assert(prompted:find("review", 1, true), "report should include child name")

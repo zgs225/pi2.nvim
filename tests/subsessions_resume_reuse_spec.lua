@@ -25,7 +25,13 @@ local function list_subagents(get_session_id, manifest)
     local lineage = (type(meta) == "table" and type(meta[parent]) == "string") and meta[parent] or parent
     local subagents = {}
     for id, e in pairs(manifest) do
-        if type(id) == "string" and id ~= "" and not id:match("^__") and type(e) == "table" and e.parent_id == lineage then
+        if
+            type(id) == "string"
+            and id ~= ""
+            and not id:match("^__")
+            and type(e) == "table"
+            and e.parent_id == lineage
+        then
             subagents[#subagents + 1] = { id = id, name = e.name, status = e.status }
         end
     end

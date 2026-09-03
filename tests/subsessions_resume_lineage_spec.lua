@@ -61,9 +61,11 @@ describe("subsession lineage on resume", function()
             lineage_id = "session-a",
             conversation_epoch = 2,
             view_parent_id = "session-a",
-            rpc = { is_running = function()
-                return true
-            end },
+            rpc = {
+                is_running = function()
+                    return true
+                end,
+            },
             chat = {
                 is_streaming = function()
                     return false

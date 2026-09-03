@@ -27,16 +27,20 @@ Subsessions.spawn = function(_parent, opts, callback)
         agent_spawned = true,
         run_generation = 1,
     })
-    callback({ id = id, rpc = { is_running = function()
-        return true
-    end } }, nil)
+    callback({ id = id, rpc = {
+        is_running = function()
+            return true
+        end,
+    } }, nil)
 end
 
 local parent = {
     id = "e2e-parent",
-    rpc = { is_running = function()
-        return true
-    end },
+    rpc = {
+        is_running = function()
+            return true
+        end,
+    },
 }
 
 local batch_id
@@ -68,13 +72,17 @@ assert(poll_res and poll_res.status == "completed", "poll should be completed af
 
 local waited = false
 local wait_calls = 0
-Subsessions.handle_host(parent, vim.json.encode({
-    action = "wait_subagents",
-    params = { batch_id = batch_id, timeout_ms = 3000 },
-}), function(res)
-    wait_calls = wait_calls + 1
-    waited = res.status == "completed"
-end)
+Subsessions.handle_host(
+    parent,
+    vim.json.encode({
+        action = "wait_subagents",
+        params = { batch_id = batch_id, timeout_ms = 3000 },
+    }),
+    function(res)
+        wait_calls = wait_calls + 1
+        waited = res.status == "completed"
+    end
+)
 
 vim.wait(2000, function()
     return waited

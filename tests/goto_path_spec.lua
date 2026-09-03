@@ -62,7 +62,7 @@ describe("goto_path_at_cursor window selection (issue #62)", function()
         saved_agent_dir = Config.options.agent_dir
         Config.options.agent_dir = vim.fn.tempname()
 
-        target = vim.fn.tempname() .. ".txt"
+        target = vim.fn.resolve(vim.fn.tempname() .. ".txt")
         vim.fn.writefile({ "hello" }, target)
     end)
 

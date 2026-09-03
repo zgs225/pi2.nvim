@@ -86,9 +86,12 @@ describe("new_session from sub-session view", function()
 
         Sessions.new_session()
 
-        assert.is_true(vim.wait(3000, function()
-            return switched and sent.parent ~= nil
-        end, 10), "expected parent switch and new_session RPC")
+        assert.is_true(
+            vim.wait(3000, function()
+                return switched and sent.parent ~= nil
+            end, 10),
+            "expected parent switch and new_session RPC"
+        )
         assert.are.same({ "abort", "new_session" }, sent.parent)
         assert.is_nil(sent.child)
     end)

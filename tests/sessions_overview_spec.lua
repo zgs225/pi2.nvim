@@ -381,7 +381,13 @@ describe("sessions overview", function()
                 end
                 return {
                     { _id = "child-live", name = "Live", status = "active", parent_id = "parent-uuid", config = {} },
-                    { _id = "child-sleep", name = "Sleeping", status = "dormant", parent_id = "parent-uuid", config = {} },
+                    {
+                        _id = "child-sleep",
+                        name = "Sleeping",
+                        status = "dormant",
+                        parent_id = "parent-uuid",
+                        config = {},
+                    },
                 }
             end
 
@@ -408,7 +414,13 @@ describe("sessions overview", function()
                 end
                 return {
                     { _id = "child-live", name = "Live", status = "active", parent_id = "parent-uuid", config = {} },
-                    { _id = "child-sleep", name = "Sleeping", status = "dormant", parent_id = "parent-uuid", config = {} },
+                    {
+                        _id = "child-sleep",
+                        name = "Sleeping",
+                        status = "dormant",
+                        parent_id = "parent-uuid",
+                        config = {},
+                    },
                 }
             end
 

@@ -90,9 +90,60 @@ local function resolve_child_config(parent, opts)
     return nil
 end
 
+--- Format available backend models into a compact reference list.
+--- Models matching `preferred_provider` are sorted first, followed by others.
+--- Truncated to 20 models with (+N more) suffix when exceeded.
+---@param models table[]?
+---@param preferred_provider string?
+---@return string?
+local function format_available_models(models, preferred_provider)
+    if type(models) ~= "table" or #models == 0 then
+        return nil
+    end
+    local same_provider = {}
+    local other_providers = {}
+    local seen = {}
+    for _, m in ipairs(models) do
+        if type(m) == "table" and type(m.provider) == "string" and type(m.id) == "string" then
+            local ref = m.provider .. "/" .. m.id
+            if not seen[ref] then
+                seen[ref] = true
+                if preferred_provider and m.provider == preferred_provider then
+                    same_provider[#same_provider + 1] = ref
+                else
+                    other_providers[#other_providers + 1] = ref
+                end
+            end
+        end
+    end
+    table.sort(same_provider)
+    table.sort(other_providers)
+    local ordered = {}
+    for _, ref in ipairs(same_provider) do
+        ordered[#ordered + 1] = ref
+    end
+    for _, ref in ipairs(other_providers) do
+        ordered[#ordered + 1] = ref
+    end
+    if #ordered == 0 then
+        return nil
+    end
+    local max_display = 20
+    local shown = {}
+    for i = 1, math.min(#ordered, max_display) do
+        shown[#shown + 1] = ordered[i]
+    end
+    local extra = #ordered - max_display
+    local res = table.concat(shown, ", ")
+    if extra > 0 then
+        res = res .. string.format(" (+%d more)", extra)
+    end
+    return res
+end
+
 ---@param session pi.Session
 ---@param config pi.PinnedConfig?
----@param callback fun(ok: boolean)
+---@param callback fun(ok: boolean, err?: string)
 local function apply_config(session, config, callback)
     if not config or not config.model then
         callback(true)
@@ -101,7 +152,11 @@ local function apply_config(session, config, callback)
     local function after_model()
         if config.thinking_level then
             session.rpc:send({ type = "set_thinking_level", level = config.thinking_level }, function(res)
-                callback(res.success == true)
+                if res.success then
+                    callback(true)
+                else
+                    callback(false, res.error or "failed to set thinking level")
+                end
             end)
         else
             callback(true)
@@ -115,7 +170,21 @@ local function apply_config(session, config, callback)
             })
             after_model()
         else
-            callback(false)
+            local base_err = res.error
+            if type(base_err) ~= "string" or base_err == "" then
+                base_err = string.format("Model not found: %s/%s", config.model.provider, config.model.id)
+            end
+            local sent = session.rpc:send({ type = "get_available_models" }, function(models_res)
+                local models_list = models_res.success and models_res.data and models_res.data.models
+                local formatted = format_available_models(models_list, config.model.provider)
+                local full_err = (formatted and formatted ~= "")
+                        and string.format("%s. Available models: [%s]", base_err, formatted)
+                    or base_err
+                callback(false, full_err)
+            end)
+            if not sent then
+                callback(false, base_err)
+            end
         end
     end)
 end
@@ -245,9 +314,16 @@ function M.spawn(parent, opts, callback)
                 run_generation = 1,
             })
             unreserve()
-            apply_config(child, config, function()
-                send_task(child, opts.task, function(ok)
-                    if ok then
+            apply_config(child, config, function(ok, config_err)
+                if not ok then
+                    Manifest.patch(session_id, { status = "failed" })
+                    Sessions.close_session(child)
+                    require("pi.ui.sessions").request_refresh()
+                    callback(nil, config_err or "failed to apply sub-session config")
+                    return
+                end
+                send_task(child, opts.task, function(sent_ok)
+                    if sent_ok then
                         require("pi.ui.sessions").request_refresh()
                         callback(child, nil)
                     else
@@ -800,5 +876,7 @@ function M.preview(child_id)
         title_pos = "center",
     })
 end
+
+M._format_available_models = format_available_models
 
 return M

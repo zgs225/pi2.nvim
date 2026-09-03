@@ -111,10 +111,13 @@ describe("subsession completion reporting", function()
 
         Subsessions.on_child_settled(child)
 
-        assert.is_true(vim.wait(3000, function()
-            local entry = Manifest.load()["child-1"]
-            return entry and entry.reported == true
-        end, 10), "completion report was not marked reported")
+        assert.is_true(
+            vim.wait(3000, function()
+                local entry = Manifest.load()["child-1"]
+                return entry and entry.reported == true
+            end, 10),
+            "completion report was not marked reported"
+        )
 
         local rows = SessionList.build_rows({ parent }, function()
             return 0
@@ -191,10 +194,13 @@ describe("subsession completion reporting", function()
             },
         })
 
-        assert.is_true(vim.wait(3000, function()
-            local entry = Manifest.load()["child-user"]
-            return entry and entry.reported == true
-        end, 10), "user-spawned completion was not reported")
+        assert.is_true(
+            vim.wait(3000, function()
+                local entry = Manifest.load()["child-user"]
+                return entry and entry.reported == true
+            end, 10),
+            "user-spawned completion was not reported"
+        )
         assert.is_truthy(prompted)
         assert.is_truthy(prompted:find("worker", 1, true))
         assert.is_truthy(prompted:find("done report", 1, true))

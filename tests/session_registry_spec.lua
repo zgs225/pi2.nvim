@@ -213,9 +213,12 @@ describe("session registry (P0)", function()
         Sessions.load_session_path(session, "/tmp/fake-session.jsonl", function(ok)
             assert.is_true(ok)
         end)
-        assert.is_true(vim.wait(3000, function()
-            return sent
-        end, 10), "switch_session was not sent")
+        assert.is_true(
+            vim.wait(3000, function()
+                return sent
+            end, 10),
+            "switch_session was not sent"
+        )
     end)
 
     it("load_session_path preserves view_parent_id when rebind_parent_context is false", function()
@@ -260,9 +263,12 @@ describe("session registry (P0)", function()
         Sessions.load_session_path(session, "/tmp/child.jsonl", function(ok)
             assert.is_true(ok)
         end, { rebind_parent_context = false })
-        assert.is_true(vim.wait(3000, function()
-            return sent
-        end, 10), "switch_session was not sent")
+        assert.is_true(
+            vim.wait(3000, function()
+                return sent
+            end, 10),
+            "switch_session was not sent"
+        )
         assert.are.equal("parent-id", session.view_parent_id)
         assert.are.equal(2, session.conversation_epoch)
         assert.are.equal("lineage", session.lineage_id)
@@ -316,9 +322,12 @@ describe("session registry (P0)", function()
         Sessions.load_session_path(session, "/tmp/parent.jsonl", function(ok)
             assert.is_true(ok)
         end)
-        assert.is_true(vim.wait(3000, function()
-            return sent
-        end, 10), "switch_session was not sent")
+        assert.is_true(
+            vim.wait(3000, function()
+                return sent
+            end, 10),
+            "switch_session was not sent"
+        )
         assert.is_nil(session.view_parent_id)
         assert.are.equal(0, session.conversation_epoch)
         assert.are.equal("resumed-parent", session.lineage_id)
@@ -360,8 +369,11 @@ describe("session registry (P0)", function()
         Sessions.load_session_path(session, "/tmp/missing.jsonl", function(ok)
             loaded = ok
         end)
-        assert.is_true(vim.wait(3000, function()
-            return loaded == false
-        end, 10), "callback should report switch failure")
+        assert.is_true(
+            vim.wait(3000, function()
+                return loaded == false
+            end, 10),
+            "callback should report switch failure"
+        )
     end)
 end)
