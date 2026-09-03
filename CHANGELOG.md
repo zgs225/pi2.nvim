@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-09-03
+
+- **FIXED:** Auto session titles no longer come back empty on reasoning models that keep thinking after `thinking: disabled` (e.g. CommandCode DeepSeek V4 Flash). Title generation now prefers `streamSimple` with `reasoning: "off"` and a 1024-token floor so the answer is not truncated by reasoning; display length is still capped by `title.max_chars`.
+
 ## 2026-09-01
 
 - **ADDED:** sessions-overview keys `f` / `C` / `t` — fork, clone, or tree-navigate the session under the cursor (same flows as `:PiFork` / `:PiClone` / `:PiTree`). The list jumps to that session's tab first, so the existing pickers, prefill and streaming guards all run against the right session unchanged. Issue #101.
