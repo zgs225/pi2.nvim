@@ -303,6 +303,20 @@ describe("sessions overview", function()
             assert.are.equal(#chunks, #marks)
             pcall(vim.api.nvim_buf_delete, buf, { force = true })
         end)
+
+        it("formats a sub-session child row up to the model without trailing icons", function()
+            local row = {
+                depth = 1,
+                status = "idle",
+                name = "integration",
+                subtitle = "gemini-3.8-flash-high",
+            }
+            local line, chunks = SessionList.format_line(row, 0)
+            assert.are.equal("  └─ ● integration · gemini-3.8-flash-high", line)
+            assert.are.equal(2, #chunks)
+            assert.are.equal("●", line:sub(chunks[1][1] + 1, chunks[1][2]))
+            assert.are.equal("integration · gemini-3.8-flash-high", line:sub(chunks[2][1] + 1, chunks[2][2]))
+        end)
     end)
 
     describe("build_rows", function()

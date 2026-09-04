@@ -37,7 +37,6 @@ local show_hidden_children = false
 ---@field title_generating boolean backend auto-title generation in progress
 ---@field subtitle? string model · thinking badge for sub-rows
 ---@field dormant? boolean process not running (disk only)
----@field unread_report? boolean completion report not yet seen
 ---@field session? pi.Session live session reference when available
 ---@field is_current_view? boolean row is the tab's focused session (parent or child)
 ---@field is_tree_parent? boolean parent row shown while viewing a child in the tab
@@ -201,16 +200,15 @@ function M.format_line(row, tick)
     local name = row.name or "…"
     local pending = row.name == nil
     local subtitle = row.subtitle and (" · " .. row.subtitle) or ""
-    local unread = row.unread_report and " ✉" or ""
     local provisional = pending or name == "(unnamed)"
     local spinner = row.title_generating and provisional and M.spinner_frame(tick)
-    local line = indent .. branch .. dot .. " " .. (spinner and spinner .. " " or "") .. name .. subtitle .. unread
+    local line = indent .. branch .. dot .. " " .. (spinner and spinner .. " " or "") .. name .. subtitle
     local prefix = indent .. branch
     local dot_start = #prefix
     local name_start = dot_start + #dot + 1 + (spinner and #spinner + 1 or 0)
     local chunks = {
         { dot_start, dot_start + #dot, M.dot_hl(row, tick) },
-        { name_start, name_start + #name + #subtitle + #unread, pending and "PiSessionsListPending" or "Normal" },
+        { name_start, name_start + #name + #subtitle, pending and "PiSessionsListPending" or "Normal" },
     }
     if spinner then
         table.insert(chunks, 2, { name_start - #spinner - 1, name_start - 1, "PiSessionsListSpinner" })
@@ -301,7 +299,6 @@ local function append_child_row(out, entry, tab, opts)
         title_generating = false,
         subtitle = subtitle,
         dormant = dormant,
-        unread_report = entry.status == "completed" and not entry.reported,
         session = child,
         is_current_view = opts.is_current_view == true,
     }

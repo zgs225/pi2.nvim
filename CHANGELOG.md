@@ -2,6 +2,7 @@
 
 ## 2026-09-04
 
+- **CHANGED:** Sub-session rows in `:PiSessions` now stop at the model subtitle instead of rendering a trailing completion icon (`✉`).
 - **ADDED:** `:PiSubView` and `pi.sub_view()` — view a sub-session's full rendered conversation in a read-only floating window without rebinding the tab's chat. In `:PiSessions`, `p` now opens this rich viewer with markdown rendering, folding tool/thinking blocks, `q`/`<Esc>` to close, and `<CR>` to promote the sub-session to the active tab view.
 - **FIXED:** `:PiAbort` issued while viewing a sub-session now reaches the whole chain: the parent session also receives the abort, and running batches are cancelled for both the child's and the parent's lineage. A batch cancelled while a child is still spawning aborts and closes that late child instead of leaking an orphan process that occupies a `max_children` slot.
 - **FIXED:** `:PiAbort` now cancels a `wait_subagents` wait on a batch recorded under a different lineage (e.g. a stale `batch_id` after resume/fork): batch waiters record their owner lineage and `cancel_for_parent` matches it, so the pending host select is answered instead of hanging until `subagent.batch_timeout_ms`.
