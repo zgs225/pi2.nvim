@@ -54,7 +54,7 @@ When filing an issue, attaching the relevant section of `rpc.log` is by far the 
 
 ## Sub-agent wait stuck after children finish
 
-`wait_subagents` / `dispatch_subagents({ wait = true })` blocks the parent pi process on a host `select` until Neovim replies with `extension_ui_response`. If that reply is dropped (encode/send failure), the parent stays busy even though the child row looks idle and `.pi2-sub-batches.json` already says `completed`. Abort the parent (`:PiAbort`) and retry the wait. With `debug = true` or `:PiToggleDebug`, `rpc.log` should show the `extension_ui_response` (or `Failed to encode RPC command` / `Failed to send RPC command`).
+`wait_subagents` / `dispatch_subagents({ wait = true })` blocks the parent pi process on a host `select` until Neovim replies with `extension_ui_response`. The tunneled sub-agent tools forward the tool `AbortSignal` to that select, so `:PiAbort` interrupts a pending wait immediately instead of hanging until `subagent.batch_timeout_ms`. If a reply is dropped (encode/send failure), the parent may still stay busy even though the child row looks idle and `.pi2-sub-batches.json` already says `completed` — abort the parent (`:PiAbort`) and retry the wait. With `debug = true` or `:PiToggleDebug`, `rpc.log` should show the `extension_ui_response` (or `Failed to encode RPC command` / `Failed to send RPC command`).
 
 ## Process lifecycle
 

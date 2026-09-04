@@ -72,12 +72,17 @@ function toolResult(data: unknown) {
 	};
 }
 
-async function hostRequest(ctx: ExtensionContext, action: string, params: Record<string, unknown> = {}) {
+async function hostRequest(
+	ctx: ExtensionContext,
+	action: string,
+	params: Record<string, unknown> = {},
+	signal?: AbortSignal,
+) {
 	if (!ctx.hasUI) {
 		return toolResult({ error: "host UI not available" });
 	}
 	const payload = JSON.stringify({ action, params });
-	const result = await ctx.ui.select(HOST_TITLE, [payload]);
+	const result = await ctx.ui.select(HOST_TITLE, [payload], signal ? { signal } : undefined);
 	if (!result) return toolResult({ error: "cancelled" });
 	try {
 		return toolResult(JSON.parse(result));
@@ -211,8 +216,8 @@ export default function subagentBridge(pi: ExtensionAPI) {
 				}),
 			),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			return hostRequest(ctx, "dispatch_subagents", params);
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			return hostRequest(ctx, "dispatch_subagents", params, signal);
 		},
 	});
 
@@ -223,8 +228,8 @@ export default function subagentBridge(pi: ExtensionAPI) {
 		parameters: Type.Object({
 			batch_id: Type.String(),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			return hostRequest(ctx, "poll_subagents", params);
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			return hostRequest(ctx, "poll_subagents", params, signal);
 		},
 	});
 
@@ -237,8 +242,8 @@ export default function subagentBridge(pi: ExtensionAPI) {
 			batch_id: Type.String(),
 			timeout_ms: Type.Optional(Type.Number({ description: "Max wait in ms (default from config)" })),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			return hostRequest(ctx, "wait_subagents", params);
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			return hostRequest(ctx, "wait_subagents", params, signal);
 		},
 	});
 
@@ -247,8 +252,8 @@ export default function subagentBridge(pi: ExtensionAPI) {
 		label: "List Sub-agent Batches",
 		description: "List dispatch batches for the current parent session (newest first).",
 		parameters: Type.Object({}),
-		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
-			return hostRequest(ctx, "list_batches", {});
+		async execute(_toolCallId, _params, signal, _onUpdate, ctx) {
+			return hostRequest(ctx, "list_batches", {}, signal);
 		},
 	});
 
@@ -260,8 +265,8 @@ export default function subagentBridge(pi: ExtensionAPI) {
 		parameters: Type.Object({
 			targets: Type.Array(Type.String({ description: "Sub-agent session ids from list_subagents" })),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			return hostRequest(ctx, "stop_subagents", params);
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			return hostRequest(ctx, "stop_subagents", params, signal);
 		},
 	});
 }

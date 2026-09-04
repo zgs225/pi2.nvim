@@ -67,7 +67,7 @@ And mid-session management:
 
 ## Sub-sessions
 
-A parent session can run **sub-sessions** in parallel — each child is an independent `pi --mode rpc` process with its own session file, model, and thinking level. Relationships and bookkeeping live in `<agent_dir>/sessions/<encoded-cwd>/.pi2-subsessions.json`; message content stays in each child's JSONL (the authoritative store). Child processes are **detached from the tab**, same as a parent after `:tabclose`: closing the parent tab does not stop running sub-sessions. Stop them with `:PiSubClose` / `x` in `:PiSessions`, `stop_subagents`, `:PiAbort` (cancels the parent's running batches), or by quitting Neovim.
+A parent session can run **sub-sessions** in parallel — each child is an independent `pi --mode rpc` process with its own session file, model, and thinking level. Relationships and bookkeeping live in `<agent_dir>/sessions/<encoded-cwd>/.pi2-subsessions.json`; message content stays in each child's JSONL (the authoritative store). Child processes are **detached from the tab**, same as a parent after `:tabclose`: closing the parent tab does not stop running sub-sessions. Stop them with `:PiSubClose` / `x` in `:PiSessions`, `stop_subagents`, `:PiAbort`, or by quitting Neovim. `:PiAbort` cancels the parent's running batches — including a batch the parent is currently waiting on, even one recorded under an older lineage — and works while viewing a child too: the abort is forwarded to the parent session, and a batch cancelled while a child is still spawning aborts and closes that late child instead of leaving an orphan process.
 
 | Command | What it does |
 | --- | --- |

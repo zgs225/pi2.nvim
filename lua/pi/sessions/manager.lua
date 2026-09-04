@@ -150,6 +150,12 @@ local function migrate_session_id(session, new_id)
         tab_session_id[session.attached_tab] = new_id
     end
     require("pi.subsessions.manifest").bind_session_lineage(session, new_id)
+    if old_id and old_id:match("^tmp%-") then
+        -- Alias temporary session id to the real id so any stale references
+        -- (e.g. aborts issued before migration) resolve to the real lineage.
+        -- Never rewrite lineage mappings between two real ids.
+        require("pi.subsessions.manifest").register_session_lineage(old_id, new_id)
+    end
 end
 
 ---@param rpc pi.Rpc

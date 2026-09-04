@@ -82,6 +82,8 @@ While the agent is **streaming** or **auto-retrying** (statusline shows "Retryin
 
 When a turn is aborted (by double-`<Esc>`, `:PiAbort`, or `pi.abort()`), the statusline center briefly shows an **Aborted** confirmation (`PiAborted` highlight) for about two seconds, and the completion marker left in the history (`· aborted`) uses that same prominent highlight rather than the muted busy color — so it's obvious the turn was cancelled.
 
+Aborting while the tab is viewing a [sub-session](sessions.md#sub-sessions) forwards the abort to the parent session as well and cancels the parent's running sub-agent batches, so a parent blocked in `wait_subagents` wakes up promptly.
+
 When the agent is **idle**, `<Esc>` keeps its normal behavior (leaves insert mode) and the gesture is inert — no hint, no abort.
 
 Controlled by the `abort` config:

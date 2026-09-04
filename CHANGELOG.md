@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-09-04
+
+- **FIXED:** `:PiAbort` issued while viewing a sub-session now reaches the whole chain: the parent session also receives the abort, and running batches are cancelled for both the child's and the parent's lineage. A batch cancelled while a child is still spawning aborts and closes that late child instead of leaking an orphan process that occupies a `max_children` slot.
+- **FIXED:** `:PiAbort` now cancels a `wait_subagents` wait on a batch recorded under a different lineage (e.g. a stale `batch_id` after resume/fork): batch waiters record their owner lineage and `cancel_for_parent` matches it, so the pending host select is answered instead of hanging until `subagent.batch_timeout_ms`.
+- **FIXED:** `extensions/subagent.ts` forwards the tool `AbortSignal` to the host `select` for all tunneled tools, so a core-side abort (`session.abort()` → `waitForIdle()`) unblocks a pending `wait_subagents` / `dispatch_subagents({ wait = true })` immediately even when no `extension_ui_response` is on its way.
+- **FIXED:** Temporary session ids (`tmp-*`) are aliased to the real session id when the backend id arrives, so an abort issued against a stale tmp id still resolves the correct batch lineage.
+
 ## 2026-09-03
 
 - **FIXED:** Dispatched subagents no longer hang the parent process when the user switches to view a child session or closes the parent tab. RPC protocol events (including `extension_ui_request` host bridge calls for `__pi_subagent__`, session run states, and buffer reloads) are decoupled from the tab's `Chat` instance so detached background sessions process and respond to host requests immediately. Human attention requests cleanly queue without crashing or getting pruned when `session.tab` is detached.

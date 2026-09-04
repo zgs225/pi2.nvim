@@ -150,16 +150,57 @@ end
 function M.abort()
     local Sessions = require("pi.sessions.manager")
     local session = Sessions.get()
-    if session and session.rpc:is_running() then
-        if session.id then
-            pcall(function()
-                local Manifest = require("pi.subsessions.manifest")
-                local lineage = Manifest.lineage_for_session(session)
-                require("pi.subsessions.batch").cancel_for_parent(lineage ~= "" and lineage or session.id)
-            end)
-        end
-        require("pi.attention").clear_session(session)
-        session.rpc:send({ type = "abort" })
+    if not session then
+        return
+    end
+
+    local parent
+    if session.view_parent_id and session.view_parent_id ~= "" then
+        parent = Sessions.get_by_id(session.view_parent_id)
+    end
+
+    local running = {}
+    if session.rpc and session.rpc:is_running() then
+        table.insert(running, session)
+    end
+    if parent and parent ~= session and parent.rpc and parent.rpc:is_running() then
+        table.insert(running, parent)
+    end
+
+    if #running == 0 then
+        return
+    end
+
+    if session.id or (parent and parent.id) then
+        pcall(function()
+            local Manifest = require("pi.subsessions.manifest")
+            local Batch = require("pi.subsessions.batch")
+            local seen = {}
+            local function cancel_target(target)
+                if not target or not target.id then
+                    return
+                end
+                local lineage = Manifest.lineage_for_session(target)
+                local key = lineage ~= "" and lineage or target.id
+                if key and not seen[key] then
+                    seen[key] = true
+                    Batch.cancel_for_parent(key)
+                end
+            end
+            cancel_target(session)
+            if parent and parent ~= session then
+                cancel_target(parent)
+            end
+        end)
+    end
+
+    require("pi.attention").clear_session(session)
+    if parent and parent ~= session then
+        require("pi.attention").clear_session(parent)
+    end
+
+    for _, target in ipairs(running) do
+        target.rpc:send({ type = "abort" })
     end
 end
 

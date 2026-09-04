@@ -17,7 +17,11 @@ local cache = nil
 ---@type string?
 local cache_path = nil
 
----@type table<string, fun(result: table)[]>
+---@class pi.SubsessionWaiter
+---@field cb fun(result: table): boolean
+---@field owner? string
+
+---@type table<string, pi.SubsessionWaiter[]>
 local waiters = {}
 
 ---@class pi.SubsessionBatchItem
@@ -210,15 +214,15 @@ local function notify_waiters(batch_id)
     if not is_terminal_status(batch.status) then
         return
     end
-    local cbs = waiters[batch_id]
-    if not cbs then
+    local entries = waiters[batch_id]
+    if not entries then
         return
     end
     waiters[batch_id] = nil
     local snap = M.snapshot(batch)
-    for _, cb in ipairs(cbs) do
+    for _, waiter in ipairs(entries) do
         vim.schedule(function()
-            cb(snap)
+            waiter.cb(snap)
         end)
     end
 end
@@ -426,6 +430,16 @@ local function run_batch(batch, parent)
             }, function(child, err)
                 local b = M.get(batch.id)
                 if not b or b.status == "cancelled" then
+                    if child then
+                        if child.rpc and child.rpc:is_running() then
+                            child.rpc:send({ type = "abort" })
+                        end
+                        Subsessions.close(child.id)
+                        Manifest.patch(child.id, {
+                            status = "interrupted",
+                            last_active_at = Manifest.iso_now(),
+                        })
+                    end
                     return
                 end
                 if not child then
@@ -601,11 +615,12 @@ end
 
 ---@param batch_id string
 ---@param callback fun(result: table)
----@param opts? { timeout_ms?: integer, interval_ms?: integer }
+---@param opts? { timeout_ms?: integer, interval_ms?: integer, owner?: string }
 function M.wait(batch_id, callback, opts)
     opts = opts or {}
     local timeout_ms = opts.timeout_ms or (Config.options.subagent or {}).batch_timeout_ms or 300000
     local interval_ms = opts.interval_ms or 200
+    local owner = opts.owner
     local started = vim.uv.hrtime() / 1e6
     local settled = false
 
@@ -620,14 +635,14 @@ function M.wait(batch_id, callback, opts)
             return false
         end
         settled = true
-        local cbs = waiters[batch_id]
-        if cbs then
-            for i = #cbs, 1, -1 do
-                if cbs[i] == finish then
-                    table.remove(cbs, i)
+        local entries = waiters[batch_id]
+        if entries then
+            for i = #entries, 1, -1 do
+                if entries[i].cb == finish then
+                    table.remove(entries, i)
                 end
             end
-            if #cbs == 0 then
+            if #entries == 0 then
                 waiters[batch_id] = nil
             end
         end
@@ -673,7 +688,7 @@ function M.wait(batch_id, callback, opts)
         end
     end
     waiters[batch_id] = waiters[batch_id] or {}
-    table.insert(waiters[batch_id], finish)
+    table.insert(waiters[batch_id], { cb = finish, owner = owner })
     vim.defer_fn(tick, interval_ms)
 end
 
@@ -709,12 +724,29 @@ end
 
 ---@param parent_id string Session id or lineage id.
 function M.cancel_for_parent(parent_id)
+    if not parent_id or parent_id == "" then
+        return
+    end
     local lineage = Manifest.resolve_lineage(parent_id) or parent_id
     local batches = M.load()
     for id, batch in pairs(batches) do
-        local batch_lineage = Manifest.resolve_lineage(batch.parent_id) or batch.parent_id
-        if batch_lineage == lineage and (batch.status == "running" or batch.status == "pending") then
-            M.cancel(id)
+        if batch.status == "running" or batch.status == "pending" then
+            local batch_lineage = Manifest.resolve_lineage(batch.parent_id) or batch.parent_id
+            local should_cancel = (batch_lineage == lineage)
+            if not should_cancel and waiters[id] then
+                for _, w in ipairs(waiters[id]) do
+                    if w.owner and w.owner ~= "" then
+                        local owner_lineage = Manifest.resolve_lineage(w.owner) or w.owner
+                        if owner_lineage == lineage then
+                            should_cancel = true
+                            break
+                        end
+                    end
+                end
+            end
+            if should_cancel then
+                M.cancel(id)
+            end
         end
     end
 end

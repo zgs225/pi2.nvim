@@ -40,7 +40,9 @@ pi.toggle_auto_compaction()   -- flip automatic compaction on/off; the statuslin
 pi.changed_files()            -- string[]: files modified by edit/write tools this session
 
 -- Agent control
-pi.abort()                    -- cancel the current agent turn, keep the session alive
+pi.abort()                    -- cancel the current agent turn, keep the session alive;
+                              -- while viewing a sub-session, also aborts the parent
+                              -- session and cancels its running sub-agent batches
 pi.abort_bash()               -- cancel the running direct bash (!) command
 pi.abort_retry()              -- cancel the auto-retry backoff ("Retrying…" state); only
                               -- takes effect while the core is between retry attempts

@@ -645,6 +645,11 @@ function M.handle_host(parent, payload, on_done)
     local action = req.action
     local params = req.params or {}
 
+    local lineage = Manifest.lineage_for_session(parent)
+    if lineage == "" then
+        lineage = parent.id
+    end
+
     if action == "dispatch_subagents" then
         local function finish(result)
             if on_done then
@@ -659,7 +664,7 @@ function M.handle_host(parent, payload, on_done)
                 finish(result)
                 return
             end
-            Batch.wait(result.batch_id, finish, { timeout_ms = params.timeout_ms })
+            Batch.wait(result.batch_id, finish, { timeout_ms = params.timeout_ms, owner = lineage })
         end)
         return
     end
@@ -700,7 +705,7 @@ function M.handle_host(parent, payload, on_done)
             if on_done then
                 on_done(result)
             end
-        end, { timeout_ms = params.timeout_ms })
+        end, { timeout_ms = params.timeout_ms, owner = lineage })
         return
     end
 
