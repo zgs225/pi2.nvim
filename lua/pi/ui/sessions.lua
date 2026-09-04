@@ -894,7 +894,7 @@ end
 --- Shortcuts shown by the help overlay: { key(s), description } pairs.
 ---@type [string, string][]
 local HELP_ENTRIES = {
-    { "<CR>, o", "Open the session under the cursor" },
+    { "<CR>, o", "Switch to / open the session in chat" },
     { "a, i", "Open the session and type at its prompt's end" },
     { "r", "Rename the session under the cursor" },
     { "s", "Show this session's stats (:PiSessionStats)" },
@@ -903,7 +903,7 @@ local HELP_ENTRIES = {
     { "f", "Fork this session from a past message (:PiFork)" },
     { "C", "Clone this session (:PiClone)" },
     { "t", "Navigate this session's tree (:PiTree)" },
-    { "p", "Preview sub-session messages (read-only)" },
+    { "p", "Preview sub-session (rich viewer)" },
     { "x", "Close sub-session process (:PiSubClose)" },
     { "H", "Toggle hidden / prior-conversation sub-sessions" },
     { "R", "Refresh the list" },
@@ -1250,7 +1250,7 @@ local function ensure_buf()
         if row and row.child_id then
             require("pi.subsessions").preview(row.child_id)
         end
-    end, vim.tbl_extend("force", map_opts, { desc = "Preview sub-session" }))
+    end, vim.tbl_extend("force", map_opts, { desc = "Preview sub-session (rich viewer)" }))
     vim.keymap.set("n", "x", function()
         local row = rows[vim.api.nvim_win_get_cursor(0)[1]]
         if row and row.child_id then

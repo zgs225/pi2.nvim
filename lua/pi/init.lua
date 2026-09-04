@@ -731,4 +731,9 @@ function M.sub_close()
     require("pi.subsessions").sub_close()
 end
 
+--- View a sub-session in a read-only float viewer (:PiSubView).
+function M.sub_view()
+    require("pi.subsessions").sub_view()
+end
+
 return M

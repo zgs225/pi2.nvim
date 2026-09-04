@@ -64,6 +64,7 @@ And mid-session management:
 | `:PiSubSwitch` | `pi.sub_switch()` | Picker to switch the current tab's chat to a child sub-session (including dormant). |
 | `:PiSubParent` | `pi.sub_parent()` | Return from a child sub-session view to the parent. |
 | `:PiSubClose` | `pi.sub_close()` | Close the current sub-session's RPC process (session file retained). |
+| `:PiSubView` | `pi.sub_view()` | View a sub-session in a read-only float viewer. |
 
 ## Sub-sessions
 
@@ -75,6 +76,7 @@ A parent session can run **sub-sessions** in parallel — each child is an indep
 | `:PiSubSwitch` | Pick a child (active or dormant) and bind the current tab's chat to it. |
 | `:PiSubParent` / `gp` in history | Switch back to the parent; breadcrumb `◂ 父：…` shows while viewing a child. |
 | `:PiSubClose` | Close the current sub-session's RPC process (session file retained). |
+| `:PiSubView` | Picker to view a child sub-session in a read-only float viewer. |
 
 Switching parent ↔ child or sibling children **rebinds the tab UI** and rebuilds history from `get_messages`. It does **not** send RPC `switch_session` when the target process already has that session file open, so a running agent on the target is not aborted. The statusline spinner elapsed time continues from that session's first `agent_start` for the current run (it does not restart when you switch). Dormant children are revived in a new process, which still loads the file via `switch_session`.
 
@@ -133,7 +135,7 @@ When you run several sessions across tabs, `:PiSessions` gives you a single dash
 
 The list is a single shared buffer (filetype `pi-sessions`): every tab that opens it gets its own window on the same buffer, so a status change redraws all open views at once. Updates are event-driven (agent start/end, compaction, session creation/teardown, attention requests, name changes) — nothing polls.
 
-Keys inside the list: `<CR>` / `o` jump to that session's tab and open its chat (on a child row: bind the tab's chat to that sub-session), `a` / `i` do the same but drop you straight into Insert mode at the very end of that session's prompt draft (multi-line drafts land past the last line — ready to append), `r` renames the session under the cursor (same as `:PiSessionName`, without leaving the list), `s` shows the session's stats dashboard under the cursor (same data as `:PiSessionStats` — tokens, cost, context — in a dialog float, without leaving the list), `c` compacts the session under the cursor in the background (same as `:PiCompact` — the row's status dot switches to the compacting state while it runs, no tab switch), `d` opens the diff review of the session's changed files under the cursor (same panel as `:PiDiff` — the combined git diff in a floating window, without leaving the list), `f` / `C` / `t` fork, clone, or tree-navigate the session under the cursor (same flows as `:PiFork` / `:PiClone` / `:PiTree` — the list jumps to that session's tab first, so the pickers, prefill and streaming guards all run against the right session), `p` previews a sub-session's recent messages in a read-only float (no tab switch), `x` closes a sub-session's RPC process, `H` toggles hidden sub-session rows (dormant / settled), `R` re-fetches session names, `?` toggles a shortcut help overlay, `q` closes the window.
+Keys inside the list: `<CR>` / `o` jump to that session's tab and open its chat (on a child row: bind the tab's chat to that sub-session), `a` / `i` do the same but drop you straight into Insert mode at the very end of that session's prompt draft (multi-line drafts land past the last line — ready to append), `r` renames the session under the cursor (same as `:PiSessionName`, without leaving the list), `s` shows the session's stats dashboard under the cursor (same data as `:PiSessionStats` — tokens, cost, context — in a dialog float, without leaving the list), `c` compacts the session under the cursor in the background (same as `:PiCompact` — the row's status dot switches to the compacting state while it runs, no tab switch), `d` opens the diff review of the session's changed files under the cursor (same panel as `:PiDiff` — the combined git diff in a floating window, without leaving the list), `f` / `C` / `t` fork, clone, or tree-navigate the session under the cursor (same flows as `:PiFork` / `:PiClone` / `:PiTree` — the list jumps to that session's tab first, so the pickers, prefill and streaming guards all run against the right session), `p` previews a sub-session in a read-only float viewer (no tab switch), `x` closes a sub-session's RPC process, `H` toggles hidden sub-session rows (dormant / settled), `R` re-fetches session names, `?` toggles a shortcut help overlay, `q` closes the window.
 
 Sub-session child rows are sorted **newest first** by `created_at`, with the session id as a stable tiebreaker so refresh does not reshuffle them.
 

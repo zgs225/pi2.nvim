@@ -53,6 +53,7 @@ pi.sub_new()                  -- spawn a background sub-session (:PiSubNew)
 pi.sub_switch()               -- picker to switch to a child sub-session
 pi.sub_parent()               -- return to parent session from child view
 pi.sub_close()                -- close current sub-session process (file retained)
+pi.sub_view()                 -- picker to view a child sub-session in a read-only float (:PiSubView)
 
 -- Prompt input
 pi.send_mention(args?, opts?) -- insert an @-mention for the current buffer / selection

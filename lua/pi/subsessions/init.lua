@@ -870,33 +870,58 @@ function M.sub_close()
     end
 end
 
---- Preview sub-session in a float (for :PiSessions `p` key).
----@param child_id string
-function M.preview(child_id)
-    local path = Read.find_path(child_id)
-    if not path then
-        Notify.warn("Sub-session file not found")
+--- User command: picker to view a child sub-session in a read-only float.
+function M.sub_view()
+    local parent = Sessions.get()
+    if not parent then
+        Notify.warn("No active session")
         return
     end
-    local tail = (Config.options.subagent or {}).read_tail or 50
-    local lines = Read.project_tail(path, tail)
-    local manifest = Manifest.load()
-    local entry = manifest[child_id]
-    local title = entry and entry.name or child_id
-    local buf = vim.api.nvim_create_buf(false, true)
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-    vim.bo[buf].modifiable = false
-    vim.api.nvim_open_win(buf, true, {
-        relative = "editor",
-        width = math.min(80, vim.o.columns - 4),
-        height = math.min(20, #lines + 2),
-        row = math.floor((vim.o.lines - 20) / 2),
-        col = math.floor((vim.o.columns - 80) / 2),
-        style = "minimal",
-        border = "rounded",
-        title = " " .. title .. " ",
-        title_pos = "center",
-    })
+    local root_id = parent.view_parent_id or parent.id
+    local root_sess = (root_id and Sessions.get_by_id(root_id)) or parent
+    local lineage = Manifest.lineage_for_session(root_sess)
+    local children = Manifest.children_of(lineage)
+    if parent.view_parent_id then
+        -- also allow switching among siblings when already in child view
+        children = Manifest.children_of(lineage)
+    end
+    if #children == 0 then
+        Notify.info("No sub-sessions for this conversation")
+        return
+    end
+    ---@type string[]
+    local labels = {}
+    for _, entry in ipairs(children) do
+        labels[#labels + 1] = ("%s · %s"):format(entry.name, entry.status)
+    end
+    Dialog.select({ title = "View Sub-session", options = labels, kind = "pi-sub-view" }, function(choice)
+        if not choice then
+            return
+        end
+        local idx = vim.tbl_contains(labels, choice) and vim.fn.index(labels, choice) + 1 or nil
+        if not idx then
+            for i, l in ipairs(labels) do
+                if l == choice then
+                    idx = i
+                    break
+                end
+            end
+        end
+        if not idx then
+            return
+        end
+        local entry = children[idx]
+        local child_id = entry._id
+        M.preview(child_id)
+    end)
+end
+
+--- Preview sub-session in a read-only float viewer.
+--- Upgrade of the original raw-text preview: now renders full chat history
+--- with tool blocks, thinking, markdown, and live streaming support.
+---@param child_id string
+function M.preview(child_id)
+    require("pi.ui.subsession_viewer").open(child_id)
 end
 
 --- Test-only: exported for unit tests.

@@ -177,6 +177,10 @@ function M.setup()
     vim.api.nvim_create_user_command("PiSubClose", function()
         Pi.sub_close()
     end, { desc = "Close the current sub-session process (file retained)" })
+
+    vim.api.nvim_create_user_command("PiSubView", function()
+        Pi.sub_view()
+    end, { desc = "View sub-session in a read-only float" })
 end
 
 return M
