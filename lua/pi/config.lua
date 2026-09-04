@@ -268,6 +268,11 @@
 ---@field map_command? fun(cmd: table, ctx: pi.RpcAdapterContext): table? Map or drop outbound RPC commands.
 ---@field map_event? fun(msg: table, ctx: pi.RpcAdapterContext): table? Map or drop inbound RPC events.
 
+---@class pi.SubagentViewerConfig
+---@field width? number Width in columns (>=1) or fraction of editor width (<1, default 0.7)
+---@field height? number Height in lines (>=1) or fraction of editor height (<1, default 0.75)
+---@field border? string|string[] Float border style (default "rounded")
+
 ---@class pi.SubagentConfig
 ---@field enabled? boolean Inject subagent.ts extension (default true)
 ---@field max_children? integer Max concurrent sub-sessions per parent lineage (default 5)
@@ -279,6 +284,7 @@
 ---@field batch_ttl_hours? integer Hours to retain completed batch records (default 24)
 ---@field show_full_ids? boolean Show full UUIDs in sub-agent tool rows (default false; truncated)
 ---@field sessions_list? pi.SubagentSessionsListConfig
+---@field viewer? pi.SubagentViewerConfig Float window sizing for the sub-session viewer
 
 ---@class pi.SubagentSessionsListConfig
 ---@field show_dormant? boolean Show closed (dormant) children in :PiSessions (default false; use :PiSubSwitch)
@@ -453,6 +459,11 @@ local defaults = {
             show_dormant = false,
             show_completed = "unread",
             show_failed = "unread",
+        },
+        viewer = {
+            width = 0.7,
+            height = 0.75,
+            border = "rounded",
         },
     },
     vision = {},

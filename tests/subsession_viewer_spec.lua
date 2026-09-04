@@ -5,6 +5,7 @@ local Sessions = require("pi.sessions.manager")
 local Read = require("pi.subsessions.read")
 local Subsessions = require("pi.subsessions")
 local Notify = require("pi.notify")
+local Config = require("pi.config")
 
 local function pump(ms)
     vim.wait(ms or 50, function()
@@ -199,6 +200,13 @@ describe("pi.ui.subsession_viewer", function()
         assert.is_table(cfg.border)
         assert.equals("╭", cfg.border[1])
         assert.equals(" Worker Alpha [dormant] ", cfg.title[1][1])
+        local expected_w = math.max(20, math.min(vim.o.columns - 4, math.floor(vim.o.columns * 0.7)))
+        local expected_h = math.max(
+            5,
+            math.min(vim.o.lines - vim.o.cmdheight - 3, math.floor((vim.o.lines - vim.o.cmdheight - 1) * 0.75))
+        )
+        assert.equals(expected_w, cfg.width)
+        assert.equals(expected_h, cfg.height)
 
         -- Window options
         assert.is_true(vim.wo[win].wrap)
@@ -225,6 +233,73 @@ describe("pi.ui.subsession_viewer", function()
         assert.is_false(vim.api.nvim_win_is_valid(win))
         assert.is_false(vim.api.nvim_buf_is_valid(buf))
         assert.is_true(closed_called)
+    end)
+
+    it("respects custom width, height, and border from subagent.viewer config and opts", function()
+        local child_id = "child-dim-1"
+        local file_path = tmp_dir .. "/dim.jsonl"
+        local f = io.open(file_path, "w")
+        assert.is_not_nil(f)
+        f:write(vim.json.encode({ type = "message", message = { role = "user", content = "dim test" } }))
+        f:close()
+
+        local orig_load = Manifest.load
+        local orig_find_path = Read.find_path
+        Manifest.load = function()
+            return {
+                [child_id] = {
+                    name = "Dim Worker",
+                    status = "dormant",
+                    task_prompt = "dim test",
+                    parent_id = "p-1",
+                    config = { model = { provider = "anthropic", id = "claude-3-5-sonnet" } },
+                    reported = true,
+                    created_at = "now",
+                    last_active_at = "now",
+                },
+            }
+        end
+        Read.find_path = function()
+            return file_path
+        end
+
+        -- 1. Test via config options
+        Config.setup({
+            subagent = {
+                viewer = {
+                    width = 60,
+                    height = 20,
+                    border = "single",
+                },
+            },
+        })
+
+        Viewer.open(child_id)
+        assert.is_true(Viewer.is_open())
+        local win = Viewer._win()
+        local win_cfg = vim.api.nvim_win_get_config(win)
+        assert.equals(60, win_cfg.width)
+        assert.equals(20, win_cfg.height)
+        assert.equals("┌", win_cfg.border[1])
+        Viewer.close()
+
+        -- 2. Test via opts override
+        Viewer.open(child_id, {
+            width = 45,
+            height = 15,
+            border = "double",
+        })
+        assert.is_true(Viewer.is_open())
+        win = Viewer._win()
+        win_cfg = vim.api.nvim_win_get_config(win)
+        assert.equals(45, win_cfg.width)
+        assert.equals(15, win_cfg.height)
+        assert.equals("╔", win_cfg.border[1])
+        Viewer.close()
+
+        Manifest.load = orig_load
+        Read.find_path = orig_find_path
+        Config.setup({})
     end)
 
     it("promotes on <CR> keymap", function()

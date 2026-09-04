@@ -214,6 +214,11 @@ require("pi").setup({
             show_completed = "unread", -- "all" | "unread" | "none" — unread hides agent workers + acknowledged user completions
             show_failed = "unread",   -- "all" | "unread" | "none"
         },
+        viewer = {
+            width = 0.7,              -- columns (>=1) or fraction of editor width (<1, default 0.7)
+            height = 0.75,            -- lines (>=1) or fraction of editor height (<1, default 0.75)
+            border = "rounded",       -- float border style (default "rounded")
+        },
     },
 
     -- Vision fallback for non-vision main models. When `model` is set

@@ -4,6 +4,7 @@
 
 local M = {}
 
+local Config = require("pi.config")
 local Notify = require("pi.notify")
 local Highlights = require("pi.ui.highlights")
 local History = require("pi.ui.chat.history")
@@ -15,6 +16,9 @@ local Vision = require("pi.vision")
 
 ---@class pi.SubsessionViewerOpts
 ---@field on_close? fun()
+---@field width? number Width in columns (>=1) or fraction of editor width (<1)
+---@field height? number Height in lines (>=1) or fraction of editor height (<1)
+---@field border? string|string[] Float border style
 
 -- Module state
 ---@type integer?
@@ -33,6 +37,18 @@ local viewer_event_queue = nil
 local viewer_tab_counter = -100
 ---@type fun()?
 local viewer_on_close = nil
+
+--- Resolve a dimension (columns/lines) from a config value; values < 1 are
+--- fractions of the available space.
+---@param value number
+---@param available integer
+---@return integer
+local function resolve_dimension(value, available)
+    if value < 1 then
+        return math.max(1, math.floor(available * value))
+    end
+    return math.max(1, math.floor(value))
+end
 
 ---@param name string
 ---@param status string
@@ -491,11 +507,19 @@ function M.open(child_id, opts)
     vim.bo[buf].bufhidden = "wipe"
 
     -- 5. Open float window, set keymaps
+    local subagent_cfg = Config.options.subagent or {}
+    local viewer_cfg = subagent_cfg.viewer or {}
+    local raw_w = opts.width or viewer_cfg.width or 0.7
+    local raw_h = opts.height or viewer_cfg.height or 0.75
+    local border = opts.border or viewer_cfg.border or "rounded"
+
     local editor_w = vim.o.columns
-    local editor_h = vim.o.lines - vim.o.cmdheight
-    local width = math.max(20, math.min(editor_w - 4, math.floor(editor_w * 0.85)))
-    local height = math.max(5, math.min(editor_h - 4, math.floor(editor_h * 0.8)))
-    local row = math.floor((editor_h - height) / 2)
+    local editor_h = vim.o.lines - vim.o.cmdheight - 1
+    local total_w = resolve_dimension(raw_w, editor_w)
+    local total_h = resolve_dimension(raw_h, editor_h)
+    local width = math.max(20, math.min(editor_w - 4, total_w))
+    local height = math.max(5, math.min(editor_h - 2, total_h))
+    local row = math.max(0, math.floor((editor_h - height) / 2))
     local col = math.floor((editor_w - width) / 2)
     local title = format_title(name, status)
 
@@ -506,7 +530,7 @@ function M.open(child_id, opts)
         width = width,
         height = height,
         style = "minimal",
-        border = "rounded",
+        border = border,
         title = title,
         title_pos = "center",
     })
