@@ -7,6 +7,7 @@ local History = require("pi.sessions.history")
 local MANIFEST_FILE = ".pi2-subsessions.json"
 
 ---@class pi.SubsessionManifestEntry
+---@field _id? string Manifest key (child session id)
 ---@field parent_id string
 ---@field name string
 ---@field task_prompt string

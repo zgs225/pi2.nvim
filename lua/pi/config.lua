@@ -206,6 +206,7 @@
 ---@class pi.SessionsListConfig
 ---@field mode? "follow"|"side"|"float" How the list window opens: "side" or "float" explicitly, or "follow" the current tab's chat layout (default "follow")
 ---@field auto_open? boolean Open the list together with the chat (default false)
+---@field collapse_subsessions? boolean Collapse sub-sessions under parent rows by default (default false)
 ---@field position? "left"|"right"|"top"|"bottom" Window placement in the side layout (default "left")
 ---@field width? integer Window width for left/right placement in the side layout (default 40)
 ---@field height? integer Window height for top/bottom placement in the side layout (default 12)
@@ -290,6 +291,8 @@
 ---@field show_dormant? boolean Show closed (dormant) children in :PiSessions (default false; use :PiSubSwitch)
 ---@field show_completed? "all"|"unread"|"none" Completed children in :PiSessions (default "unread")
 ---@field show_failed? "all"|"unread"|"none" Failed children in :PiSessions (default "unread")
+---@field collapse_children? boolean Collapse sub-sessions by default (alias for sessions_list.collapse_subsessions)
+---@field collapsed? boolean Alias for collapse_children
 
 ---@class pi.Options
 ---@field cli pi.CliConfig
@@ -456,6 +459,7 @@ local defaults = {
         batch_timeout_ms = 300000,
         batch_ttl_hours = 24,
         sessions_list = {
+            collapse_children = false,
             show_dormant = false,
             show_completed = "unread",
             show_failed = "unread",
@@ -476,6 +480,7 @@ local defaults = {
     sessions_list = {
         mode = "follow",
         auto_open = false,
+        collapse_subsessions = false,
         position = "left",
         width = 40,
         height = 12,

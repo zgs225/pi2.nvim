@@ -210,6 +210,7 @@ require("pi").setup({
         batch_ttl_hours = 24,         -- retain completed batch records (hours)
         show_full_ids = false,        -- show full UUIDs in sub-agent tool rows (default: truncated …suffix)
         sessions_list = {
+            collapse_children = false, -- collapse sub-sessions by default (alias for sessions_list.collapse_subsessions)
             show_dormant = false,     -- show closed children in :PiSessions (default: use :PiSubSwitch)
             show_completed = "unread", -- "all" | "unread" | "none" — unread hides agent workers + acknowledged user completions
             show_failed = "unread",   -- "all" | "unread" | "none"
@@ -267,6 +268,8 @@ require("pi").setup({
         mode = "follow",
         -- Open the list together with the chat (:Pi etc.).
         auto_open = false,
+        -- Collapse sub-sessions under parent rows by default (default: false).
+        collapse_subsessions = false,
         -- Window placement in the side layout: "left" | "right" | "top" | "bottom".
         position = "left",
         -- Window width for left/right placement (side layout).

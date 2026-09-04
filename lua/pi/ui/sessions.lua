@@ -42,6 +42,9 @@ local show_hidden_children = false
 ---@field is_tree_parent? boolean parent row shown while viewing a child in the tab
 ---@field marker_col? integer 1-based byte column of the status dot (for current-tab marker)
 ---@field marker_len? integer byte length of the status dot glyph
+---@field has_children? boolean parent row has visible sub-sessions
+---@field collapsed? boolean whether child sub-sessions are folded
+---@field child_count? integer number of visible sub-sessions
 
 ---@type integer? shared list buffer
 local buf = nil
@@ -186,6 +189,76 @@ function M.spinner_frame(tick)
     return SPINNER_FRAMES[(tick % #SPINNER_FRAMES) + 1]
 end
 
+--- Explicit fold state per parent lineage/session id.
+--- true = collapsed, false = expanded. nil = use default.
+---@type table<string, boolean>
+local parent_folds = {}
+
+--- Key for tracking fold state of a parent session.
+---@param parent_sess pi.Session|string?
+---@return string?
+local function parent_key(parent_sess)
+    if not parent_sess then
+        return nil
+    end
+    if type(parent_sess) == "string" then
+        return parent_sess
+    end
+    local Manifest = require("pi.subsessions.manifest")
+    local lineage = Manifest.lineage_for_session(parent_sess)
+    if lineage and lineage ~= "" then
+        return lineage
+    end
+    return parent_sess.id
+end
+
+--- Whether sub-sessions should start collapsed by default according to config.
+---@return boolean
+local function default_collapsed()
+    local sl = Config.options.sessions_list
+    if sl and sl.collapse_subsessions == true then
+        return true
+    end
+    local sub_sl = Config.options.subagent and Config.options.subagent.sessions_list
+    if sub_sl and (sub_sl.collapse_children == true or sub_sl.collapsed == true) then
+        return true
+    end
+    return false
+end
+
+--- Check whether a parent session's sub-sessions are collapsed.
+---@param parent_sess pi.Session|string?
+---@param is_active_parent? boolean True when the current tab is actively viewing a child of this parent
+---@return boolean
+local function is_parent_collapsed(parent_sess, is_active_parent)
+    local key = parent_key(parent_sess)
+    if not key then
+        return false
+    end
+    local explicit = parent_folds[key]
+    if explicit ~= nil then
+        return explicit
+    end
+    if is_active_parent then
+        return false
+    end
+    return default_collapsed()
+end
+
+--- Toggle the collapsed state for a parent session.
+---@param parent_sess pi.Session|string?
+---@param is_active_parent? boolean
+---@return boolean? new_state
+local function toggle_parent_collapsed(parent_sess, is_active_parent)
+    local key = parent_key(parent_sess)
+    if not key then
+        return nil
+    end
+    local current = is_parent_collapsed(parent_sess, is_active_parent)
+    parent_folds[key] = not current
+    return parent_folds[key]
+end
+
 --- Format a row: the status dot at the left edge, the name right after it.
 --- While the backend generates a title the pending placeholder is animated.
 --- Chunks are byte ranges: { col_start, col_end, hl_group }.
@@ -194,16 +267,27 @@ end
 ---@return string line
 ---@return integer[][] chunks
 function M.format_line(row, tick)
-    local indent = row.depth and row.depth > 0 and "  " or " "
-    local branch = row.depth and row.depth > 0 and "└─ " or ""
     local dot = row.dormant and "◌" or "●"
     local name = row.name or "…"
     local pending = row.name == nil
-    local subtitle = row.subtitle and (" · " .. row.subtitle) or ""
+    local subtitle = (row.subtitle and row.subtitle ~= "") and (" · " .. row.subtitle) or ""
     local provisional = pending or name == "(unnamed)"
     local spinner = row.title_generating and provisional and M.spinner_frame(tick)
-    local line = indent .. branch .. dot .. " " .. (spinner and spinner .. " " or "") .. name .. subtitle
-    local prefix = indent .. branch
+
+    local prefix
+    local count = ""
+    local has_fold = false
+    if row.depth and row.depth > 0 then
+        prefix = "  └─ "
+    elseif row.has_children then
+        prefix = row.collapsed and "▸ " or "▾ "
+        count = (row.collapsed and row.child_count and row.child_count > 0) and (" (" .. row.child_count .. ")") or ""
+        has_fold = true
+    else
+        prefix = " "
+    end
+
+    local line = prefix .. dot .. " " .. (spinner and spinner .. " " or "") .. name .. subtitle .. count
     local dot_start = #prefix
     local name_start = dot_start + #dot + 1 + (spinner and #spinner + 1 or 0)
     local chunks = {
@@ -212,6 +296,12 @@ function M.format_line(row, tick)
     }
     if spinner then
         table.insert(chunks, 2, { name_start - #spinner - 1, name_start - 1, "PiSessionsListSpinner" })
+    end
+    if has_fold then
+        table.insert(chunks, { 0, #prefix, "PiSessionsListDotDim" })
+        if #count > 0 then
+            table.insert(chunks, { #line - #count, #line, "PiSessionsListDotDim" })
+        end
     end
     return line, chunks
 end
@@ -274,7 +364,7 @@ end
 
 ---@param out pi.SessionsListRow[]
 ---@param entry pi.SubsessionManifestEntry
----@param tab pi.TabId
+---@param tab? pi.TabId
 ---@param opts { is_current_view?: boolean }
 local function append_child_row(out, entry, tab, opts)
     local Sessions = require("pi.sessions.manager")
@@ -318,31 +408,35 @@ local function child_filter_ctx()
     }
 end
 
---- Append manifest child rows that pass the sessions-list visibility filter.
----@param out pi.SessionsListRow[]
+--- Get visible child entries for a parent session.
 ---@param parent_sess pi.Session?
----@param tab pi.TabId
 ---@param current_child_id? string
-local function append_visible_children(out, parent_sess, tab, current_child_id)
+---@return { entry: pi.SubsessionManifestEntry, is_current: boolean }[]
+local function get_visible_children(parent_sess, current_child_id)
     if not parent_sess then
-        return
+        return {}
     end
     local Manifest = require("pi.subsessions.manifest")
     local lineage = Manifest.lineage_for_session(parent_sess)
     if lineage == "" then
-        return
+        return {}
     end
     local epoch = parent_sess.conversation_epoch or 0
     local ctx = child_filter_ctx()
+    local visible_entries = {}
     for _, entry in ipairs(Manifest.children_of(lineage)) do
         local child_id = entry._id
         local is_current = type(current_child_id) == "string" and child_id == current_child_id
         local same_epoch = (entry.parent_epoch or 0) == epoch
         local visible = is_current or show_hidden_children or (same_epoch and ChildFilter.child_visible(entry, ctx))
         if visible then
-            append_child_row(out, entry, tab, { is_current_view = is_current })
+            visible_entries[#visible_entries + 1] = {
+                entry = entry,
+                is_current = is_current,
+            }
         end
     end
+    return visible_entries
 end
 
 --- Toggle whether hidden sub-session rows are shown in :PiSessions.
@@ -361,8 +455,8 @@ end
 --- Build a parent (depth 0) row for a live session process.
 ---@param out pi.SessionsListRow[]
 ---@param session pi.Session
----@param tab pi.TabId
----@param opts { is_current_view?: boolean, is_tree_parent?: boolean, name?: string? }
+---@param tab? pi.TabId
+---@param opts { is_current_view?: boolean, is_tree_parent?: boolean, name?: string?, has_children?: boolean, collapsed?: boolean, child_count?: integer }
 local function append_parent_row(out, session, tab, opts, attention_count, name_of, flags_of, generating_of)
     local sid = session.id
     local f = flags_of and flags_of(session) or nil
@@ -379,6 +473,9 @@ local function append_parent_row(out, session, tab, opts, attention_count, name_
         session = session,
         is_current_view = opts.is_current_view == true,
         is_tree_parent = opts.is_tree_parent == true,
+        has_children = opts.has_children == true,
+        collapsed = opts.collapsed == true,
+        child_count = opts.child_count,
     }
 end
 
@@ -420,26 +517,44 @@ function M.build_rows(sessions, attention_count, name_of, flags_of, generating_o
 
         if in_child_view and root_id then
             local parent_sess = Sessions.get_by_id(root_id)
+            local visible_children = get_visible_children(parent_sess, session.id)
+            local child_count = #visible_children
+            local has_children = child_count > 0
+            local is_active_parent = tab == nil or tab == current_tab()
+            local collapsed = has_children and is_parent_collapsed(parent_sess, is_active_parent) or false
+
             if parent_sess then
                 append_parent_row(out, parent_sess, tab, {
                     is_current_view = false,
                     is_tree_parent = true,
                     name = name_of(parent_sess) or name_from_session_file(parent_sess),
+                    has_children = has_children,
+                    collapsed = collapsed,
+                    child_count = child_count,
                 }, attention_count, name_of, flags_of, generating_of)
             end
-            append_visible_children(out, parent_sess, tab, session.id)
+            if not collapsed then
+                for _, item in ipairs(visible_children) do
+                    append_child_row(out, item.entry, tab, { is_current_view = item.is_current })
+                end
+            end
         else
-            append_parent_row(
-                out,
-                session,
-                tab,
-                { is_current_view = true },
-                attention_count,
-                name_of,
-                flags_of,
-                generating_of
-            )
-            append_visible_children(out, session, tab, nil)
+            local visible_children = get_visible_children(session, nil)
+            local child_count = #visible_children
+            local has_children = child_count > 0
+            local collapsed = has_children and is_parent_collapsed(session, false) or false
+
+            append_parent_row(out, session, tab, {
+                is_current_view = true,
+                has_children = has_children,
+                collapsed = collapsed,
+                child_count = child_count,
+            }, attention_count, name_of, flags_of, generating_of)
+            if not collapsed then
+                for _, item in ipairs(visible_children) do
+                    append_child_row(out, item.entry, tab, { is_current_view = item.is_current })
+                end
+            end
         end
     end
     return out
@@ -902,6 +1017,8 @@ local HELP_ENTRIES = {
     { "t", "Navigate this session's tree (:PiTree)" },
     { "p", "Preview sub-session (rich viewer)" },
     { "x", "Close sub-session process (:PiSubClose)" },
+    { "<Tab>, za", "Fold / unfold sub-sessions" },
+    { "zM, zR", "Collapse / expand all sub-sessions" },
     { "H", "Toggle hidden / prior-conversation sub-sessions" },
     { "R", "Refresh the list" },
     { "q", "Close the list" },
@@ -1193,6 +1310,147 @@ local function tree_under_cursor()
     require("pi").tree()
 end
 
+--- Toggle fold/unfold for the session under cursor.
+--- On a parent row with children: toggles fold state for that parent.
+--- On a child row: collapses that child's parent and moves cursor to the parent row.
+local function toggle_fold_under_cursor()
+    local cur_win = vim.api.nvim_get_current_win()
+    local cursor = vim.api.nvim_win_get_cursor(cur_win)
+    local lnum = cursor[1]
+    local row = rows[lnum]
+    if not row then
+        return
+    end
+
+    if row.depth and row.depth > 0 then
+        local parent_row = nil
+        local parent_lnum = nil
+        for p = lnum - 1, 1, -1 do
+            if rows[p] and (rows[p].depth == nil or rows[p].depth == 0) then
+                parent_row = rows[p]
+                parent_lnum = p
+                break
+            end
+        end
+        if not parent_row then
+            return
+        end
+        local parent_sess = parent_row.session
+        if not parent_sess and parent_row.session_id then
+            local Sessions = require("pi.sessions.manager")
+            parent_sess = Sessions.get_by_id(parent_row.session_id)
+        end
+        local key = parent_key(parent_sess) or parent_row.session_id
+        if key then
+            parent_folds[key] = true
+            M._render()
+            local target_lnum = parent_lnum
+            for new_lnum, r in ipairs(rows) do
+                if
+                    (r.session_id and r.session_id == parent_row.session_id)
+                    or (parent_sess and r.session == parent_sess)
+                then
+                    target_lnum = new_lnum
+                    break
+                end
+            end
+            pcall(vim.api.nvim_win_set_cursor, cur_win, { target_lnum, 0 })
+        end
+        return
+    end
+
+    if row.has_children then
+        local parent_sess = row.session
+        if not parent_sess and row.session_id then
+            local Sessions = require("pi.sessions.manager")
+            parent_sess = Sessions.get_by_id(row.session_id)
+        end
+        local key = parent_key(parent_sess) or row.session_id
+        if key then
+            local current = row.collapsed == true
+            parent_folds[key] = not current
+            M._render()
+        end
+    end
+end
+
+--- Collapse all parent sessions with children.
+local function collapse_all_folds()
+    local Sessions = require("pi.sessions.manager")
+    local cur_win = vim.api.nvim_get_current_win()
+    local cur_row = rows[vim.api.nvim_win_get_cursor(cur_win)[1]]
+    local parent_to_target = nil
+    if cur_row and cur_row.depth and cur_row.depth > 0 then
+        for p = vim.api.nvim_win_get_cursor(cur_win)[1] - 1, 1, -1 do
+            if rows[p] and (rows[p].depth == nil or rows[p].depth == 0) then
+                parent_to_target = rows[p].session_id
+                break
+            end
+        end
+    end
+
+    for _, r in ipairs(rows) do
+        if r.has_children then
+            local key = parent_key(r.session) or r.session_id
+            if key then
+                parent_folds[key] = true
+            end
+        end
+    end
+
+    for _, session in ipairs(Sessions.list()) do
+        local root_id = session.view_parent_id or session.id
+        local parent_sess = session.view_parent_id and Sessions.get_by_id(root_id) or session
+        if parent_sess then
+            local visible = get_visible_children(parent_sess, session.view_parent_id and session.id or nil)
+            if #visible > 0 then
+                local key = parent_key(parent_sess) or root_id
+                if key then
+                    parent_folds[key] = true
+                end
+            end
+        end
+    end
+
+    M._render()
+
+    if parent_to_target then
+        for new_lnum, r in ipairs(rows) do
+            if r.session_id == parent_to_target and (r.depth == nil or r.depth == 0) then
+                pcall(vim.api.nvim_win_set_cursor, cur_win, { new_lnum, 0 })
+                break
+            end
+        end
+    end
+end
+
+--- Expand all parent sessions with children.
+local function expand_all_folds()
+    local Sessions = require("pi.sessions.manager")
+    for k in pairs(parent_folds) do
+        parent_folds[k] = false
+    end
+    for _, r in ipairs(rows) do
+        if r.has_children then
+            local key = parent_key(r.session) or r.session_id
+            if key then
+                parent_folds[key] = false
+            end
+        end
+    end
+    for _, session in ipairs(Sessions.list()) do
+        local root_id = session.view_parent_id or session.id
+        local parent_sess = session.view_parent_id and Sessions.get_by_id(root_id) or session
+        if parent_sess then
+            local key = parent_key(parent_sess) or root_id
+            if key then
+                parent_folds[key] = false
+            end
+        end
+    end
+    M._render()
+end
+
 ---@return integer
 local function ensure_buf()
     if buf and vim.api.nvim_buf_is_valid(buf) then
@@ -1254,6 +1512,25 @@ local function ensure_buf()
             require("pi.subsessions").close(row.child_id)
         end
     end, vim.tbl_extend("force", map_opts, { desc = "Close sub-session process" }))
+    vim.keymap.set(
+        "n",
+        "<Tab>",
+        toggle_fold_under_cursor,
+        vim.tbl_extend("force", map_opts, { desc = "Fold / unfold sub-sessions" })
+    )
+    vim.keymap.set(
+        "n",
+        "za",
+        toggle_fold_under_cursor,
+        vim.tbl_extend("force", map_opts, { desc = "Fold / unfold sub-sessions" })
+    )
+    vim.keymap.set(
+        "n",
+        "zM",
+        collapse_all_folds,
+        vim.tbl_extend("force", map_opts, { desc = "Collapse all sub-sessions" })
+    )
+    vim.keymap.set("n", "zR", expand_all_folds, vim.tbl_extend("force", map_opts, { desc = "Expand all sub-sessions" }))
     vim.keymap.set("n", "H", function()
         M.toggle_show_hidden_children()
         M._render()
@@ -1468,6 +1745,27 @@ function M._fetch_name(session)
     fetch_name(session)
 end
 
+--- Test hook: whether a parent session's sub-sessions are collapsed.
+---@param parent_sess pi.Session|string?
+---@param is_active_parent? boolean
+---@return boolean
+function M._is_parent_collapsed(parent_sess, is_active_parent)
+    return is_parent_collapsed(parent_sess, is_active_parent)
+end
+
+--- Test hook: toggle collapsed state for a parent session.
+---@param parent_sess pi.Session|string?
+---@param is_active_parent? boolean
+---@return boolean?
+function M._toggle_parent_collapsed(parent_sess, is_active_parent)
+    return toggle_parent_collapsed(parent_sess, is_active_parent)
+end
+
+--- Test hook: reset all fold state.
+function M._reset_folds()
+    parent_folds = {}
+end
+
 --- Test hook: drop all module state.
 function M._reset()
     stop_blink()
@@ -1486,6 +1784,7 @@ function M._reset()
     name_cache = setmetatable({}, { __mode = "k" })
     refresh_scheduled = false
     child_completion_seen = {}
+    parent_folds = {}
 end
 
 return M
