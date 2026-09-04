@@ -549,4 +549,417 @@ describe("pi.ui.subsession_viewer", function()
         Manifest.load = orig_load
         Sessions.get_by_id = orig_get_by_id
     end)
+
+    it("updates buffer on live streaming events", function()
+        local child_id = "child-stream-1"
+        local rpc_cb = nil
+        local mock_session = {
+            id = child_id,
+            rpc = {
+                is_running = function()
+                    return true
+                end,
+                send = function(self, payload, cb)
+                    if payload.type == "get_messages" then
+                        rpc_cb = cb
+                        return true
+                    end
+                    return false
+                end,
+            },
+        }
+
+        local orig_load = Manifest.load
+        local orig_get_by_id = Sessions.get_by_id
+
+        Manifest.load = function()
+            return { [child_id] = { name = "Stream Worker", status = "active" } }
+        end
+        Sessions.get_by_id = function(id)
+            if id == child_id then
+                return mock_session
+            end
+            return nil
+        end
+
+        Viewer.open(child_id)
+        assert.is_true(Viewer.is_open())
+        assert.is_not_nil(rpc_cb)
+
+        -- Initial load finishes
+        rpc_cb({
+            success = true,
+            data = { messages = { { role = "user", content = "Initial prompt" } } },
+        })
+        pump(100)
+
+        -- Stream events arrive
+        Viewer.on_session_event(mock_session, { type = "agent_start" })
+        Viewer.on_session_event(mock_session, {
+            type = "message_update",
+            assistantMessageEvent = { type = "thinking_start" },
+        })
+        Viewer.on_session_event(mock_session, {
+            type = "message_update",
+            assistantMessageEvent = { type = "thinking_delta", delta = "Thinking deeply..." },
+        })
+        Viewer.on_session_event(mock_session, {
+            type = "message_update",
+            assistantMessageEvent = { type = "thinking_end" },
+        })
+        Viewer.on_session_event(mock_session, {
+            type = "message_update",
+            assistantMessageEvent = { type = "text_delta", delta = "I found the answer." },
+        })
+        Viewer.on_session_event(mock_session, {
+            type = "tool_execution_start",
+            toolName = "read",
+            toolCallId = "call_99",
+            args = { path = "foo.lua" },
+        })
+        Viewer.on_session_event(mock_session, {
+            type = "tool_execution_end",
+            toolName = "read",
+            toolCallId = "call_99",
+            result = "file content",
+            isError = false,
+        })
+        Viewer.on_session_event(mock_session, { type = "agent_end" })
+        pump(150)
+
+        local buf = Viewer._history():buf()
+        local text = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+        assert.is_truthy(text:find("Initial prompt", 1, true))
+        assert.is_truthy(text:find("I found the answer.", 1, true))
+        assert.is_truthy(text:find("foo.lua", 1, true))
+
+        Viewer.close()
+        Manifest.load = orig_load
+        Sessions.get_by_id = orig_get_by_id
+    end)
+
+    it("buffers events arriving during get_messages loading and flushes them in order", function()
+        local child_id = "child-buffer-1"
+        local rpc_cb = nil
+        local mock_session = {
+            id = child_id,
+            rpc = {
+                is_running = function()
+                    return true
+                end,
+                send = function(self, payload, cb)
+                    if payload.type == "get_messages" then
+                        rpc_cb = cb
+                        return true
+                    end
+                    return false
+                end,
+            },
+        }
+
+        local orig_load = Manifest.load
+        local orig_get_by_id = Sessions.get_by_id
+
+        Manifest.load = function()
+            return { [child_id] = { name = "Buffer Worker", status = "active" } }
+        end
+        Sessions.get_by_id = function(id)
+            if id == child_id then
+                return mock_session
+            end
+            return nil
+        end
+
+        Viewer.open(child_id)
+        assert.is_true(Viewer.is_open())
+        assert.is_true(Viewer._loading())
+
+        -- Arrive while loading
+        Viewer.on_session_event(mock_session, {
+            type = "message_update",
+            assistantMessageEvent = { type = "text_delta", delta = "first queued chunk" },
+        })
+        Viewer.on_session_event(mock_session, {
+            type = "message_update",
+            assistantMessageEvent = { type = "text_delta", delta = " second queued chunk" },
+        })
+
+        local queue = Viewer._event_queue()
+        assert.is_not_nil(queue)
+        assert.equals(2, #queue)
+
+        -- Deliver response
+        rpc_cb({
+            success = true,
+            data = { messages = { { role = "user", content = "Queued base prompt" } } },
+        })
+        pump(100)
+
+        assert.is_false(Viewer._loading())
+        assert.is_nil(Viewer._event_queue())
+
+        local buf = Viewer._history():buf()
+        local text = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+        assert.is_truthy(text:find("Queued base prompt", 1, true))
+        assert.is_truthy(text:find("first queued chunk second queued chunk", 1, true))
+
+        Viewer.close()
+        Manifest.load = orig_load
+        Sessions.get_by_id = orig_get_by_id
+    end)
+
+    it("updates window title when agent_start or agent_end arrives", function()
+        local child_id = "child-title-1"
+        local rpc_cb = nil
+        local mock_session = {
+            id = child_id,
+            rpc = {
+                is_running = function()
+                    return true
+                end,
+                send = function(self, payload, cb)
+                    if payload.type == "get_messages" then
+                        rpc_cb = cb
+                        return true
+                    end
+                    return false
+                end,
+            },
+        }
+
+        local orig_load = Manifest.load
+        local orig_get_by_id = Sessions.get_by_id
+
+        Manifest.load = function()
+            return { [child_id] = { name = "Title Worker", status = "idle" } }
+        end
+        Sessions.get_by_id = function(id)
+            if id == child_id then
+                return mock_session
+            end
+            return nil
+        end
+
+        Viewer.open(child_id)
+        rpc_cb({ success = true, data = { messages = {} } })
+        pump(100)
+
+        local win = Viewer._win()
+        local cfg = vim.api.nvim_win_get_config(win)
+        assert.equals(" Title Worker [idle] ", cfg.title[1][1])
+
+        -- agent_start
+        Viewer.on_session_event(mock_session, { type = "agent_start" })
+        pump(100)
+        cfg = vim.api.nvim_win_get_config(win)
+        assert.equals(" Title Worker [active] ", cfg.title[1][1])
+
+        -- agent_end
+        Viewer.on_session_event(mock_session, { type = "agent_end" })
+        pump(100)
+        cfg = vim.api.nvim_win_get_config(win)
+        assert.equals(" Title Worker [completed] ", cfg.title[1][1])
+
+        Viewer.close()
+        Manifest.load = orig_load
+        Sessions.get_by_id = orig_get_by_id
+    end)
+
+    it("ignores events for a different session id or after viewer is closed", function()
+        local child_id = "child-target-1"
+        local other_id = "child-other-2"
+        local rpc_cb = nil
+        local mock_session = {
+            id = child_id,
+            rpc = {
+                is_running = function()
+                    return true
+                end,
+                send = function(self, payload, cb)
+                    if payload.type == "get_messages" then
+                        rpc_cb = cb
+                        return true
+                    end
+                    return false
+                end,
+            },
+        }
+        local other_session = {
+            id = other_id,
+            rpc = {
+                is_running = function()
+                    return true
+                end,
+                send = function()
+                    return true
+                end,
+            },
+        }
+
+        local orig_load = Manifest.load
+        local orig_get_by_id = Sessions.get_by_id
+
+        Manifest.load = function()
+            return { [child_id] = { name = "Target Worker", status = "active" } }
+        end
+        Sessions.get_by_id = function(id)
+            if id == child_id then
+                return mock_session
+            end
+            return nil
+        end
+
+        Viewer.open(child_id)
+        rpc_cb({
+            success = true,
+            data = { messages = { { role = "user", content = "Target only" } } },
+        })
+        pump(100)
+
+        -- Event for different session should be ignored
+        Viewer.on_session_event(other_session, {
+            type = "message_update",
+            assistantMessageEvent = { type = "text_delta", delta = "UNWANTED_OTHER" },
+        })
+        pump(100)
+
+        local buf = Viewer._history():buf()
+        local text = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+        assert.is_nil(text:find("UNWANTED_OTHER", 1, true))
+
+        -- Close viewer and send event for target session
+        Viewer.close()
+        Viewer.on_session_event(mock_session, {
+            type = "message_update",
+            assistantMessageEvent = { type = "text_delta", delta = "UNWANTED_CLOSED" },
+        })
+        pump(100)
+
+        assert.is_false(Viewer.is_open())
+        assert.is_false(Viewer.is_open_for(child_id))
+
+        Manifest.load = orig_load
+        Sessions.get_by_id = orig_get_by_id
+    end)
+
+    it("Sessions.handle_event forwards live events to subsession viewer", function()
+        local child_id = "child-fwd-1"
+        local rpc_cb = nil
+        local mock_session = {
+            id = child_id,
+            rpc = {
+                is_running = function()
+                    return true
+                end,
+                send = function(self, payload, cb)
+                    if payload.type == "get_messages" then
+                        rpc_cb = cb
+                        return true
+                    end
+                    return false
+                end,
+            },
+        }
+
+        local orig_load = Manifest.load
+        local orig_get_by_id = Sessions.get_by_id
+
+        Manifest.load = function()
+            return { [child_id] = { name = "Forward Worker", status = "active" } }
+        end
+        Sessions.get_by_id = function(id)
+            if id == child_id then
+                return mock_session
+            end
+            return nil
+        end
+
+        Viewer.open(child_id)
+        rpc_cb({
+            success = true,
+            data = { messages = { { role = "user", content = "Start forward test" } } },
+        })
+        pump(100)
+
+        -- Dispatch through Sessions.handle_event
+        Sessions.handle_event(mock_session, {
+            type = "message_update",
+            assistantMessageEvent = { type = "text_delta", delta = "forwarded stream text" },
+        })
+        pump(100)
+
+        local buf = Viewer._history():buf()
+        local text = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+        assert.is_truthy(text:find("forwarded stream text", 1, true))
+
+        Viewer.close()
+        Manifest.load = orig_load
+        Sessions.get_by_id = orig_get_by_id
+    end)
+
+    it("handles live user message_start and aborted message_end", function()
+        local child_id = "child-user-msg-1"
+        local rpc_cb = nil
+        local mock_session = {
+            id = child_id,
+            rpc = {
+                is_running = function()
+                    return true
+                end,
+                send = function(self, payload, cb)
+                    if payload.type == "get_messages" then
+                        rpc_cb = cb
+                        return true
+                    end
+                    return false
+                end,
+            },
+        }
+
+        local orig_load = Manifest.load
+        local orig_get_by_id = Sessions.get_by_id
+
+        Manifest.load = function()
+            return { [child_id] = { name = "User Msg Worker", status = "active" } }
+        end
+        Sessions.get_by_id = function(id)
+            if id == child_id then
+                return mock_session
+            end
+            return nil
+        end
+
+        Viewer.open(child_id)
+        rpc_cb({ success = true, data = { messages = {} } })
+        pump(100)
+
+        -- Live user message arrives
+        Viewer.on_session_event(mock_session, {
+            type = "message_start",
+            message = { role = "user", content = "Subsequent user instruction" },
+        })
+        pump(100)
+
+        -- Tool starts then gets aborted
+        Viewer.on_session_event(mock_session, {
+            type = "tool_execution_start",
+            toolName = "bash",
+            toolCallId = "call_abort_1",
+            args = { command = "sleep 10" },
+        })
+        Viewer.on_session_event(mock_session, {
+            type = "message_end",
+            message = { role = "assistant", stopReason = "aborted" },
+        })
+        pump(100)
+
+        local buf = Viewer._history():buf()
+        local text = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+        assert.is_truthy(text:find("Subsequent user instruction", 1, true))
+        assert.is_truthy(text:find("sleep 10", 1, true))
+
+        Viewer.close()
+        Manifest.load = orig_load
+        Sessions.get_by_id = orig_get_by_id
+    end)
 end)

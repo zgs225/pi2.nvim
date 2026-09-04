@@ -3389,6 +3389,13 @@ function History:on_bash_output(id, delta)
     self:_ensure_stream_timer()
 end
 
+--- Alias for on_bash_output matching the RPC event name.
+---@param id string
+---@param delta string
+function History:on_bash_update(id, delta)
+    self:on_bash_output(id, delta)
+end
+
 --- Render a coalesced output chunk into a bash block.
 ---@param block pi.BashBlock
 ---@param delta string

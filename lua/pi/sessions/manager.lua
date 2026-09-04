@@ -611,6 +611,17 @@ function M.handle_event(session, msg)
         end
     end
 
+    local SubsessionViewer = package.loaded["pi.ui.subsession_viewer"]
+    if
+        SubsessionViewer
+        and SubsessionViewer.is_open_for
+        and SubsessionViewer.on_session_event
+        and session.id
+        and SubsessionViewer.is_open_for(session.id)
+    then
+        SubsessionViewer.on_session_event(session, msg)
+    end
+
     if t == "agent_start" then
         mark_run_start(session)
         session._detached_retrying = false

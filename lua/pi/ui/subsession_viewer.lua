@@ -11,6 +11,7 @@ local Render = require("pi.ui.render")
 local Manifest = require("pi.subsessions.manifest")
 local Sessions = require("pi.sessions.manager")
 local Read = require("pi.subsessions.read")
+local Vision = require("pi.vision")
 
 ---@class pi.SubsessionViewerOpts
 ---@field on_close? fun()
@@ -22,6 +23,12 @@ local viewer_win = nil
 local viewer_history = nil
 ---@type string?
 local viewer_child_id = nil
+---@type string?
+local viewer_session_name = nil
+---@type boolean
+local viewer_loading = false
+---@type pi.RpcEvent[]?
+local viewer_event_queue = nil
 ---@type integer
 local viewer_tab_counter = -100
 ---@type fun()?
@@ -102,7 +109,7 @@ local function replay(history, messages)
                 end
             end
 
-            local parsed = require("pi.vision").parse(text)
+            local parsed = Vision.parse(text)
             if parsed.model then
                 if parsed.text ~= "" then
                     history:add_user_message(parsed.text, msg.timestamp, nil)
@@ -250,6 +257,10 @@ end
 
 --- Close the viewer float and clean up resources.
 function M.close()
+    viewer_loading = false
+    viewer_event_queue = nil
+    viewer_session_name = nil
+
     if viewer_win == nil and viewer_history == nil then
         return
     end
@@ -285,6 +296,148 @@ end
 ---@return boolean
 function M.is_open()
     return viewer_win ~= nil and vim.api.nvim_win_is_valid(viewer_win)
+end
+
+--- Check if viewer is currently open for a specific child session id.
+---@param child_id? string
+---@return boolean
+function M.is_open_for(child_id)
+    return M.is_open() and child_id ~= nil and viewer_child_id == child_id
+end
+
+--- Update the viewer window title.
+---@param name? string
+---@param status string
+function M.update_title(name, status)
+    if not viewer_win or not vim.api.nvim_win_is_valid(viewer_win) then
+        return
+    end
+    if name and name ~= "" then
+        viewer_session_name = name
+    end
+    local title_name = (viewer_session_name and viewer_session_name ~= "") and viewer_session_name
+        or (viewer_child_id or "subsession")
+    pcall(vim.api.nvim_win_set_config, viewer_win, {
+        title = format_title(title_name, status),
+        title_pos = "center",
+    })
+end
+
+--- Handle a live session event for the active viewer.
+---@param session pi.Session
+---@param msg pi.RpcEvent
+local function handle_live_event(session, msg)
+    local history = viewer_history
+    if not history then
+        return
+    end
+
+    local t = msg.type
+    if t == "agent_start" then
+        history:on_agent_start(nil)
+        M.update_title(viewer_session_name, "active")
+    elseif t == "message_start" then
+        local message = msg.message
+        if message and message.role == "user" then
+            local text = ""
+            local image_count = 0
+            if type(message.content) == "string" then
+                text = message.content
+            elseif type(message.content) == "table" then
+                for _, part in ipairs(message.content) do
+                    if type(part) == "string" then
+                        text = text .. part
+                    elseif type(part) == "table" and part.type == "text" then
+                        text = text .. (part.text or "")
+                    elseif type(part) == "table" and part.type == "image" then
+                        image_count = image_count + 1
+                    end
+                end
+            end
+
+            local parsed = Vision.parse(text)
+            if parsed.model then
+                if parsed.text ~= "" then
+                    history:add_user_message(parsed.text, message.timestamp, nil)
+                end
+                history:add_vision_block(parsed.model, parsed.description or "")
+            elseif text ~= "" or image_count > 0 then
+                history:add_user_message(text, message.timestamp, image_count > 0 and image_count or nil)
+            end
+        end
+    elseif t == "message_update" then
+        local ev = msg.assistantMessageEvent
+        if ev then
+            if ev.type == "thinking_start" then
+                history:on_thinking_start()
+            elseif ev.type == "thinking_delta" then
+                history:on_thinking_delta(ev.delta or "")
+            elseif ev.type == "thinking_end" then
+                history:on_thinking_end()
+            elseif ev.type == "text_delta" then
+                history:on_thinking_end()
+                history:on_text_delta(ev.delta or "")
+            end
+        end
+    elseif t == "tool_execution_start" then
+        local args = normalize_tool_args(msg.args) or msg.args
+        history:on_tool_start(msg.toolName or "tool", msg.toolCallId, args)
+    elseif t == "tool_execution_end" then
+        history:on_tool_end(msg.toolName or "tool", msg.toolCallId, msg.result, msg.isError)
+    elseif t == "tool_execution_update" then
+        history:on_tool_update(msg.toolName or "tool", msg.toolCallId, msg)
+    elseif t == "bash_execution_update" or msg.type == "bash_execution_update" then
+        history:on_bash_update(msg.id, msg.delta or "")
+    elseif t == "message_end" then
+        local message = msg.message
+        if message and message.role == "assistant" then
+            local stop = message.stopReason
+            if stop == "aborted" or stop == "error" then
+                local error_message
+                if stop == "aborted" then
+                    error_message = "[aborted] Operation aborted"
+                else
+                    error_message = message.errorMessage or "Error"
+                end
+                if type(history.mark_pending_tools_errored) == "function" then
+                    history:mark_pending_tools_errored(error_message)
+                end
+            end
+        end
+    elseif t == "agent_end" or t == "agent_settled" then
+        history:on_agent_end()
+        M.update_title(viewer_session_name, "completed")
+    end
+
+    if history:win() and vim.api.nvim_win_is_valid(history:win()) then
+        if type(history._maybe_scroll) == "function" then
+            history:_maybe_scroll()
+        elseif type(history.scroll_to_bottom) == "function" then
+            history:scroll_to_bottom()
+        end
+    end
+end
+
+--- Handle a live session event for the active viewer.
+---@param session pi.Session
+---@param msg pi.RpcEvent
+function M.on_session_event(session, msg)
+    if not session or not session.id or not M.is_open_for(session.id) then
+        return
+    end
+
+    if viewer_loading then
+        viewer_event_queue = viewer_event_queue or {}
+        viewer_event_queue[#viewer_event_queue + 1] = msg
+        return
+    end
+
+    vim.schedule(function()
+        if not session or not session.id or not M.is_open_for(session.id) then
+            return
+        end
+        handle_live_event(session, msg)
+    end)
 end
 
 --- Get the child_id currently being viewed.
@@ -361,6 +514,9 @@ function M.open(child_id, opts)
     viewer_win = win
     viewer_history = history
     viewer_child_id = child_id
+    viewer_session_name = name
+    viewer_loading = false
+    viewer_event_queue = nil
     viewer_on_close = opts.on_close
     history:set_win(win)
 
@@ -426,21 +582,36 @@ function M.open(child_id, opts)
     -- 6. Load messages (RPC or JSONL) and replay into ChatHistory
     if is_live and session and session.rpc then
         local current_child = child_id
+        viewer_loading = true
+        viewer_event_queue = {}
         local sent = session.rpc:send({ type = "get_messages" }, function(res)
             vim.schedule(function()
                 if not M.is_open() or viewer_child_id ~= current_child then
                     return
                 end
                 if not res.success then
+                    viewer_loading = false
+                    viewer_event_queue = nil
                     local err = res.error or "Failed to load subsession messages"
                     Notify.error(err)
                     return
                 end
                 local messages = (res.data or {}).messages or {}
                 replay(history, messages)
+                viewer_loading = false
+                local queue = viewer_event_queue or {}
+                viewer_event_queue = nil
+                for _, queued_msg in ipairs(queue) do
+                    if not M.is_open_for(current_child) then
+                        break
+                    end
+                    handle_live_event(session, queued_msg)
+                end
             end)
         end)
         if not sent then
+            viewer_loading = false
+            viewer_event_queue = nil
             Notify.error("Failed to request messages from subsession RPC")
         end
     else
@@ -469,6 +640,16 @@ end
 ---@return table[] messages, string? session_name
 function M._load_messages_from_jsonl(path)
     return load_messages_from_jsonl(path)
+end
+
+---@return boolean
+function M._loading()
+    return viewer_loading
+end
+
+---@return pi.RpcEvent[]?
+function M._event_queue()
+    return viewer_event_queue
 end
 
 return M
