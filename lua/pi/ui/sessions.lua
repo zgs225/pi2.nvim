@@ -284,7 +284,7 @@ function M.format_line(row, tick)
         count = (row.collapsed and row.child_count and row.child_count > 0) and (" (" .. row.child_count .. ")") or ""
         has_fold = true
     else
-        prefix = " "
+        prefix = "  "
     end
 
     local line = prefix .. dot .. " " .. (spinner and spinner .. " " or "") .. name .. subtitle .. count
@@ -971,7 +971,7 @@ refresh_current_markers = function()
                         and not row.error
                     local marker_on = row.status == "idle" or blink_tick % 2 == 0
                     if markable and marker_on then
-                        local col = row.marker_col or 2
+                        local col = row.marker_col or 3
                         local len = row.marker_len or 1
                         local ok, id = pcall(vim.api.nvim_win_call, win, function()
                             return vim.fn.matchaddpos("PiSessionsListCurrent", { { lnum, col, len } }, 20)

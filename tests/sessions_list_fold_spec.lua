@@ -189,7 +189,7 @@ describe("sub-session fold/unfold in :PiSessions", function()
             assert.is_true(rows[1].collapsed)
         end)
 
-        it("sessions with no sub-sessions format normally with 1 space prefix", function()
+        it("sessions with no sub-sessions format with 2 space prefix aligning with fold arrows", function()
             local parent = fake_session({ id = "parent-solo" })
             Manifest.children_of = function()
                 return {}
@@ -207,10 +207,51 @@ describe("sub-session fold/unfold in :PiSessions", function()
             assert.are.equal(0, rows[1].child_count)
 
             local line, chunks = SessionList.format_line(rows[1], 0)
-            assert.are.equal(" ● Solo", line)
+            assert.are.equal("  ● Solo", line)
             assert.are.equal(2, #chunks)
-            assert.are.equal(1, chunks[1][1])
+            assert.are.equal(2, chunks[1][1])
             assert.are.equal("Normal", chunks[2][3])
+        end)
+
+        it("aligns status dot vertically across parent (expanded/collapsed) and solo sessions", function()
+            local expanded_parent = {
+                has_children = true,
+                collapsed = false,
+                child_count = 2,
+                status = "idle",
+                attention = 0,
+                name = "parent-expanded",
+            }
+            local collapsed_parent = {
+                has_children = true,
+                collapsed = true,
+                child_count = 2,
+                status = "idle",
+                attention = 0,
+                name = "parent-collapsed",
+            }
+            local solo_session = {
+                has_children = false,
+                collapsed = false,
+                child_count = 0,
+                status = "idle",
+                attention = 0,
+                name = "solo",
+            }
+
+            local line_exp, chunks_exp = SessionList.format_line(expanded_parent, 0)
+            local line_col, chunks_col = SessionList.format_line(collapsed_parent, 0)
+            local line_sol, chunks_sol = SessionList.format_line(solo_session, 0)
+
+            -- All three lines place the dot at display column 3 (2 display columns prefix)
+            assert.are.equal(2, vim.fn.strdisplaywidth(line_exp:sub(1, chunks_exp[1][1])))
+            assert.are.equal(2, vim.fn.strdisplaywidth(line_col:sub(1, chunks_col[1][1])))
+            assert.are.equal(2, vim.fn.strdisplaywidth(line_sol:sub(1, chunks_sol[1][1])))
+
+            -- Names all start at display column 5 (2 cols prefix + 1 col dot + 1 space)
+            assert.are.equal(4, vim.fn.strdisplaywidth(line_exp:sub(1, chunks_exp[2][1])))
+            assert.are.equal(4, vim.fn.strdisplaywidth(line_col:sub(1, chunks_col[2][1])))
+            assert.are.equal(4, vim.fn.strdisplaywidth(line_sol:sub(1, chunks_sol[2][1])))
         end)
 
         it("active child view keeps parent expanded by default", function()

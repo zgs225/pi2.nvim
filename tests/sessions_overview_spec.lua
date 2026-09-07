@@ -226,11 +226,11 @@ describe("sessions overview", function()
         it("puts the dot at the left edge and the name right after it", function()
             local row = { tab = 1, status = "idle", attention = 0, name = "fix login" }
             local line, chunks = SessionList.format_line(row, 0)
-            assert.are.equal(" ● fix login", line)
+            assert.are.equal("  ● fix login", line)
             assert.are.equal(2, #chunks)
-            assert.are.equal(1, chunks[1][1]) -- one-cell left margin before the dot
+            assert.are.equal(2, chunks[1][1]) -- two-cell left margin before the dot
             assert.are.equal("●", line:sub(chunks[1][1] + 1, chunks[1][2]))
-            assert.are.equal(1 + #"●" + 1, chunks[2][1])
+            assert.are.equal(2 + #"●" + 1, chunks[2][1])
             assert.are.equal("Normal", chunks[2][3])
         end)
 
@@ -242,7 +242,7 @@ describe("sessions overview", function()
         it("animates the row while a title is being generated", function()
             local row = { tab = 1, status = "idle", attention = 0, name = nil, title_generating = true }
             local line, chunks = SessionList.format_line(row, 0)
-            assert.are.equal(" ● ⠋ …", line)
+            assert.are.equal("  ● ⠋ …", line)
             assert.are.equal(3, #chunks)
             -- dot, spinner, pending name
             assert.are.equal("PiSessionsListSpinner", chunks[2][3])
@@ -257,7 +257,7 @@ describe("sessions overview", function()
         it("animates an (unnamed) label while the title generates", function()
             local row = { tab = 1, status = "idle", attention = 0, name = "(unnamed)", title_generating = true }
             local line, chunks = SessionList.format_line(row, 0)
-            assert.are.equal(" ● ⠋ (unnamed)", line)
+            assert.are.equal("  ● ⠋ (unnamed)", line)
             assert.are.equal(3, #chunks)
             assert.are.equal("PiSessionsListSpinner", chunks[2][3])
         end)
@@ -268,7 +268,7 @@ describe("sessions overview", function()
             -- not flicker spinner + title twice.
             local row = { tab = 1, status = "idle", attention = 0, name = "fix login", title_generating = true }
             local line, chunks = SessionList.format_line(row, 0)
-            assert.are.equal(" ● fix login", line)
+            assert.are.equal("  ● fix login", line)
             assert.are.equal(2, #chunks)
         end)
 
@@ -277,7 +277,7 @@ describe("sessions overview", function()
                 { tab = 1, status = "idle", attention = 0, name = nil, title_generating = false },
                 7
             )
-            assert.are.equal(" ● …", line)
+            assert.are.equal("  ● …", line)
             assert.are.equal(2, #chunks)
         end)
 
@@ -676,7 +676,7 @@ describe("sessions overview", function()
                 assert.are.equal(1, s.send_count) -- redraw is not a retry trigger
 
                 local lines = vim.api.nvim_buf_get_lines(0, 0, -1, false)
-                assert.are.equal(" ● (unnamed)", lines[1])
+                assert.are.equal("  ● (unnamed)", lines[1])
             end)
             package.loaded["pi.sessions.manager"] = real_manager
             if not ok then
@@ -963,7 +963,7 @@ describe("sessions overview", function()
                 SessionList._render()
                 local m = marker_match(win)
                 assert.is_not_nil(m)
-                assert.same({ 1, 2, 3 }, m.pos1)
+                assert.same({ 1, 3, 3 }, m.pos1)
                 assert.are.equal("PiSessionsListBusy", dot_extmark_hl(bufnr, 1))
 
                 -- Off phase: no marker; the dot falls through to the dim
