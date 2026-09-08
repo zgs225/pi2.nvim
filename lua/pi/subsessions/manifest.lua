@@ -171,8 +171,9 @@ function M.lineage_for_session(session)
     if type(session.lineage_id) == "string" and session.lineage_id ~= "" then
         return session.lineage_id
     end
-    if type(session.id) == "string" and session.id ~= "" then
-        return M.resolve_lineage(session.id) or session.id
+    local id = session.id
+    if type(id) == "string" and id ~= "" then
+        return M.resolve_lineage(id) or id
     end
     return ""
 end
@@ -236,7 +237,7 @@ end
 
 ---@return string
 function M.iso_now()
-    return os.date("!%Y-%m-%dT%H:%M:%SZ")
+    return tostring(os.date("!%Y-%m-%dT%H:%M:%SZ"))
 end
 
 ---@param parent_id string Lineage id.

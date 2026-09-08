@@ -459,6 +459,7 @@ local defaults = {
         max_batch_size = 5,
         batch_timeout_ms = 300000,
         batch_ttl_hours = 24,
+        show_full_ids = false,
         sessions_list = {
             collapse_children = false,
             show_dormant = false,

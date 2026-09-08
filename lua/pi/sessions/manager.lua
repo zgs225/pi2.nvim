@@ -103,7 +103,7 @@ local tab_session_id = {}
 local next_temp_id = 0
 
 --- Load a session file into an existing RPC process (defined below).
----@type fun(session: pi.Session, session_path: string)
+---@type fun(session: pi.Session, session_path: string, opts?: pi.LoadSessionOpts, callback?: fun(ok: boolean))
 local load_session
 
 ---@return pi.TabId
@@ -236,8 +236,8 @@ local function bind_chat_to_session(session, chat, tab)
         end
     end
 
-    if session.attached_tab and session.attached_tab ~= tab then
-        local prev_tab = session.attached_tab
+    local prev_tab = session.attached_tab
+    if prev_tab and prev_tab ~= tab then
         if tab_session_id[prev_tab] == session.id then
             tab_session_id[prev_tab] = nil
         end

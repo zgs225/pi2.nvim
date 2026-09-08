@@ -461,6 +461,10 @@ local function run_batch(batch, parent)
         end
 
         local target = item.target
+        if not target then
+            M.complete_item(batch.id, item.ref, false, { error = "missing target" })
+            return
+        end
         local function send_to(child)
             local b = M.get(batch.id)
             if not b or b.status == "cancelled" then
@@ -762,9 +766,9 @@ function M.rebuild()
         local ts = created:match("^(%d%d%d%d%-%d%d%-%d%d)T")
         if ts then
             local y, m, d = ts:match("^(%d+)%-(%d+)%-(%d+)$")
-            if y and m and d then
-                local age_h = (now - os.time({ year = tonumber(y), month = tonumber(m), day = tonumber(d), hour = 0 }))
-                    / 3600
+            local ny, nm, nd = tonumber(y), tonumber(m), tonumber(d)
+            if ny and nm and nd then
+                local age_h = (now - os.time({ year = ny, month = nm, day = nd, hour = 0 })) / 3600
                 if age_h > ttl_hours and batch.status ~= "running" then
                     batches[id] = nil
                     changed = true

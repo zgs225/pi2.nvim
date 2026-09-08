@@ -605,7 +605,7 @@ function M.rebuild_statuses()
                     entry.status = "dormant"
                 end
             else
-                entry.last_active_at = os.date("!%Y-%m-%dT%H:%M:%SZ", vim.fn.getftime(path))
+                entry.last_active_at = tostring(os.date("!%Y-%m-%dT%H:%M:%SZ", vim.fn.getftime(path)))
                 local inferred = Read.infer_run_status(path)
                 if inferred == "completed" then
                     entry.status = "completed"
@@ -835,7 +835,10 @@ function M.sub_switch()
             return
         end
         local entry = children[idx]
-        local child_id = entry._id
+        local child_id = entry and entry._id
+        if not child_id then
+            return
+        end
         M.switch_to(child_id, function(ok, err)
             if not ok then
                 Notify.error(err or "switch failed")
@@ -911,7 +914,10 @@ function M.sub_view()
             return
         end
         local entry = children[idx]
-        local child_id = entry._id
+        local child_id = entry and entry._id
+        if not child_id then
+            return
+        end
         M.preview(child_id)
     end)
 end
