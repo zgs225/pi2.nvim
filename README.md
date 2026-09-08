@@ -29,10 +29,10 @@ https://github.com/user-attachments/assets/55080963-3066-44c2-9017-a81828033ef7
     <sub> Workflow demo </sub>
 </p>
 
-![pi2.nvim demo](assets/demo.gif)
+![Sub-agents orchestrated from :PiSessions](assets/subagents-demo.png)
 
 <p align="center">
-    <sub> pi2.nvim in action — agent reads, edits, and verifies a file with live streaming and <code>:PiTree</code> session navigation </sub>
+    <sub> Manage parallel sub-agents from one parent chat — each child runs on its own model under the <code>:PiSessions</code> tree, while a read-only viewer float streams the active child's thoughts and tool runs live, with context / model / thinking level in its footer statusline </sub>
 </p>
 
 <details>
@@ -112,6 +112,17 @@ https://github.com/user-attachments/assets/4d087f23-c459-496d-92b9-7540be7340ce
 
 https://github.com/user-attachments/assets/f210246a-2427-4fdb-b679-eeb6ceae4538
 </details>
+
+## Sub-sessions & sub-agents
+
+A session per tab is the baseline; `pi2.nvim` adds **sub-sessions** — a parent session can spawn parallel agent conversations, each an independent background `pi --mode rpc` process with its own session file, model, and thinking level. They are not extra tabs: they are delegable workers you steer from the same chat you work in.
+
+- **Reusable.** Children are first-class sessions, not fire-and-forget tasks — `:PiSubClose` makes a child *dormant* rather than gone: `list_subagents` still lists it and `dispatch_subagents({ target, message })` revives the same child. The manifest (`.pi2-subsessions.json`) persists the family tree across parent `/new`, resume, and Neovim restarts.
+- **Interactive.** Follow any child live or take over entirely: bind the tab to a child with `:PiSubSwitch` (or `<CR>` on its row) and return with `:PiSubParent` / `gp` (a `◂ 父：…` breadcrumb marks child views); a finished user-spawned child reports back into the parent chat (`[Sub-session "…" completed]`); `:PiAbort` cancels the parent's pending batches even while you are inside a child.
+- **Integrated with `:PiSessions`.** Children appear as indented rows under their parent with status dots and model badges — fold/unfold with `<Tab>` / `za` (`zM` / `zR` for all), recall hidden rows with `H`, and the row keys (`c` compact, `s` stats, `d` diff review, `f`/`C`/`t` fork/clone/tree) work on child rows too.
+- **Preview without switching.** `p` on a row — or `:PiSubView` — opens a read-only floating viewer that streams the child's turn as it happens: thoughts, tool calls, output — with a footer statusline showing context usage, active model, and thinking level.
+
+The parent agent also gets orchestration tools of its own (`dispatch_subagents`, `poll_subagents`, `wait_subagents`, `stop_subagents`), and both sides carry static system-prompt notes on how to behave. Full workflow, list keys, and `subagent.*` options: [Sub-sessions](doc/sessions.md#sub-sessions).
 
 ## Requirements
 
@@ -248,6 +259,11 @@ require("pi").setup({
 | `:PiClone` | Duplicate the current session branch into a new session file |
 | `:PiSessions` | Toggle the live sessions overview (all active sessions: name + busy/idle/attention) |
 | `:PiSessionStats` | Show the session stats dashboard: messages, tokens (with cache split), per-model cost breakdown, cache re-billed waste, context usage — plus the vision extension's own usage (`Extensions` section) |
+| `:PiSubNew` | Spawn a background sub-session with a task prompt (inherits model/thinking by default) |
+| `:PiSubSwitch` | Pick a child sub-session (including dormant) and switch the current tab's chat to it |
+| `:PiSubParent` | Return from a child sub-session view to the parent session |
+| `:PiSubClose` | Close the current sub-session's RPC process (session file retained) |
+| `:PiSubView` | View a child sub-session in a read-only float viewer with real-time streaming |
 | `:PiDiff` | Review the git diff of every file changed by the current session in one panel: file list + diff, grouped per git work tree |
 | `:PiToggleStartupDetails` | Toggle the startup block between compact and expanded |
 | `:PiToggleThinking` | Show or hide thinking blocks |
@@ -273,7 +289,7 @@ Detailed guides live in [`doc/`](doc/):
 | Doc | What's inside |
 | --- | --- |
 | [doc/usage.md](doc/usage.md) | Chat & layouts, prompt (submit/queue/abort), direct bash mode (`!`), prompt history & drafts, `@mentions`, slash commands, completion, attachments, zen mode, statusline, navigation, quickfix, tool blocks, models, thinking, markdown rendering, buffer reload, startup block |
-| [doc/sessions.md](doc/sessions.md) | One session per tab, storage & cwd scoping, continue/resume, session tree (`:PiTree`), fork/clone (`:PiFork`/`:PiClone`), sessions overview (`:PiSessions`), compaction |
+| [doc/sessions.md](doc/sessions.md) | One session per tab, storage & cwd scoping, continue/resume, sub-sessions (`:PiSub*`), session tree (`:PiTree`), fork/clone (`:PiFork`/`:PiClone`), sessions overview (`:PiSessions`), compaction |
 | [doc/diff-review.md](doc/diff-review.md) | Two-way diff review of agent edits, review notes, permission-extension protocol reference, session diff review (`:PiDiff`) |
 | [doc/attention.md](doc/attention.md) | Attention queue, dialogs, notifications, queue inspection API |
 | [doc/extensions.md](doc/extensions.md) | Extension UI routing, startup announcements, `on_widget` custom blocks, adapting non-upstream RPC backends |
@@ -322,6 +338,7 @@ Everything below is present in `pi2.nvim` and **not** in upstream `alex35mil/pi.
 
 **Sessions & editor integration**
 
+- [Sub-sessions & sub-agent orchestration](doc/sessions.md#sub-sessions) — run parallel background sub-sessions (`:PiSubNew`), switch between parent and children (`:PiSubSwitch`/`:PiSubParent`), inspect live streaming in a read-only float viewer (`:PiSubView`), with automatic manifest bookkeeping (`.pi2-subsessions.json`) and Agent tool integration.
 - [Sessions overview (`:PiSessions`)](doc/sessions.md#sessions-overview-pisessions) — a live, shared dashboard of every active session with animated status dots.
 - [Session tree navigation (`:PiTree`)](doc/sessions.md#session-tree-navigation-pitree) — jump back to any past conversation point, optionally summarizing the abandoned branch.
 - [Fork and clone (`:PiFork` / `:PiClone`)](doc/sessions.md#fork-and-clone) — rewind to a past user message and re-ask in a new session, or duplicate the whole current branch into a new session file, mirroring the TUI's `/fork` and `/clone`.
