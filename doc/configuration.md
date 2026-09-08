@@ -220,6 +220,7 @@ require("pi").setup({
             width = 0.7,              -- columns (>=1) or fraction of editor width (<1, default 0.7)
             height = 0.75,            -- lines (>=1) or fraction of editor height (<1, default 0.75)
             border = "rounded",       -- float border style (default "rounded")
+            statusline = true,        -- show statusline in float footer (context, model, thinking level)
         },
     },
 

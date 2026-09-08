@@ -1037,4 +1037,287 @@ describe("pi.ui.subsession_viewer", function()
         Manifest.load = orig_load
         Sessions.get_by_id = orig_get_by_id
     end)
+
+    it("formats statusline chunks with context, model, and thinking level", function()
+        local chunks, plain = Viewer._format_statusline({
+            model_id = "claude-3-5-sonnet",
+            model_provider = "anthropic",
+            model_context_window = 200000,
+            thinking_level = "high",
+            context_tokens = 25000,
+        })
+        assert.is_table(chunks)
+        assert.is_truthy(plain:find("claude-3-5-sonnet", 1, true))
+        assert.is_truthy(plain:find("high", 1, true))
+        assert.is_truthy(plain:find("12.5%/200k", 1, true))
+
+        -- Thinking off
+        local _, plain_off = Viewer._format_statusline({
+            model_id = "gpt-4o",
+            thinking_level = "off",
+        })
+        assert.is_truthy(plain_off:find("thinking off", 1, true))
+
+        -- Tokens only without context window
+        local _, plain_tokens = Viewer._format_statusline({
+            model_id = "deepseek",
+            context_tokens = 15000,
+        })
+        assert.is_truthy(plain_tokens:find("15k", 1, true))
+
+        -- High context warning thresholds
+        local chunks_warn = Viewer._format_statusline({
+            model_id = "claude",
+            model_context_window = 100000,
+            context_tokens = 75000, -- 75% > 70% warn
+        })
+        local found_warn_hl = false
+        for _, c in ipairs(chunks_warn) do
+            if c[2] == "PiStatusLineWarning" then
+                found_warn_hl = true
+            end
+        end
+        assert.is_true(found_warn_hl)
+
+        -- High context error thresholds
+        local chunks_err = Viewer._format_statusline({
+            model_id = "claude",
+            model_context_window = 100000,
+            context_tokens = 95000, -- 95% > 90% error
+        })
+        local found_err_hl = false
+        for _, c in ipairs(chunks_err) do
+            if c[2] == "PiStatusLineError" then
+                found_err_hl = true
+            end
+        end
+        assert.is_true(found_err_hl)
+    end)
+
+    it("parses model, thinking, and usage from dormant JSONL file", function()
+        local file_path = tmp_dir .. "/status_session.jsonl"
+        local lines = {
+            vim.json.encode({ type = "session", sessionId = "sess-status-1" }),
+            vim.json.encode({ type = "model_change", modelId = "gemini-flash", provider = "google" }),
+            vim.json.encode({ type = "thinking_level_change", thinkingLevel = "medium" }),
+            vim.json.encode({
+                type = "message",
+                message = {
+                    role = "assistant",
+                    usage = { input = 4000, output = 1000, cacheRead = 500, cacheWrite = 0 },
+                },
+            }),
+        }
+        local f = io.open(file_path, "w")
+        assert.is_not_nil(f)
+        f:write(table.concat(lines, "\n"))
+        f:close()
+
+        local msgs, session_name, status = Viewer._load_messages_from_jsonl(file_path)
+        assert.equals(1, #msgs)
+        assert.equals("gemini-flash", status.model_id)
+        assert.equals("google", status.model_provider)
+        assert.equals("medium", status.thinking_level)
+        assert.equals(5500, status.context_tokens)
+    end)
+
+    it("displays statusline in float footer when opening dormant session", function()
+        local child_id = "dormant-status-1"
+        local file_path = tmp_dir .. "/dormant_status.jsonl"
+        local lines = {
+            vim.json.encode({ type = "session", sessionId = child_id }),
+            vim.json.encode({ type = "session_info", name = "Status Worker" }),
+            vim.json.encode({ type = "model_change", modelId = "claude-3-7-sonnet" }),
+            vim.json.encode({ type = "thinking_level_change", thinkingLevel = "high" }),
+            vim.json.encode({
+                type = "message",
+                message = {
+                    role = "assistant",
+                    usage = { input = 10000, output = 2000, cacheRead = 0, cacheWrite = 0 },
+                },
+            }),
+        }
+        local f = io.open(file_path, "w")
+        assert.is_not_nil(f)
+        f:write(table.concat(lines, "\n"))
+        f:close()
+
+        local orig_load = Manifest.load
+        local orig_find_path = Read.find_path
+        Manifest.load = function()
+            return {
+                [child_id] = {
+                    name = "Status Worker",
+                    status = "dormant",
+                    config = { model = { id = "claude-3-7-sonnet" }, thinking_level = "high" },
+                },
+            }
+        end
+        Read.find_path = function(id)
+            if id == child_id then
+                return file_path
+            end
+            return nil
+        end
+
+        Viewer.open(child_id)
+        pump(100)
+
+        assert.is_true(Viewer.is_open())
+        local win = Viewer._win()
+        local cfg = vim.api.nvim_win_get_config(win)
+        assert.is_table(cfg.footer)
+        local footer_text = ""
+        for _, chunk in ipairs(cfg.footer) do
+            footer_text = footer_text .. chunk[1]
+        end
+        assert.is_truthy(footer_text:find("claude-3-7-sonnet", 1, true))
+        assert.is_truthy(footer_text:find("high", 1, true))
+        assert.is_truthy(footer_text:find("12k", 1, true))
+        assert.is_truthy(vim.wo[win].statusline:find("claude-3-7-sonnet", 1, true))
+
+        Viewer.close()
+        Manifest.load = orig_load
+        Read.find_path = orig_find_path
+    end)
+
+    it("respects statusline = false in subagent.viewer config and opts", function()
+        local child_id = "status-disabled-1"
+        local file_path = tmp_dir .. "/status_off.jsonl"
+        local lines = {
+            vim.json.encode({ type = "session", sessionId = child_id }),
+            vim.json.encode({ type = "model_change", modelId = "claude-3-7-sonnet" }),
+        }
+        local f = io.open(file_path, "w")
+        assert.is_not_nil(f)
+        f:write(table.concat(lines, "\n"))
+        f:close()
+
+        local orig_load = Manifest.load
+        local orig_find_path = Read.find_path
+        Manifest.load = function()
+            return { [child_id] = { name = "Worker", status = "dormant" } }
+        end
+        Read.find_path = function()
+            return file_path
+        end
+
+        Viewer.open(child_id, { statusline = false })
+        pump(100)
+
+        local win = Viewer._win()
+        local cfg = vim.api.nvim_win_get_config(win)
+        assert.is_nil(cfg.footer)
+
+        Viewer.close()
+        Manifest.load = orig_load
+        Read.find_path = orig_find_path
+    end)
+
+    it("updates statusline when live RPC get_state, get_messages, and live events arrive", function()
+        local child_id = "child-live-status-1"
+        local rpc_cbs = {}
+        local mock_session = {
+            id = child_id,
+            rpc = {
+                is_running = function()
+                    return true
+                end,
+                send = function(self, payload, cb)
+                    rpc_cbs[payload.type] = cb
+                    return true
+                end,
+            },
+        }
+
+        local orig_load = Manifest.load
+        local orig_get_by_id = Sessions.get_by_id
+        Manifest.load = function()
+            return { [child_id] = { name = "Live Status Worker", status = "active" } }
+        end
+        Sessions.get_by_id = function(id)
+            if id == child_id then
+                return mock_session
+            end
+            return nil
+        end
+
+        Viewer.open(child_id)
+        assert.is_not_nil(rpc_cbs["get_state"])
+        assert.is_not_nil(rpc_cbs["get_messages"])
+
+        -- get_state responds
+        rpc_cbs["get_state"]({
+            success = true,
+            data = {
+                model = { id = "gpt-4o", provider = "openai", contextWindow = 128000 },
+                thinkingLevel = "low",
+            },
+        })
+        pump(50)
+
+        local st = Viewer._status()
+        assert.equals("gpt-4o", st.model_id)
+        assert.equals("openai", st.model_provider)
+        assert.equals(128000, st.model_context_window)
+        assert.equals("low", st.thinking_level)
+
+        -- get_messages responds with usage
+        rpc_cbs["get_messages"]({
+            success = true,
+            data = {
+                messages = {
+                    {
+                        role = "assistant",
+                        usage = { input = 20000, output = 5600, cacheRead = 0, cacheWrite = 0 },
+                    },
+                },
+            },
+        })
+        pump(50)
+
+        assert.equals(25600, Viewer._status().context_tokens)
+        local win = Viewer._win()
+        local cfg = vim.api.nvim_win_get_config(win)
+        local footer_text = ""
+        for _, chunk in ipairs(cfg.footer) do
+            footer_text = footer_text .. chunk[1]
+        end
+        assert.is_truthy(footer_text:find("gpt-4o", 1, true))
+        assert.is_truthy(footer_text:find("low", 1, true))
+        assert.is_truthy(footer_text:find("20.0%/128k", 1, true))
+
+        -- Live event: message_end with higher usage
+        Viewer.on_session_event(mock_session, {
+            type = "message_end",
+            message = {
+                role = "assistant",
+                usage = { input = 50000, output = 14000, cacheRead = 0, cacheWrite = 0 },
+            },
+        })
+        pump(50)
+        assert.equals(64000, Viewer._status().context_tokens)
+
+        -- Live event: thinking_level_change
+        Viewer.on_session_event(mock_session, {
+            type = "thinking_level_change",
+            thinkingLevel = "high",
+        })
+        pump(50)
+        assert.equals("high", Viewer._status().thinking_level)
+
+        -- Live event: model_change
+        Viewer.on_session_event(mock_session, {
+            type = "model_change",
+            modelId = "claude-3-5",
+            contextWindow = 200000,
+        })
+        pump(50)
+        assert.equals("claude-3-5", Viewer._status().model_id)
+        assert.equals(200000, Viewer._status().model_context_window)
+
+        Viewer.close()
+        Manifest.load = orig_load
+        Sessions.get_by_id = orig_get_by_id
+    end)
 end)

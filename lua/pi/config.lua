@@ -273,6 +273,7 @@
 ---@field width? number Width in columns (>=1) or fraction of editor width (<1, default 0.7)
 ---@field height? number Height in lines (>=1) or fraction of editor height (<1, default 0.75)
 ---@field border? string|string[] Float border style (default "rounded")
+---@field statusline? boolean Show statusline in viewer footer (default true)
 
 ---@class pi.SubagentConfig
 ---@field enabled? boolean Inject subagent.ts extension (default true)
@@ -468,6 +469,7 @@ local defaults = {
             width = 0.7,
             height = 0.75,
             border = "rounded",
+            statusline = true,
         },
     },
     vision = {},

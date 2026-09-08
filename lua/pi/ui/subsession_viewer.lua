@@ -13,12 +13,22 @@ local Manifest = require("pi.subsessions.manifest")
 local Sessions = require("pi.sessions.manager")
 local Read = require("pi.subsessions.read")
 local Vision = require("pi.vision")
+local Stats = require("pi.stats")
 
 ---@class pi.SubsessionViewerOpts
 ---@field on_close? fun()
 ---@field width? number Width in columns (>=1) or fraction of editor width (<1)
 ---@field height? number Height in lines (>=1) or fraction of editor height (<1)
 ---@field border? string|string[] Float border style
+---@field statusline? boolean Whether to show statusline in viewer footer
+
+---@class pi.SubsessionViewerStatus
+---@field model_id string?
+---@field model_provider string?
+---@field model_context_window integer?
+---@field model_reasoning boolean?
+---@field thinking_level string?
+---@field context_tokens integer?
 
 -- Module state
 ---@type integer?
@@ -37,6 +47,17 @@ local viewer_event_queue = nil
 local viewer_tab_counter = -100
 ---@type fun()?
 local viewer_on_close = nil
+---@type boolean
+local viewer_statusline_enabled = true
+---@type pi.SubsessionViewerStatus
+local viewer_status = {
+    model_id = nil,
+    model_provider = nil,
+    model_context_window = nil,
+    model_reasoning = nil,
+    thinking_level = nil,
+    context_tokens = nil,
+}
 
 --- Resolve a dimension (columns/lines) from a config value; values < 1 are
 --- fractions of the available space.
@@ -48,6 +69,146 @@ local function resolve_dimension(value, available)
         return math.max(1, math.floor(available * value))
     end
     return math.max(1, math.floor(value))
+end
+
+--- Get status line config for a built-in component.
+---@param name string
+---@return table
+local function component_config(name)
+    local components = ((Config.options.statusline or {}).components or {})
+    local cfg = components[name]
+    return type(cfg) == "table" and cfg or {}
+end
+
+---@param status pi.SubsessionViewerStatus
+---@return string[]?
+local function build_context_chunk(status)
+    local text = nil
+    local hl = "PiStatusLine"
+    local cfg = component_config("context")
+    if status.model_context_window and status.model_context_window > 0 then
+        local total = Stats.format_tokens(status.model_context_window)
+        if status.context_tokens and status.context_tokens > 0 then
+            local pct = (status.context_tokens / status.model_context_window) * 100
+            text = string.format("%.1f%%/%s", pct, total)
+            if cfg.error and pct > cfg.error then
+                hl = "PiStatusLineError"
+            elseif cfg.warn and pct > cfg.warn then
+                hl = "PiStatusLineWarning"
+            end
+        else
+            text = "-/" .. total
+        end
+    elseif status.context_tokens and status.context_tokens > 0 then
+        text = Stats.format_tokens(status.context_tokens)
+    end
+    if not text then
+        return nil
+    end
+    local icon = cfg.icon
+    if type(icon) == "string" and icon ~= "" then
+        text = icon .. " " .. text
+    end
+    return { text, hl }
+end
+
+---@param status pi.SubsessionViewerStatus
+---@return string[]?
+local function build_model_chunk(status)
+    if not status.model_id or status.model_id == "" then
+        return nil
+    end
+    local cfg = component_config("model")
+    local text = status.model_id
+    if cfg.provider == "always" and status.model_provider and status.model_provider ~= "" then
+        text = text .. "  [" .. status.model_provider .. "]"
+    end
+    local icon = cfg.icon
+    if type(icon) == "string" and icon ~= "" then
+        text = icon .. " " .. text
+    end
+    return { text, "PiStatusLine" }
+end
+
+---@param status pi.SubsessionViewerStatus
+---@return string[]?
+local function build_thinking_chunk(status)
+    if not status.thinking_level or status.thinking_level == "" then
+        return nil
+    end
+    local cfg = component_config("thinking")
+    local text = status.thinking_level == "off" and "thinking off" or status.thinking_level
+    local icon = cfg.icon
+    if type(icon) == "string" and icon ~= "" then
+        text = icon .. " " .. text
+    end
+    return { text, "PiThinking" }
+end
+
+--- Build statusline chunks and plain text for subsession viewer footer.
+---@param status pi.SubsessionViewerStatus
+---@return string[][]? chunks
+---@return string plain
+local function format_statusline(status)
+    if viewer_statusline_enabled == false then
+        return nil, ""
+    end
+
+    local items = {}
+    local c = build_context_chunk(status)
+    if c then
+        items[#items + 1] = c
+    end
+    local m = build_model_chunk(status)
+    if m then
+        items[#items + 1] = m
+    end
+    local th = build_thinking_chunk(status)
+    if th then
+        items[#items + 1] = th
+    end
+
+    if #items == 0 then
+        return nil, ""
+    end
+
+    ---@type string[][]
+    local chunks = { { " ", "PiStatusLine" } }
+    local plain_parts = {}
+    for i, item in ipairs(items) do
+        if i > 1 then
+            chunks[#chunks + 1] = { "  ·  ", "PiStatusLine" }
+            plain_parts[#plain_parts + 1] = "  ·  "
+        end
+        chunks[#chunks + 1] = item
+        plain_parts[#plain_parts + 1] = item[1]
+    end
+    chunks[#chunks + 1] = { " ", "PiStatusLine" }
+
+    local plain = " " .. table.concat(plain_parts, "") .. " "
+    return chunks, plain
+end
+
+--- Try to find contextWindow for a model across known sessions / cache.
+---@param model_id string?
+---@param provider string?
+---@return integer?
+local function resolve_context_window(model_id, provider)
+    if not model_id or model_id == "" then
+        return nil
+    end
+    for _, sess in ipairs(Sessions.list_all()) do
+        if sess._models_cache and type(sess._models_cache.list) == "table" then
+            for _, m in ipairs(sess._models_cache.list) do
+                if m.id == model_id and (not provider or m.provider == provider) then
+                    if type(m.contextWindow) == "number" and m.contextWindow > 0 then
+                        return m.contextWindow
+                    end
+                end
+            end
+        end
+    end
+    return nil
 end
 
 ---@param name string
@@ -236,23 +397,56 @@ local function replay(history, messages)
 end
 
 ---@param path string
----@return table[] messages, string? session_name
+---@return table[] messages, string? session_name, table status
 local function load_messages_from_jsonl(path)
     local file = io.open(path, "r")
     if not file then
-        return {}, nil
+        return {}, nil, {}
     end
     ---@type table[]
     local messages = {}
     ---@type string?
     local session_name = nil
+    local status = {}
     for line in file:lines() do
         if line ~= "" then
             local ok, entry = pcall(vim.json.decode, line)
             if ok and type(entry) == "table" then
                 local t = entry.type
                 if t == "message" and type(entry.message) == "table" then
-                    messages[#messages + 1] = entry.message
+                    local msg = entry.message
+                    messages[#messages + 1] = msg
+                    if msg.role == "assistant" then
+                        local u = (type(msg.usage) == "table" and msg.usage)
+                            or (type(entry.usage) == "table" and entry.usage)
+                        if u and (u.input or 0) > 0 then
+                            status.context_tokens = (u.input or 0)
+                                + (u.output or 0)
+                                + (u.cacheRead or 0)
+                                + (u.cacheWrite or 0)
+                        end
+                        local m = msg.model or entry.model or entry.modelId
+                        if m and type(m) == "string" and m ~= "" then
+                            status.model_id = m
+                        end
+                        local p = msg.provider or entry.provider
+                        if p and type(p) == "string" and p ~= "" then
+                            status.model_provider = p
+                        end
+                    end
+                elseif t == "model_change" then
+                    local m = entry.modelId or entry.model
+                    if m and type(m) == "string" and m ~= "" then
+                        status.model_id = m
+                    end
+                    local p = entry.provider
+                    if p and type(p) == "string" and p ~= "" then
+                        status.model_provider = p
+                    end
+                elseif t == "thinking_level_change" then
+                    if entry.thinkingLevel and type(entry.thinkingLevel) == "string" then
+                        status.thinking_level = entry.thinkingLevel
+                    end
                 elseif t == "compaction_summary" then
                     messages[#messages + 1] = {
                         role = "compactionSummary",
@@ -268,7 +462,7 @@ local function load_messages_from_jsonl(path)
         end
     end
     file:close()
-    return messages, session_name
+    return messages, session_name, status
 end
 
 --- Close the viewer float and clean up resources.
@@ -276,6 +470,15 @@ function M.close()
     viewer_loading = false
     viewer_event_queue = nil
     viewer_session_name = nil
+    viewer_statusline_enabled = true
+    viewer_status = {
+        model_id = nil,
+        model_provider = nil,
+        model_context_window = nil,
+        model_reasoning = nil,
+        thinking_level = nil,
+        context_tokens = nil,
+    }
 
     if viewer_win == nil and viewer_history == nil then
         return
@@ -337,6 +540,48 @@ function M.update_title(name, status)
         title = format_title(title_name, status),
         title_pos = "center",
     })
+end
+
+--- Update the viewer window statusline / footer.
+function M.update_statusline()
+    if not viewer_win or not vim.api.nvim_win_is_valid(viewer_win) then
+        return
+    end
+    if viewer_statusline_enabled == false then
+        pcall(vim.api.nvim_win_set_config, viewer_win, {
+            footer = "",
+            footer_pos = "center",
+        })
+        pcall(function()
+            if viewer_win and vim.api.nvim_win_is_valid(viewer_win) then
+                vim.wo[viewer_win].statusline = ""
+            end
+        end)
+        return
+    end
+
+    local chunks, plain = format_statusline(viewer_status)
+    if chunks and #chunks > 0 then
+        pcall(vim.api.nvim_win_set_config, viewer_win, {
+            footer = chunks,
+            footer_pos = "center",
+        })
+        pcall(function()
+            if viewer_win and vim.api.nvim_win_is_valid(viewer_win) then
+                vim.wo[viewer_win].statusline = plain or ""
+            end
+        end)
+    else
+        pcall(vim.api.nvim_win_set_config, viewer_win, {
+            footer = "",
+            footer_pos = "center",
+        })
+        pcall(function()
+            if viewer_win and vim.api.nvim_win_is_valid(viewer_win) then
+                vim.wo[viewer_win].statusline = ""
+            end
+        end)
+    end
 end
 
 --- Handle a live session event for the active viewer.
@@ -408,6 +653,16 @@ local function handle_live_event(session, msg)
         local message = msg.message
         if message and message.role == "assistant" then
             local stop = message.stopReason
+            if stop ~= "aborted" and stop ~= "error" and type(message.usage) == "table" then
+                local u = message.usage
+                if (u.input or 0) > 0 then
+                    viewer_status.context_tokens = (u.input or 0)
+                        + (u.output or 0)
+                        + (u.cacheRead or 0)
+                        + (u.cacheWrite or 0)
+                    M.update_statusline()
+                end
+            end
             if stop == "aborted" or stop == "error" then
                 local error_message
                 if stop == "aborted" then
@@ -423,6 +678,26 @@ local function handle_live_event(session, msg)
     elseif t == "agent_end" or t == "agent_settled" then
         history:on_agent_end()
         M.update_title(viewer_session_name, "completed")
+        M.update_statusline()
+    elseif t == "model_change" then
+        if msg.modelId then
+            viewer_status.model_id = msg.modelId
+        end
+        if msg.provider then
+            viewer_status.model_provider = msg.provider
+        end
+        if msg.contextWindow then
+            viewer_status.model_context_window = msg.contextWindow
+        else
+            viewer_status.model_context_window =
+                resolve_context_window(viewer_status.model_id, viewer_status.model_provider)
+        end
+        M.update_statusline()
+    elseif t == "thinking_level_change" then
+        if msg.thinkingLevel then
+            viewer_status.thinking_level = msg.thinkingLevel
+            M.update_statusline()
+        end
     end
 
     if history:win() and vim.api.nvim_win_is_valid(history:win()) then
@@ -476,10 +751,43 @@ function M.open(child_id, opts)
     local entry = manifest[child_id]
     local name = (entry and entry.name and entry.name ~= "") and entry.name or child_id
 
+    viewer_status = {
+        model_id = nil,
+        model_provider = nil,
+        model_context_window = nil,
+        model_reasoning = nil,
+        thinking_level = nil,
+        context_tokens = nil,
+    }
+
+    if entry and entry.config then
+        local cfg = entry.config
+        if cfg.model then
+            viewer_status.model_id = cfg.model.id
+            viewer_status.model_provider = cfg.model.provider
+        end
+        if cfg.thinking_level then
+            viewer_status.thinking_level = cfg.thinking_level
+        end
+    end
+
     -- 3. Determine if live (Sessions.get_by_id) or dormant (disk)
     local session = Sessions.get_by_id(child_id)
     local is_live = session ~= nil and session.rpc ~= nil and session.rpc:is_running()
     local status = (entry and entry.status) or (is_live and "active" or "dormant")
+
+    if session then
+        local pin = session.pinned_config
+        if pin then
+            if pin.model then
+                viewer_status.model_id = pin.model.id
+                viewer_status.model_provider = pin.model.provider
+            end
+            if pin.thinking_level then
+                viewer_status.thinking_level = pin.thinking_level
+            end
+        end
+    end
 
     -- For dormant sessions, verify the session file exists before opening window
     local dormant_messages = nil
@@ -492,11 +800,30 @@ function M.open(child_id, opts)
             Notify.warn("Sub-session file not found")
             return
         end
-        local msgs, session_name = load_messages_from_jsonl(path)
+        local msgs, session_name, jsonl_status = load_messages_from_jsonl(path)
         dormant_messages = msgs
         if session_name and (not entry or not entry.name or entry.name == "") then
             name = session_name
         end
+        if jsonl_status then
+            if jsonl_status.model_id then
+                viewer_status.model_id = jsonl_status.model_id
+            end
+            if jsonl_status.model_provider then
+                viewer_status.model_provider = jsonl_status.model_provider
+            end
+            if jsonl_status.thinking_level then
+                viewer_status.thinking_level = jsonl_status.thinking_level
+            end
+            if jsonl_status.context_tokens then
+                viewer_status.context_tokens = jsonl_status.context_tokens
+            end
+        end
+    end
+
+    if not viewer_status.model_context_window and viewer_status.model_id then
+        viewer_status.model_context_window =
+            resolve_context_window(viewer_status.model_id, viewer_status.model_provider)
     end
 
     -- 4. Create ChatHistory with fake tab id
@@ -509,6 +836,12 @@ function M.open(child_id, opts)
     -- 5. Open float window, set keymaps
     local subagent_cfg = Config.options.subagent or {}
     local viewer_cfg = subagent_cfg.viewer or {}
+    if opts.statusline ~= nil then
+        viewer_statusline_enabled = opts.statusline
+    else
+        viewer_statusline_enabled = (viewer_cfg.statusline ~= false)
+    end
+
     local raw_w = opts.width or viewer_cfg.width or 0.7
     local raw_h = opts.height or viewer_cfg.height or 0.75
     local border = opts.border or viewer_cfg.border or "rounded"
@@ -522,8 +855,9 @@ function M.open(child_id, opts)
     local row = math.max(0, math.floor((editor_h - height) / 2))
     local col = math.floor((editor_w - width) / 2)
     local title = format_title(name, status)
+    local initial_chunks, initial_plain = format_statusline(viewer_status)
 
-    local win = vim.api.nvim_open_win(buf, true, {
+    local win_opts = {
         relative = "editor",
         row = row,
         col = col,
@@ -533,7 +867,22 @@ function M.open(child_id, opts)
         border = border,
         title = title,
         title_pos = "center",
-    })
+    }
+    if viewer_statusline_enabled and initial_chunks and #initial_chunks > 0 then
+        win_opts.footer = initial_chunks
+        win_opts.footer_pos = "center"
+    end
+
+    local win = vim.api.nvim_open_win(buf, true, win_opts)
+    if viewer_statusline_enabled and initial_plain and initial_plain ~= "" then
+        pcall(function()
+            vim.wo[win].statusline = initial_plain
+        end)
+    else
+        pcall(function()
+            vim.wo[win].statusline = ""
+        end)
+    end
 
     viewer_win = win
     viewer_history = history
@@ -608,6 +957,29 @@ function M.open(child_id, opts)
         local current_child = child_id
         viewer_loading = true
         viewer_event_queue = {}
+
+        session.rpc:send({ type = "get_state" }, function(state_res)
+            vim.schedule(function()
+                if not M.is_open_for(current_child) then
+                    return
+                end
+                local d = state_res.data
+                if state_res.success and type(d) == "table" then
+                    local m = d.model
+                    if type(m) == "table" then
+                        viewer_status.model_id = m.id
+                        viewer_status.model_provider = m.provider
+                        viewer_status.model_context_window = m.contextWindow
+                        viewer_status.model_reasoning = m.reasoning == true
+                    end
+                    if d.thinkingLevel then
+                        viewer_status.thinking_level = d.thinkingLevel
+                    end
+                    M.update_statusline()
+                end
+            end)
+        end)
+
         local sent = session.rpc:send({ type = "get_messages" }, function(res)
             vim.schedule(function()
                 if not M.is_open() or viewer_child_id ~= current_child then
@@ -621,6 +993,28 @@ function M.open(child_id, opts)
                     return
                 end
                 local messages = (res.data or {}).messages or {}
+                for _, msg in ipairs(messages) do
+                    if msg.role == "assistant" then
+                        local u = msg.usage
+                        if type(u) == "table" and (u.input or 0) > 0 then
+                            viewer_status.context_tokens = (u.input or 0)
+                                + (u.output or 0)
+                                + (u.cacheRead or 0)
+                                + (u.cacheWrite or 0)
+                        end
+                        if msg.model and not viewer_status.model_id then
+                            viewer_status.model_id = msg.model
+                        end
+                        if msg.provider and not viewer_status.model_provider then
+                            viewer_status.model_provider = msg.provider
+                        end
+                    end
+                end
+                if not viewer_status.model_context_window and viewer_status.model_id then
+                    viewer_status.model_context_window =
+                        resolve_context_window(viewer_status.model_id, viewer_status.model_provider)
+                end
+                M.update_statusline()
                 replay(history, messages)
                 viewer_loading = false
                 local queue = viewer_event_queue or {}
@@ -661,7 +1055,7 @@ function M._replay(history, messages)
 end
 
 ---@param path string
----@return table[] messages, string? session_name
+---@return table[] messages, string? session_name, table? status
 function M._load_messages_from_jsonl(path)
     return load_messages_from_jsonl(path)
 end
@@ -674,6 +1068,17 @@ end
 ---@return pi.RpcEvent[]?
 function M._event_queue()
     return viewer_event_queue
+end
+
+---@return pi.SubsessionViewerStatus
+function M._status()
+    return viewer_status
+end
+
+---@param status? pi.SubsessionViewerStatus
+---@return string[][]? chunks, string plain
+function M._format_statusline(status)
+    return format_statusline(status or viewer_status)
 end
 
 return M

@@ -2,6 +2,7 @@
 
 ## 2026-09-08
 
+- **ADDED:** Sub-session viewer statusline — the read-only floating viewer (opened with `p` in `:PiSessions` or `:PiSubView`) now renders a statusline in the float's footer displaying the sub-session's context usage (tokens and context window percentage with warn/error thresholds), active model (with provider prefix/suffix), and thinking level. Updates live on `get_state`, message usage, and model/thinking change events. Configurable via `subagent.viewer.statusline` (default `true`).
 - **ADDED:** Sub-agent system-prompt injection — parent RPC processes get a byte-constant orchestration note and child sub-sessions a byte-constant worker note (new bundled `extensions/subagent-child.ts`), both appended via the `before_agent_start` hook. Parents are taught the delegation discipline (reuse children via `{ target, message }`, fan out in one dispatch, collect by `batch_id`); children are told there is no interactive user, their last message is the final report, questions are impossible, task scope is strict, and nested sub-agents are unavailable. Byte-identical text keeps pi's prompt-cache prefix stable across turns; `subagent.enabled = false` injects neither.
 - **FIXED:** Sub-sessions in `:PiSessions` no longer bypass completed/dormant filters just because their backend RPC process remains alive. Settled agent workers, acknowledged user completions, and `show_completed = "none"` now correctly hide idle children; running children keep their live visibility while actively busy or compacting.
 
