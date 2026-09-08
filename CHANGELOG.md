@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-09-08
+
+- **ADDED:** Dedicated history renderers, Nerd Font icons, and tree view (`:PiTree`) preview support for pi's built-in read-only tools (`grep`, `find`, `ls`):
+  - `grep`: compact input summary line `/{pattern}/ in {path}` with optional `({glob})` filter and `limit {limit}`, magnify icon (`󰍉`), and auto-collapse on multi-line results.
+  - `find`: compact input summary line `{pattern} in {path}` with optional `(limit {limit})`, file-search icon (`󰡩`), and `glob` legacy alias support.
+  - `ls`: compact input summary line `{path}` (defaults to `.`) with optional `(limit {limit})`, folder icon (`󰉋`), and auto-collapse.
+  - Tree view (`:PiTree`): recognizes arguments for `grep` (pattern), `find` (pattern/path), and `ls` (path, defaulting to `.`) to show helpful single-line previews on tool turns. Issue #105.
+
 ## 2026-09-03
 
 - **FIXED:** Pasting into the prompt no longer inserts literal `^[[106;5u` (Kitty CSI-u Ctrl+J) or the xterm `^[[27;5;106~` / Shift+Enter `^[[13;2u` encodings in place of newlines. Streamed paste chunks that split a sequence are rejoined. Image-paste interception is unchanged and still prompt-only.
