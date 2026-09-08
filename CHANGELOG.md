@@ -2,19 +2,14 @@
 
 ## 2026-09-08
 
+- **ADDED:** Dedicated history renderers, Nerd Font icons, and tree view (`:PiTree`) preview support for pi's built-in read-only tools (`grep`, `find`, `ls`):
+  - `grep`: compact input summary line `/{pattern}/ in {path}` with optional `({glob})` filter and `limit {limit}`, magnify icon (`󰍉`), and auto-collapse on multi-line results.
+  - `find`: compact input summary line `{pattern} in {path}` with optional `(limit {limit})`, file-search icon (`󰡩`), and `glob` legacy alias support.
+  - `ls`: compact input summary line `{path}` (defaults to `.`) with optional `(limit {limit})`, folder icon (`󰉋`), and auto-collapse.
+  - Tree view (`:PiTree`): recognizes arguments for `grep` (pattern), `find` (pattern/path), and `ls` (path, defaulting to `.`) to show helpful single-line previews on tool turns. Issue #105.
 - **ADDED:** Sub-session viewer statusline — the read-only floating viewer (opened with `p` in `:PiSessions` or `:PiSubView`) now renders a statusline in the float's footer displaying the sub-session's context usage (tokens and context window percentage with warn/error thresholds), active model (with provider prefix/suffix), and thinking level. Updates live on `get_state`, message usage, and model/thinking change events. Configurable via `subagent.viewer.statusline` (default `true`).
 - **ADDED:** Sub-agent system-prompt injection — parent RPC processes get a byte-constant orchestration note and child sub-sessions a byte-constant worker note (new bundled `extensions/subagent-child.ts`), both appended via the `before_agent_start` hook. Parents are taught the delegation discipline (reuse children via `{ target, message }`, fan out in one dispatch, collect by `batch_id`); children are told there is no interactive user, their last message is the final report, questions are impossible, task scope is strict, and nested sub-agents are unavailable. Byte-identical text keeps pi's prompt-cache prefix stable across turns; `subagent.enabled = false` injects neither.
 - **FIXED:** Sub-sessions in `:PiSessions` no longer bypass completed/dormant filters just because their backend RPC process remains alive. Settled agent workers, acknowledged user completions, and `show_completed = "none"` now correctly hide idle children; running children keep their live visibility while actively busy or compacting.
-
-## 2026-09-04
-
-- **ADDED:** Sub-session fold / unfold in `:PiSessions` — collapse and expand child rows under their parent session row. Parent rows with sub-sessions show fold indicators (`▾` expanded, `▸` collapsed with child count badge `(N)`). Controlled by `<Tab>` / `za` to toggle the fold under cursor (on a child row: collapses its parent and moves cursor to the parent), `zM` to collapse all, and `zR` to expand all. Default collapse behavior is configurable via `sessions_list.collapse_subsessions` or `subagent.sessions_list.collapse_children`; actively viewed sub-sessions in the current tab keep their parent expanded by default.
-- **CHANGED:** Sub-session rows in `:PiSessions` now stop at the model subtitle instead of rendering a trailing completion icon (`✉`).
-- **ADDED:** `:PiSubView` and `pi.sub_view()` — view a sub-session's full rendered conversation in a read-only floating window without rebinding the tab's chat. In `:PiSessions`, `p` now opens this rich viewer with real-time streaming for active runs, markdown rendering, folding tool/thinking blocks, `q`/`<Esc>` to close, and `<CR>` to promote the sub-session to the active tab view. Float geometry defaults to a compact 70% width / 75% height and is configurable via `subagent.viewer` (`width`, `height`, `border`).
-- **FIXED:** `:PiAbort` issued while viewing a sub-session now reaches the whole chain: the parent session also receives the abort, and running batches are cancelled for both the child's and the parent's lineage. A batch cancelled while a child is still spawning aborts and closes that late child instead of leaking an orphan process that occupies a `max_children` slot.
-- **FIXED:** `:PiAbort` now cancels a `wait_subagents` wait on a batch recorded under a different lineage (e.g. a stale `batch_id` after resume/fork): batch waiters record their owner lineage and `cancel_for_parent` matches it, so the pending host select is answered instead of hanging until `subagent.batch_timeout_ms`.
-- **FIXED:** `extensions/subagent.ts` forwards the tool `AbortSignal` to the host `select` for all tunneled tools, so a core-side abort (`session.abort()` → `waitForIdle()`) unblocks a pending `wait_subagents` / `dispatch_subagents({ wait = true })` immediately even when no `extension_ui_response` is on its way.
-- **FIXED:** Temporary session ids (`tmp-*`) are aliased to the real session id when the backend id arrives, so an abort issued against a stale tmp id still resolves the correct batch lineage.
 
 ## 2026-09-03
 

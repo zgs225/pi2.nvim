@@ -28,7 +28,9 @@ local TOOL_ICONS = {
     edit = nf(0xF03EB), -- nf-md-pencil
     write = nf(0xF0193), -- nf-md-content-save
     grep = nf(0xF0349), -- nf-md-magnify
+    find = nf(0xF0869), -- nf-md-file-search
     glob = nf(0xF024B), -- nf-md-folder
+    ls = nf(0xF024B), -- nf-md-folder
     web_fetch = nf(0xF0593), -- nf-md-web
     web_search = nf(0xF0349), -- nf-md-magnify
     fetch_content = nf(0xF059F), -- nf-md-web
@@ -89,7 +91,7 @@ function M.sanitize_text(text)
     if type(text) ~= "string" then
         text = text == nil and "" or tostring(text)
     end
-    return text:gsub("%z", "␀")
+    return (text:gsub("%z", "␀"))
 end
 
 --- Collapse newlines for single-line buffer rows (nvim_buf_set_lines rejects `\n` in one item).
@@ -1276,7 +1278,64 @@ local renderers = {
             return ("stopped %d"):format(n)
         end,
     },
+
+    -- Built-in read-only tools: compact input summary + collapse thresholds
+    grep = {
+        input_visible = 1,
+        output_visible = 1,
+        on_start = function(history, args)
+            if not args then
+                return
+            end
+            local pattern = type(args.pattern) == "string" and args.pattern or ""
+            local path = type(args.path) == "string" and args.path ~= "" and args.path or "."
+            local line = string.format("/%s/ in %s", pattern, path)
+            if type(args.glob) == "string" and args.glob ~= "" then
+                line = line .. string.format(" (%s)", args.glob)
+            end
+            if args.limit ~= nil then
+                line = line .. string.format(" limit %s", args.limit)
+            end
+            render_body_line(history, line)
+        end,
+        on_end = render_result_output,
+    },
+    find = {
+        input_visible = 1,
+        output_visible = 1,
+        on_start = function(history, args)
+            if not args then
+                return
+            end
+            local pattern = type(args.pattern) == "string" and args.pattern or ""
+            local path = type(args.path) == "string" and args.path ~= "" and args.path or "."
+            local line = string.format("%s in %s", pattern, path)
+            if args.limit ~= nil then
+                line = line .. string.format(" (limit %s)", args.limit)
+            end
+            render_body_line(history, line)
+        end,
+        on_end = render_result_output,
+    },
+    ls = {
+        input_visible = 1,
+        output_visible = 1,
+        on_start = function(history, args)
+            if not args then
+                return
+            end
+            local path = type(args.path) == "string" and args.path ~= "" and args.path or "."
+            local line = path
+            if args.limit ~= nil then
+                line = line .. string.format(" (limit %s)", args.limit)
+            end
+            render_body_line(history, line)
+        end,
+        on_end = render_result_output,
+    },
 }
+
+renderers.glob = renderers.find
 
 ---@type pi.ToolRenderer
 local default_renderer = {

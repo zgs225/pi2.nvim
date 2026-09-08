@@ -674,7 +674,7 @@ Successful tool calls end silently (a blank breathing line); only errors print a
 Tools come in two rendering styles:
 
 - **Inline tools** render as a single line. `read` is the canonical example — it shows `read path/to/file (42 lines)` and stays on one line even when the file is huge, because inlining the content would just be noise. Consecutive inline tool calls are grouped without blank lines between them.
-- **Full-block tools** get the multi-line indented block shown above. `bash`, `edit`, `write`, the four [pi-web-access](https://github.com/nicobailon/pi-web-access) tools (`web_search`, `fetch_content`, `source_check`, `get_search_content`), and any tool pi2.nvim doesn't have a dedicated renderer for fall into this category.
+- **Full-block tools** get the multi-line indented block shown above. `bash`, `edit`, `write`, the built-in read-only search tools (`grep`, `find`, `ls`), the four [pi-web-access](https://github.com/nicobailon/pi-web-access) tools (`web_search`, `fetch_content`, `source_check`, `get_search_content`), and any tool pi2.nvim doesn't have a dedicated renderer for fall into this category.
 
 ### Auto-collapse and `<Tab>`
 
@@ -695,6 +695,9 @@ Built-in thresholds:
 | `read` | — | — | Always inline |
 | `edit` | unlimited | 0 | Renders the proposed diff as input; no separate output section |
 | `write` | unlimited | 0 | Same shape as `edit` for a whole-file write |
+| `grep` | 1 | 1 | Built-in search — `/{pattern}/ in {path}`, with optional `({glob})` and `limit {limit}` |
+| `find` | 1 | 1 | Built-in search — `{pattern} in {path}`, with optional `(limit {limit})` (`glob` is accepted as an alias) |
+| `ls` | 1 | 1 | Built-in listing — `{path}` (defaults to `.`), with optional `(limit {limit})` |
 | `web_search` | 1 | 1 | [pi-web-access](https://github.com/nicobailon/pi-web-access) — the `query`, or up to three `queries` joined with ` · ` (longer lists truncate as `…(+N)`) |
 | `fetch_content` | 1 | 1 | pi-web-access — the `url`, or each entry of `urls` on its own line |
 | `source_check` | 1 | 1 | pi-web-access — the `claim` being checked |
