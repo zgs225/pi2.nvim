@@ -91,6 +91,32 @@ describe("pi.tree", function()
             assert.is_truthy(text:find("(+1)", 1, true))
         end)
 
+        it("summarizes grep, find, and ls tool calls with arguments in tree preview", function()
+            local e_grep = msg("a", "assistant", {
+                { type = "toolCall", name = "grep", arguments = { pattern = "TODO", path = "." } },
+            })
+            local text_grep = Tree.entry_preview(e_grep)
+            assert.is_truthy(text_grep:find("TODO", 1, true))
+
+            local e_find = msg("b", "assistant", {
+                { type = "toolCall", name = "find", arguments = { pattern = "*.lua", path = "lua" } },
+            })
+            local text_find = Tree.entry_preview(e_find)
+            assert.is_truthy(text_find:find("*.lua", 1, true))
+
+            local e_ls = msg("c", "assistant", {
+                { type = "toolCall", name = "ls", arguments = { path = "src" } },
+            })
+            local text_ls = Tree.entry_preview(e_ls)
+            assert.is_truthy(text_ls:find("src", 1, true))
+
+            local e_ls_default = msg("d", "assistant", {
+                { type = "toolCall", name = "ls", arguments = { limit = 500 } },
+            })
+            local text_ls_default = Tree.entry_preview(e_ls_default)
+            assert.is_truthy(text_ls_default:find(".", 1, true))
+        end)
+
         it("marks an aborted turn", function()
             local e = {
                 type = "message",

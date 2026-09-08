@@ -31,7 +31,9 @@ local TOOL_ARG_KEYS = {
     edit = { "path", "file_path" },
     write = { "path", "file_path" },
     grep = { "pattern", "regex", "path" },
+    find = { "pattern", "path" },
     glob = { "pattern", "path" },
+    ls = { "path" },
     web_fetch = { "url" },
     web_search = { "query", "pattern" },
 }
@@ -77,6 +79,9 @@ local function tool_fragment(name, args)
         if type(v) == "string" and vim.trim(v) ~= "" then
             return one_line(v:match("^[^\n]*"))
         end
+    end
+    if name == "ls" then
+        return "."
     end
     -- fallback: first non-empty string argument
     for _, v in pairs(args) do
