@@ -562,6 +562,94 @@ describe("sessions overview", function()
             Manifest.children_of = orig_children
             assert.are.equal(1, #rows)
         end)
+
+        it("hides settled agent worker even when child RPC process is running", function()
+            local Manifest = require("pi.subsessions.manifest")
+            local Sessions = require("pi.sessions.manager")
+            local orig_children = Manifest.children_of
+            Manifest.children_of = function(parent_id)
+                if parent_id ~= "parent-uuid" then
+                    return {}
+                end
+                return {
+                    {
+                        _id = "agent-worker",
+                        name = "Worker",
+                        status = "completed",
+                        reported = true,
+                        agent_spawned = true,
+                        parent_id = "parent-uuid",
+                        config = {},
+                    },
+                }
+            end
+
+            local parent = fake_session({ tab = 42 })
+            parent.id = "parent-uuid"
+            parent.lineage_id = "parent-uuid"
+
+            local child_session = fake_session({})
+            child_session.id = "agent-worker"
+            child_session.parent_id = "parent-uuid"
+            Sessions._register_for_test(child_session)
+
+            local rows = SessionList.build_rows({ parent }, function()
+                return 0
+            end, function()
+                return "parent"
+            end)
+
+            Manifest.children_of = orig_children
+            Sessions._reset()
+
+            assert.are.equal(1, #rows)
+            assert.are.equal("parent-uuid", rows[1].session_id)
+        end)
+
+        it("shows agent worker when child RPC process is actively busy", function()
+            local Manifest = require("pi.subsessions.manifest")
+            local Sessions = require("pi.sessions.manager")
+            local orig_children = Manifest.children_of
+            Manifest.children_of = function(parent_id)
+                if parent_id ~= "parent-uuid" then
+                    return {}
+                end
+                return {
+                    {
+                        _id = "agent-worker",
+                        name = "Worker",
+                        status = "completed",
+                        reported = true,
+                        agent_spawned = true,
+                        parent_id = "parent-uuid",
+                        config = {},
+                    },
+                }
+            end
+
+            local parent = fake_session({ tab = 42 })
+            parent.id = "parent-uuid"
+            parent.lineage_id = "parent-uuid"
+
+            local child_session = fake_session({})
+            child_session.id = "agent-worker"
+            child_session.parent_id = "parent-uuid"
+            child_session.chat = nil
+            child_session._detached_busy = true
+            Sessions._register_for_test(child_session)
+
+            local rows = SessionList.build_rows({ parent }, function()
+                return 0
+            end, function()
+                return "parent"
+            end)
+
+            Manifest.children_of = orig_children
+            Sessions._reset()
+
+            assert.are.equal(2, #rows)
+            assert.are.equal("agent-worker", rows[2].child_id)
+        end)
     end)
 
     describe("name resolution", function()

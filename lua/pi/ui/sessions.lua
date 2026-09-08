@@ -403,7 +403,11 @@ local function child_filter_ctx()
         end,
         process_running = function(id)
             local child = Sessions.get_by_id(id)
-            return child ~= nil and child.rpc:is_running()
+            if not child or not child.rpc:is_running() then
+                return false
+            end
+            local st = M.status_of(child)
+            return st == "busy" or st == "compacting"
         end,
     }
 end

@@ -59,4 +59,34 @@ describe("subagent sessions_list filter", function()
             end,
         }))
     end)
+
+    it("hides agent-spawned completed children when process is idle", function()
+        Config.setup({ subagent = { sessions_list = {} } })
+        assert.is_false(Filter.child_visible(
+            entry({
+                status = "completed",
+                agent_spawned = true,
+            }),
+            {
+                process_running = function()
+                    return false
+                end,
+            }
+        ))
+    end)
+
+    it("respects show_completed = none for idle children", function()
+        Config.setup({ subagent = { sessions_list = { show_completed = "none" } } })
+        assert.is_false(Filter.child_visible(
+            entry({
+                status = "completed",
+                agent_spawned = false,
+            }),
+            {
+                process_running = function()
+                    return false
+                end,
+            }
+        ))
+    end)
 end)

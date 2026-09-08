@@ -6,7 +6,7 @@ local M = {}
 
 ---@class pi.SessionsListChildFilterCtx
 ---@field completion_seen? fun(child_id: string): boolean
----@field process_running? fun(child_id: string): boolean
+---@field process_running? fun(child_id: string): boolean True when child task is actively executing (busy/compacting).
 
 --- Whether a manifest child should appear under its parent in :PiSessions.
 --- Dormant / settled children stay in the manifest for :PiSubSwitch and list_subagents.

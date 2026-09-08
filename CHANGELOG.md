@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-09-08
+
+- **FIXED:** Sub-sessions in `:PiSessions` no longer bypass completed/dormant filters just because their backend RPC process remains alive. Settled agent workers, acknowledged user completions, and `show_completed = "none"` now correctly hide idle children; running children keep their live visibility while actively busy or compacting.
+
 ## 2026-09-04
 
 - **ADDED:** Sub-session fold / unfold in `:PiSessions` — collapse and expand child rows under their parent session row. Parent rows with sub-sessions show fold indicators (`▾` expanded, `▸` collapsed with child count badge `(N)`). Controlled by `<Tab>` / `za` to toggle the fold under cursor (on a child row: collapses its parent and moves cursor to the parent), `zM` to collapse all, and `zR` to expand all. Default collapse behavior is configurable via `sessions_list.collapse_subsessions` or `subagent.sessions_list.collapse_children`; actively viewed sub-sessions in the current tab keep their parent expanded by default.
