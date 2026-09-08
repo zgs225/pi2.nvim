@@ -2,6 +2,7 @@
 
 ## 2026-09-08
 
+- **ADDED:** Sub-agent system-prompt injection — parent RPC processes get a byte-constant orchestration note and child sub-sessions a byte-constant worker note (new bundled `extensions/subagent-child.ts`), both appended via the `before_agent_start` hook. Parents are taught the delegation discipline (reuse children via `{ target, message }`, fan out in one dispatch, collect by `batch_id`); children are told there is no interactive user, their last message is the final report, questions are impossible, task scope is strict, and nested sub-agents are unavailable. Byte-identical text keeps pi's prompt-cache prefix stable across turns; `subagent.enabled = false` injects neither.
 - **FIXED:** Sub-sessions in `:PiSessions` no longer bypass completed/dormant filters just because their backend RPC process remains alive. Settled agent workers, acknowledged user completions, and `show_completed = "none"` now correctly hide idle children; running children keep their live visibility while actively busy or compacting.
 
 ## 2026-09-04

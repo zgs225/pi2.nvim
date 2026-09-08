@@ -197,7 +197,8 @@ require("pi").setup({
     },
 
     -- Sub-sessions (子会话). When enabled (default), injects extensions/subagent.ts
-    -- into parent RPC processes so the Agent can spawn and steer child sessions.
+    -- into parent RPC processes so the Agent can spawn and steer child sessions
+    -- (children get extensions/subagent-child.ts: a worker system-prompt note only).
     -- Children run as detached background processes with their own session files.
     subagent = {
         enabled = true,

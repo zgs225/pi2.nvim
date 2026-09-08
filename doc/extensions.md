@@ -202,7 +202,7 @@ require("pi").setup({
 
 ## Bundled sub-agent extension (`extensions/subagent.ts`)
 
-When `subagent.enabled` is true (default), pi2.nvim injects `extensions/subagent.ts` into **parent** RPC processes (child sub-session processes omit it). The extension registers Agent-callable tools:
+When `subagent.enabled` is true (default), pi2.nvim injects `extensions/subagent.ts` into **parent** RPC processes (child sub-session processes get `extensions/subagent-child.ts` instead — see below; `subagent.enabled = false` injects neither). The extension registers Agent-callable tools:
 
 | Tool | Role |
 | --- | --- |
@@ -217,4 +217,6 @@ When `subagent.enabled` is true (default), pi2.nvim injects `extensions/subagent
 **Chat rendering:** sub-agent tools use localized short labels (`子·派发` / `sub·dispatch`, from `title.lang` or your UI locale), Material Design outline nerd-font icons, and manifest **names** for child targets (same source as `:PiSessions` child rows; UUIDs truncate to `…suffix` unless `subagent.show_full_ids` is true). `dispatch_subagents` renders as a **block** when `items` has more than one entry or `wait` is not `true`; a single item with `wait: true` stays **inline** like `read` or `bash`.
 
 Action tools tunnel through a silent `ctx.ui.select` with title `__pi_subagent__`, handled in `lua/pi/ui/extension.lua` without showing a picker. That path requires a host UI (`ctx.hasUI`); without it the tools return `{ error: "host UI not available" }` instead of dispatching. When `dispatch_subagents` specifies an explicit `model` that does not exist on the backend, spawn fails fast and the item error reports available models to enable self-correction. `stop_subagents` reports `stopped` as the number of child RPC processes that were actually running (invalid ids are ignored). See [Sessions → Sub-sessions](sessions.md#sub-sessions).
+
+**System-prompt notes:** both extensions append a short, **byte-constant** note to the system prompt on every turn via the `before_agent_start` hook. `subagent.ts` adds an orchestration note (when to delegate, reuse children via `{ target, message }`, fan out independent tasks in one dispatch, collect by `batch_id`, a child's last message is its final report); `subagent-child.ts` adds a worker note (no interactive user, never ask questions, the last assistant message is the final report, stay strictly within the task, no nested sub-agents). The text is byte-identical on every submission, so it does not invalidate pi's prompt-cache prefix — same rationale as the [vision fallback](usage.md#vision-fallback) capability note. Per-turn state (like the live child inventory) deliberately stays out of the prompt; `list_subagents` is the live source.
 

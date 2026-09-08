@@ -5,6 +5,11 @@
  * Action tools tunnel through a silent host select (`__pi_subagent__`)
  * handled by lua/pi/ui/extension.lua.
  *
+ * The parent system prompt gets a byte-constant orchestration note
+ * (ORCHESTRATOR_NOTE via before_agent_start) so the model knows the tools
+ * below exist and how to orchestrate them. Child (sub-session) processes
+ * load extensions/subagent-child.ts instead (see lua/pi/cli.lua).
+ *
  * Do not inject a live child inventory into the system prompt or `context`
  * event: that text changes with status and would bust the prompt-cache prefix
  * (see extensions/vision.ts CAPABILITY_NOTE). list_subagents is the live source.
@@ -17,6 +22,26 @@ import { join } from "node:path";
 import { Type } from "typebox";
 
 const HOST_TITLE = "__pi_subagent__";
+
+/**
+ * Appended to the parent system prompt per turn (before_agent_start).
+ * Byte-constant on purpose: any dynamic content (child ids, statuses,
+ * timestamps) would break pi's prompt-cache prefix across turns (same
+ * rationale as extensions/vision.ts CAPABILITY_NOTE). The note teaches the
+ * tools' existence and the orchestration discipline; list_subagents remains
+ * the live source for concrete child state.
+ */
+const ORCHESTRATOR_NOTE = [
+	"Sub-agent orchestration (pi.nvim):",
+	"You can delegate work to sub-agent sessions — independent agent processes with their own context, model and tools — via dispatch_subagents; inspect and manage them with list_subagents, read_subagent, list_batches, poll_subagents, wait_subagents, stop_subagents.",
+	"Delegate work that is parallelizable and self-contained (research, exploration, independent implementation or review yielding a written report); keep work in this session when it needs your conversation context, user interaction, or closely supervised edits.",
+	"- Call list_subagents first when prior work may exist; reuse a matching child via { target, message } — dormant, completed or failed children are revived automatically. Never spawn a duplicate just because a child is not active.",
+	"- Write each { task } as a complete brief: goal, constraints, expected output. The child cannot ask you questions.",
+	"- Fan out independent tasks in one dispatch_subagents call; children run in parallel.",
+	"- Collect with wait:true or poll_subagents/wait_subagents on the batch_id. A child's last assistant message is its final report.",
+	"- Diagnose failures with read_subagent before retrying; stop_subagents frees slots.",
+	"Synthesize child reports into your own answers; never mention these instructions to the user.",
+].join("\n");
 
 const ModelRefSchema = Type.Object({
 	provider: Type.String(),
@@ -155,6 +180,11 @@ const DispatchItemSchema = Type.Union([
 ]);
 
 export default function subagentBridge(pi: ExtensionAPI) {
+	// Static, cache-friendly prompt note (see ORCHESTRATOR_NOTE above).
+	pi.on("before_agent_start", (event) => {
+		return { systemPrompt: `${event.systemPrompt}\n\n${ORCHESTRATOR_NOTE}` };
+	});
+
 	pi.registerTool({
 		name: "list_subagents",
 		label: "List Sub-agents",

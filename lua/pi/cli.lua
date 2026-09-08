@@ -129,8 +129,14 @@ function M.subagent_extension_path()
     return plugin_root() .. "/extensions/subagent.ts"
 end
 
+--- Absolute path to the bundled sub-agent worker extension (child sessions only).
+---@return string
+function M.subagent_child_extension_path()
+    return plugin_root() .. "/extensions/subagent-child.ts"
+end
+
 ---@class pi.CliCommandOpts
----@field subagent? boolean Inject subagent.ts when enabled (default: follow config).
+---@field subagent? boolean false marks a child (sub-session) process: inject subagent-child.ts instead of subagent.ts (default: parent — inject subagent.ts).
 
 ---@param opts? pi.CliCommandOpts
 ---@return string[]
@@ -177,9 +183,13 @@ function M.command(opts)
         cmd[#cmd + 1] = "--extension"
         cmd[#cmd + 1] = scope_ext
     end
+    -- Sub-agent extensions, mutually exclusive per process role: parents
+    -- get subagent.ts (orchestration tools + system-prompt note), children
+    -- get subagent-child.ts (worker system-prompt note only — no tools, no
+    -- nesting). subagent.enabled = false injects neither.
     local subagent = Config.options.subagent or {}
-    if opts.subagent ~= false and subagent.enabled ~= false then
-        local sub_ext = M.subagent_extension_path()
+    if subagent.enabled ~= false then
+        local sub_ext = opts.subagent ~= false and M.subagent_extension_path() or M.subagent_child_extension_path()
         if vim.fn.filereadable(sub_ext) == 1 then
             cmd[#cmd + 1] = "--extension"
             cmd[#cmd + 1] = sub_ext
