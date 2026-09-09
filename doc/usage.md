@@ -702,6 +702,13 @@ Built-in thresholds:
 | `fetch_content` | 1 | 1 | pi-web-access — the `url`, or each entry of `urls` on its own line |
 | `source_check` | 1 | 1 | pi-web-access — the `claim` being checked |
 | `get_search_content` | 1 | 1 | pi-web-access — `responseId` plus whichever selector is present (`query` / `queryIndex` / `url` / `urlIndex`) |
+| `dispatch_subagents` | unlimited | unlimited | Sub-agent fan-out — the item task tree and per-item result list are the signal, so the block never auto-collapses (only window-width overflow truncates) |
+| `list_subagents` | — | — | Always inline |
+| `read_subagent` | — | — | Always inline |
+| `list_batches` | — | — | Always inline |
+| `poll_subagents` | — | — | Always inline |
+| `wait_subagents` | — | — | Always inline |
+| `stop_subagents` | — | — | Always inline |
 | (unknown) | 1 | 1 | Default renderer picks the first string argument as summary |
 
 ### Status resolution
