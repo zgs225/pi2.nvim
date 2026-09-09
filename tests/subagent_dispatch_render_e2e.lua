@@ -31,7 +31,6 @@ local ok, err = pcall(function()
     })
 
     local h = History.new(992)
-    h._blocks_expanded = true
     h:on_tool_start("dispatch_subagents", "e2e-dispatch", {
         items = {
             { ref = "spawn", task = "explore codebase" },
@@ -89,6 +88,18 @@ local ok, err = pcall(function()
 
     assert(joined:find("status:", 1, true), "expected status line on batch end")
     assert(joined:find("✓", 1, true), "expected completion marks")
+
+    -- The block must stay fully expanded after on_tool_end: the item tree
+    -- lines drawn on_start are still present and no collapse summary markers
+    -- ("+N lines") were substituted for the fan-out content.
+    local tree_after = 0
+    for _, line in ipairs(vim.api.nvim_buf_get_lines(h:buf(), 0, -1, false)) do
+        if line:find("├─", 1, true) or line:find("└─", 1, true) then
+            tree_after = tree_after + 1
+        end
+    end
+    assert(tree_after >= 2, "expected item tree lines to survive on_tool_end, got " .. tree_after)
+    assert(not joined:match("%+%d+ lines"), 'expected no collapse summary markers ("+N lines") after on_tool_end')
 end)
 
 if old_lang == vim.NIL then

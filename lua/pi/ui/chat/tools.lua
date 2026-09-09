@@ -1163,8 +1163,12 @@ local renderers = {
         inline_status = function(result)
             return SubToolUi.batch_status_text(SubToolUi.result_details(result))
         end,
-        input_visible = 0,
-        output_visible = 3,
+        -- No input_visible/output_visible thresholds: the item task tree (on_start)
+        -- and the per-item result list + status line (on_end) are the signal
+        -- content (edit-like), so the block stays fully expanded by default in
+        -- every phase (running / completed wait:true / completed wait:false /
+        -- replay). The only remaining fold trigger is the generic window-width
+        -- overflow truncation in history.lua.
         on_start = function(history, args)
             if SubToolUi.dispatch_inline(args) or type(args) ~= "table" or type(args.items) ~= "table" then
                 return

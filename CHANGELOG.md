@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-09-09
+
+- **CHANGED:** `dispatch_subagents` no longer auto-collapses — the multi-item fan-out task tree and per-item results stay fully visible (the block folds only on window-width overflow).
+
 ## 2026-09-08
 
 - **ADDED:** Dedicated history renderers, Nerd Font icons, and tree view (`:PiTree`) preview support for pi's built-in read-only tools (`grep`, `find`, `ls`):
