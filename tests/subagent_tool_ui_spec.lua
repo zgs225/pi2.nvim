@@ -184,4 +184,149 @@ describe("subagent tool_ui", function()
         assert.is_true(Tools.is_inline(renderer, { items = { { task = "a" } }, wait = true }))
         assert.is_false(Tools.is_inline(renderer, { items = { { task = "a" }, { task = "b" } }, wait = true }))
     end)
+
+    describe("item_config_label and dispatch rendering with model and thinking_level", function()
+        it("returns nil when neither model nor thinking_level is present", function()
+            assert.is_nil(SubToolUi.item_config_label({ task = "just task" }))
+            assert.is_nil(SubToolUi.item_config_label(nil))
+        end)
+
+        it("formats model with table id", function()
+            local label = SubToolUi.item_config_label({
+                task = "test",
+                model = { provider = "anthropic", id = "claude-3-7-sonnet" },
+            })
+            assert.are.equal("claude-3-7-sonnet", label)
+        end)
+
+        it("formats model with string id", function()
+            local label = SubToolUi.item_config_label({
+                task = "test",
+                model = "gpt-4o",
+            })
+            assert.are.equal("gpt-4o", label)
+        end)
+
+        it("formats thinking_level alone", function()
+            local label = SubToolUi.item_config_label({
+                task = "test",
+                thinking_level = "high",
+            })
+            assert.are.equal("think: high", label)
+        end)
+
+        it("supports think_level alias", function()
+            local label = SubToolUi.item_config_label({
+                task = "test",
+                think_level = "low",
+            })
+            assert.are.equal("think: low", label)
+        end)
+
+        it("formats both model and thinking_level", function()
+            local label = SubToolUi.item_config_label({
+                task = "test",
+                model = { provider = "anthropic", id = "claude-3-7-sonnet" },
+                thinking_level = "high",
+            })
+            assert.are.equal("claude-3-7-sonnet · think: high", label)
+        end)
+
+        it("falls back to manifest config for target subagents", function()
+            Manifest.upsert("child-cfg", {
+                parent_id = "p",
+                name = "worker-1",
+                task_prompt = "t",
+                config = {
+                    model = { provider = "anthropic", id = "claude-3-5-haiku" },
+                    thinking_level = "medium",
+                },
+                status = "active",
+                reported = false,
+                created_at = "t",
+                last_active_at = "t",
+            })
+            local label = SubToolUi.item_config_label({
+                target = "child-cfg",
+                message = "continue work",
+            })
+            assert.are.equal("claude-3-5-haiku · think: medium", label)
+        end)
+
+        it("formats dispatch_header_detail with config for single item", function()
+            local detail = SubToolUi.dispatch_header_detail({
+                items = {
+                    {
+                        task = "analyze",
+                        name = "analyzer",
+                        model = { provider = "anthropic", id = "claude-3-7-sonnet" },
+                        thinking_level = "high",
+                    },
+                },
+            })
+            assert.are.equal("analyzer (claude-3-7-sonnet · think: high)", detail)
+        end)
+
+        it("inline_text includes model and thinking level for single item", function()
+            local renderer = Tools.get_renderer("dispatch_subagents")
+            local text = renderer.inline_text({
+                items = {
+                    {
+                        task = "single task",
+                        name = "worker-single",
+                        model = { provider = "openai", id = "gpt-4o" },
+                        thinking_level = "off",
+                    },
+                },
+                wait = true,
+            })
+            assert.are.equal("worker-single (gpt-4o · think: off)", text)
+        end)
+
+        it("renders model and thinking level in multi-item dispatch block lines", function()
+            local History = require("pi.ui.chat.history")
+            Config.setup({ title = { lang = "zh" }, render = { engine = "builtin" } })
+            local h = History.new(995)
+            h:on_tool_start("dispatch_subagents", "d-cfg-test", {
+                items = {
+                    {
+                        ref = "t1",
+                        name = "task-one",
+                        task = "first task",
+                        model = { provider = "anthropic", id = "claude-3-7-sonnet" },
+                        thinking_level = "high",
+                    },
+                    {
+                        ref = "t2",
+                        name = "task-two",
+                        task = "second task",
+                        model = "gpt-4o",
+                    },
+                    {
+                        ref = "t3",
+                        name = "task-three",
+                        task = "third task",
+                    },
+                },
+                wait = false,
+            })
+            vim.wait(100)
+            local lines = vim.api.nvim_buf_get_lines(h:buf(), 0, -1, false)
+            local t1_found, t2_found, t3_found = false, false, false
+            for _, line in ipairs(lines) do
+                if line:find("[t1]", 1, true) and line:find("claude-3-7-sonnet · think: high", 1, true) then
+                    t1_found = true
+                end
+                if line:find("[t2]", 1, true) and line:find("(gpt-4o)", 1, true) then
+                    t2_found = true
+                end
+                if line:find("[t3]", 1, true) and line:find("task-three", 1, true) and not line:find("%(") then
+                    t3_found = true
+                end
+            end
+            assert.is_true(t1_found, "line for t1 should include model and thinking level")
+            assert.is_true(t2_found, "line for t2 should include model alone")
+            assert.is_true(t3_found, "line for t3 without config should not have parenthesis")
+        end)
+    end)
 end)

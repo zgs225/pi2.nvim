@@ -2,6 +2,7 @@
 
 ## 2026-09-09
 
+- **ADDED:** `dispatch_subagents` renders model and thinking level in chat — when dispatching sub-agent tasks, items specifying an explicit `model` (e.g. `{ provider, id }` or string) and/or `thinking_level` (or reusing target children with manifest configuration) now display the configuration suffix (e.g. `(claude-3-7-sonnet · think: high)`) in both inline items and block task-tree nodes. Issue #106.
 - **CHANGED:** `dispatch_subagents` no longer auto-collapses — the multi-item fan-out task tree and per-item results stay fully visible (the block folds only on window-width overflow).
 
 ## 2026-09-08

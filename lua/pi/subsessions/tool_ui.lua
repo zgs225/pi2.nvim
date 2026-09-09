@@ -138,6 +138,58 @@ function M.item_label(item)
     return "?"
 end
 
+--- Format model and thinking level for a dispatch item, e.g. "claude-3-7-sonnet · think: high".
+--- Checks item.model and item.thinking_level (or item.think_level), and falls back
+--- to manifest config for target sub-agents when not explicitly supplied.
+---@param item table
+---@return string?
+function M.item_config_label(item)
+    if type(item) ~= "table" then
+        return nil
+    end
+
+    local model = item.model
+    local thinking_level = item.thinking_level or item.think_level
+
+    if (not model or not thinking_level) and type(item.target) == "string" and item.target ~= "" then
+        local entry = Manifest.load()[item.target]
+        local cfg = entry and entry.config
+        if cfg then
+            if not model and cfg.model then
+                model = cfg.model
+            end
+            if not thinking_level and cfg.thinking_level then
+                thinking_level = cfg.thinking_level
+            end
+        end
+    end
+
+    local model_id
+    if type(model) == "table" then
+        if type(model.id) == "string" and model.id ~= "" then
+            model_id = model.id
+        elseif type(model.name) == "string" and model.name ~= "" then
+            model_id = model.name
+        end
+    elseif type(model) == "string" and model ~= "" then
+        model_id = model
+    end
+
+    local tl_str
+    if type(thinking_level) == "string" and thinking_level ~= "" then
+        tl_str = "think: " .. thinking_level
+    end
+
+    if model_id and tl_str then
+        return model_id .. " · " .. tl_str
+    elseif model_id then
+        return model_id
+    elseif tl_str then
+        return tl_str
+    end
+    return nil
+end
+
 ---@param args? table
 ---@return string?
 function M.dispatch_header_detail(args)
@@ -149,7 +201,12 @@ function M.dispatch_header_detail(args)
         return nil
     end
     if n == 1 then
-        return M.item_label(args.items[1])
+        local label = M.item_label(args.items[1])
+        local cfg = M.item_config_label(args.items[1])
+        if cfg then
+            return label .. " (" .. cfg .. ")"
+        end
+        return label
     end
     local spawn_n, msg_n = 0, 0
     for _, item in ipairs(args.items) do
