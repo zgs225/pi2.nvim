@@ -1156,7 +1156,16 @@ local renderers = {
         end,
         inline_text = function(args)
             if SubToolUi.dispatch_inline(args) then
-                return args and args.items and SubToolUi.item_label(args.items[1])
+                local item = args and args.items and args.items[1]
+                if not item then
+                    return nil
+                end
+                local label = SubToolUi.item_label(item)
+                local cfg = SubToolUi.item_config_label(item)
+                if cfg then
+                    return label .. " (" .. cfg .. ")"
+                end
+                return label
             end
             return SubToolUi.dispatch_header_detail(args)
         end,
@@ -1176,7 +1185,12 @@ local renderers = {
             for i, item in ipairs(args.items) do
                 local prefix = i == #args.items and "  └─ " or "  ├─ "
                 local ref = type(item.ref) == "string" and item.ref ~= "" and ("[%s] "):format(item.ref) or ""
-                render_body_line(history, prefix .. ref .. SubToolUi.item_label(item))
+                local label = SubToolUi.item_label(item)
+                local cfg = SubToolUi.item_config_label(item)
+                if cfg then
+                    label = label .. " (" .. cfg .. ")"
+                end
+                render_body_line(history, prefix .. ref .. label)
             end
         end,
         on_end = function(history, args, result, is_error, insert_at)
