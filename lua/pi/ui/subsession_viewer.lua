@@ -1013,7 +1013,10 @@ function M.open(child_id, opts)
             return nil
         end
 
-        local session = Sessions.get_by_id(child_id)
+        -- `viewer_live_session` is the fallback for a live session whose id
+        -- migrated while the viewer was open (`get_by_id` no longer finds the
+        -- id captured at open time, object identity still resolves).
+        local session = Sessions.get_by_id(child_id) or viewer_live_session
         if not session or not session.rpc or not session.rpc:is_running() then
             Notify.warn("Cannot switch: the session process is not running")
             return
