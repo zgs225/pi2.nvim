@@ -37,6 +37,7 @@ const ORCHESTRATOR_NOTE = [
 	"Delegate work that is parallelizable and self-contained (research, exploration, independent implementation or review yielding a written report); keep work in this session when it needs your conversation context, user interaction, or closely supervised edits.",
 	"- Call list_subagents first when prior work may exist; reuse a matching child via { target, message } — dormant, completed or failed children are revived automatically. Never spawn a duplicate just because a child is not active.",
 	"- Write each { task } as a complete brief: goal, constraints, expected output. The child cannot ask you questions.",
+	"- Give every new child a short descriptive name (2-5 words, like 'auth-review'): it is the label :PiSessions, the dispatch block and the completion notice show. Only { target, message } reuse items go without one.",
 	"- Fan out independent tasks in one dispatch_subagents call; children run in parallel.",
 	"- Collect with wait:true or poll_subagents/wait_subagents on the batch_id. A child's last assistant message is its final report.",
 	"- Diagnose failures with read_subagent before retrying; stop_subagents frees slots.",
@@ -165,7 +166,12 @@ const DispatchItemSchema = Type.Union([
 	Type.Object({
 		ref: Type.Optional(Type.String({ description: "Correlation id for poll results" })),
 		task: Type.String({ description: "Task for a new sub-agent" }),
-		name: Type.Optional(Type.String()),
+		name: Type.Optional(
+			Type.String({
+				description:
+					"Short 2-5 word label for this child (e.g. 'auth-review'), shown in :PiSessions, the dispatch block and the completion notice. Falls back to a truncated task when omitted; the child's own generated title may replace a fallback, never an explicit name.",
+			}),
+		),
 		model: Type.Optional(ModelRefSchema),
 		thinking_level: Type.Optional(Type.String()),
 	}),

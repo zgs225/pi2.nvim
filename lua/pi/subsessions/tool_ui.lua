@@ -130,7 +130,8 @@ function M.item_label(item)
         if type(item.name) == "string" and item.name ~= "" then
             return item.name
         end
-        return item.task:sub(1, 40)
+        -- Same derivation the manifest stores as name_source = "fallback".
+        return Manifest.fallback_name(item.task) or "?"
     end
     if type(item.target) == "string" and item.target ~= "" then
         return M.child_name(item.target) or M.short_id(item.target) or item.target
