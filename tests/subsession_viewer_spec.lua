@@ -382,7 +382,7 @@ describe("pi.ui.subsession_viewer", function()
             return nil
         end
         Notify.warn = function(msg)
-            if msg:find("Sub-session file not found", 1, true) then
+            if msg:find("Session file not found", 1, true) then
                 warned = true
             end
         end
@@ -806,7 +806,9 @@ describe("pi.ui.subsession_viewer", function()
         local orig_get_by_id = Sessions.get_by_id
 
         Manifest.load = function()
-            return { [child_id] = { name = "Title Worker", status = "idle" } }
+            -- A real child manifest row always carries its parent lineage;
+            -- childness (and the "completed" title below) keys off `parent_id`.
+            return { [child_id] = { name = "Title Worker", status = "idle", parent_id = "p-1" } }
         end
         Sessions.get_by_id = function(id)
             if id == child_id then
@@ -1319,5 +1321,615 @@ describe("pi.ui.subsession_viewer", function()
         Viewer.close()
         Manifest.load = orig_load
         Sessions.get_by_id = orig_get_by_id
+    end)
+
+    describe("viewer for non-child sessions", function()
+        ---@type table<string, any>
+        local orig = {}
+        ---@type pi.TabId[]
+        local tabs = {}
+
+        before_each(function()
+            orig = {
+                manifest_load = Manifest.load,
+                find_path = Read.find_path,
+                get_by_id = Sessions.get_by_id,
+                list = Sessions.list,
+                get_for_tab = Sessions.get_for_tab,
+                switch_to = Subsessions.switch_to,
+                switch_to_parent = Subsessions.switch_to_parent,
+                warn = Notify.warn,
+                error = Notify.error,
+            }
+            tabs = {}
+        end)
+
+        after_each(function()
+            Viewer.close()
+            Manifest.load = orig.manifest_load
+            Read.find_path = orig.find_path
+            Sessions.get_by_id = orig.get_by_id
+            Sessions.list = orig.list
+            Sessions.get_for_tab = orig.get_for_tab
+            Subsessions.switch_to = orig.switch_to
+            Subsessions.switch_to_parent = orig.switch_to_parent
+            Notify.warn = orig.warn
+            Notify.error = orig.error
+            for _, tab in ipairs(tabs) do
+                if vim.api.nvim_tabpage_is_valid(tab) then
+                    pcall(vim.cmd, "tabclose " .. vim.api.nvim_tabpage_get_number(tab))
+                end
+            end
+            tabs = {}
+        end)
+
+        --- An RPC double that records the callback per request type.
+        ---@param calls table<string, fun(res: table)>
+        ---@return table
+        local function make_rpc(calls)
+            return {
+                is_running = function()
+                    return true
+                end,
+                send = function(_, payload, cb)
+                    calls[payload.type] = cb
+                    return true
+                end,
+            }
+        end
+
+        ---@param buf integer
+        ---@param lhs string
+        ---@return table?
+        local function find_keymap(buf, lhs)
+            for _, map in ipairs(vim.api.nvim_buf_get_keymap(buf, "n")) do
+                if map.lhs == lhs then
+                    return map
+                end
+            end
+            return nil
+        end
+
+        --- Create an extra tabpage, leave it current-inactive, and record it for cleanup.
+        ---@return pi.TabId
+        local function new_tab()
+            vim.cmd("tabnew")
+            local tab = vim.api.nvim_get_current_tabpage()
+            tabs[#tabs + 1] = tab
+            vim.cmd("tabprevious")
+            return tab
+        end
+
+        ---@param path string
+        ---@param lines table[]
+        local function write_jsonl(path, lines)
+            local f = io.open(path, "w")
+            assert.is_not_nil(f)
+            f:write(table.concat(lines, "\n"))
+            f:close()
+        end
+
+        ---@param buf integer
+        ---@return string
+        local function buf_text(buf)
+            return table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+        end
+
+        ---@param win integer
+        ---@return string
+        local function win_title(win)
+            local cfg = vim.api.nvim_win_get_config(win)
+            return cfg.title[1][1]
+        end
+
+        it("opens a live non-child session, replays RPC state, and titles it by id or opts.name", function()
+            local parent_id = "parent-live-1"
+            local calls = {}
+            local mock_session = { id = parent_id, rpc = make_rpc(calls) }
+
+            Manifest.load = function()
+                return {}
+            end
+            Sessions.get_by_id = function(id)
+                if id == parent_id then
+                    return mock_session
+                end
+                return nil
+            end
+
+            Viewer.open(parent_id)
+            pump(50)
+
+            assert.is_true(Viewer.is_open())
+            assert.equals(parent_id, Viewer.viewed_child_id())
+            assert.is_true(Viewer.is_open_for(parent_id))
+            assert.is_true(Viewer.is_open_for_session(mock_session))
+            assert.is_not_nil(calls["get_state"])
+            assert.is_not_nil(calls["get_messages"])
+
+            calls["get_state"]({
+                success = true,
+                data = {
+                    model = { id = "gpt-4o", provider = "openai", contextWindow = 128000 },
+                    thinkingLevel = "low",
+                },
+            })
+            calls["get_messages"]({
+                success = true,
+                data = {
+                    messages = {
+                        { role = "user", content = "Parent prompt" },
+                        { role = "assistant", content = "Parent reply" },
+                    },
+                },
+            })
+            pump(150)
+
+            local st = Viewer._status()
+            assert.equals("gpt-4o", st.model_id)
+            assert.equals("openai", st.model_provider)
+            assert.equals("low", st.thinking_level)
+
+            local text = buf_text(Viewer._history():buf())
+            assert.is_truthy(text:find("Parent prompt", 1, true))
+            assert.is_truthy(text:find("Parent reply", 1, true))
+
+            -- No manifest entry and no opts.name -> the raw id is the display name.
+            assert.equals(" " .. parent_id .. " [active] ", win_title(Viewer._win()))
+
+            -- Re-open with an explicit override.
+            Viewer.close()
+            Viewer.open(parent_id, { name = "Given Parent" })
+            calls["get_messages"]({ success = true, data = { messages = {} } })
+            pump(80)
+            assert.equals(" Given Parent [active] ", win_title(Viewer._win()))
+
+            Viewer.close()
+            assert.is_false(Viewer.is_open_for_session(mock_session))
+        end)
+
+        it("applies opts.name over the manifest entry and over the JSONL session_info name", function()
+            local id = "parent-name-1"
+            local file_path = tmp_dir .. "/name_precedence.jsonl"
+            write_jsonl(file_path, {
+                vim.json.encode({ type = "session_info", name = "JSONL Name" }),
+                vim.json.encode({ type = "message", message = { role = "user", content = "name test" } }),
+            })
+
+            Manifest.load = function()
+                return { [id] = { name = "Manifest Name", status = "dormant", parent_id = "p-1" } }
+            end
+            Read.find_path = function()
+                return file_path
+            end
+            Sessions.get_by_id = function()
+                return nil
+            end
+
+            Viewer.open(id, { name = "Override Name" })
+            pump(50)
+            assert.equals(" Override Name [dormant] ", win_title(Viewer._win()))
+            Viewer.close()
+
+            -- Manifest entry name still beats the JSONL session_info name.
+            Viewer.open(id)
+            pump(50)
+            assert.equals(" Manifest Name [dormant] ", win_title(Viewer._win()))
+            Viewer.close()
+
+            -- Without either, the JSONL session_info name is used.
+            Manifest.load = function()
+                return {}
+            end
+            Viewer.open(id)
+            pump(50)
+            assert.equals(" JSONL Name [dormant] ", win_title(Viewer._win()))
+            Viewer.close()
+        end)
+
+        it("streams live events for a non-child id through Sessions.handle_event", function()
+            local parent_id = "parent-stream-1"
+            local calls = {}
+            local mock_session = { id = parent_id, rpc = make_rpc(calls) }
+
+            Manifest.load = function()
+                return {}
+            end
+            Sessions.get_by_id = function(id)
+                if id == parent_id then
+                    return mock_session
+                end
+                return nil
+            end
+
+            Viewer.open(parent_id)
+            calls["get_messages"]({
+                success = true,
+                data = { messages = { { role = "user", content = "stream base" } } },
+            })
+            pump(150)
+            assert.is_false(Viewer._loading())
+
+            Sessions.handle_event(mock_session, {
+                type = "message_update",
+                assistantMessageEvent = { type = "text_delta", delta = "parent stream text" },
+            })
+            pump(150)
+
+            local text = buf_text(Viewer._history():buf())
+            assert.is_truthy(text:find("parent stream text", 1, true))
+            Viewer.close()
+        end)
+
+        it("opens a dormant non-child session from session_file and parses its status", function()
+            local parent_id = "parent-dormant-1"
+            local file_path = tmp_dir .. "/parent_dormant.jsonl"
+            write_jsonl(file_path, {
+                vim.json.encode({ type = "session_info", name = "Dormant Parent" }),
+                vim.json.encode({ type = "model_change", modelId = "gemini-flash", provider = "google" }),
+                vim.json.encode({ type = "thinking_level_change", thinkingLevel = "medium" }),
+                vim.json.encode({
+                    type = "message",
+                    message = {
+                        role = "assistant",
+                        usage = { input = 4000, output = 1000, cacheRead = 500, cacheWrite = 0 },
+                    },
+                }),
+                vim.json.encode({ type = "message", message = { role = "user", content = "Dormant parent prompt" } }),
+            })
+
+            Manifest.load = function()
+                return {}
+            end
+            Read.find_path = function()
+                return nil
+            end
+            Sessions.get_by_id = function()
+                return {
+                    id = parent_id,
+                    session_file = file_path,
+                    rpc = {
+                        is_running = function()
+                            return false
+                        end,
+                    },
+                }
+            end
+
+            Viewer.open(parent_id)
+            pump(80)
+
+            assert.is_true(Viewer.is_open())
+            assert.is_false(Viewer.is_open_for_session({ id = parent_id }))
+
+            local st = Viewer._status()
+            assert.equals("gemini-flash", st.model_id)
+            assert.equals("google", st.model_provider)
+            assert.equals("medium", st.thinking_level)
+            assert.equals(5500, st.context_tokens)
+            assert.equals(" Dormant Parent [dormant] ", win_title(Viewer._win()))
+
+            local text = buf_text(Viewer._history():buf())
+            assert.is_truthy(text:find("Dormant parent prompt", 1, true))
+            Viewer.close()
+        end)
+
+        it("warns without opening a window when a non-child session has no file", function()
+            local warned = nil
+            local errored = nil
+
+            Manifest.load = function()
+                return {}
+            end
+            Read.find_path = function()
+                return nil
+            end
+            Sessions.get_by_id = function()
+                return nil
+            end
+            Notify.warn = function(msg)
+                warned = msg
+            end
+            Notify.error = function(msg)
+                errored = msg
+            end
+
+            Viewer.open("missing-parent")
+
+            assert.is_truthy((warned or ""):find("Session file not found", 1, true))
+            assert.is_nil(errored)
+            assert.is_false(Viewer.is_open())
+            assert.is_nil(Viewer._win())
+        end)
+
+        it("jumps to the non-child session's tab and focuses its prompt on <CR>", function()
+            local parent_id = "parent-jump-1"
+            local switch_to_called = false
+            local focused = false
+            local chat = {}
+            function chat:ensure_shown_and_focus_prompt()
+                focused = true
+            end
+            local mock_session = {
+                id = parent_id,
+                chat = chat,
+                rpc = {
+                    is_running = function()
+                        return true
+                    end,
+                    send = function()
+                        return true
+                    end,
+                },
+            }
+
+            Manifest.load = function()
+                return {}
+            end
+            Sessions.get_by_id = function(id)
+                if id == parent_id then
+                    return mock_session
+                end
+                return nil
+            end
+            Sessions.list = function()
+                return {}
+            end
+            Subsessions.switch_to = function()
+                switch_to_called = true
+            end
+
+            local target_tab = new_tab()
+            mock_session.attached_tab = target_tab
+            Sessions.get_for_tab = function(tab)
+                if tab == target_tab then
+                    return mock_session
+                end
+                return nil
+            end
+
+            Viewer.open(parent_id)
+            assert.is_true(Viewer.is_open())
+
+            local cr_map = find_keymap(Viewer._history():buf(), "<CR>")
+            assert.is_not_nil(cr_map)
+            assert.equals("Open this session in chat", cr_map.desc)
+            cr_map.callback()
+
+            assert.is_false(switch_to_called)
+            assert.is_true(focused)
+            assert.is_false(Viewer.is_open())
+            assert.equals(target_tab, vim.api.nvim_get_current_tabpage())
+        end)
+
+        it("switches a child view back to the non-child parent before focusing on <CR>", function()
+            local parent_id = "parent-detached-1"
+            local parent_focused = false
+            local parent_chat = {}
+            function parent_chat:ensure_shown_and_focus_prompt()
+                parent_focused = true
+            end
+
+            local parent_session = {
+                id = parent_id,
+                chat = parent_chat,
+                rpc = {
+                    is_running = function()
+                        return true
+                    end,
+                    send = function()
+                        return true
+                    end,
+                },
+            }
+            local child_bound = {
+                id = "child-in-tab-1",
+                view_parent_id = parent_id,
+                chat = { ensure_shown_and_focus_prompt = function() end },
+            }
+
+            Manifest.load = function()
+                return {}
+            end
+            Sessions.get_by_id = function(id)
+                if id == parent_id then
+                    return parent_session
+                end
+                return nil
+            end
+            Subsessions.switch_to = function()
+                error("switch_to must not run for a non-child session")
+            end
+
+            local target_tab = new_tab()
+            child_bound.attached_tab = target_tab
+
+            local bound_now = child_bound
+            Sessions.list = function()
+                return { child_bound }
+            end
+            Sessions.get_for_tab = function()
+                return bound_now
+            end
+
+            local parent_switch_called = false
+            Subsessions.switch_to_parent = function(cb)
+                parent_switch_called = true
+                bound_now = parent_session
+                cb(true)
+            end
+
+            Viewer.open(parent_id)
+            local cr_map = find_keymap(Viewer._history():buf(), "<CR>")
+            assert.is_not_nil(cr_map)
+            cr_map.callback()
+
+            assert.is_true(parent_switch_called)
+            assert.is_true(parent_focused)
+            assert.is_false(Viewer.is_open())
+            assert.equals(target_tab, vim.api.nvim_get_current_tabpage())
+        end)
+
+        it("warns and keeps the viewer open when the non-child session has no tab", function()
+            local parent_id = "parent-detached-2"
+            local warned = nil
+            local mock_session = {
+                id = parent_id,
+                rpc = {
+                    is_running = function()
+                        return true
+                    end,
+                    send = function()
+                        return true
+                    end,
+                },
+            }
+
+            Manifest.load = function()
+                return {}
+            end
+            Sessions.get_by_id = function(id)
+                if id == parent_id then
+                    return mock_session
+                end
+                return nil
+            end
+            Sessions.list = function()
+                return {}
+            end
+            Notify.warn = function(msg)
+                warned = msg
+            end
+
+            Viewer.open(parent_id)
+            assert.is_true(Viewer.is_open())
+
+            local cr_map = find_keymap(Viewer._history():buf(), "<CR>")
+            assert.is_not_nil(cr_map)
+            cr_map.callback()
+
+            assert.is_truthy((warned or ""):find("not attached to a tab", 1, true))
+            assert.is_true(Viewer.is_open())
+            Viewer.close()
+        end)
+
+        it("warns and keeps the viewer open when the non-child session is not running", function()
+            local parent_id = "parent-stopped-1"
+            local file_path = tmp_dir .. "/stopped_parent.jsonl"
+            write_jsonl(file_path, {
+                vim.json.encode({ type = "message", message = { role = "user", content = "stopped prompt" } }),
+            })
+
+            local warned = nil
+            Manifest.load = function()
+                return {}
+            end
+            Read.find_path = function()
+                return nil
+            end
+            Sessions.get_by_id = function()
+                return {
+                    id = parent_id,
+                    session_file = file_path,
+                    rpc = {
+                        is_running = function()
+                            return false
+                        end,
+                    },
+                }
+            end
+            Notify.warn = function(msg)
+                warned = msg
+            end
+
+            Viewer.open(parent_id)
+            assert.is_true(Viewer.is_open())
+
+            local cr_map = find_keymap(Viewer._history():buf(), "<CR>")
+            assert.is_not_nil(cr_map)
+            cr_map.callback()
+
+            assert.is_truthy((warned or ""):find("the session process is not running", 1, true))
+            assert.is_true(Viewer.is_open())
+            Viewer.close()
+        end)
+
+        it("keeps a non-child title idle on agent_end and agent_settled", function()
+            local parent_id = "parent-title-1"
+            local calls = {}
+            local mock_session = { id = parent_id, rpc = make_rpc(calls) }
+
+            Manifest.load = function()
+                return {}
+            end
+            Sessions.get_by_id = function(id)
+                if id == parent_id then
+                    return mock_session
+                end
+                return nil
+            end
+
+            Viewer.open(parent_id)
+            calls["get_messages"]({ success = true, data = { messages = {} } })
+            pump(150)
+
+            local win = Viewer._win()
+            assert.equals(" " .. parent_id .. " [active] ", win_title(win))
+
+            Viewer.on_session_event(mock_session, { type = "agent_start" })
+            pump(60)
+            assert.equals(" " .. parent_id .. " [active] ", win_title(win))
+
+            Viewer.on_session_event(mock_session, { type = "agent_end" })
+            pump(60)
+            assert.equals(" " .. parent_id .. " [idle] ", win_title(win))
+
+            Viewer.on_session_event(mock_session, { type = "agent_settled" })
+            pump(60)
+            assert.equals(" " .. parent_id .. " [idle] ", win_title(win))
+
+            Viewer.close()
+        end)
+
+        it("keeps receiving events for a non-child session after its id migrates", function()
+            local tmp_id = "tmp-9"
+            local calls = {}
+            local mock_session = { id = tmp_id, rpc = make_rpc(calls) }
+
+            Manifest.load = function()
+                return {}
+            end
+            Sessions.get_by_id = function(id)
+                if id == tmp_id then
+                    return mock_session
+                end
+                return nil
+            end
+
+            Viewer.open(tmp_id)
+            calls["get_messages"]({
+                success = true,
+                data = { messages = { { role = "user", content = "before migration" } } },
+            })
+            pump(150)
+
+            assert.is_true(Viewer.is_open_for(tmp_id))
+            mock_session.id = "real-42"
+            -- The captured string gate no longer matches the migrated id; the
+            -- object-identity gate still does (that is what the manager uses).
+            assert.is_false(Viewer.is_open_for("real-42"))
+            assert.is_true(Viewer.is_open_for_session(mock_session))
+
+            Sessions.handle_event(mock_session, {
+                type = "message_update",
+                assistantMessageEvent = { type = "text_delta", delta = "after migration text" },
+            })
+            pump(150)
+
+            local text = buf_text(Viewer._history():buf())
+            assert.is_truthy(text:find("after migration text", 1, true))
+            Viewer.close()
+            assert.is_false(Viewer.is_open_for_session(mock_session))
+        end)
     end)
 end)
