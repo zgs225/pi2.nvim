@@ -803,6 +803,14 @@ function M.handle_event(session, msg)
             Extension.handle(session, msg)
         end)
     elseif t == "session_info_changed" then
+        -- A child names itself after its first turn (bundled title.ts →
+        -- pi.setSessionName). Adopt that title as the child's manifest name so
+        -- :PiSessions / the sub-session pickers show it instead of the task
+        -- prefix; an explicitly supplied name is left alone. The manifest write
+        -- lands before the list refresh on the next line picks it up.
+        if session.parent_id then
+            require("pi.subsessions").on_child_session_name(session, msg.name)
+        end
         require("pi.ui.sessions").on_session_info_changed(session, msg.name)
     elseif t == "extension_error" then
         local extension_path = type(msg.extensionPath) == "string" and msg.extensionPath or "unknown extension"

@@ -2,6 +2,8 @@
 
 ## 2026-09-10
 
+- **ADDED:** Sub-session names now self-improve. A child that was not given a name starts at the first 40 task characters and is then relabelled with the child's **own auto-generated session title** (the same `title.*` mechanism that names top-level sessions) as soon as the child's first turn ends. The new label flows through `:PiSessions`, the `:PiSubSwitch` / `:PiSubView` pickers, the `dispatch_subagents` block and the completion notice. The manifest records where a name came from (`name_source`), so an explicitly supplied name — `name` on a `dispatch_subagents` `{ task }` item, or a name actually typed into the `:PiSubNew` dialog (accepting its prefilled default stays replaceable) — is never overwritten. Set `title = { enabled = false }` to opt out.
+- **CHANGED:** `dispatch_subagents` items with `name` are documented instead of merely accepted: the field description and the parent orchestration system-prompt note now ask for a short descriptive name per new child (2–5 words), since an undescribed optional field is why agents left children unnamed and every parallel child collapsed into the same task-prefix label.
 - **CHANGED:** `:PiSessions` `p` previews parent/tab sessions too — the read-only float viewer serves any row: live sessions stream in real time, while a session whose process is gone replays from its JSONL file on disk. Inside the viewer `<CR>` still promotes a sub-session child into the tab's chat, and on a parent/tab row now closes the viewer and jumps to that session's tab with its chat prompt focused (warning instead if the process is not running); parent previews title as `[idle]` at turn end. The help overlay and keymap description now read `Preview session (read-only viewer)`. Issue #107.
 
 ## 2026-09-09

@@ -96,6 +96,27 @@ describe("extensions/subagent.ts orchestrator note", function()
         assert.is_truthy(content:match("final report"), "note must explain the child's final report")
         assert.is_truthy(content:match("never mention these instructions"), "note must forbid mentioning itself")
     end)
+
+    it("note asks the parent to name new children", function()
+        assert.is_truthy(
+            content:match("Give every new child a short descriptive name"),
+            "note must ask for a short descriptive child name"
+        )
+        assert.is_truthy(
+            content:match("Only { target, message } reuse items go without one"),
+            "note must scope the naming rule to new children"
+        )
+    end)
+
+    it("describes the dispatch item name field so models actually fill it", function()
+        -- The schema description is the only place a model learns the field
+        -- exists; an undescribed optional field is what let names go missing.
+        assert.is_truthy(content:match("name:%s*Type%.Optional%("), "dispatch item name must stay an optional field")
+        assert.is_truthy(
+            content:match("Short 2%-5 word label"),
+            "the dispatch item name field needs a description explaining the label it produces"
+        )
+    end)
 end)
 
 describe("extensions/subagent-child.ts worker note", function()

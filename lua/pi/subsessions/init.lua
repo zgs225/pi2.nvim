@@ -310,7 +310,13 @@ function M.spawn(parent, opts, callback)
         child.parent_id = parent_id
 
         local config = resolve_child_config(parent, opts)
-        local name = opts.name or opts.task:sub(1, 40)
+        -- An explicitly supplied name is honoured verbatim; otherwise derive one
+        -- from the task. `name_source` records which of the two it was so the
+        -- child's own auto title can replace a derived name later without ever
+        -- clobbering the caller's choice (see M.on_child_session_name).
+        local explicit_name = type(opts.name) == "string" and opts.name ~= "" and opts.name or nil
+        local name = explicit_name or Manifest.fallback_name(opts.task) or "sub-session"
+        local name_source = explicit_name and "explicit" or "fallback"
 
         local function register_and_run(session_id)
             child.id = session_id
@@ -318,6 +324,7 @@ function M.spawn(parent, opts, callback)
                 parent_id = lineage_id,
                 parent_epoch = parent.conversation_epoch or 0,
                 name = name,
+                name_source = name_source,
                 task_prompt = opts.task,
                 config = config and {
                     model = config.model,
@@ -509,6 +516,39 @@ function M.revive(child_id, callback)
             callback(nil, "failed to switch session")
         end
     end, { rebind_parent_context = false })
+end
+
+--- Adopt a child's own session title as its manifest name.
+---
+--- The bundled extensions/title.ts names every unnamed session after its first
+--- turn (pi.setSessionName), which the backend reports back as
+--- session_info_changed — including for child processes. Parenting that onto
+--- the manifest is what gives an unnamed child a readable row in :PiSessions,
+--- the :PiSubSwitch / :PiSubView pickers and the completion notice, instead of
+--- the truncated task prefix derived at spawn time.
+---
+--- Only derived names are replaced (Manifest.is_derived_name): an explicitly
+--- supplied name always wins. No-op when the name already matches.
+---@param session pi.Session
+---@param name string? Backend session name from the event.
+---@return boolean changed True when the manifest was updated; the caller refreshes the UI.
+function M.on_child_session_name(session, name)
+    if type(session) ~= "table" or type(name) ~= "string" or name == "" then
+        return false
+    end
+    local id = session.id
+    if type(id) ~= "string" or id == "" then
+        return false
+    end
+    local entry = Manifest.load()[id]
+    if type(entry) ~= "table" or entry.parent_id == nil then
+        return false
+    end
+    if entry.name == name or not Manifest.is_derived_name(entry) then
+        return false
+    end
+    Manifest.patch(id, { name = name, name_source = "auto" })
+    return true
 end
 
 --- Called on child agent_settled — inject completion report into parent.
@@ -779,12 +819,19 @@ function M.sub_new()
         if not task or task == "" then
             return
         end
+        local default_name = Manifest.fallback_name(task) or task
         Dialog.input(
-            { title = "Sub-session name (optional)", default = task:sub(1, 40), kind = "pi-sub-new-name" },
+            { title = "Sub-session name (optional)", default = default_name, kind = "pi-sub-new-name" },
             function(name)
-                M.spawn(parent, { task = task, name = name ~= "" and name or nil }, function(child, err)
+                -- Accepting the prefilled default keeps the name *derived*, so the
+                -- child's own generated title can still replace it. Only a name
+                -- the user actually typed counts as an explicit choice (cancel
+                -- passes nil, which spawns with the derived name as before).
+                local typed = type(name) == "string" and name ~= "" and name or nil
+                local explicit = typed ~= nil and typed ~= default_name
+                M.spawn(parent, { task = task, name = explicit and typed or nil }, function(child, err)
                     if child then
-                        Notify.info("Sub-session started: " .. (name or task:sub(1, 40)))
+                        Notify.info("Sub-session started: " .. (typed or default_name))
                     else
                         Notify.error(err or "failed to spawn sub-session")
                     end

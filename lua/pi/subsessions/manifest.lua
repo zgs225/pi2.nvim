@@ -15,6 +15,7 @@ local MANIFEST_FILE = ".pi2-subsessions.json"
 ---@field status "active"|"completed"|"failed"|"interrupted"|"dormant"
 ---@field reported boolean
 ---@field last_report? string
+---@field name_source? "explicit"|"fallback"|"auto" Where `name` came from: "explicit" (caller-supplied — dispatch `name`, the :PiSubNew dialog) is never overwritten; "fallback" is derived from `task_prompt` and may be replaced by the child's auto-generated title; "auto" is that title. Absent in manifests written before this field existed — see `M.is_derived_name`.
 ---@field created_at string
 ---@field last_active_at string
 ---@field agent_spawned? boolean True when spawned by parent Agent tool (skip prompt injection).
@@ -22,6 +23,11 @@ local MANIFEST_FILE = ".pi2-subsessions.json"
 ---@field parent_epoch? integer Parent conversation epoch when spawned (default 0).
 
 local LINEAGE_KEY = "__lineage__"
+
+--- Characters of `task_prompt` kept when deriving a child name. The dispatch
+--- block's display fallback (tool_ui.item_label) uses the same derivation via
+--- M.fallback_name, so a derived name always matches what the caller saw.
+local FALLBACK_NAME_CHARS = 40
 
 ---@type table<string, any>?
 local cache = nil
@@ -233,6 +239,41 @@ function M.is_child_session(session_id)
     end
     local entry = M.load()[session_id]
     return type(entry) == "table" and entry.parent_id ~= nil
+end
+
+--- Name derived from the task text when the caller supplies none.
+---@param task? string
+---@return string?
+function M.fallback_name(task)
+    if type(task) ~= "string" or task == "" then
+        return nil
+    end
+    return task:sub(1, FALLBACK_NAME_CHARS)
+end
+
+--- True when an entry's `name` was derived rather than supplied, i.e. the
+--- child's own auto-generated title may replace it (M.on_child_session_name).
+---
+--- Entries written before `name_source` existed have no provenance to read, so
+--- they fall back to an exact comparison with M.fallback_name(task_prompt).
+--- The only explicit name that is not protected by that heuristic is one that
+--- happens to equal the task prefix — replacing it with a generated title is
+--- an improvement there, not a loss.
+---@param entry? pi.SubsessionManifestEntry
+---@return boolean
+function M.is_derived_name(entry)
+    if type(entry) ~= "table" then
+        return false
+    end
+    if entry.name_source == "explicit" or entry.name_source == "auto" then
+        return false
+    end
+    local name = entry.name
+    if type(name) ~= "string" or name == "" then
+        return true
+    end
+    local fallback = M.fallback_name(entry.task_prompt)
+    return fallback ~= nil and name == fallback
 end
 
 ---@return string
