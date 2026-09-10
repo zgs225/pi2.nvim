@@ -78,6 +78,11 @@ describe("session list help overlay", function()
         assert.is_truthy(text:find("Clone this session", 1, true), "help should describe clone")
         assert.is_truthy(text:find("Navigate this session's tree", 1, true), "help should describe tree")
         assert.is_truthy(text:find("Refresh the list", 1, true), "help should describe refresh")
+        assert.is_truthy(
+            text:find("Preview session (read-only viewer)", 1, true),
+            "help should describe the read-only preview"
+        )
+        assert.is_truthy(text:find("Close sub-session process", 1, true), "help should describe sub-session close")
     end)
 
     it("binds r to rename and R to refresh in the list buffer", function()
@@ -87,6 +92,12 @@ describe("session list help overlay", function()
         local refresh = vim.fn.maparg("R", "n", false, true)
         assert.equals(1, refresh.buffer)
         assert.equals("Refresh session list", refresh.desc)
+    end)
+
+    it("binds p to the read-only preview in the list buffer", function()
+        local map = vim.fn.maparg("p", "n", false, true)
+        assert.equals(1, map.buffer)
+        assert.equals("Preview session (read-only viewer)", map.desc)
     end)
 
     it("binds a and i to the append-at-end prompt focus in the list buffer", function()
