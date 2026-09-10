@@ -1,6 +1,6 @@
---- Read-only subsession viewer — a floating window that displays the full
---- rendered chat history of a sub-session without taking over the tab's
---- session binding.
+--- Read-only session viewer — a floating window that displays the full
+--- rendered chat history of a sub-session or of a parent/tab session without
+--- taking over the tab's session binding.
 
 local M = {}
 
@@ -17,6 +17,7 @@ local Stats = require("pi.stats")
 
 ---@class pi.SubsessionViewerOpts
 ---@field on_close? fun()
+---@field name? string Display-name override (beats manifest entry and JSONL session_info)
 ---@field width? number Width in columns (>=1) or fraction of editor width (<1)
 ---@field height? number Height in lines (>=1) or fraction of editor height (<1)
 ---@field border? string|string[] Float border style
@@ -37,6 +38,10 @@ local viewer_win = nil
 local viewer_history = nil
 ---@type string?
 local viewer_child_id = nil
+---@type boolean
+local viewer_is_child = false
+---@type pi.Session?
+local viewer_live_session = nil
 ---@type string?
 local viewer_session_name = nil
 ---@type boolean
@@ -470,6 +475,9 @@ function M.close()
     viewer_loading = false
     viewer_event_queue = nil
     viewer_session_name = nil
+    viewer_child_id = nil
+    viewer_is_child = false
+    viewer_live_session = nil
     viewer_statusline_enabled = true
     viewer_status = {
         model_id = nil,
@@ -490,7 +498,6 @@ function M.close()
 
     viewer_win = nil
     viewer_history = nil
-    viewer_child_id = nil
     viewer_on_close = nil
 
     if win and vim.api.nvim_win_is_valid(win) then
@@ -522,6 +529,26 @@ end
 ---@return boolean
 function M.is_open_for(child_id)
     return M.is_open() and child_id ~= nil and viewer_child_id == child_id
+end
+
+--- Check if the viewer is open for a specific live session object.
+--- Robust against id migration (`tmp-N` -> real id): the string gate above goes
+--- stale while the object identity is stable.
+---@param session pi.Session
+---@return boolean
+function M.is_open_for_session(session)
+    return M.is_open() and session ~= nil and viewer_live_session == session
+end
+
+--- True when the viewer is currently displaying `session`, matching either the
+--- id captured when it was opened or (after an id migration) the object identity.
+---@param session pi.Session?
+---@return boolean
+local function viewer_shows_session(session)
+    if not session then
+        return false
+    end
+    return (session.id ~= nil and M.is_open_for(session.id)) or M.is_open_for_session(session)
 end
 
 --- Update the viewer window title.
@@ -677,7 +704,9 @@ local function handle_live_event(session, msg)
         end
     elseif t == "agent_end" or t == "agent_settled" then
         history:on_agent_end()
-        M.update_title(viewer_session_name, "completed")
+        -- Only sub-sessions are manifest-patched on settle; a parent/tab session
+        -- returns to idle instead of claiming a completion it never reports.
+        M.update_title(viewer_session_name, viewer_is_child and "completed" or "idle")
         M.update_statusline()
     elseif t == "model_change" then
         if msg.modelId then
@@ -713,7 +742,7 @@ end
 ---@param session pi.Session
 ---@param msg pi.RpcEvent
 function M.on_session_event(session, msg)
-    if not session or not session.id or not M.is_open_for(session.id) then
+    if not viewer_shows_session(session) then
         return
     end
 
@@ -724,7 +753,7 @@ function M.on_session_event(session, msg)
     end
 
     vim.schedule(function()
-        if not session or not session.id or not M.is_open_for(session.id) then
+        if not viewer_shows_session(session) then
             return
         end
         handle_live_event(session, msg)
@@ -737,7 +766,8 @@ function M.viewed_child_id()
     return M.is_open() and viewer_child_id or nil
 end
 
---- Open the viewer for a given child_id.
+--- Open the viewer for a session id — a sub-session child (promotable) or a
+--- parent/tab session (read-only, jumped to with `<CR>`).
 ---@param child_id string
 ---@param opts? pi.SubsessionViewerOpts
 function M.open(child_id, opts)
@@ -749,7 +779,19 @@ function M.open(child_id, opts)
     -- 2. Look up manifest entry for name/status
     local manifest = Manifest.load()
     local entry = manifest[child_id]
-    local name = (entry and entry.name and entry.name ~= "") and entry.name or child_id
+
+    -- Name precedence: opts.name > manifest entry name > JSONL session_info > raw id.
+    ---@type string?
+    local entry_name
+    if entry and type(entry.name) == "string" and entry.name ~= "" then
+        entry_name = entry.name
+    end
+    ---@type string?
+    local opts_name
+    if type(opts.name) == "string" and opts.name ~= "" then
+        opts_name = opts.name
+    end
+    local name = opts_name or entry_name or child_id
 
     viewer_status = {
         model_id = nil,
@@ -797,12 +839,13 @@ function M.open(child_id, opts)
             path = child_id
         end
         if not path then
-            Notify.warn("Sub-session file not found")
+            Notify.warn("Session file not found")
             return
         end
         local msgs, session_name, jsonl_status = load_messages_from_jsonl(path)
         dormant_messages = msgs
-        if session_name and (not entry or not entry.name or entry.name == "") then
+        -- The JSONL fallback only applies while no name is known yet.
+        if session_name and session_name ~= "" and not opts_name and not entry_name then
             name = session_name
         end
         if jsonl_status then
@@ -887,6 +930,7 @@ function M.open(child_id, opts)
     viewer_win = win
     viewer_history = history
     viewer_child_id = child_id
+    viewer_is_child = Manifest.is_child_session(child_id)
     viewer_session_name = name
     viewer_loading = false
     viewer_event_queue = nil
@@ -921,14 +965,99 @@ function M.open(child_id, opts)
         M.close()
     end, { buffer = buf, nowait = true, desc = "Close subsession viewer" })
 
+    -- <CR> promotes a sub-session into the tab, or jumps to the chat of a
+    -- parent/tab session. Parent semantics differ: switch_to() sets
+    -- view_parent_id on the target and may patch the manifest lineage, so it
+    -- must never run for a non-child.
     vim.keymap.set("n", "<CR>", function()
-        M.close()
-        require("pi.subsessions").switch_to(child_id, function(ok, err)
-            if not ok and err then
-                Notify.error(err)
+        if viewer_is_child then
+            M.close()
+            require("pi.subsessions").switch_to(child_id, function(ok, err)
+                if not ok and err then
+                    Notify.error(err)
+                end
+            end)
+            return
+        end
+
+        ---@param tab? pi.TabId
+        ---@return boolean
+        local function valid_tab(tab)
+            if not tab then
+                return false
             end
-        end)
-    end, { buffer = buf, nowait = true, desc = "Promote subsession to active view" })
+            local ok, valid = pcall(vim.api.nvim_tabpage_is_valid, tab)
+            if not ok then
+                return false
+            end
+            return valid and true or false
+        end
+
+        --- Resolve the tab showing `id`: the session's own tab when attached,
+        --- otherwise the tab of one of its children (a detached parent currently
+        --- shown through a child view).
+        ---@param target pi.Session
+        ---@return pi.TabId?
+        local function resolve_target_tab(target)
+            if valid_tab(target.attached_tab) then
+                return target.attached_tab
+            end
+            if valid_tab(target.tab) then
+                return target.tab
+            end
+            for _, other in ipairs(Sessions.list() or {}) do
+                if other.view_parent_id == child_id and valid_tab(other.attached_tab) then
+                    return other.attached_tab
+                end
+            end
+            return nil
+        end
+
+        -- `viewer_live_session` is the fallback for a live session whose id
+        -- migrated while the viewer was open (`get_by_id` no longer finds the
+        -- id captured at open time, object identity still resolves).
+        local session = Sessions.get_by_id(child_id) or viewer_live_session
+        if not session or not session.rpc or not session.rpc:is_running() then
+            Notify.warn("Cannot switch: the session process is not running")
+            return
+        end
+
+        local target_tab = resolve_target_tab(session)
+        if not target_tab then
+            Notify.warn("Cannot switch: the session is not attached to a tab")
+            return
+        end
+
+        M.close()
+        local switched = pcall(vim.api.nvim_set_current_tabpage, target_tab)
+        if not switched then
+            Notify.warn("Cannot switch: the session tab is no longer available")
+            return
+        end
+
+        local bound = Sessions.get_for_tab(target_tab)
+        if bound and bound.view_parent_id then
+            -- The tab is showing one of this session's children: switch the tab
+            -- back to the parent first.
+            require("pi.subsessions").switch_to_parent(function(ok, err)
+                if not ok then
+                    if err then
+                        Notify.error(err)
+                    end
+                    return
+                end
+                local parent = Sessions.get_for_tab(target_tab)
+                if parent and parent.chat then
+                    parent.chat:ensure_shown_and_focus_prompt()
+                end
+            end)
+        else
+            local target = bound or session
+            if target and target.chat then
+                target.chat:ensure_shown_and_focus_prompt()
+            end
+        end
+    end, { buffer = buf, nowait = true, desc = "Open this session in chat" })
 
     vim.keymap.set("n", "<Tab>", function()
         if not history then
@@ -955,12 +1084,14 @@ function M.open(child_id, opts)
     -- 6. Load messages (RPC or JSONL) and replay into ChatHistory
     if is_live and session and session.rpc then
         local current_child = child_id
+        local live_session = session
+        viewer_live_session = session
         viewer_loading = true
         viewer_event_queue = {}
 
         session.rpc:send({ type = "get_state" }, function(state_res)
             vim.schedule(function()
-                if not M.is_open_for(current_child) then
+                if not M.is_open_for(current_child) and viewer_live_session ~= live_session then
                     return
                 end
                 local d = state_res.data
@@ -982,7 +1113,7 @@ function M.open(child_id, opts)
 
         local sent = session.rpc:send({ type = "get_messages" }, function(res)
             vim.schedule(function()
-                if not M.is_open() or viewer_child_id ~= current_child then
+                if not M.is_open() or (viewer_child_id ~= current_child and viewer_live_session ~= live_session) then
                     return
                 end
                 if not res.success then
@@ -1020,7 +1151,7 @@ function M.open(child_id, opts)
                 local queue = viewer_event_queue or {}
                 viewer_event_queue = nil
                 for _, queued_msg in ipairs(queue) do
-                    if not M.is_open_for(current_child) then
+                    if not M.is_open_for(current_child) and viewer_live_session ~= live_session then
                         break
                     end
                     handle_live_event(session, queued_msg)
