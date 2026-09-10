@@ -617,7 +617,12 @@ function M.handle_event(session, msg)
         and SubsessionViewer.is_open_for
         and SubsessionViewer.on_session_event
         and session.id
-        and SubsessionViewer.is_open_for(session.id)
+        and (
+            SubsessionViewer.is_open_for(session.id)
+            -- Object-identity gate: the viewed session's id can migrate
+            -- (tmp-N -> real id) while the viewer stays open for that object.
+            or (SubsessionViewer.is_open_for_session and SubsessionViewer.is_open_for_session(session))
+        )
     then
         SubsessionViewer.on_session_event(session, msg)
     end
