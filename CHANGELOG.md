@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-09-10
+
+- **CHANGED:** `:PiSessions` `p` previews parent/tab sessions too — the read-only float viewer serves any row: live sessions stream in real time, while a session whose process is gone replays from its JSONL file on disk. Inside the viewer `<CR>` still promotes a sub-session child into the tab's chat, and on a parent/tab row now closes the viewer and jumps to that session's tab with its chat prompt focused (warning instead if the process is not running); parent previews title as `[idle]` at turn end. The help overlay and keymap description now read `Preview session (read-only viewer)`. Issue #107.
+
 ## 2026-09-09
 
 - **ADDED:** `dispatch_subagents` renders model and thinking level in chat — when dispatching sub-agent tasks, items specifying an explicit `model` (e.g. `{ provider, id }` or string) and/or `thinking_level` (or reusing target children with manifest configuration) now display the configuration suffix (e.g. `(claude-3-7-sonnet · think: high)`) in both inline items and block task-tree nodes. Issue #106.
