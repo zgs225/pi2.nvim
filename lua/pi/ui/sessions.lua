@@ -1019,7 +1019,7 @@ local HELP_ENTRIES = {
     { "f", "Fork this session from a past message (:PiFork)" },
     { "C", "Clone this session (:PiClone)" },
     { "t", "Navigate this session's tree (:PiTree)" },
-    { "p", "Preview sub-session (rich viewer)" },
+    { "p", "Preview session (read-only viewer)" },
     { "x", "Close sub-session process (:PiSubClose)" },
     { "<Tab>, za", "Fold / unfold sub-sessions" },
     { "zM, zR", "Collapse / expand all sub-sessions" },
@@ -1314,6 +1314,27 @@ local function tree_under_cursor()
     require("pi").tree()
 end
 
+--- Preview the session under the cursor in the read-only sub-session viewer.
+--- Works on any row: parent/tab rows and sub-session rows alike. The row's
+--- already-resolved display name is forwarded so the viewer titles its float
+--- with it (parent rows have no manifest entry to read a name from), and the
+--- live session's id is preferred over the render-time `session_id` because it
+--- is the freshest value and survives the tmp-N → real-id migration
+--- (manager.migrate_session_id); `session_id` stays as a fallback for rows
+--- whose session object is already gone.
+---@return nil
+local function preview_under_cursor()
+    local row, session = row_session_under_cursor()
+    if not row then
+        return
+    end
+    local id = row.child_id or (session and session.id) or row.session_id
+    if not id then
+        return
+    end
+    require("pi.ui.subsession_viewer").open(id, { name = row.name })
+end
+
 --- Toggle fold/unfold for the session under cursor.
 --- On a parent row with children: toggles fold state for that parent.
 --- On a child row: collapses that child's parent and moves cursor to the parent row.
@@ -1504,12 +1525,12 @@ local function ensure_buf()
         tree_under_cursor,
         vim.tbl_extend("force", map_opts, { desc = "Navigate this session's tree" })
     )
-    vim.keymap.set("n", "p", function()
-        local row = rows[vim.api.nvim_win_get_cursor(0)[1]]
-        if row and row.child_id then
-            require("pi.subsessions").preview(row.child_id)
-        end
-    end, vim.tbl_extend("force", map_opts, { desc = "Preview sub-session (rich viewer)" }))
+    vim.keymap.set(
+        "n",
+        "p",
+        preview_under_cursor,
+        vim.tbl_extend("force", map_opts, { desc = "Preview session (read-only viewer)" })
+    )
     vim.keymap.set("n", "x", function()
         local row = rows[vim.api.nvim_win_get_cursor(0)[1]]
         if row and row.child_id then
