@@ -124,6 +124,23 @@ function M.last_assistant_message(path)
     return nil
 end
 
+--- Stop reason of the last assistant message in a session file.
+---@param path string
+---@return string? stop_reason e.g. "aborted", "stop", "error"
+function M.last_stop_reason(path)
+    local entries = read_jsonl(path)
+    for i = #entries, 1, -1 do
+        local entry = entries[i]
+        if entry.type == "message" and type(entry.message) == "table" and entry.message.role == "assistant" then
+            if type(entry.message.stopReason) == "string" then
+                return entry.message.stopReason
+            end
+            return nil
+        end
+    end
+    return nil
+end
+
 --- Infer a child's run status from the last meaningful JSONL entry.
 ---@param path string
 ---@return "completed"|"interrupted"|nil

@@ -1,6 +1,7 @@
 local Batch = require("pi.subsessions.batch")
 local Manifest = require("pi.subsessions.manifest")
 local Sessions = require("pi.sessions.manager")
+local Subsessions = require("pi.subsessions")
 local Pi = require("pi")
 
 local function make_mock_rpc(sent_list, running_override)
@@ -37,6 +38,8 @@ local function make_mock_chat()
         end,
         set_subsession_breadcrumb = function() end,
         clear_subsession_breadcrumb = function() end,
+        render_statusline = function() end,
+        refresh_prompt_attention = function() end,
     }
 end
 
@@ -65,6 +68,8 @@ describe("sub-session abort propagation and lineage resolution", function()
         end
         Manifest._reset()
         Sessions._reset()
+        Subsessions._reset_abort_epochs()
+        Subsessions._reset_child_aborts()
     end)
 
     after_each(function()
@@ -74,9 +79,11 @@ describe("sub-session abort propagation and lineage resolution", function()
         Manifest.path = real_manifest_path
         Manifest._reset()
         Sessions._reset()
+        Subsessions._reset_abort_epochs()
+        Subsessions._reset_child_aborts()
     end)
 
-    it("Child-view abort reaches parent and cancels batch", function()
+    it("Child-view abort stays inside the child", function()
         local parent_sent = {}
         local child_sent = {}
 
@@ -130,14 +137,15 @@ describe("sub-session abort propagation and lineage resolution", function()
         Pi.abort()
 
         assert.is_true(has_abort(child_sent), "Child received abort")
-        assert.is_true(has_abort(parent_sent), "Parent received abort")
+        assert.is_false(has_abort(parent_sent), "Parent must not receive the child-view abort")
         local current_batch = Batch.get(batch_id)
         assert.equals("cancelled", current_batch.status)
-        assert.equals(0, #parent.attention.pending)
+        assert.equals("cancelled", current_batch.items[1].status)
+        assert.equals(1, #parent.attention.pending)
         assert.equals(0, #child.attention.pending)
     end)
 
-    it("Non-running child still forwards to parent", function()
+    it("Child-view abort with an idle child still isolates the parent", function()
         local parent_sent = {}
         local child_sent = {}
 
@@ -145,7 +153,7 @@ describe("sub-session abort propagation and lineage resolution", function()
             id = "parent-uuid-2",
             lineage_id = "parent-uuid-2",
             rpc = make_mock_rpc(parent_sent, true),
-            attention = { pending = {} },
+            attention = { pending = { { id = "parent-att" } } },
             startup_announcements = {},
             system_errors = {},
             changed_files = {},
@@ -155,7 +163,7 @@ describe("sub-session abort propagation and lineage resolution", function()
             id = "child-uuid-2",
             view_parent_id = "parent-uuid-2",
             rpc = make_mock_rpc(child_sent, false),
-            attention = { pending = {} },
+            attention = { pending = { { id = "child-att" } } },
             startup_announcements = {},
             system_errors = {},
             changed_files = {},
@@ -189,10 +197,107 @@ describe("sub-session abort propagation and lineage resolution", function()
 
         Pi.abort()
 
+        -- An idle child cannot be sent `abort`, but its pending batch item is
+        -- still cancelled so a parent blocked in wait_subagents wakes up — and
+        -- the parent itself must stay untouched.
         assert.is_false(has_abort(child_sent), "Non-running child did not receive abort")
-        assert.is_true(has_abort(parent_sent), "Parent received abort")
+        assert.is_false(has_abort(parent_sent), "Parent must not receive the child-view abort")
+        assert.equals(1, #parent.attention.pending)
+        assert.equals(0, #child.attention.pending)
         local current_batch = Batch.get(batch_id)
         assert.equals("cancelled", current_batch.status)
+        assert.equals("cancelled", current_batch.items[1].status)
+        assert.is_string(current_batch.items[1].error, "cancelled item carries a reason")
+    end)
+
+    it("Parent-view abort cascades to active children without closing processes", function()
+        local parent_sent = {}
+        local active_sent = {}
+        local done_sent = {}
+
+        local parent = {
+            id = "parent-view-1",
+            lineage_id = "parent-view-1",
+            rpc = make_mock_rpc(parent_sent),
+            attention = { pending = { { id = "parent-att" } } },
+            startup_announcements = {},
+            system_errors = {},
+            changed_files = {},
+        }
+
+        local active_child = {
+            id = "active-child",
+            rpc = make_mock_rpc(active_sent),
+            attention = { pending = {} },
+            startup_announcements = {},
+            system_errors = {},
+            changed_files = {},
+        }
+
+        local done_child = {
+            id = "done-child",
+            rpc = make_mock_rpc(done_sent),
+            attention = { pending = { { id = "done-att" } } },
+            startup_announcements = {},
+            system_errors = {},
+            changed_files = {},
+        }
+
+        -- An abort-only cascade must never stop a child process.
+        local active_stops, done_stops = 0, 0
+        active_child.rpc.stop = function()
+            active_stops = active_stops + 1
+        end
+        done_child.rpc.stop = function()
+            done_stops = done_stops + 1
+        end
+
+        Sessions._register_for_test(parent)
+        Sessions._register_for_test(active_child)
+        Sessions._register_for_test(done_child)
+        local tab = vim.api.nvim_get_current_tabpage()
+        Sessions.bind_chat(parent, make_mock_chat(), tab)
+
+        Manifest.upsert(parent.id, {
+            parent_id = parent.id,
+            status = "active",
+            name = "parent",
+        })
+        Manifest.upsert(active_child.id, {
+            parent_id = parent.id,
+            status = "active",
+            name = "a",
+        })
+        Manifest.upsert(done_child.id, {
+            parent_id = parent.id,
+            status = "completed",
+            name = "d",
+        })
+
+        local real_close = Subsessions.close
+        local real_close_session = Sessions.close_session
+        local close_calls, close_session_calls = 0, 0
+        Subsessions.close = function()
+            close_calls = close_calls + 1
+        end
+        Sessions.close_session = function()
+            close_session_calls = close_session_calls + 1
+        end
+
+        Pi.abort()
+
+        Subsessions.close = real_close
+        Sessions.close_session = real_close_session
+
+        assert.is_true(has_abort(parent_sent), "Parent received abort")
+        assert.is_true(has_abort(active_sent), "Active child received abort")
+        assert.is_false(has_abort(done_sent), "Completed child must not receive abort")
+        assert.equals(1, #done_child.attention.pending, "Completed child keeps its attention")
+        assert.equals(0, #parent.attention.pending, "Parent attention is cleared")
+        assert.equals(0, close_calls, "Subsessions.close is never called")
+        assert.equals(0, close_session_calls, "Sessions.close_session is never called")
+        assert.equals(0, active_stops, "Active child process is not stopped")
+        assert.equals(0, done_stops, "Completed child process is not stopped")
     end)
 
     it("tmp→real lineage alias", function()

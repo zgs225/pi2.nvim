@@ -10,6 +10,70 @@ local Read = require("pi.subsessions.read")
 local Batch = require("pi.subsessions.batch")
 local Sessions = require("pi.sessions.manager")
 
+--- Abort epochs per lineage: interactive spawns capture the epoch at start and
+--- bail out when it changes mid-flight (see M.spawn).
+local abort_epochs = {}
+
+--- Bump the abort epoch for a lineage so in-flight interactive spawns for it stop.
+---@param lineage_id string
+function M.mark_lineage_aborted(lineage_id)
+    if type(lineage_id) ~= "string" or lineage_id == "" then
+        return
+    end
+    abort_epochs[lineage_id] = (abort_epochs[lineage_id] or 0) + 1
+end
+
+---@param lineage_id string
+---@return integer epoch Current abort epoch (0 when unknown).
+function M.abort_epoch(lineage_id)
+    if type(lineage_id) ~= "string" or lineage_id == "" then
+        return 0
+    end
+    return abort_epochs[lineage_id] or 0
+end
+
+--- Test helper: drop all recorded abort epochs.
+function M._reset_abort_epochs()
+    abort_epochs = {}
+end
+
+--- Highest generation aborted per child. A child's `agent_settled` carries no
+--- generation of its own, and the parent may already have reused that child for
+--- a newer run by the time it arrives — so the settle path filters batch items
+--- by this watermark instead of by the current manifest generation.
+local child_aborts = {}
+
+--- Record the generation aborted for a child (monotonic per child).
+---@param child_id string
+---@param generation? integer
+function M.mark_child_aborted(child_id, generation)
+    if type(child_id) ~= "string" or child_id == "" or type(generation) ~= "number" then
+        return
+    end
+    -- `nil` means "never recorded": a recorded 0 must not be confused with an
+    -- absent watermark (real runs start at 1, but the distinction is what keeps
+    -- `aborted_generation` honest).
+    local current = child_aborts[child_id]
+    if current == nil or generation > current then
+        child_aborts[child_id] = generation
+    end
+end
+
+--- Highest generation aborted for a child, or nil when none was recorded.
+---@param child_id string
+---@return integer?
+function M.aborted_generation(child_id)
+    if type(child_id) ~= "string" or child_id == "" then
+        return nil
+    end
+    return child_aborts[child_id]
+end
+
+--- Test helper: drop all recorded abort watermarks.
+function M._reset_child_aborts()
+    child_aborts = {}
+end
+
 ---@param a string?
 ---@param b string?
 ---@return boolean
@@ -246,6 +310,8 @@ function M.on_parent_new_conversation(parent)
     end
     parent.conversation_epoch = (parent.conversation_epoch or 0) + 1
     parent.view_parent_id = nil
+    -- A process reused for a fresh conversation is no longer a child.
+    parent.parent_id = nil
     require("pi.ui.sessions").request_refresh()
 end
 
@@ -253,6 +319,8 @@ end
 ---@param session pi.Session
 ---@param session_path string
 function M.on_parent_resumed(session, session_path)
+    -- A process reused by :PiResume is no longer a child; drop stale parentage.
+    session.parent_id = nil
     session.view_parent_id = nil
     session.conversation_epoch = 0
     session.lineage_id = nil
@@ -275,9 +343,23 @@ function M.spawn(parent, opts, callback)
         return
     end
 
+    -- Abort epoch of the lineage as it resolves *now*: `with_parent_id` below can
+    -- do an id-lookup round-trip, and before that round-trip finishes the parent
+    -- may still be keyed by a `tmp-` id. An abort landing in that window bumps
+    -- that pre-migration key, so it is captured here as well as after the lookup.
+    local entry_lineage = Manifest.lineage_for_session(parent)
+    local entry_epoch = M.abort_epoch(entry_lineage)
+
     with_parent_id(parent, function(parent_id)
         if parent_id == "" then
             callback(nil, "parent session id not available")
+            return
+        end
+
+        -- Nothing has been reserved or created yet, so an abort that arrived
+        -- while the id lookup was in flight just cancels this spawn.
+        if M.abort_epoch(entry_lineage) ~= entry_epoch then
+            callback(nil, "sub-session aborted while spawning")
             return
         end
 
@@ -286,6 +368,10 @@ function M.spawn(parent, opts, callback)
         if lineage_id == "" then
             lineage_id = parent_id
         end
+        -- Abort-epoch guard: if the lineage is aborted while the async spawn
+        -- chain below is still in flight, the chain bails out instead of
+        -- starting a task for a sub-session the user already cancelled.
+        local epoch = M.abort_epoch(lineage_id)
 
         local max = subcfg.max_children or 5
         if not Manifest.try_reserve_spawn(lineage_id, max) then
@@ -320,6 +406,12 @@ function M.spawn(parent, opts, callback)
 
         local function register_and_run(session_id)
             child.id = session_id
+            if M.abort_epoch(lineage_id) ~= epoch then
+                unreserve()
+                Sessions.close_session(child)
+                callback(nil, "sub-session aborted while spawning")
+                return
+            end
             Manifest.upsert(session_id, {
                 parent_id = lineage_id,
                 parent_epoch = parent.conversation_epoch or 0,
@@ -339,6 +431,16 @@ function M.spawn(parent, opts, callback)
             })
             unreserve()
             apply_config(child, config, function(ok, config_err)
+                -- Abort can land during the config round-trip: the child is in
+                -- the manifest but has not received its task yet, so reclaim it
+                -- instead of starting work the user already cancelled.
+                if M.abort_epoch(lineage_id) ~= epoch then
+                    Manifest.patch(session_id, { status = "interrupted", last_active_at = Manifest.iso_now() })
+                    Sessions.close_session(child)
+                    require("pi.ui.sessions").request_refresh()
+                    callback(nil, "sub-session aborted while spawning")
+                    return
+                end
                 if not ok then
                     Manifest.patch(session_id, { status = "failed", last_active_at = Manifest.iso_now() })
                     Sessions.close_session(child)
@@ -362,6 +464,12 @@ function M.spawn(parent, opts, callback)
         -- Wait for backend session id via get_state.
         child.rpc:send({ type = "get_state" }, function(res)
             vim.schedule(function()
+                if M.abort_epoch(lineage_id) ~= epoch then
+                    unreserve()
+                    Sessions.close_session(child)
+                    callback(nil, "sub-session aborted while spawning")
+                    return
+                end
                 if not res.success or not res.data then
                     unreserve()
                     Sessions.close_session(child)
@@ -574,7 +682,33 @@ function M.on_child_settled(child)
 
     local path = child.session_file or Read.find_path(child.id)
     local report = path and Read.last_assistant_message(path) or nil
+    local aborted = path ~= nil and Read.last_stop_reason(path) == "aborted"
     local parent = Sessions.find_by_lineage(entry.parent_id)
+
+    if aborted then
+        -- Settle the aborted run's own items (waking a parent blocked in
+        -- wait_subagents) without touching a newer run: prefer the recorded
+        -- abort watermark over the manifest generation, which the parent may
+        -- already have bumped by reusing this child.
+        local watermark = M.aborted_generation(child.id)
+        local current = type(entry.run_generation) == "number" and entry.run_generation or nil
+        Batch.interrupt_items_for_child(child.id, {
+            generation = watermark or current,
+            reason = "cancelled: aborted by user",
+        })
+        -- When the child was already reused for a newer run this settle belongs
+        -- to the aborted run only: leave the live run's manifest status alone.
+        if not (watermark and current and current > watermark) then
+            Manifest.patch(child.id, {
+                status = "interrupted",
+                last_report = report,
+                last_active_at = Manifest.iso_now(),
+            })
+        end
+        after_completed(parent)
+        return
+    end
+
     local claimed = Batch.on_child_settled(child.id)
 
     -- Agent tool path or a running batch item: skip parent prompt injection.
@@ -914,10 +1048,21 @@ function M.sub_close()
         Notify.warn("Current session is not a sub-session")
         return
     end
-    M.close(current.id)
     if in_child_view then
-        M.switch_to_parent(function() end)
+        -- Return to the parent BEFORE closing: M.close detaches the tab, after
+        -- which switch_to_parent's Sessions.get() fails and the user is
+        -- stranded on a dead child view.
+        local child_id = current.id
+        M.switch_to_parent(function(ok)
+            if ok then
+                M.close(child_id)
+            else
+                Notify.warn("Cannot return to parent; sub-session left running")
+            end
+        end)
+        return
     end
+    M.close(current.id)
 end
 
 --- User command: picker to view a child sub-session in a read-only float.

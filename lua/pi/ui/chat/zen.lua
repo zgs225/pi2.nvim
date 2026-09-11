@@ -6,6 +6,7 @@
 ---@field _win integer?
 ---@field _prev_win integer?
 ---@field _winleave_aucmd integer?
+---@field _winclosed_aucmd integer?
 ---@field _resize_aucmd integer?
 ---@field _bound_keys { lhs: string, modes: string[], saved: table<string, table?> }[]
 local Zen = {}
@@ -27,6 +28,7 @@ function Zen.new(prompt)
     self._win = nil
     self._prev_win = nil
     self._winleave_aucmd = nil
+    self._winclosed_aucmd = nil
     self._resize_aucmd = nil
     self._bound_keys = {}
     return self
@@ -110,6 +112,19 @@ function Zen:enter()
         style = "minimal",
         border = "none",
         zindex = ZEN_ZINDEX,
+    })
+
+    -- The zen float can be closed by anything outside this module (tab close,
+    -- :q, a layout teardown). WinClosed is the only reliable signal left once
+    -- the window is gone, so tear the overlay down from here.
+    self._winclosed_aucmd = vim.api.nvim_create_autocmd("WinClosed", {
+        pattern = tostring(self._win),
+        once = true,
+        callback = function()
+            vim.schedule(function()
+                self:exit()
+            end)
+        end,
     })
 
     vim.wo[self._win].wrap = true
@@ -272,7 +287,10 @@ function Zen:_reposition()
 end
 
 function Zen:exit()
-    if not self:is_active() then
+    -- Not `is_active()`: the zen window may already be gone (external close),
+    -- in which case _win is non-nil but invalid and the backdrop still needs
+    -- tearing down.
+    if self._win == nil and self._backdrop_win == nil then
         return
     end
 
@@ -288,6 +306,10 @@ function Zen:exit()
     if self._resize_aucmd then
         vim.api.nvim_del_autocmd(self._resize_aucmd)
         self._resize_aucmd = nil
+    end
+    if self._winclosed_aucmd then
+        pcall(vim.api.nvim_del_autocmd, self._winclosed_aucmd)
+        self._winclosed_aucmd = nil
     end
 
     -- Capture cursor position before closing — this is where the user

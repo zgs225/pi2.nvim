@@ -1121,7 +1121,27 @@ function Chat:_send_message(queue_type)
         end, attachments)
     end
 
-    self._agent.send(cmd)
+    if self._agent.send(cmd) == false then
+        -- The RPC process is gone (or the send failed): never silently drop
+        -- the user's message. Undo the optimistic UI state and put the text
+        -- and attachments back into the prompt so they can be retried.
+        if queue_type then
+            self._history:remove_pending_queue_entry(expanded)
+        end
+        self._vision_inflight = nil
+        if vision_model then
+            -- Clear the pending preview row / status this path set optimistically.
+            self._history:set_vision_pending(nil)
+            if not self._streaming and not self._compacting then
+                self:set_status(nil)
+            end
+        end
+        self._prompt:set_text(text)
+        if attachments and #attachments > 0 then
+            self._attachments:restore(attachments)
+        end
+        Notify.error("Failed to send the message (is the pi process running?) — restored to the prompt")
+    end
 end
 
 --- Execute a direct bash command (! prefix) via the RPC `bash` command.

@@ -843,8 +843,19 @@ function M.handle_event(session, msg)
         end
     elseif t == "_process_exit" then
         mark_run_end(session)
+        -- Crash vs intentional stop: close_session()/stop() unregister the
+        -- session synchronously before the async on_exit dispatch, so a
+        -- session still registered here died unexpectedly.
+        local was_registered = session.id ~= nil and registry[session.id] ~= nil
         if session.id then
             registry[session.id] = nil
+        end
+        if was_registered and session.parent_id and session.id then
+            -- Ordering matters: Batch.on_child_settled reads the manifest's
+            -- `failed` status to settle the running batch item, so patch first.
+            local Manifest = require("pi.subsessions.manifest")
+            Manifest.patch(session.id, { status = "failed", last_active_at = Manifest.iso_now() })
+            require("pi.subsessions").on_child_settled(session)
         end
         if chat then
             vim.schedule(function()

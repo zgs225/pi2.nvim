@@ -8,6 +8,7 @@ describe("subsession batch", function()
     local manifest_tmp
     local real_spawn
     local real_revive
+    local real_close
     local real_manifest_path
     local Subsessions
 
@@ -23,12 +24,14 @@ describe("subsession batch", function()
         Subsessions = require("pi.subsessions")
         real_spawn = Subsessions.spawn
         real_revive = Subsessions.revive
+        real_close = Subsessions.close
         Manifest._reset()
     end)
 
     after_each(function()
         Subsessions.spawn = real_spawn
         Subsessions.revive = real_revive
+        Subsessions.close = real_close
         os.remove(batch_tmp)
         os.remove(manifest_tmp)
         Batch._reset()
@@ -424,6 +427,143 @@ describe("subsession batch", function()
 
         Batch.cancel_for_parent("session-new")
         assert.equals("cancelled", Batch.get(batch_id).status)
+    end)
+
+    -- A9: the spawn/revive callbacks close over a stale in-memory item while
+    -- the batch is reloaded from disk. A cancel (or a settle) landing in
+    -- between must not let a late callback resurrect a cancelled item.
+    it("a stale spawn callback must not resurrect a cancelled item", function()
+        local spawn_cb
+        local sent = {}
+        local closed = {}
+        Subsessions.spawn = function(_parent, _opts, callback)
+            spawn_cb = callback
+        end
+        Subsessions.close = function(id)
+            closed[#closed + 1] = id
+            return true
+        end
+
+        local parent = {
+            id = "parent-1",
+            rpc = {
+                is_running = function()
+                    return true
+                end,
+            },
+        }
+        local batch_id
+        Batch.dispatch(parent, { items = { { ref = "a", task = "t", name = "A" } } }, function(res)
+            batch_id = res.batch_id
+        end)
+
+        assert.is_true(
+            vim.wait(1000, function()
+                return spawn_cb ~= nil
+            end, 10),
+            "spawn must be reached"
+        )
+
+        Manifest.upsert("c1", {
+            parent_id = "parent-1",
+            name = "c1",
+            task_prompt = "t",
+            config = {},
+            status = "active",
+            reported = false,
+            created_at = Manifest.iso_now(),
+            last_active_at = Manifest.iso_now(),
+            agent_spawned = true,
+            run_generation = 1,
+        })
+
+        Batch.cancel(batch_id)
+        assert.equals("cancelled", Batch.poll(batch_id).items[1].status)
+
+        spawn_cb({
+            id = "c1",
+            rpc = {
+                is_running = function()
+                    return true
+                end,
+                send = function(_, cmd)
+                    sent[#sent + 1] = cmd
+                    return true
+                end,
+            },
+        }, nil)
+
+        local snap = Batch.poll(batch_id)
+        assert.equals("cancelled", snap.items[1].status, "a cancelled item must never become running")
+        assert.is_nil(snap.items[1].target)
+        assert.equals("abort", sent[1] and sent[1].type, "the orphaned child must be aborted")
+        assert.is_true(vim.tbl_contains(closed, "c1"), "the orphaned child must be closed")
+        assert.equals("interrupted", Manifest.load()["c1"].status)
+    end)
+
+    it("a stale revive callback must not bump generation or keep the revived child", function()
+        local revive_cb
+        local sent = {}
+        Subsessions.revive = function(_target, callback)
+            revive_cb = callback
+        end
+        Subsessions.close = function(_id)
+            return true
+        end
+
+        Manifest.upsert("child-u", {
+            parent_id = "parent-1",
+            name = "child-u",
+            task_prompt = "t",
+            config = {},
+            status = "dormant",
+            reported = false,
+            created_at = Manifest.iso_now(),
+            last_active_at = Manifest.iso_now(),
+            agent_spawned = false,
+            run_generation = 5,
+        })
+
+        local parent = {
+            id = "parent-1",
+            rpc = {
+                is_running = function()
+                    return true
+                end,
+            },
+        }
+        local batch_id
+        Batch.dispatch(parent, { items = { { ref = "r", target = "child-u", message = "go" } } }, function(res)
+            batch_id = res.batch_id
+        end)
+
+        assert.is_true(
+            vim.wait(1000, function()
+                return revive_cb ~= nil
+            end, 10),
+            "revive must be reached"
+        )
+
+        Batch.cancel(batch_id)
+
+        revive_cb({
+            id = "child-u",
+            rpc = {
+                is_running = function()
+                    return true
+                end,
+                send = function(_, cmd)
+                    sent[#sent + 1] = cmd
+                    return true
+                end,
+            },
+        }, nil)
+
+        local entry = Manifest.load()["child-u"]
+        assert.equals(5, entry.run_generation, "a stale revive must not bump the generation")
+        assert.equals("interrupted", entry.status)
+        assert.equals("cancelled", Batch.poll(batch_id).items[1].status)
+        assert.equals("abort", sent[1] and sent[1].type, "the freshly revived child must be aborted")
     end)
 
     describe("item validation", function()

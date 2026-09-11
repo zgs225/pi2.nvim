@@ -691,6 +691,12 @@ function M.clear_session(session)
     if removed == 0 then
         return
     end
+    -- Cancel each queued request before dropping it: the backend is blocked in
+    -- ctx.ui.*() until it receives an extension_ui_response, and dropping the
+    -- queue without one would leave it waiting forever.
+    for _, entry in ipairs(pending) do
+        send_response(session, { type = "extension_ui_response", id = entry.id, cancelled = true })
+    end
     session.attention.pending = {}
     reschedule_timer(true)
     request_redraw()

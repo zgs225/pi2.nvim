@@ -11,6 +11,7 @@
 ---@field _bash_mode boolean
 ---@field _on_bash_mode_change fun(is_bash: boolean)?
 ---@field _resume_insert? "eol"|"bol"|"mid"
+---@field _draft_path string? resolved per-workspace draft file for this prompt
 local Prompt = {}
 Prompt.__index = Prompt
 
@@ -65,6 +66,7 @@ function Prompt.new(tab, attachments)
     self._zen = false
     self._bash_mode = false
     self._on_bash_mode_change = nil
+    self._draft_path = nil
 
     local panel = Config.options.panels.prompt
     local name = panel.name and panel.name(tab) or ("π-prompt | " .. tab)
@@ -367,6 +369,10 @@ end
 --- workspace's draft file — never from another project's.
 ---@param cwd string
 function Prompt:set_workspace(cwd)
+    -- Keep the resolved path on the instance: several chats (one per tab) may
+    -- live in the same process, and a module-level path would let them clobber
+    -- or delete each other's drafts.
+    self._draft_path = Draft.path_for(cwd)
     Draft.set_workspace(cwd)
     local draft_cfg = Config.options.prompt and Config.options.prompt.draft
     if not draft_cfg or draft_cfg.enabled == false then
@@ -375,7 +381,7 @@ function Prompt:set_workspace(cwd)
     if not self._buf or not vim.api.nvim_buf_is_valid(self._buf) then
         return
     end
-    local draft = Draft.restore_once()
+    local draft = Draft.restore_once(self._draft_path)
     if draft and draft ~= "" then
         vim.api.nvim_buf_set_lines(self._buf, 0, -1, false, vim.split(draft, "\n", { plain = true }))
     end
@@ -389,7 +395,7 @@ function Prompt:_save_draft()
         return
     end
     local text = table.concat(vim.api.nvim_buf_get_lines(self._buf, 0, -1, false), "\n")
-    Draft.save(vim.trim(text) == "" and "" or text)
+    Draft.save(vim.trim(text) == "" and "" or text, self._draft_path)
 end
 
 ---@return integer

@@ -716,11 +716,16 @@ function M.extract_tool_sections(history, block)
     local ns_id = history:ns()
     local header_row = vim.api.nvim_buf_get_extmark_by_id(buf, ns_id, block.icon_extmark, {})[1]
     local footer_row = vim.api.nvim_buf_get_extmark_by_id(buf, ns_id, block.end_extmark, {})[1]
+    if not header_row or not footer_row then
+        -- The block's header/footer anchors are gone (e.g. a collapse cleared
+        -- the namespace): there is no valid inner range to read.
+        return {}, {}, false
+    end
     local has_output = block.output_extmark ~= nil
 
     local input_end = footer_row
     if has_output then
-        input_end = vim.api.nvim_buf_get_extmark_by_id(buf, ns_id, block.output_extmark, {})[1]
+        input_end = vim.api.nvim_buf_get_extmark_by_id(buf, ns_id, block.output_extmark, {})[1] or footer_row
     end
     local input_lines = vim.api.nvim_buf_get_lines(buf, header_row + 1, input_end, false)
 
@@ -738,7 +743,7 @@ function M.extract_tool_sections(history, block)
 
     local output_lines = {}
     if has_output then
-        local output_row = vim.api.nvim_buf_get_extmark_by_id(buf, ns_id, block.output_extmark, {})[1]
+        local output_row = vim.api.nvim_buf_get_extmark_by_id(buf, ns_id, block.output_extmark, {})[1] or footer_row
         -- Output section: separator, actual lines...
         local content_start = output_row + 1 -- skip separator
         if content_start < footer_row then

@@ -55,6 +55,25 @@ describe("scoped_models.read", function()
     end)
 end)
 
+describe("scoped_models.state_path", function()
+    after_each(function()
+        ScopedModels._set_path(nil)
+    end)
+
+    it("embeds the PID so concurrent nvim instances cannot clobber each other", function()
+        local path = ScopedModels.state_path("2")
+        assert.is_truthy(path:find(tostring(vim.fn.getpid()), 1, true), "state_path must contain the PID: " .. path)
+        -- PID segment before the tab segment, and distinct tabs stay distinct.
+        assert.is_truthy(path:match("pi2nvim%-scope%-%d+%-2$") ~= nil, "unexpected layout: " .. path)
+        assert.are_not.equal(ScopedModels.state_path("2"), ScopedModels.state_path("3"))
+    end)
+
+    it("still honours the test override", function()
+        ScopedModels._set_path("/tmp/pi2nvim-scope-test")
+        assert.are.equal("/tmp/pi2nvim-scope-test", ScopedModels.state_path("2"))
+    end)
+end)
+
 describe("scoped_models.filter", function()
     local all_models = {
         { provider = "opencode-go", id = "deepseek-v4-flash" },
