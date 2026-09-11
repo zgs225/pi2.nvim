@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-09-11
+
+- **ADDED:** Compact letter-style thinking component in the prompt statusline and sub-session viewer. Replaces long statusline strings (e.g. `󰟶 high`, `󰟶 thinking off`) with a compact letter badge and level-specific colors. When disabled (`off`), it renders a single slashed lightbulb icon `󰹏` without trailing text; active reasoning levels render unslashed lightbulb `󰌵` with uppercase letter codes (`MIN`, `L`, `M`, `H`, `X`, `MAX`).
+- **ADDED:** Level-specific thinking highlight groups (`PiThinkingOff`, `PiThinkingMinimal`, `PiThinkingLow`, `PiThinkingMedium`, `PiThinkingHigh`, `PiThinkingXhigh`, `PiThinkingMax`). Each level gets its own semantic color gradient, enabled by default via `statusline.components.thinking.colored = true`.
+- **CHANGED:** Statusline thinking configuration supports `colored` and per-level `levels` overrides in `statusline.components.thinking`, allowing customization of icon, text, and highlight group per level. Issue #108.
+
 ## 2026-09-10
 
 - **ADDED:** Sub-session names now self-improve. A child that was not given a name starts at the first 40 task characters and is then relabelled with the child's **own auto-generated session title** (the same `title.*` mechanism that names top-level sessions) as soon as the child's first turn ends. The new label flows through `:PiSessions`, the `:PiSubSwitch` / `:PiSubView` pickers, the `dispatch_subagents` block and the completion notice. The manifest records where a name came from (`name_source`), so an explicitly supplied name — `name` on a `dispatch_subagents` `{ task }` item, or a name actually typed into the `:PiSubNew` dialog (accepting its prefilled default stays replaceable) — is never overwritten. Set `title = { enabled = false }` to opt out.

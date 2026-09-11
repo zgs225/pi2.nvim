@@ -447,7 +447,7 @@ The **center** group is centered in the window and has placement priority: when 
 | `compaction` | 󰏗 | Auto-compaction is enabled — the same icon as the compaction summary label |
 | `attention` | `󰵚` / `󰵚 2` | There's at least one pending attention request |
 | `model` | `claude-opus-4-6` / `claude-opus-4-6  [anthropic]` | A model is active. The `[provider]` suffix appears when the same model id is served by several providers (or by one provider through several base URLs) — see the `provider` option below |
-| `thinking` | `xhigh` / `thinking off` | The current model supports reasoning |
+| `thinking` | `󰌵 H` / `󰹏` | The current model supports reasoning |
 | `spinner` | `⠋ Working… 12s · Thinking` | The agent is busy. The elapsed figure counts from the start of the run (the first `agent_start`) and keeps counting across mid-run status changes — compaction, retries, and the resumed `agent_start` after compaction — resetting only when the run ends. Switching the tab UI to a session that is still running in the background (parent ↔ child, or sibling children) continues that same clock; it does not restart at the moment you switch. While the double-<Esc> abort gesture is armed, the hint temporarily replaces the spinner; an `Aborted` confirmation outranks both |
 | `queue` | `⏵ 2` | There are pending steer/follow-up messages |
 
@@ -481,6 +481,22 @@ statusline = {
 
         -- `attention` can show a numeric counter instead of the icon.
         attention = { icon = "󰵚", counter = false },
+
+        -- `thinking` shows a compact letter indicator with level-specific
+        -- colors (`colored = true` by default) and customizable `levels`:
+        thinking = {
+            icon = "󰌵",
+            colored = true,
+            levels = {
+                off = { icon = "󰹏", text = "" },
+                minimal = { text = "MIN" },
+                low = { text = "L" },
+                medium = { text = "M" },
+                high = { text = "H" },
+                xhigh = { text = "X" },
+                max = { text = "MAX" },
+            },
+        },
     },
 },
 ```
@@ -818,7 +834,7 @@ Beyond visibility, reasoning-capable models let you pick _how much_ the model th
 off | minimal | low | medium | high | xhigh
 ```
 
-`off` disables reasoning entirely (where the model supports that), and each successive level gives the model more budget to think. `xhigh` is OpenAI codex-max-only; the other five are broadly supported across reasoning models. The currently-active level appears in the `thinking` statusline component (see [Statusline](#statusline)).
+`off` disables reasoning entirely (where the model supports that), and each successive level gives the model more budget to think. `xhigh` is OpenAI codex-max-only; the other five are broadly supported across reasoning models. The currently-active level appears in the `thinking` statusline component (`󰌵 H`, `󰌵 MIN`, `󰹏` when off; see [Statusline](#statusline)).
 
 Two ways to change it mid-session:
 

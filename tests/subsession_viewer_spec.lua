@@ -1050,7 +1050,7 @@ describe("pi.ui.subsession_viewer", function()
         })
         assert.is_table(chunks)
         assert.is_truthy(plain:find("claude-3-5-sonnet", 1, true))
-        assert.is_truthy(plain:find("high", 1, true))
+        assert.is_truthy(plain:find("󰌵 H", 1, true))
         assert.is_truthy(plain:find("12.5%/200k", 1, true))
 
         -- Thinking off
@@ -1058,7 +1058,7 @@ describe("pi.ui.subsession_viewer", function()
             model_id = "gpt-4o",
             thinking_level = "off",
         })
-        assert.is_truthy(plain_off:find("thinking off", 1, true))
+        assert.is_truthy(plain_off:find("󰹏", 1, true))
 
         -- Tokens only without context window
         local _, plain_tokens = Viewer._format_statusline({
@@ -1174,7 +1174,7 @@ describe("pi.ui.subsession_viewer", function()
             footer_text = footer_text .. chunk[1]
         end
         assert.is_truthy(footer_text:find("claude-3-7-sonnet", 1, true))
-        assert.is_truthy(footer_text:find("high", 1, true))
+        assert.is_truthy(footer_text:find("󰌵 H", 1, true))
         assert.is_truthy(footer_text:find("12k", 1, true))
         assert.is_truthy(vim.wo[win].statusline:find("claude-3-7-sonnet", 1, true))
 
@@ -1286,7 +1286,7 @@ describe("pi.ui.subsession_viewer", function()
             footer_text = footer_text .. chunk[1]
         end
         assert.is_truthy(footer_text:find("gpt-4o", 1, true))
-        assert.is_truthy(footer_text:find("low", 1, true))
+        assert.is_truthy(footer_text:find("󰌵 L", 1, true))
         assert.is_truthy(footer_text:find("20.0%/128k", 1, true))
 
         -- Live event: message_end with higher usage

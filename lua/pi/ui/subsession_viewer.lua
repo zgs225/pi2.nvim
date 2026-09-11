@@ -135,19 +135,75 @@ local function build_model_chunk(status)
     return { text, "PiStatusLine" }
 end
 
+local DEFAULT_THINKING_LEVELS = {
+    off = { icon = "󰹏", text = "" },
+    minimal = { text = "MIN" },
+    low = { text = "L" },
+    medium = { text = "M" },
+    high = { text = "H" },
+    xhigh = { text = "X" },
+    max = { text = "MAX" },
+}
+
+local DEFAULT_THINKING_HLS = {
+    off = "PiThinkingOff",
+    minimal = "PiThinkingMinimal",
+    low = "PiThinkingLow",
+    medium = "PiThinkingMedium",
+    high = "PiThinkingHigh",
+    xhigh = "PiThinkingXhigh",
+    max = "PiThinkingMax",
+}
+
 ---@param status pi.SubsessionViewerStatus
 ---@return string[]?
 local function build_thinking_chunk(status)
     if not status.thinking_level or status.thinking_level == "" then
         return nil
     end
+    local level = status.thinking_level
     local cfg = component_config("thinking")
-    local text = status.thinking_level == "off" and "thinking off" or status.thinking_level
-    local icon = cfg.icon
-    if type(icon) == "string" and icon ~= "" then
-        text = icon .. " " .. text
+    local user_levels = type(cfg.levels) == "table" and cfg.levels or {}
+    local def_level = DEFAULT_THINKING_LEVELS[level] or { text = level }
+    local level_cfg = user_levels[level] or {}
+
+    local icon = level_cfg.icon
+    if icon == nil then
+        if level == "off" then
+            icon = (DEFAULT_THINKING_LEVELS.off or {}).icon or "󰹏"
+        elseif cfg.icon == false then
+            icon = ""
+        elseif type(cfg.icon) == "string" and cfg.icon ~= "" then
+            icon = cfg.icon
+        else
+            icon = "󰌵"
+        end
     end
-    return { text, "PiThinking" }
+
+    local text = level_cfg.text
+    if text == nil then
+        text = def_level.text
+    end
+
+    local hl = level_cfg.hl
+    if not hl then
+        if cfg.colored ~= false then
+            hl = DEFAULT_THINKING_HLS[level] or "PiThinking"
+        else
+            hl = "PiStatusLine"
+        end
+    end
+
+    local display
+    if icon ~= "" and text ~= "" then
+        display = icon .. " " .. text
+    elseif icon ~= "" then
+        display = icon
+    else
+        display = text
+    end
+
+    return { display, hl }
 end
 
 --- Build statusline chunks and plain text for subsession viewer footer.

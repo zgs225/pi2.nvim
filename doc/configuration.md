@@ -117,7 +117,19 @@ require("pi").setup({
             -- when the same model id is served by several providers/endpoints,
             -- "always" appends it unconditionally, "never" keeps the bare id.
             model = { icon = "󰚩", provider = "ambiguous" },
-            thinking = { icon = "󰟶" },
+            thinking = {
+                icon = "󰌵",
+                colored = true,
+                levels = {
+                    off = { icon = "󰹏", text = "" },
+                    minimal = { text = "MIN" },
+                    low = { text = "L" },
+                    medium = { text = "M" },
+                    high = { text = "H" },
+                    xhigh = { text = "X" },
+                    max = { text = "MAX" },
+                },
+            },
             queue = { icon = "⏵" },
         },
     },

@@ -131,6 +131,13 @@ All highlight groups are defined with `default = true`, so they can be overridde
 | `PiStatusLineAttention` | Attention component highlight |
 | `PiStatusLineWarning` | `warn`-threshold highlight for `context` / `cost` components |
 | `PiStatusLineError` | `error`-threshold highlight for `context` / `cost` components |
+| `PiThinkingOff` | Statusline thinking indicator: `off` level |
+| `PiThinkingMinimal` | Statusline thinking indicator: `minimal` level |
+| `PiThinkingLow` | Statusline thinking indicator: `low` level |
+| `PiThinkingMedium` | Statusline thinking indicator: `medium` level |
+| `PiThinkingHigh` | Statusline thinking indicator: `high` level |
+| `PiThinkingXhigh` | Statusline thinking indicator: `xhigh` level |
+| `PiThinkingMax` | Statusline thinking indicator: `max` level |
 
 ## Session stats
 
