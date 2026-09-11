@@ -3,6 +3,9 @@
 -- session was blocked in wait_subagents; they now assert the FIXED behavior.
 -- Case 4 is the exception: it documents intended double-<Esc> guard behavior
 -- (inert while not streaming/retrying), which is by design and unchanged.
+-- Case 1 has since been superseded on purpose: aborting from a child view now
+-- isolates the parent session (only the child's own pending batch items are
+-- cancelled), so the single-session abort below is the intended behavior.
 
 local Batch = require("pi.subsessions.batch")
 local Manifest = require("pi.subsessions.manifest")
@@ -42,6 +45,8 @@ local function make_mock_chat()
         end,
         set_subsession_breadcrumb = function() end,
         clear_subsession_breadcrumb = function() end,
+        render_statusline = function() end,
+        refresh_prompt_attention = function() end,
     }
 end
 
@@ -61,6 +66,8 @@ describe("regression: PiAbort during sub-wait", function()
         end
         Manifest._reset()
         Sessions._reset()
+        Subsessions._reset_abort_epochs()
+        Subsessions._reset_child_aborts()
     end)
 
     after_each(function()
@@ -70,9 +77,11 @@ describe("regression: PiAbort during sub-wait", function()
         Manifest.path = real_manifest_path
         Manifest._reset()
         Sessions._reset()
+        Subsessions._reset_abort_epochs()
+        Subsessions._reset_child_aborts()
     end)
 
-    it("Case 1: PiAbort in child view aborts the parent session and cancels the batch", function()
+    it("Case 1: PiAbort in child view isolates the parent session", function()
         local parent_sent = {}
         local child_sent = {}
 
@@ -80,7 +89,7 @@ describe("regression: PiAbort during sub-wait", function()
             id = "parent-uuid-1",
             lineage_id = "parent-uuid-1",
             rpc = make_mock_rpc(parent_sent),
-            attention = { pending = {} },
+            attention = { pending = { { id = "parent-att" } } },
             startup_announcements = {},
             system_errors = {},
             changed_files = {},
@@ -90,7 +99,7 @@ describe("regression: PiAbort during sub-wait", function()
             id = "child-uuid-1",
             view_parent_id = "parent-uuid-1",
             rpc = make_mock_rpc(child_sent),
-            attention = { pending = {} },
+            attention = { pending = { { id = "child-att" } } },
             startup_announcements = {},
             system_errors = {},
             changed_files = {},
@@ -143,11 +152,19 @@ describe("regression: PiAbort during sub-wait", function()
         end
         local current_batch = Batch.get(batch_id)
 
-        -- FIXED: the abort reaches BOTH the child and the parent, and the
-        -- batch is cancelled via the parent's lineage.
+        -- ISOLATION: only the child is aborted. The parent session, its
+        -- attention and its other batch items are left untouched; the child's
+        -- own pending batch item is cancelled so a parent blocked in
+        -- wait_subagents wakes up.
         assert.is_true(child_aborted, "Child received abort")
-        assert.is_true(parent_aborted, "Parent received abort while viewing the child")
+        assert.is_false(parent_aborted, "Parent must not be aborted from a child view")
         assert.equals("cancelled", current_batch.status)
+        assert.equals("cancelled", current_batch.items[1].status)
+        assert.is_string(current_batch.items[1].error, "cancelled item carries a reason")
+        assert.is_true(#current_batch.items[1].error > 0, "cancelled item reason is non-empty")
+        assert.is_true(#parent.attention.pending > 0, "Parent attention is preserved")
+        assert.equals(0, #child.attention.pending, "Child attention is cleared")
+        assert.equals(0, Subsessions.abort_epoch(parent.id))
     end)
 
     it("Case 2: extensions/subagent.ts forwards the tool AbortSignal to the host select", function()
