@@ -255,7 +255,7 @@ describe("statusline", function()
         sl:set_model_ambiguity_for("anthropic", "claude-x", "[anthropic]")
         local text = status_row()
         assert.is_not_nil(text:find("claude-x", 1, true))
-        assert.is_not_nil(text:find("xhigh", 1, true))
+        assert.is_not_nil(text:find("󰌵 X", 1, true))
         assert.is_nil(text:find("[anthropic]", 1, true))
     end)
 
@@ -268,7 +268,7 @@ describe("statusline", function()
         sl:set_model_ambiguity_for("anthropic", "claude-x", "[anthropic]")
         local text = status_row()
         assert.is_not_nil(text:find("claude-x  [anthropic]", 1, true))
-        assert.is_not_nil(text:find("xhigh", 1, true))
+        assert.is_not_nil(text:find("󰌵 X", 1, true))
     end)
 
     it("truncation: narrowest window ellipsizes the model id, thinking drops", function()
@@ -280,14 +280,14 @@ describe("statusline", function()
         sl:set_model_ambiguity_for("anthropic", "claude-x", "[anthropic]")
         local text = status_row()
         assert.is_not_nil(text:find("…", 1, true))
-        assert.is_nil(text:find("xhigh", 1, true))
+        assert.is_nil(text:find("󰌵 X", 1, true))
     end)
 
     it("truncation: separators are skipped, never cut", function()
         narrow_window(30)
         Config.options.statusline = vim.tbl_deep_extend("force", {}, saved_statusline_cfg, {
             components = { model = { icon = false, provider = "never" } },
-            layout = { right = { "model", string.rep("X", 22), "thinking" } },
+            layout = { right = { "model", string.rep("Z", 22), "thinking" } },
         })
         sl:update_state({
             model = { provider = "anthropic", id = "claude-x", reasoning = true },
@@ -295,8 +295,8 @@ describe("statusline", function()
         })
         local text = status_row()
         assert.is_not_nil(text:find("claude-x", 1, true))
-        assert.is_not_nil(text:find("xhigh", 1, true))
-        assert.is_nil(text:find("X", 1, true))
+        assert.is_not_nil(text:find("󰌵 X", 1, true))
+        assert.is_nil(text:find("Z", 1, true))
     end)
 
     it("truncation: custom components can mark soft chunks too", function()
@@ -314,5 +314,131 @@ describe("statusline", function()
         local text = status_row()
         assert.is_not_nil(text:find("ab", 1, true))
         assert.is_nil(text:find("[soft]", 1, true))
+    end)
+
+    describe("thinking component", function()
+        it("hides when the model does not support reasoning", function()
+            sl:update_state({
+                model = { provider = "anthropic", id = "claude-haiku", reasoning = false },
+                thinkingLevel = "high",
+            })
+            local text = status_row()
+            assert.is_nil(text:find("󰌵", 1, true))
+            assert.is_nil(text:find("󰹏", 1, true))
+        end)
+
+        it("renders off level as slashed lightbulb without text and PiThinkingOff highlight", function()
+            sl:update_state({
+                model = { provider = "anthropic", id = "claude-sonnet", reasoning = true },
+                thinkingLevel = "off",
+            })
+            local text, row = status_row()
+            assert.is_not_nil(text:find("󰹏", 1, true))
+            assert.is_nil(text:find("off", 1, true))
+            local found = false
+            for _, chunk in ipairs(row) do
+                if chunk[1]:find("󰹏", 1, true) then
+                    assert.are.equal("PiThinkingOff", chunk[2])
+                    found = true
+                end
+            end
+            assert.is_true(found)
+        end)
+
+        it("renders all active thinking levels with compact letter text and distinct highlights", function()
+            local cases = {
+                { level = "minimal", expected_text = "󰌵 MIN", expected_hl = "PiThinkingMinimal" },
+                { level = "low", expected_text = "󰌵 L", expected_hl = "PiThinkingLow" },
+                { level = "medium", expected_text = "󰌵 M", expected_hl = "PiThinkingMedium" },
+                { level = "high", expected_text = "󰌵 H", expected_hl = "PiThinkingHigh" },
+                { level = "xhigh", expected_text = "󰌵 X", expected_hl = "PiThinkingXhigh" },
+                { level = "max", expected_text = "󰌵 MAX", expected_hl = "PiThinkingMax" },
+            }
+            for _, c in ipairs(cases) do
+                sl:update_state({
+                    model = { provider = "anthropic", id = "claude-sonnet", reasoning = true },
+                    thinkingLevel = c.level,
+                })
+                local text, row = status_row()
+                assert.is_not_nil(text:find(c.expected_text, 1, true), "expected " .. c.expected_text)
+                local found = false
+                for _, chunk in ipairs(row) do
+                    if chunk[1]:find(c.expected_text, 1, true) then
+                        assert.are.equal(c.expected_hl, chunk[2])
+                        found = true
+                    end
+                end
+                assert.is_true(found, "chunk hl not found for " .. c.level)
+            end
+        end)
+
+        it("uses PiStatusLine when colored is false", function()
+            Config.options.statusline = vim.tbl_deep_extend("force", {}, saved_statusline_cfg, {
+                components = { thinking = { colored = false } },
+            })
+            sl:update_state({
+                model = { provider = "anthropic", id = "claude-sonnet", reasoning = true },
+                thinkingLevel = "high",
+            })
+            local text, row = status_row()
+            assert.is_not_nil(text:find("󰌵 H", 1, true))
+            local found = false
+            for _, chunk in ipairs(row) do
+                if chunk[1]:find("󰌵 H", 1, true) then
+                    assert.are.equal("PiStatusLine", chunk[2])
+                    found = true
+                end
+            end
+            assert.is_true(found)
+        end)
+
+        it("supports custom level overrides for icon, text, and hl", function()
+            Config.options.statusline = vim.tbl_deep_extend("force", {}, saved_statusline_cfg, {
+                components = {
+                    thinking = {
+                        levels = {
+                            high = { icon = "󰟶", text = "HI", hl = "MyHighHl" },
+                            off = { icon = "󰒲", text = "Zzz" },
+                        },
+                    },
+                },
+            })
+            sl:update_state({
+                model = { provider = "anthropic", id = "claude-sonnet", reasoning = true },
+                thinkingLevel = "high",
+            })
+            local text, row = status_row()
+            assert.is_not_nil(text:find("󰟶 HI", 1, true))
+            for _, chunk in ipairs(row) do
+                if chunk[1]:find("󰟶 HI", 1, true) then
+                    assert.are.equal("MyHighHl", chunk[2])
+                end
+            end
+
+            sl:update_state({
+                model = { provider = "anthropic", id = "claude-sonnet", reasoning = true },
+                thinkingLevel = "off",
+            })
+            text, _ = status_row()
+            assert.is_not_nil(text:find("󰒲 Zzz", 1, true))
+        end)
+
+        it("supports top-level icon override as fallback for active levels without duplicating icon", function()
+            Config.options.statusline = vim.tbl_deep_extend("force", {}, saved_statusline_cfg, {
+                components = {
+                    thinking = {
+                        icon = "",
+                    },
+                },
+            })
+            sl:update_state({
+                model = { provider = "anthropic", id = "claude-sonnet", reasoning = true },
+                thinkingLevel = "medium",
+            })
+            local text = status_row()
+            assert.is_not_nil(text:find(" M", 1, true))
+            -- Ensure no duplicate icons
+            assert.is_nil(text:find(" ", 1, true))
+        end)
     end)
 end)

@@ -153,6 +153,16 @@
 ---@field icon? string|false Prefix icon rendered before the component text. Use false to disable.
 ---@field provider? "never"|"ambiguous"|"always" Show the provider alongside the model id: "never" hides it, "ambiguous" (default) shows it only when the same model id exists under several providers/endpoints, "always" shows it unconditionally
 
+---@class pi.StatusLineThinkingLevelConfig
+---@field icon? string Icon displayed for this level.
+---@field text? string Text or abbreviation displayed after the icon (empty string for icon-only).
+---@field hl? string Highlight group for this level (overrides the default level color).
+
+---@class pi.StatusLineThinkingConfig
+---@field icon? string|false Default/fallback prefix icon. Use false to disable.
+---@field colored? boolean Colorize thinking indicator per level (default true).
+---@field levels? table<string, pi.StatusLineThinkingLevelConfig> Level-specific icon/text/hl mappings.
+
 ---@class pi.StatusLineComponents
 ---@field tokens? pi.StatusLineComponentConfig
 ---@field cache? pi.StatusLineComponentConfig
@@ -161,7 +171,7 @@
 ---@field context? pi.StatusLineContextConfig
 ---@field attention? pi.StatusLineAttentionConfig
 ---@field model? pi.StatusLineModelConfig
----@field thinking? pi.StatusLineComponentConfig
+---@field thinking? pi.StatusLineThinkingConfig
 ---@field queue? pi.StatusLineComponentConfig
 
 ---@class pi.StatusLineConfig
@@ -406,7 +416,19 @@ local defaults = {
             context = { icon = "", warn = 70, error = 90 },
             attention = { icon = "󰵚", counter = false },
             model = { icon = "󰚩", provider = "ambiguous" },
-            thinking = { icon = "󰟶" },
+            thinking = {
+                icon = "󰌵",
+                colored = true,
+                levels = {
+                    off = { icon = "󰹏", text = "" },
+                    minimal = { text = "MIN" },
+                    low = { text = "L" },
+                    medium = { text = "M" },
+                    high = { text = "H" },
+                    xhigh = { text = "X" },
+                    max = { text = "MAX" },
+                },
+            },
             queue = { icon = "⏵" },
         },
     },
