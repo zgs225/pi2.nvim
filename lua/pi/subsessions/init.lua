@@ -914,10 +914,21 @@ function M.sub_close()
         Notify.warn("Current session is not a sub-session")
         return
     end
-    M.close(current.id)
     if in_child_view then
-        M.switch_to_parent(function() end)
+        -- Return to the parent BEFORE closing: M.close detaches the tab, after
+        -- which switch_to_parent's Sessions.get() fails and the user is
+        -- stranded on a dead child view.
+        local child_id = current.id
+        M.switch_to_parent(function(ok)
+            if ok then
+                M.close(child_id)
+            else
+                Notify.warn("Cannot return to parent; sub-session left running")
+            end
+        end)
+        return
     end
+    M.close(current.id)
 end
 
 --- User command: picker to view a child sub-session in a read-only float.

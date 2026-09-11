@@ -255,6 +255,21 @@ local function patch_item(batch, ref, patch)
     return nil
 end
 
+---@param batch pi.SubsessionBatch?
+---@param ref string
+---@return pi.SubsessionBatchItem?
+local function find_item(batch, ref)
+    if not batch then
+        return nil
+    end
+    for _, item in ipairs(batch.items) do
+        if item.ref == ref then
+            return item
+        end
+    end
+    return nil
+end
+
 ---@param batch pi.SubsessionBatch
 ---@param failed_ref string
 local function maybe_cancel_siblings(batch, failed_ref)
@@ -437,11 +452,27 @@ local function run_batch(batch, parent)
     ---@param item pi.SubsessionBatchItem
     local function start_item(item)
         local current = M.get(batch.id)
-        if not current or current.status == "cancelled" then
+        if not current or is_terminal_status(current.status) then
             return
         end
         if item.status ~= "queued" then
             return
+        end
+
+        --- Resolve the *live* batch/item from disk: the in-memory `item` this
+        --- closure captured is stale once a cancel/complete persisted to disk.
+        ---@param expected_status string
+        ---@return pi.SubsessionBatch?, pi.SubsessionBatchItem?
+        local function live_item(expected_status)
+            local b = M.get(batch.id)
+            if not b or is_terminal_status(b.status) then
+                return nil, nil
+            end
+            local live = find_item(b, item.ref)
+            if not live or live.status ~= expected_status then
+                return nil, nil
+            end
+            return b, live
         end
 
         if item.task then
@@ -454,8 +485,11 @@ local function run_batch(batch, parent)
                 thinking_level = item.thinking_level,
                 agent_spawned = true,
             }, function(child, err)
-                local b = M.get(batch.id)
-                if not b or b.status == "cancelled" then
+                local b, live = live_item("spawning")
+                if not b or not live then
+                    -- Batch/item no longer wants this spawn (cancelled or
+                    -- already settled): discard the child instead of
+                    -- resurrecting a cancelled item as "running".
                     if child then
                         if child.rpc and child.rpc:is_running() then
                             child.rpc:send({ type = "abort" })
@@ -473,14 +507,9 @@ local function run_batch(batch, parent)
                     return
                 end
                 local entry = Manifest.load()[child.id]
-                for _, it in ipairs(b.items) do
-                    if it.ref == item.ref then
-                        it.target = child.id
-                        it.generation = entry and entry.run_generation
-                        it.status = "running"
-                        break
-                    end
-                end
+                live.target = child.id
+                live.generation = entry and entry.run_generation
+                live.status = "running"
                 persist(b)
             end)
             return
@@ -492,8 +521,11 @@ local function run_batch(batch, parent)
             return
         end
         local function send_to(child)
-            local b = M.get(batch.id)
-            if not b or b.status == "cancelled" then
+            local b, live = live_item("queued")
+            if not b or not live then
+                -- Stale callback: the item was cancelled or already settled.
+                -- Leave the child running (no abort, no close, no generation
+                -- bump) — it belongs to whatever superseded this item.
                 return
             end
             if not child then
@@ -501,13 +533,8 @@ local function run_batch(batch, parent)
                 return
             end
             local gen = M.bump_generation(target)
-            for _, it in ipairs(b.items) do
-                if it.ref == item.ref then
-                    it.generation = gen
-                    it.status = "running"
-                    break
-                end
-            end
+            live.generation = gen
+            live.status = "running"
             persist(b)
             child.rpc:send({ type = "prompt", message = item.message }, function(res)
                 if not res.success then
@@ -524,6 +551,21 @@ local function run_batch(batch, parent)
         Subsessions.revive(target, function(revived, err)
             if not revived then
                 M.complete_item(batch.id, item.ref, false, { error = err or "revive failed" })
+                return
+            end
+            local b, live = live_item("queued")
+            if not b or not live then
+                -- Revive won the race against a cancel/complete: the freshly
+                -- revived child has no item to serve. Same cleanup as the
+                -- stale spawn callback above.
+                if revived.rpc and revived.rpc:is_running() then
+                    revived.rpc:send({ type = "abort" })
+                end
+                Subsessions.close(revived.id)
+                Manifest.patch(revived.id, {
+                    status = "interrupted",
+                    last_active_at = Manifest.iso_now(),
+                })
                 return
             end
             send_to(revived)
