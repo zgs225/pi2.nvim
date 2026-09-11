@@ -3,7 +3,9 @@
 --- Refresh is asynchronous (stale-while-revalidate): once a cache exists for
 --- the current cwd, readers never block — an expired cache is returned
 --- immediately while a single background refresh repopulates it. Only the
---- first (cold) call per cwd fetches synchronously.
+--- first (cold) call per cwd fetches synchronously, and even that one never
+--- walks the directory tree on the main loop: a non-git cwd answers empty and
+--- is repopulated asynchronously with `fd` (or `find`).
 
 ---@class pi.FileCache
 ---@field files string[]
@@ -12,6 +14,8 @@
 ---@field timestamp number
 
 local M = {}
+
+local Notify = require("pi.notify")
 
 ---@type pi.FileCache?
 local cache = nil
@@ -24,7 +28,12 @@ local refresh_spawns = 0
 
 local CACHE_TTL_NS = 5e9 -- 5 seconds
 
+--- Hard cap on a directory walk result, so a huge tree cannot blow up memory.
+local MAX_FILES = 20000
+
 local GIT_LS_FILES_ARGS = { "git", "ls-files", "--cached", "--others", "--exclude-standard" }
+local FALLBACK_FD_ARGS = { "fd", "--type", "f" }
+local FALLBACK_FIND_ARGS = { "find", ".", "-type", "f" }
 
 --- Check if a buffer is a pi prompt buffer.
 ---@param buf? integer
@@ -56,15 +65,22 @@ local function parse_ls_files(stdout)
     return vim.split(vim.trim(stdout), "\n", { plain = true, trimempty = true })
 end
 
---- Synchronous listing fallback for non-git directories.
---- Must run on the main loop (uses vim.fn).
+--- Parse an `fd`/`find` stdout into a file list: one path per line, normalized
+--- to relative paths without a leading `./`, capped at MAX_FILES.
+---@param stdout string
 ---@return string[]
-local function glob_files()
+local function parse_fallback(stdout)
     local files = {}
-    local raw = vim.fn.glob("**/*", false, true)
-    for _, f in ipairs(raw) do
-        if vim.fn.isdirectory(f) == 0 then
-            files[#files + 1] = f
+    if not stdout or stdout == "" then
+        return files
+    end
+    for _, line in ipairs(vim.split(vim.trim(stdout), "\n", { plain = true, trimempty = true })) do
+        local path = vim.startswith(line, "./") and line:sub(3) or line
+        if path ~= "" then
+            files[#files + 1] = path
+            if #files >= MAX_FILES then
+                break
+            end
         end
     end
     return files
@@ -75,6 +91,34 @@ end
 ---@return boolean
 local function is_stale(cwd)
     return not cache or cache.cwd ~= cwd or (vim.uv.hrtime() - cache.timestamp) >= CACHE_TTL_NS
+end
+
+--- Second-phase refresh for non-git directories: spawn `fd`/`find` instead of
+--- globbing on the main loop. Owns the `refreshing` flag until it completes.
+---@param cwd string
+---@param args string[]
+local function refresh_fallback(cwd, args)
+    local stat = vim.uv.fs_stat(cwd)
+    if not stat or stat.type ~= "directory" then
+        -- The cwd vanished (e.g. a deleted temp dir) while the refresh was
+        -- pending: nothing to list, and spawning would only throw.
+        refreshing = false
+        return
+    end
+    local ok, err = pcall(vim.system, args, { text = true, cwd = cwd }, function(result)
+        -- uv callback: fast event context; all vim.fn work must be deferred.
+        vim.schedule(function()
+            refreshing = false
+            if vim.fn.getcwd() ~= cwd then
+                return -- cwd changed; the next reader will refetch
+            end
+            store(parse_fallback(result.stdout), cwd)
+        end)
+    end)
+    if not ok then
+        refreshing = false
+        Notify.warn("file cache fallback failed to start: " .. tostring(err))
+    end
 end
 
 --- Refresh the cache asynchronously (single-flight).
@@ -89,27 +133,41 @@ function M.refresh(cwd)
     refreshing = true
     refresh_spawns = refresh_spawns + 1
 
+    -- Resolve the fallback argv on the main loop: only vim.fn may decide
+    -- whether `fd` is available.
+    local fallback_args = vim.fn.executable("fd") == 1 and FALLBACK_FD_ARGS or FALLBACK_FIND_ARGS
+
     -- Defer the process spawn to the next event loop turn: uv spawn itself
     -- costs a few ms, and readers on the expired path should pay nothing.
     vim.schedule(function()
+        local stat = vim.uv.fs_stat(cwd)
+        if not stat or stat.type ~= "directory" then
+            -- The cwd vanished while the refresh was pending (e.g. a deleted
+            -- temp dir): skip silently, the next reader starts over.
+            refreshing = false
+            return
+        end
         local ok, err = pcall(vim.system, GIT_LS_FILES_ARGS, { text = true, cwd = cwd }, function(result)
             -- uv callback: fast event context. All vim.fn / API work must
             -- be deferred to the main loop.
             vim.schedule(function()
-                refreshing = false
                 if vim.fn.getcwd() ~= cwd then
+                    refreshing = false
                     return -- cwd changed; the next reader will refetch
                 end
                 if result.code == 0 and result.stdout and result.stdout ~= "" then
+                    refreshing = false
                     store(parse_ls_files(result.stdout), cwd)
-                else
-                    store(glob_files(), cwd)
+                    return
                 end
+                -- Not a git repo (or git failed): directory walk via a second
+                -- process. `refreshing` stays held until the fallback lands.
+                refresh_fallback(cwd, fallback_args)
             end)
         end)
         if not ok then
             refreshing = false
-            require("pi.notify").warn("file cache refresh failed to start: " .. tostring(err))
+            Notify.warn("file cache refresh failed to start: " .. tostring(err))
         end
     end)
 end
@@ -131,20 +189,23 @@ function M.list()
     return M._fetch_sync(cwd)
 end
 
---- Synchronous cold-start fetch. Blocks the main loop; used only when no
---- cache exists for the cwd.
+--- Synchronous cold-start fetch. Blocks the main loop only on `git ls-files`;
+--- a non-git cwd answers empty immediately and is repopulated asynchronously
+--- (a recursive glob here could hang the editor on a large tree).
 ---@param cwd string
 ---@return string[]
 function M._fetch_sync(cwd)
     local result = vim.system(GIT_LS_FILES_ARGS, { text = true, cwd = cwd }):wait()
-    local files
     if result.code == 0 and result.stdout and result.stdout ~= "" then
-        files = parse_ls_files(result.stdout)
-    else
-        files = glob_files()
+        local files = parse_ls_files(result.stdout)
+        store(files, cwd)
+        return files
     end
-    store(files, cwd)
-    return files
+    store({}, cwd)
+    vim.schedule(function()
+        M.refresh(cwd)
+    end)
+    return {}
 end
 
 --- Check if a relative path exists in the project.

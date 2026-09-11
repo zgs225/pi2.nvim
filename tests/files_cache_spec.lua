@@ -151,15 +151,40 @@ describe("files cache", function()
         assert.same(0, FilesCache._refresh_spawns())
     end)
 
-    it("falls back to glob in non-git directories", function()
+    it("non-git directories answer cold, then populate via an async walk", function()
         dir = vim.fn.tempname()
         vim.fn.mkdir(dir .. "/sub", "p")
         vim.fn.writefile({ "x" }, dir .. "/d.txt")
         vim.fn.writefile({ "x" }, dir .. "/sub/e.txt")
         vim.cmd("cd " .. vim.fn.fnameescape(dir))
 
-        local files = FilesCache.list()
-        table.sort(files)
-        assert.same({ "d.txt", "sub/e.txt" }, files)
+        -- A cold fetch must not glob the tree on the main loop: it answers
+        -- empty immediately and schedules the fd/find fallback refresh.
+        assert.same({}, FilesCache.list())
+        local c = FilesCache._cache()
+        assert.is_not_nil(c)
+        assert.same(vim.fn.getcwd(), c.cwd)
+
+        -- The background directory walk populates the cache (works with either
+        -- `fd` or `find`; both are normalized to cwd-relative paths).
+        wait_for(function()
+            local files = vim.deepcopy(FilesCache.list())
+            table.sort(files)
+            return #files == 2 and files[1] == "d.txt" and files[2] == "sub/e.txt"
+        end)
+    end)
+
+    it("non-git fallback refresh is single-flight", function()
+        dir = vim.fn.tempname()
+        vim.fn.mkdir(dir, "p")
+        vim.fn.writefile({ "x" }, dir .. "/d.txt")
+        vim.cmd("cd " .. vim.fn.fnameescape(dir))
+
+        FilesCache.list()
+        FilesCache.list() -- second cold call falls back to the (empty) cache
+        wait_for(function()
+            return FilesCache._cache() ~= nil and #FilesCache._cache().files == 1
+        end)
+        assert.same(1, FilesCache._refresh_spawns())
     end)
 end)

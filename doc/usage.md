@@ -315,6 +315,8 @@ Other completion plugins (nvim-cmp, etc.) aren't shipped as first-class sources,
 
 Supported formats: `png`, `jpg`/`jpeg`, `gif`, `webp`, `svg`.
 
+A single attachment is capped at 25 MB (decoded); larger files are rejected with an error instead of being read into memory.
+
 There are three ways to attach an image:
 
 **1. From a file path** with `:PiAttachImage`:
