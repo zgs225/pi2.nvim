@@ -372,6 +372,17 @@ local function with_parent_id(parent, callback)
     end)
 end
 
+--- JSON `null` decodes to `vim.NIL` (`vim.json.decode` in handle_host), which
+--- is truthy *and* throws when indexed. Treat it as absent, so an explicit
+--- `"model": null` from a model that pads optional fields is neither rejected as
+--- "field present" nor propagated into spawn where `config.model.provider`
+--- would raise "attempt to index vim.NIL".
+---@param value any
+---@return boolean
+local function present(value)
+    return value ~= nil and value ~= vim.NIL
+end
+
 ---@param raw table
 ---@param index integer
 ---@return pi.SubsessionBatchItem?, string?
@@ -380,18 +391,22 @@ local function normalize_item(raw, index)
         return nil, ("item %d: expected object"):format(index)
     end
     local ref = type(raw.ref) == "string" and raw.ref ~= "" and raw.ref or tostring(index - 1)
-    if type(raw.task) == "string" and raw.task ~= "" then
-        return {
-            ref = ref,
-            task = raw.task,
-            name = type(raw.name) == "string" and raw.name or nil,
-            model = raw.model,
-            thinking_level = raw.thinking_level,
-            status = "queued",
-        },
-            nil
+    local is_spawn = type(raw.task) == "string" and raw.task ~= ""
+    local is_reuse = type(raw.target) == "string" and raw.target ~= ""
+    if is_spawn and is_reuse then
+        return nil, ("item %d: use either `task` (spawn) or `target` + `message` (reuse), not both"):format(index)
     end
-    if type(raw.target) == "string" and raw.target ~= "" and type(raw.message) == "string" then
+    if is_reuse then
+        -- Spawn-only fields are rejected rather than silently dropped: a reused
+        -- child keeps its own model/thinking level and name.
+        for _, field in ipairs({ "name", "model", "thinking_level" }) do
+            if present(raw[field]) then
+                return nil, ("item %d: `%s` is not accepted on a reuse item ({ target, message })"):format(index, field)
+            end
+        end
+        if type(raw.message) ~= "string" then
+            return nil, ("item %d: reuse items need `message` (string)"):format(index)
+        end
         return {
             ref = ref,
             target = raw.target,
@@ -400,7 +415,18 @@ local function normalize_item(raw, index)
         },
             nil
     end
-    return nil, ("item %d: need task or (target + message)"):format(index)
+    if is_spawn then
+        return {
+            ref = ref,
+            task = raw.task,
+            name = type(raw.name) == "string" and raw.name or nil,
+            model = present(raw.model) and raw.model or nil,
+            thinking_level = present(raw.thinking_level) and raw.thinking_level or nil,
+            status = "queued",
+        },
+            nil
+    end
+    return nil, ("item %d: need `task` to spawn a child, or `target` + `message` to reuse one"):format(index)
 end
 
 ---@param batch pi.SubsessionBatch
@@ -543,12 +569,28 @@ function M.dispatch(parent, opts, callback)
 
         ---@type pi.SubsessionBatchItem[]
         local items = {}
+        local seen_refs = {}
         for i, raw in ipairs(raw_items) do
             local item, err = normalize_item(raw, i)
             if not item then
                 callback({ error = err })
                 return
             end
+            -- Refs must be unique. Both the spawn callback in run_batch and
+            -- on_child_settled resolve an item by ref with first-match-wins
+            -- (patch_item), so a duplicate misroutes a child's target onto the
+            -- wrong item and can strand the batch permanently non-terminal
+            -- (wait_subagents then only ends on its timeout).
+            if seen_refs[item.ref] then
+                callback({
+                    error = ("item %d: duplicate ref %q (refs must be unique; omitted refs default to the item index)"):format(
+                        i,
+                        item.ref
+                    ),
+                })
+                return
+            end
+            seen_refs[item.ref] = true
             items[#items + 1] = item
         end
 

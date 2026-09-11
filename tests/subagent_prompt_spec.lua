@@ -119,6 +119,96 @@ describe("extensions/subagent.ts orchestrator note", function()
     end)
 end)
 
+describe("extensions/subagent.ts Available tools snippets", function()
+    --- Every tool the parent Agent can call. Keep in sync with registerTool().
+    local TOOLS = {
+        "list_subagents",
+        "read_subagent",
+        "dispatch_subagents",
+        "poll_subagents",
+        "wait_subagents",
+        "list_batches",
+        "stop_subagents",
+    }
+
+    local content
+
+    before_each(function()
+        local path = repo_root() .. "/extensions/subagent.ts"
+        local file = io.open(path, "r")
+        assert.is_not_nil(file, "subagent.ts must exist at: " .. path)
+        content = file:read("*a")
+        file:close()
+    end)
+
+    --- The registerTool block for one tool, up to its execute() body.
+    ---@param tool string
+    ---@return string?
+    local function tool_block(tool)
+        return content:match('name: "' .. tool .. '",(.-)async execute')
+    end
+
+    -- pi's buildSystemPrompt builds "Available tools" from toolSnippets[name]
+    -- (visibleTools = tools.filter((name) => !!toolSnippets[name])), so a
+    -- registered custom tool WITHOUT a promptSnippet is omitted from that list
+    -- entirely and models that discover tools by reading it never see it.
+    it("every registered tool declares a non-empty promptSnippet", function()
+        for _, tool in ipairs(TOOLS) do
+            local block = tool_block(tool)
+            assert.is_not_nil(block, "subagent.ts must registerTool " .. tool)
+            local snippet = block:match('promptSnippet: "(.-)"')
+            assert.is_not_nil(snippet, tool .. " must declare a promptSnippet or pi hides it from Available tools")
+            assert.is_true(#snippet > 0, tool .. " promptSnippet must not be empty")
+        end
+    end)
+
+    it("promptSnippets are static one-liners", function()
+        for _, tool in ipairs(TOOLS) do
+            local snippet = assert(tool_block(tool)):match('promptSnippet: "(.-)"')
+            assert.is_nil(snippet:find("${", 1, true), tool .. " promptSnippet must not interpolate")
+            assert.is_nil(snippet:find("\\n", 1, true), tool .. " promptSnippet must stay one line")
+            assert.is_true(#snippet <= 120, tool .. " promptSnippet should stay a short one-liner")
+        end
+    end)
+
+    it("documents why promptSnippet is required", function()
+        assert.is_truthy(
+            content:match("Available tools"),
+            "the header comment must explain the Available tools requirement"
+        )
+    end)
+end)
+
+-- The description must describe the TS projectTail that actually runs, not the
+-- host-side projection in lua/pi/subsessions/read.lua (which has no callers).
+-- An earlier draft did describe the dead Lua renderer, claiming non-message
+-- entries become 'thinking collapsed' / 'tool result: ok|failed' lines and that
+-- tool output is omitted — both untrue of projectTail.
+describe("extensions/subagent.ts read_subagent projection description", function()
+    local desc
+
+    before_each(function()
+        local file = assert(io.open(repo_root() .. "/extensions/subagent.ts", "r"))
+        local content = file:read("*a")
+        file:close()
+        local block = assert(content:match('name: "read_subagent",(.-)async execute'))
+        desc = assert(block:match('description:%s*"(.-)",'))
+    end)
+
+    it("does not claim the dead Lua renderer's collapsed lines", function()
+        for _, wrong in ipairs({ "thinking collapsed", "tool output is not included", "tool (call)" }) do
+            assert.is_nil(desc:find(wrong, 1, true), "read_subagent must not claim: " .. wrong)
+        end
+    end)
+
+    it("names the real projection rules", function()
+        assert.is_truthy(desc:find("(entry)", 1, true), "must mention the fallback (entry) line")
+        assert.is_truthy(desc:find("500", 1, true), "must state the 500-character content cut")
+        assert.is_truthy(desc:find("message.role", 1, true), "must state the message.role condition")
+        assert.is_truthy(desc:find("session file not found", 1, true), "must state the unknown-id error")
+    end)
+end)
+
 describe("extensions/subagent-child.ts worker note", function()
     local content
 

@@ -116,7 +116,7 @@ describe("reopened parent reuses a closed sub-session", function()
         local text = subagent_ts()
         assert.is_truthy(text:find("Closed (dormant) children remain reusable", 1, true))
         assert.is_truthy(text:find("Do not spawn a new child only because status is not active", 1, true))
-        assert.is_truthy(text:find("the host revives the process", 1, true))
+        assert.is_truthy(text:find("are revived automatically", 1, true))
     end)
 
     it("lists dormant children when the parent id comes from sessionManager", function()

@@ -425,4 +425,186 @@ describe("subsession batch", function()
         Batch.cancel_for_parent("session-new")
         assert.equals("cancelled", Batch.get(batch_id).status)
     end)
+
+    describe("item validation", function()
+        local parent ---@type table
+
+        before_each(function()
+            parent = {
+                id = "parent-1",
+                rpc = {
+                    is_running = function()
+                        return true
+                    end,
+                },
+            }
+        end)
+
+        ---@param items table[]
+        ---@return table result
+        local function dispatch(items)
+            local result
+            Batch.dispatch(parent, { items = items }, function(res)
+                result = res
+            end)
+            return result
+        end
+
+        it("rejects spawn-only fields on a reuse item instead of dropping them", function()
+            for _, field in ipairs({ "name", "model", "thinking_level" }) do
+                local item = { target = "child-uuid", message = "continue" }
+                item[field] = "x"
+                local res = dispatch({ item })
+                assert.is_nil(res.batch_id)
+                assert.is_truthy(res.error and res.error:find("`" .. field .. "`", 1, true))
+            end
+            assert.is_nil(next(Batch.load()))
+        end)
+
+        it("rejects a reuse item without a message", function()
+            local res = dispatch({ { target = "child-uuid" } })
+            assert.is_nil(res.batch_id)
+            assert.is_truthy(res.error and res.error:find("`message`", 1, true))
+        end)
+
+        it("rejects an item that is both spawn and reuse", function()
+            local res = dispatch({ { task = "t", target = "child-uuid", message = "m" } })
+            assert.is_nil(res.batch_id)
+            assert.is_truthy(res.error and res.error:find("not both", 1, true))
+        end)
+
+        it("names both accepted shapes when an item is neither", function()
+            local res = dispatch({ { ref = "r" } })
+            assert.is_nil(res.batch_id)
+            assert.is_truthy(res.error and res.error:find("`task`", 1, true))
+            assert.is_truthy(res.error and res.error:find("`target` + `message`", 1, true))
+        end)
+
+        it("still accepts name/model/thinking_level on a spawn item", function()
+            Subsessions.spawn = function(_p, opts, callback)
+                callback({ id = "child-spawn-cfg", spawned = opts }, nil)
+            end
+            local res = dispatch({
+                {
+                    task = "t",
+                    name = "worker",
+                    model = { provider = "anthropic", id = "claude-3-7-sonnet" },
+                    thinking_level = "high",
+                },
+            })
+            assert.is_string(res.batch_id)
+            Batch.cancel(res.batch_id)
+        end)
+
+        -- The host bridge decodes with vim.json.decode, so a JSON `null` arrives
+        -- as vim.NIL: truthy, and indexing it raises. Both paths must treat it as
+        -- an absent field.
+        it("rejects duplicate refs, which would misroute completions", function()
+            -- patch_item/on_child_settled resolve an item by ref (first match),
+            -- so a duplicate strands the batch non-terminal forever.
+            local res = dispatch({ { ref = "dup", task = "a" }, { ref = "dup", task = "b" } })
+            assert.is_nil(res.batch_id)
+            assert.is_truthy(res.error and res.error:find("duplicate ref", 1, true))
+            assert.is_truthy(res.error and res.error:find("dup", 1, true))
+            assert.is_nil(next(Batch.load()))
+        end)
+
+        it("rejects an explicit ref colliding with a defaulted index ref", function()
+            -- item 2 defaults to ref "1"; item 1 explicitly claims it.
+            local res = dispatch({ { ref = "1", task = "a" }, { task = "b" } })
+            assert.is_nil(res.batch_id)
+            assert.is_truthy(res.error and res.error:find("duplicate ref", 1, true))
+        end)
+
+        it("accepts distinct refs and reaches completed", function()
+            Subsessions.spawn = function(_p, opts, callback)
+                local id = "child-" .. (opts.name or "x")
+                Manifest.upsert(id, {
+                    parent_id = "parent-1",
+                    name = opts.name or id,
+                    task_prompt = opts.task,
+                    config = {},
+                    status = "active",
+                    reported = false,
+                    created_at = Manifest.iso_now(),
+                    last_active_at = Manifest.iso_now(),
+                    agent_spawned = true,
+                    run_generation = 1,
+                })
+                callback({
+                    id = id,
+                    rpc = {
+                        is_running = function()
+                            return true
+                        end,
+                    },
+                }, nil)
+            end
+            local res = dispatch({ { ref = "a", task = "t", name = "a" }, { ref = "b", task = "t", name = "b" } })
+            assert.is_string(res.batch_id)
+            vim.wait(1000, function()
+                return (Batch.poll(res.batch_id).summary.running or 0) == 2
+            end, 20)
+            for _, id in ipairs({ "child-a", "child-b" }) do
+                Manifest.patch(id, { status = "completed" })
+                Batch.on_child_settled(id)
+            end
+            assert.equals("completed", Batch.poll(res.batch_id).status)
+        end)
+
+        it("treats JSON null fields as absent on a spawn item", function()
+            local spawned ---@type table?
+            Subsessions.spawn = function(_p, opts, callback)
+                spawned = opts
+                callback({
+                    id = "child-null",
+                    rpc = {
+                        is_running = function()
+                            return true
+                        end,
+                    },
+                }, nil)
+            end
+            local item = vim.json.decode('{"task":"t","model":null,"thinking_level":null,"name":null}')
+            assert.equals(vim.NIL, item.model, "precondition: vim.json.decode maps null to vim.NIL")
+            local res = dispatch({ item })
+            assert.is_string(res.batch_id)
+            -- run_batch is deferred, so spawn happens on the next event-loop turn.
+            vim.wait(1000, function()
+                return spawned ~= nil
+            end, 20)
+            assert.is_not_nil(spawned, "spawn must be reached for a spawn item")
+            assert.is_nil(spawned.model, "null model must not reach spawn (indexing it would raise)")
+            assert.is_nil(spawned.thinking_level)
+            assert.is_nil(spawned.name)
+            Batch.cancel(res.batch_id)
+        end)
+
+        it("treats JSON null fields as absent on a reuse item", function()
+            Subsessions.revive = function(_parent, _id, callback)
+                callback({
+                    id = "child-uuid",
+                    rpc = {
+                        is_running = function()
+                            return false
+                        end,
+                    },
+                }, nil)
+            end
+            local item = vim.json.decode('{"target":"child-uuid","message":"go","model":null,"name":null}')
+            assert.equals(vim.NIL, item.model, "precondition: vim.json.decode maps null to vim.NIL")
+            local res = dispatch({ item })
+            assert.is_string(res.batch_id, "explicit nulls must not count as spawn-only fields")
+            Batch.cancel(res.batch_id)
+        end)
+
+        it("still rejects a non-null spawn-only field on a reuse item", function()
+            -- decode returns a single item object, not an array of items.
+            local item = vim.json.decode('{"target":"child-uuid","message":"go","model":false}')
+            assert.equals(false, item.model, "precondition: JSON false stays a boolean")
+            local res = dispatch({ item })
+            assert.is_nil(res.batch_id)
+            assert.is_truthy(res.error and res.error:find("`model`", 1, true))
+        end)
+    end)
 end)

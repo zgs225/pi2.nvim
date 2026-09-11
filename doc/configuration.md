@@ -205,7 +205,6 @@ require("pi").setup({
         max_children = 5,           -- concurrent active children per parent lineage
         report_mode = "last_message", -- completion report uses child's last assistant output
         default_config = "inherit",   -- "inherit" parent model/thinking, or "default"
-        read_tail = 50,               -- default projection lines for read_subagent
         max_batch_size = 5,           -- max items per dispatch_subagents batch
         batch_timeout_ms = 300000,    -- default wait_subagents timeout (5 min)
         batch_ttl_hours = 24,         -- retain completed batch records (hours)

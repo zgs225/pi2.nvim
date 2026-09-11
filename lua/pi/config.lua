@@ -280,7 +280,6 @@
 ---@field max_children? integer Max concurrent sub-sessions per parent lineage (default 5)
 ---@field report_mode? "last_message" Report mode when sub-session completes (default "last_message")
 ---@field default_config? "inherit"|"default" Sub-session model/thinking default (default "inherit")
----@field read_tail? integer Default projection tail for read_subagent (default 50)
 ---@field max_batch_size? integer Max items per dispatch_subagents batch (default 5)
 ---@field batch_timeout_ms? integer Default wait_subagents timeout (default 300000)
 ---@field batch_ttl_hours? integer Hours to retain completed batch records (default 24)
@@ -455,7 +454,6 @@ local defaults = {
         max_children = 5,
         report_mode = "last_message",
         default_config = "inherit",
-        read_tail = 50,
         max_batch_size = 5,
         batch_timeout_ms = 300000,
         batch_ttl_hours = 24,
