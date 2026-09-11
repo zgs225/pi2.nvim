@@ -270,13 +270,36 @@ local function find_item(batch, ref)
     return nil
 end
 
+--- Abort a child's agent and optionally close its RPC process, never letting
+--- one unresponsive child break the caller's item loop. An unguarded `rpc:send`
+--- or `close` that raises would skip the rest of the loop — including the
+--- `persist` / `notify_waiters` at the end — leaving a cancelled batch that
+--- never wakes its waiter.
+---@param child_id? string
+---@param close? boolean
+local function abort_child_process(child_id, close)
+    if type(child_id) ~= "string" or child_id == "" then
+        return
+    end
+    local child = Sessions.get_by_id(child_id)
+    if child and child.rpc and child.rpc:is_running() then
+        pcall(function()
+            child.rpc:send({ type = "abort" })
+        end)
+    end
+    if close then
+        pcall(function()
+            require("pi.subsessions").close(child_id)
+        end)
+    end
+end
+
 ---@param batch pi.SubsessionBatch
 ---@param failed_ref string
 local function maybe_cancel_siblings(batch, failed_ref)
     if not batch.cancel_siblings_on_fail then
         return
     end
-    local Subsessions = require("pi.subsessions")
     for _, item in ipairs(batch.items) do
         if
             item.ref ~= failed_ref
@@ -284,13 +307,7 @@ local function maybe_cancel_siblings(batch, failed_ref)
         then
             item.status = "cancelled"
             item.error = "cancelled: sibling failed"
-            if item.target then
-                local child = Sessions.get_by_id(item.target)
-                if child and child.rpc:is_running() then
-                    child.rpc:send({ type = "abort" })
-                end
-                Subsessions.close(item.target)
-            end
+            abort_child_process(item.target, true)
         end
     end
 end
@@ -791,18 +808,11 @@ function M.cancel(batch_id)
         return true
     end
     batch.status = "cancelled"
-    local Subsessions = require("pi.subsessions")
     for _, item in ipairs(batch.items) do
         if item.status == "queued" or item.status == "spawning" or item.status == "running" then
             item.status = "cancelled"
             item.error = "batch cancelled"
-            if item.target then
-                local child = Sessions.get_by_id(item.target)
-                if child and child.rpc:is_running() then
-                    child.rpc:send({ type = "abort" })
-                end
-                Subsessions.close(item.target)
-            end
+            abort_child_process(item.target, true)
         end
     end
     persist(batch)
@@ -811,32 +821,150 @@ function M.cancel(batch_id)
 end
 
 ---@param parent_id string Session id or lineage id.
-function M.cancel_for_parent(parent_id)
-    if not parent_id or parent_id == "" then
-        return
-    end
+---@param fn fun(batch_id: string, batch: pi.SubsessionBatch)
+local function for_each_target_batch(parent_id, fn)
     local lineage = Manifest.resolve_lineage(parent_id) or parent_id
     local batches = M.load()
     for id, batch in pairs(batches) do
         if batch.status == "running" or batch.status == "pending" then
             local batch_lineage = Manifest.resolve_lineage(batch.parent_id) or batch.parent_id
-            local should_cancel = (batch_lineage == lineage)
-            if not should_cancel and waiters[id] then
+            local matches = (batch_lineage == lineage)
+            if not matches and waiters[id] then
                 for _, w in ipairs(waiters[id]) do
                     if w.owner and w.owner ~= "" then
                         local owner_lineage = Manifest.resolve_lineage(w.owner) or w.owner
                         if owner_lineage == lineage then
-                            should_cancel = true
+                            matches = true
                             break
                         end
                     end
                 end
             end
-            if should_cancel then
-                M.cancel(id)
+            if matches then
+                fn(id, batch)
             end
         end
     end
+end
+
+---@param parent_id string Session id or lineage id.
+function M.cancel_for_parent(parent_id)
+    if not parent_id or parent_id == "" then
+        return
+    end
+    for_each_target_batch(parent_id, function(id)
+        M.cancel(id)
+    end)
+end
+
+--- Record the abort watermark for a child whose in-flight item is being
+--- cancelled, so a late `agent_settled` (which carries no generation) can tell
+--- the aborted run apart from a newer run on the same child.
+---@param child_id? string
+---@param generation? any
+local function note_child_aborted(child_id, generation)
+    if type(child_id) ~= "string" or child_id == "" or type(generation) ~= "number" then
+        return
+    end
+    pcall(function()
+        require("pi.subsessions").mark_child_aborted(child_id, generation)
+    end)
+end
+
+--- Abort-only cancellation of one batch: marks the batch cancelled and aborts
+--- (never closes) its in-flight children, then wakes any waiters.
+---@param batch_id string
+---@return boolean ok
+function M.abort(batch_id)
+    local batch = M.get(batch_id)
+    if not batch then
+        return false
+    end
+    if is_terminal_status(batch.status) then
+        return true
+    end
+    batch.status = "cancelled"
+    for _, item in ipairs(batch.items) do
+        if item.status == "queued" or item.status == "spawning" or item.status == "running" then
+            item.status = "cancelled"
+            item.error = "batch cancelled"
+            if item.target then
+                note_child_aborted(item.target, item.generation)
+                abort_child_process(item.target, false)
+            end
+        end
+    end
+    persist(batch)
+    notify_waiters(batch_id)
+    return true
+end
+
+--- Abort-only counterpart of M.cancel_for_parent: same matching rules (own
+--- lineage + batches this lineage is currently waiting on), but children are
+--- aborted instead of closed.
+---@param parent_id string
+---@return integer n Batches aborted.
+function M.abort_for_parent(parent_id)
+    if not parent_id or parent_id == "" then
+        return 0
+    end
+    local n = 0
+    for_each_target_batch(parent_id, function(id, batch)
+        if batch.status == "running" or batch.status == "pending" then
+            M.abort(id)
+            n = n + 1
+        end
+    end)
+    return n
+end
+
+--- Mark a child's in-flight batch items as cancelled without killing sibling
+--- items or the child process. Idempotent: a terminal item is skipped, and a
+--- later complete_item for it is already a no-op.
+---
+--- `opts.generation`, when given, only matches items whose generation is **at
+--- most** that value — the aborted run and anything older, never a newer run the
+--- parent started by reusing this child after the abort.
+---@param child_id string
+---@param opts? { generation?: integer, reason?: string }
+---@return integer n Number of items marked cancelled.
+function M.interrupt_items_for_child(child_id, opts)
+    opts = opts or {}
+    if type(child_id) ~= "string" or child_id == "" then
+        return 0
+    end
+    if type(opts.generation) == "number" then
+        note_child_aborted(child_id, opts.generation)
+    end
+    local n = 0
+    local batches = M.load()
+    for batch_id, batch in pairs(batches) do
+        if batch.status == "running" or batch.status == "pending" then
+            local changed = 0
+            for _, item in ipairs(batch.items) do
+                if
+                    item.target == child_id
+                    and (item.status == "queued" or item.status == "spawning" or item.status == "running")
+                    and (
+                        type(opts.generation) ~= "number"
+                        or (type(item.generation) == "number" and item.generation <= opts.generation)
+                    )
+                then
+                    item.status = "cancelled"
+                    item.error = opts.reason or "cancelled: aborted by user"
+                    note_child_aborted(item.target, item.generation)
+                    changed = changed + 1
+                end
+            end
+            if changed > 0 then
+                recompute_status(batch)
+                persist(batch)
+                notify_waiters(batch_id)
+                n = n + changed
+            end
+        end
+    end
+    return n
 end
 
 --- Reconcile running batches after Neovim restart.

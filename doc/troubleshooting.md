@@ -64,7 +64,7 @@ Each π session owns an underlying `pi --mode rpc` subprocess. One tab = one ses
 - **Alive** as long as the tab is alive. Hiding the chat (`:PiToggleChat`) or switching away from the tab does **not** stop the process — the session keeps running in the background, and any queued [attention](attention.md) requests keep being tracked.
 - **Torn down** on `TabClosed` for the owning tab, or on `VimLeavePre` for all sessions at once. pi2.nvim sends the appropriate shutdown, waits briefly, and lets the child exit cleanly.
 - **Stopped explicitly** via `:PiStop` / `pi.stop()` — kills the RPC process for the current tab's session immediately and closes the chat windows. Use this when you want to reclaim resources without closing the tab, or to force a clean restart (a subsequent `:Pi` will spawn a fresh process).
-- **Aborted** via `:PiAbort` / `pi.abort()` — cancels whatever the agent is currently doing mid-turn but keeps the session and process alive, so you can immediately send a new prompt. Different from `:PiStop`: abort stops the _agent_, stop kills the _process_.
+- **Aborted** via `:PiAbort` / `pi.abort()` — cancels whatever the agent is currently doing mid-turn but keeps the session and process alive, so you can immediately send a new prompt. On a parent session the abort also cascades to its sub-sessions, and the processes of children that already received their task stay alive and reusable (a child still spawning is reclaimed); inside a child view only that child is interrupted, never the parent. Different from `:PiStop`: abort stops the _agent_, stop kills the _process_.
 
 ## What to check when something's wrong
 
