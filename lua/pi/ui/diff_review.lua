@@ -61,6 +61,8 @@ local list_jump
 ---@field deleted boolean
 ---@field status "A"|"M"|"D"
 ---@field body string[]
+---@field header string? Raw `diff --git` remainder, used only as a last-resort
+--- path source for header-only sections (mode/binary/rename).
 
 ---@class pi.DiffReviewGroup
 ---@field toplevel string Work tree root.
@@ -111,7 +113,10 @@ function M.parse_sections(output)
     local current = nil ---@type pi.DiffReviewSectionDraft?
     for _, line in ipairs(vim.split(output or "", "\n", { plain = true })) do
         if line:match("^diff %-%-git ") then
-            current = { deleted = false, status = "M", body = {} }
+            -- Keep the header remainder: some sections (mode-only changes,
+            -- binary diffs, content-less renames) carry no ---/+++ lines and
+            -- need it as a last-resort path source in the post-pass.
+            current = { deleted = false, status = "M", body = {}, header = line:sub(12) }
             parsed[#parsed + 1] = current
         elseif current then
             current.body[#current.body + 1] = line
@@ -123,10 +128,20 @@ function M.parse_sections(output)
             else
                 local new_path = line:match("^%+%+%+ b/(.+)$") or line:match('^%+%+%+ "b/(.+)"$')
                 local old_path = line:match("^%-%-%- a/(.+)$") or line:match('^%-%-%- "a/(.+)"$')
+                -- Binary diffs and content-less renames carry no ---/+++ lines:
+                -- take the path from their dedicated body lines so those files
+                -- stay listed instead of silently disappearing from :PiDiff.
+                local binary_new = line:match("^Binary files .+ and b/(.*) differ$")
+                local binary_old = line:match("^Binary files a/(.*) and /dev/null differ$")
+                local rename_to = line:match('^rename to "(.*)"$') or line:match("^rename to (.+)$")
                 if new_path then
                     current.path = new_path
-                elseif old_path and not current.path then
-                    current.path = old_path
+                elseif rename_to then
+                    current.path = rename_to
+                elseif binary_new then
+                    current.path = binary_new
+                elseif (old_path or binary_old) and not current.path then
+                    current.path = old_path or binary_old
                 end
             end
             if vim.startswith(line, "new file mode") then
@@ -141,9 +156,19 @@ function M.parse_sections(output)
     local sections = {}
     for _, section in ipairs(parsed) do
         local path = section.path
-        -- Sections without a `---`/`+++` body (e.g. binary-only diffs) have
-        -- no usable path: drop them instead of showing an empty row.
+        -- Last resort for header-only sections (mode-only change, type change):
+        -- the header is ambiguous, but git writes the *same* path on both sides
+        -- for these, so only trust it when the unquoted halves match exactly.
+        if not path and section.header and not section.header:find('"', 1, true) then
+            local a_side, b_side = section.header:match("^a/(.*) b/(.*)$")
+            if a_side and a_side == b_side then
+                path = b_side
+            end
+        end
+        -- Sections whose path cannot be derived at all are dropped rather than
+        -- shown as an empty row.
         if path then
+            section.path = path
             -- Drop the empty line left by the trailing newline of the output.
             while #section.body > 0 and section.body[#section.body] == "" do
                 section.body[#section.body] = nil

@@ -151,9 +151,7 @@ describe("diff_review parse_sections", function()
         assert.are.equal("+new", sections[1].body[#sections[1].body])
     end)
 
-    it("drops sections whose path cannot be derived from the body", function()
-        -- Binary diffs (and content-less renames) have no `---`/`+++` lines;
-        -- dropping them beats inventing a path from the ambiguous header.
+    it("keeps binary-only diffs via the Binary files body line", function()
         local output = table.concat({
             "diff --git a/img.png b/img.png",
             "index 1111111..2222222 100644",
@@ -167,8 +165,47 @@ describe("diff_review parse_sections", function()
             "",
         }, "\n")
         local sections = M.parse_sections(output)
+        assert.are.equal(2, #sections)
+        assert.are.equal("img.png", sections[1].path)
+        assert.are.equal("kept.txt", sections[2].path)
+    end)
+
+    it("keeps content-less renames via the rename to body line", function()
+        local output = table.concat({
+            "diff --git a/old-name.txt b/new-name.txt",
+            "similarity index 100%",
+            "rename from old-name.txt",
+            "rename to new-name.txt",
+            "",
+        }, "\n")
+        local sections = M.parse_sections(output)
         assert.are.equal(1, #sections)
-        assert.are.equal("kept.txt", sections[1].path)
+        assert.are.equal("new-name.txt", sections[1].path)
+        assert.are.equal("M", sections[1].status)
+    end)
+
+    it("keeps mode-only changes via an identical unquoted header", function()
+        local output = table.concat({
+            "diff --git a/script.sh b/script.sh",
+            "old mode 100644",
+            "new mode 100755",
+            "",
+        }, "\n")
+        local sections = M.parse_sections(output)
+        assert.are.equal(1, #sections)
+        assert.are.equal("script.sh", sections[1].path)
+    end)
+
+    it("drops a section whose path cannot be derived at all", function()
+        -- Quoted header (so the identical-halves fallback cannot be trusted)
+        -- and no ---/+++/rename/binary line: nothing usable to show.
+        local output = table.concat({
+            'diff --git "a/weird\\tname" "b/weird\\tname"',
+            "old mode 100644",
+            "new mode 100755",
+            "",
+        }, "\n")
+        assert.are.same({}, M.parse_sections(output))
     end)
 end)
 
