@@ -113,6 +113,23 @@ describe("vision", function()
         end)
     end)
 
+    describe("state_path", function()
+        after_each(function()
+            Vision._set_path(nil)
+        end)
+
+        it("embeds the PID so concurrent nvim instances cannot clobber each other", function()
+            local path = Vision.state_path()
+            assert.is_truthy(path:find("pi2nvim-vision-model-", 1, true), "unexpected name: " .. path)
+            assert.is_truthy(path:find(tostring(vim.fn.getpid()), 1, true), "missing PID: " .. path)
+        end)
+
+        it("still honours the test override", function()
+            Vision._set_path("/tmp/pi2nvim-vision-test")
+            assert.are.equal("/tmp/pi2nvim-vision-test", Vision.state_path())
+        end)
+    end)
+
     describe("parse_notify", function()
         it("extracts the reason from a prefixed error", function()
             assert.are.equal("boom", Vision.parse_notify("[pi-vision] boom"))
