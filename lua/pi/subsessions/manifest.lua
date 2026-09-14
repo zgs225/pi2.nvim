@@ -34,6 +34,11 @@ local cache = nil
 ---@type string?
 local cache_path = nil
 
+--- True when the last `load()` read an existing, non-empty file that failed to
+--- decode. Callers that rewrite the whole manifest must check this and refuse
+--- to save, or one unreadable byte would wipe every sub-session entry.
+local decode_failed = false
+
 --- In-flight spawn reservations per lineage (not yet upserted as active).
 ---@type table<string, integer>
 local occupy = {}
@@ -70,7 +75,17 @@ end
 function M._reset()
     cache = nil
     cache_path = nil
+    decode_failed = false
     occupy = {}
+end
+
+--- True when the last `load()` hit an existing, non-empty file that failed to
+--- decode. In that state the in-memory manifest is not backed by the disk
+--- file, so persisting it would overwrite the real (unreadable) manifest with
+--- a rebuilt table — typically empty, destroying all sub-session metadata.
+---@return boolean
+function M.decode_failed()
+    return decode_failed
 end
 
 ---@return table<string, pi.SubsessionManifestEntry>
@@ -83,6 +98,7 @@ function M.load()
     if not file then
         cache = {}
         cache_path = path
+        decode_failed = false
         return cache
     end
     local content = file:read("*a")
@@ -90,14 +106,17 @@ function M.load()
     if type(content) ~= "string" or content == "" then
         cache = {}
         cache_path = path
+        decode_failed = false
         return cache
     end
     local ok, data = pcall(vim.json.decode, content)
     if ok and type(data) == "table" then
         cache = data
         cache_path = path
+        decode_failed = false
         return cache
     end
+    decode_failed = true
     return {}
 end
 
@@ -107,6 +126,7 @@ function M.save(manifest)
     local path = M.path()
     cache = manifest
     cache_path = path
+    decode_failed = false
     local dir = vim.fn.fnamemodify(path, ":h")
     if vim.fn.isdirectory(dir) == 0 then
         vim.fn.mkdir(dir, "p")

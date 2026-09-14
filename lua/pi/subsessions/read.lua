@@ -164,16 +164,18 @@ function M.infer_run_status(path)
     return nil
 end
 
+--- Resolve a session id to its JSONL path.
+---
+--- Delegates to `History.find_by_id`, which resolves by filename convention
+--- (one readdir) instead of a full `list()` scan — a full scan parses every
+--- session file in the directory and used to make callers like
+--- `rebuild_statuses` (one lookup per manifest entry) block the editor for
+--- tens of seconds on large session dirs.
 ---@param session_id string
 ---@return string?
 function M.find_path(session_id)
-    local History = require("pi.sessions.history")
-    for _, info in ipairs(History.list()) do
-        if info.id == session_id then
-            return info.path
-        end
-    end
-    return nil
+    local info = require("pi.sessions.history").find_by_id(session_id)
+    return info and info.path or nil
 end
 
 return M

@@ -769,33 +769,78 @@ function M.on_child_settled(child)
 end
 
 --- Rebuild manifest statuses after Neovim restart.
+---
+--- The manifest is only written back when something actually changed: a
+--- rebuild that finds every entry already consistent must not rewrite a
+--- potentially large file on every startup (write amplification + mtime
+--- churn for backup tools).
 function M.rebuild_statuses()
     local manifest = Manifest.load()
+    if Manifest.decode_failed() then
+        -- The on-disk manifest did not decode: the in-memory table is not
+        -- backed by the file, so saving would overwrite the real manifest
+        -- (typically with an empty table, destroying all sub-session
+        -- metadata). Surface the corruption instead of silently wiping it.
+        Notify.error("Sub-session manifest is corrupt; skipping status rebuild (not overwriting the file)")
+        return
+    end
+    -- One full scan up front: an id → path index of every session file on
+    -- disk. `History.list()` is newest-first, so keeping the first match for
+    -- an id preserves find_path's newest-file semantics. Entries whose file
+    -- is gone (the common dormant case in a long-lived project) must not each
+    -- pay a fallback full scan through find_path — that was the
+    -- O(children × sessions) freeze of issue #110. A file created after this
+    -- snapshot is picked up by the next rebuild.
+    local index = {}
+    for _, info in ipairs(require("pi.sessions.history").list()) do
+        if index[info.id] == nil then
+            index[info.id] = info.path
+        end
+    end
+    local changed = false
     for id, entry in pairs(manifest) do
         if Manifest.is_entry_id(id) and type(entry) == "table" and entry.parent_id ~= nil then
-            local path = Read.find_path(id)
+            local path = index[id]
             if not path then
                 if entry.status == "active" then
                     entry.status = "dormant"
+                    changed = true
                 end
             else
-                entry.last_active_at = tostring(os.date("!%Y-%m-%dT%H:%M:%SZ", vim.fn.getftime(path)))
+                local mtime = tostring(os.date("!%Y-%m-%dT%H:%M:%SZ", vim.fn.getftime(path)))
+                if entry.last_active_at ~= mtime then
+                    entry.last_active_at = mtime
+                    changed = true
+                end
                 local inferred = Read.infer_run_status(path)
                 if inferred == "completed" then
-                    entry.status = "completed"
+                    if entry.status ~= "completed" then
+                        entry.status = "completed"
+                        changed = true
+                    end
                 elseif inferred == "interrupted" then
-                    entry.status = "interrupted"
+                    if entry.status ~= "interrupted" then
+                        entry.status = "interrupted"
+                        changed = true
+                    end
                 end
-                if Sessions.get_by_id(id) and Sessions.get_by_id(id).rpc:is_running() then
-                    entry.status = "active"
+                local live = Sessions.get_by_id(id)
+                if live and live.rpc:is_running() then
+                    if entry.status ~= "active" then
+                        entry.status = "active"
+                        changed = true
+                    end
                 elseif entry.status == "active" then
                     entry.status = "dormant"
+                    changed = true
                 end
             end
             manifest[id] = entry
         end
     end
-    Manifest.save(manifest)
+    if changed then
+        Manifest.save(manifest)
+    end
     pcall(function()
         Batch.rebuild()
     end)

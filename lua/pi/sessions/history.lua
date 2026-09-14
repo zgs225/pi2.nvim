@@ -139,6 +139,43 @@ function M.parse(path)
     }
 end
 
+--- Find a session file by id without scanning every session.
+---
+--- pi core names session files `<timestamp>_<id>.jsonl`, so a filename glob
+--- resolves the path with one readdir and no file reads (a full `list()`
+--- parses every file's lines and costs seconds on large session dirs). The
+--- glob hit is still verified against the header id before it is returned.
+--- Falls back to a full `list()` scan when no filename matches (files written
+--- by other tools, or a naming convention that stops holding) — the fallback
+--- preserves the old `list()`-scan semantics exactly, including picking the
+--- newest file when several share an id.
+---@param id string
+---@return pi.SessionInfo?
+function M.find_by_id(id)
+    if type(id) ~= "string" or id == "" then
+        return nil
+    end
+    local dir = M.get_sessions_dir()
+    local files = vim.fn.glob(join_path(dir, "*_" .. id .. ".jsonl"), false, true)
+    ---@type pi.SessionInfo?
+    local best = nil
+    for _, file in ipairs(files) do
+        local info = M.parse(file)
+        if info and info.id == id and (best == nil or info.modified > best.modified) then
+            best = info
+        end
+    end
+    if best then
+        return best
+    end
+    for _, info in ipairs(M.list()) do
+        if info.id == id then
+            return info
+        end
+    end
+    return nil
+end
+
 --- List all sessions for the current cwd, sorted by modified time (newest first).
 ---@return pi.SessionInfo[]
 function M.list()
