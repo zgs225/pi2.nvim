@@ -1206,10 +1206,38 @@ function History:_agent_text_has_open_fence(text)
     return open
 end
 
+--- nvim_buf_set_lines() rejects any item containing a newline, aborting the
+--- whole render with a hard error. Foreign strings can carry them: a provider
+--- may return a tool call whose *name* is the model's reasoning text (live case:
+--- `toolName = "bash rebase --continue\n\nLet me first check ..."`), and pi
+--- forwards it verbatim. Flatten newlines at the buffer write boundary so a
+--- malformed upstream string can never take the buffer down. Only newlines are
+--- touched — leading whitespace is meaningful (code blocks, indentation).
+---@param lines string[]
+---@return string[] same table when clean, otherwise a sanitized copy
+local function flatten_newlines(lines)
+    local dirty = false
+    for _, line in ipairs(lines) do
+        if type(line) == "string" and line:find("[\r\n]") then
+            dirty = true
+            break
+        end
+    end
+    if not dirty then
+        return lines
+    end
+    local out = {}
+    for i, line in ipairs(lines) do
+        out[i] = type(line) == "string" and (line:gsub("[\r\n]+", " ")) or line
+    end
+    return out
+end
+
 ---@param lines_list string[]
 ---@return integer start_row 0-indexed row where the first line was placed
 function History:_append_lines(lines_list)
     local start_row = 0
+    lines_list = flatten_newlines(lines_list)
     self:_with_modifiable(function()
         local line_count = vim.api.nvim_buf_line_count(self._buf)
         if line_count == 1 then
@@ -1237,6 +1265,7 @@ end
 ---@return integer start_row 0-indexed row where the first line was placed
 ---@return integer next_row row after the last inserted line (for chaining)
 function History:_insert_lines(row, lines_list)
+    lines_list = flatten_newlines(lines_list)
     self:_with_modifiable(function()
         vim.api.nvim_buf_set_lines(self._buf, row, row, false, lines_list)
     end)
@@ -2510,11 +2539,12 @@ function History:on_tool_start(tool_name, tool_call_id, tool_input)
         local icon = Tools.get_tool_icon(tool_name)
         local renderer = Tools.get_renderer(tool_name)
         local use_inline = Tools.is_inline(renderer, tool_input)
-        local display_name = Tools.tool_display_name(tool_name, tool_input)
+        local display_name = Tools.flatten_line(Tools.tool_display_name(tool_name, tool_input))
 
         -- Inline tools render as a single line: indent + icon + display_name + detail
         if use_inline then
             local detail = renderer.inline_text and renderer.inline_text(tool_input) or nil
+            detail = detail and Tools.flatten_line(detail) or nil
             local indent = Tools.GLYPHS.INDENT
             local line = indent .. icon .. " " .. display_name .. (detail and ("  " .. detail) or "")
 
@@ -2661,7 +2691,7 @@ function History:on_tool_end(tool_name, tool_call_id, result, is_error)
             -- Update icon + name color
             local icon = Tools.get_tool_icon(tool_name)
             local indent = Tools.GLYPHS.INDENT
-            local display_name = Tools.tool_display_name(tool_name, block.tool_input)
+            local display_name = Tools.flatten_line(Tools.tool_display_name(tool_name, block.tool_input))
             local pos = vim.api.nvim_buf_get_extmark_by_id(self._buf, ns, block.icon_extmark, {})
             if not pos[1] then
                 return
