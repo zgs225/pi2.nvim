@@ -382,6 +382,91 @@ describe("subsession batch", function()
         assert.equals(2, entry.run_generation)
     end)
 
+    it("bump_generation updates parent_epoch when provided", function()
+        Manifest.upsert("child-epoch", {
+            parent_id = "parent-1",
+            parent_epoch = 0,
+            name = "worker",
+            task_prompt = "t",
+            config = {},
+            status = "completed",
+            reported = false,
+            created_at = Manifest.iso_now(),
+            last_active_at = Manifest.iso_now(),
+            agent_spawned = true,
+            run_generation = 1,
+        })
+        Batch.bump_generation("child-epoch", 2)
+        local entry = Manifest.load()["child-epoch"]
+        assert.equals(2, entry.run_generation)
+        assert.equals("active", entry.status)
+        assert.equals(2, entry.parent_epoch)
+
+        -- omitting parent_epoch keeps existing parent_epoch intact
+        Batch.bump_generation("child-epoch")
+        local after = Manifest.load()["child-epoch"]
+        assert.equals(3, after.run_generation)
+        assert.equals(2, after.parent_epoch)
+    end)
+
+    it("run_batch updates child parent_epoch on target reuse", function()
+        local Sessions = require("pi.sessions.manager")
+        Manifest.upsert("child-reuse-epoch", {
+            parent_id = "parent-epoch-test",
+            parent_epoch = 0,
+            name = "reuse-worker",
+            task_prompt = "initial",
+            config = {},
+            status = "completed",
+            reported = false,
+            created_at = Manifest.iso_now(),
+            last_active_at = Manifest.iso_now(),
+            agent_spawned = true,
+            run_generation = 1,
+        })
+
+        local child_sess = {
+            id = "child-reuse-epoch",
+            rpc = {
+                is_running = function()
+                    return true
+                end,
+                stop = function() end,
+                send = function(_, _cmd, cb)
+                    if cb then
+                        cb({ success = true })
+                    end
+                    return true
+                end,
+            },
+        }
+        Sessions._register_for_test(child_sess)
+
+        local parent = {
+            id = "parent-epoch-test",
+            conversation_epoch = 5,
+            rpc = {
+                is_running = function()
+                    return true
+                end,
+            },
+        }
+
+        Batch.dispatch(parent, {
+            items = {
+                { ref = "reuse-item", target = "child-reuse-epoch", message = "continue work" },
+            },
+        }, function() end)
+
+        local ok = vim.wait(1000, function()
+            local entry = Manifest.load()["child-reuse-epoch"]
+            return entry and entry.parent_epoch == 5 and entry.run_generation == 2
+        end, 10)
+
+        Sessions._reset()
+        assert.is_true(ok, "manifest parent_epoch should be updated to parent conversation_epoch")
+    end)
+
     it("stores batch.parent_id as lineage and list/cancel resolve migrated ids", function()
         local parent = {
             id = "session-new",

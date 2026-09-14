@@ -2,6 +2,7 @@
 
 ## 2026-09-11
 
+- **FIXED:** Active sub-sessions whose processes are still running are no longer hidden in `:PiSessions` across conversation epochs. Previously, `/new` (or a conversation switch) bumped `parent.conversation_epoch`, and the overview visibility check used `same_epoch and ChildFilter.child_visible`, short-circuiting running sub-sessions simply because their `parent_epoch` matched the prior conversation. Live sub-sessions whose process is alive now stay visible regardless of epoch, and reusing a child via `dispatch_subagents` updates its `parent_epoch` to the parent's current epoch.
 - **FIXED:** An exception thrown by an RPC event handler or a response callback no longer aborts stdout parsing and permanently desynchronises the session stream — both are now isolated, logged and surfaced while the stream stays intact. Issue #109.
 - **FIXED:** When the `pi` process dies (crash/OOM/kill), outstanding RPC requests now fail fast with `process exited (code …)` instead of hanging forever, and a superseded job's exit no longer tears down a freshly started process. Issue #109.
 - **FIXED:** Closing or switching a session now answers its queued extension dialog requests with a cancellation, so the backend is no longer left blocked (e.g. `:PiAbort` during a permission/editor prompt). Issue #109.

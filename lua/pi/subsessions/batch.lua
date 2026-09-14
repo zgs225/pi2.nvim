@@ -228,15 +228,20 @@ local function notify_waiters(batch_id)
 end
 
 ---@param child_id string
+---@param parent_epoch? integer
 ---@return integer
-function M.bump_generation(child_id)
+function M.bump_generation(child_id, parent_epoch)
     local entry = Manifest.load()[child_id]
     local gen = (entry and entry.run_generation or 0) + 1
-    Manifest.patch(child_id, {
+    local patch = {
         run_generation = gen,
         status = "active",
         last_active_at = Manifest.iso_now(),
-    })
+    }
+    if parent_epoch ~= nil then
+        patch.parent_epoch = parent_epoch
+    end
+    Manifest.patch(child_id, patch)
     return gen
 end
 
@@ -549,7 +554,7 @@ local function run_batch(batch, parent)
                 M.complete_item(b.id, item.ref, false, { error = "sub-agent not found" })
                 return
             end
-            local gen = M.bump_generation(target)
+            local gen = M.bump_generation(target, parent.conversation_epoch)
             live.generation = gen
             live.status = "running"
             persist(b)

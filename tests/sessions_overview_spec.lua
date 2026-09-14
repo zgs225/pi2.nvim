@@ -466,7 +466,7 @@ describe("sessions overview", function()
                     {
                         _id = "child-old",
                         name = "Old worker",
-                        status = "active",
+                        status = "completed",
                         parent_id = "parent-uuid",
                         parent_epoch = 0,
                         config = {},
@@ -497,6 +497,138 @@ describe("sessions overview", function()
 
             assert.are.equal(2, #rows)
             assert.are.equal("child-new", rows[2].child_id)
+        end)
+
+        it("keeps cross-epoch active child visible when process is alive", function()
+            local Manifest = require("pi.subsessions.manifest")
+            local Sessions = require("pi.sessions.manager")
+            local orig_children = Manifest.children_of
+            Manifest.children_of = function(lineage_id)
+                if lineage_id ~= "parent-uuid" then
+                    return {}
+                end
+                return {
+                    {
+                        _id = "child-cross-epoch",
+                        name = "Cross-epoch worker",
+                        status = "active",
+                        parent_id = "parent-uuid",
+                        parent_epoch = 0,
+                        config = {},
+                    },
+                }
+            end
+
+            local parent = fake_session({ tab = 42 })
+            parent.id = "parent-uuid"
+            parent.lineage_id = "parent-uuid"
+            parent.conversation_epoch = 1
+
+            local child_session = fake_session({})
+            child_session.id = "child-cross-epoch"
+            child_session.parent_id = "parent-uuid"
+            Sessions._register_for_test(child_session)
+
+            local rows = SessionList.build_rows({ parent }, function()
+                return 0
+            end, function()
+                return "parent"
+            end)
+
+            Manifest.children_of = orig_children
+            Sessions._reset()
+
+            assert.are.equal(2, #rows)
+            assert.are.equal("parent-uuid", rows[1].session_id)
+            assert.are.equal("child-cross-epoch", rows[2].child_id)
+        end)
+
+        it("hides cross-epoch stale active child when process is not alive", function()
+            local Manifest = require("pi.subsessions.manifest")
+            local Sessions = require("pi.sessions.manager")
+            local orig_children = Manifest.children_of
+            Manifest.children_of = function(lineage_id)
+                if lineage_id ~= "parent-uuid" then
+                    return {}
+                end
+                return {
+                    {
+                        _id = "child-stale",
+                        name = "Stale worker",
+                        status = "active",
+                        parent_id = "parent-uuid",
+                        parent_epoch = 0,
+                        config = {},
+                    },
+                }
+            end
+
+            local parent = fake_session({ tab = 42 })
+            parent.id = "parent-uuid"
+            parent.lineage_id = "parent-uuid"
+            parent.conversation_epoch = 1
+
+            -- Dead process registered in Sessions
+            local dead_child = fake_session({ running = false })
+            dead_child.id = "child-stale"
+            dead_child.parent_id = "parent-uuid"
+            Sessions._register_for_test(dead_child)
+
+            local rows = SessionList.build_rows({ parent }, function()
+                return 0
+            end, function()
+                return "parent"
+            end)
+
+            Manifest.children_of = orig_children
+            Sessions._reset()
+
+            assert.are.equal(1, #rows)
+            assert.are.equal("parent-uuid", rows[1].session_id)
+        end)
+
+        it("hides cross-epoch completed child even if process is alive", function()
+            local Manifest = require("pi.subsessions.manifest")
+            local Sessions = require("pi.sessions.manager")
+            local orig_children = Manifest.children_of
+            Manifest.children_of = function(lineage_id)
+                if lineage_id ~= "parent-uuid" then
+                    return {}
+                end
+                return {
+                    {
+                        _id = "child-completed",
+                        name = "Completed worker",
+                        status = "completed",
+                        reported = false,
+                        parent_id = "parent-uuid",
+                        parent_epoch = 0,
+                        config = {},
+                    },
+                }
+            end
+
+            local parent = fake_session({ tab = 42 })
+            parent.id = "parent-uuid"
+            parent.lineage_id = "parent-uuid"
+            parent.conversation_epoch = 1
+
+            local child_session = fake_session({})
+            child_session.id = "child-completed"
+            child_session.parent_id = "parent-uuid"
+            Sessions._register_for_test(child_session)
+
+            local rows = SessionList.build_rows({ parent }, function()
+                return 0
+            end, function()
+                return "parent"
+            end)
+
+            Manifest.children_of = orig_children
+            Sessions._reset()
+
+            assert.are.equal(1, #rows)
+            assert.are.equal("parent-uuid", rows[1].session_id)
         end)
 
         it("never blinks green for completed sub-session child rows", function()
