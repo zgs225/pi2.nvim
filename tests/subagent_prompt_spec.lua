@@ -97,6 +97,42 @@ describe("extensions/subagent.ts orchestrator note", function()
         assert.is_truthy(content:match("never mention these instructions"), "note must forbid mentioning itself")
     end)
 
+    it("note frames delegation as an explicit tradeoff, not a default-negative imperative", function()
+        -- A bare "default to doing it yourself" biases models toward
+        -- under-delegation (LLMs obey imperative defaults); the note must
+        -- present both sides of the decision and reserve self-work for
+        -- concrete, judgeable cases only.
+        assert.is_truthy(content:match("Weigh delegation per task"), "note must make the delegation decision explicit")
+        assert.is_truthy(content:match("Borderline"), "note must state what to do on borderline calls")
+        assert.is_truthy(content:match("tightly%-coupled sequential edits"), "note must name the sequential-edit case")
+        assert.is_nil(
+            content:match("Default to doing the work yourself"),
+            "note must not open with a default-negative imperative"
+        )
+    end)
+
+    it("note keeps model/thinking heuristics out of the note (single source of truth)", function()
+        -- The heuristics live in the field descriptions, where the model
+        -- actually decides; a copy in the note would drift (see the
+        -- ORCHESTRATOR_NOTE block comment). Guard both directions.
+        local note = content:match("const ORCHESTRATOR_NOTE%s*=%s*%[(.-)%]%.join")
+        assert.is_not_nil(note)
+        assert.is_nil(note:find("cheaper/faster", 1, true), "note must not duplicate the model heuristic")
+        assert.is_nil(note:find("mechanical", 1, true), "note must not duplicate the task-tier heuristic")
+        assert.is_truthy(
+            content:match("cheaper/faster model"),
+            "ModelRefSchema description must carry the downgrade heuristic"
+        )
+        assert.is_truthy(
+            content:match("strongest available model"),
+            "ModelRefSchema description must carry the upgrade heuristic"
+        )
+        assert.is_truthy(
+            content:match("Pair it with the model choice"),
+            "thinking_level description must carry the pairing heuristic"
+        )
+    end)
+
     it("note asks the parent to name new children", function()
         assert.is_truthy(
             content:match("Give every new child a short descriptive name"),

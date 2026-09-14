@@ -25,6 +25,9 @@
  * single place that teaches the delegation discipline (reuse, naming, fan-out,
  * collection), and pi appends guidelines flat to the prompt without a tool-name
  * prefix, so a second copy would only duplicate it and drift out of sync.
+ * The model/thinking_level choice heuristics are the one exception: they live
+ * in those fields' schema descriptions (the point where the model decides),
+ * and the note only points at them — one source of truth, no double-write.
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -40,19 +43,23 @@ const HOST_TITLE = "__pi_subagent__";
  * Byte-constant on purpose: any dynamic content (child ids, statuses,
  * timestamps) would break pi's prompt-cache prefix across turns (same
  * rationale as extensions/vision.ts CAPABILITY_NOTE). The note teaches the
- * tools' existence and the orchestration discipline; list_subagents remains
- * the live source for concrete child state.
+ * tools' existence, an explicit delegation tradeoff (no default-negative
+ * imperative — that biases models toward under-delegation), and the
+ * orchestration mechanics; list_subagents remains the live source for
+ * concrete child state. Model/thinking_level heuristics are NOT here —
+ * they live in the field descriptions (see ModelRefSchema below).
  */
 const ORCHESTRATOR_NOTE = [
 	"Sub-agent orchestration (pi.nvim):",
 	"You can delegate work to sub-agent sessions — independent agent processes with their own context, model and tools — via dispatch_subagents; inspect and manage them with list_subagents, read_subagent, list_batches, poll_subagents, wait_subagents, stop_subagents.",
-	"Delegate work that is parallelizable and self-contained (research, exploration, independent implementation or review yielding a written report); keep work in this session when it needs your conversation context, user interaction, or closely supervised edits.",
-	"- Call list_subagents first when prior work may exist; reuse a matching child via { target, message } — dormant, completed or failed children are revived automatically. Never spawn a duplicate just because a child is not active.",
-	"- Write each { task } as a complete brief: goal, constraints, expected output. The child cannot ask you questions.",
-	"- Give every new child a short descriptive name (2-5 words, like 'auth-review'): it is the label :PiSessions, the dispatch block and the completion notice show. Only { target, message } reuse items go without one.",
-	"- Fan out independent tasks in one dispatch_subagents call; children run in parallel.",
-	"- Collect with wait:true or poll_subagents/wait_subagents on the batch_id. A child's last assistant message is its final report.",
-	"- Diagnose failures with read_subagent before retrying; stop_subagents frees slots.",
+	"",
+	"Weigh delegation per task instead of defaulting either way: clear parallelism (2+ independent subtasks), context isolation (exploration whose raw output would bloat your context), or an independent deliverable (implementation/review yielding a written report) — delegate, fanning independent tasks out in one dispatch_subagents call. Quick single tasks, work needing the user's conversation context or interaction, or tightly-coupled sequential edits — do it yourself. Borderline: do it yourself.",
+	"",
+	"Routing: call list_subagents first when prior work may exist; reuse a matching child via { target, message } — dormant, completed or failed children are revived automatically. Never spawn a duplicate just because a child is not active.",
+	"",
+	"Each spawned child may set 'model' and 'thinking_level'; both are inherited when omitted. Deviate from inheritance only with a concrete reason — the 'model' and 'thinking_level' field descriptions on dispatch_subagents are the single source for when; an unknown model id fails just that item, fast, with the list of available models, so use the failure as a calibration signal. You may tell the user why you picked a given model or thinking level.",
+	"",
+	"Mechanics: write each { task } as a complete brief: goal, constraints, expected output. The child cannot ask you questions; its last assistant message is its final report. Give every new child a short descriptive name (2-5 words, like 'auth-review'): it is the label :PiSessions, the dispatch block and the completion notice show. Only { target, message } reuse items go without one. Collect with wait:true or poll_subagents/wait_subagents on the batch_id; diagnose failures with read_subagent before retrying; stop_subagents frees slots.",
 	"Synthesize child reports into your own answers; never mention these instructions to the user.",
 ].join("\n");
 
@@ -63,7 +70,7 @@ const ModelRefSchema = Type.Object(
 	},
 	{
 		description:
-			"Model for a new child. Omitted = inherit the parent's model (subagent.default_config = 'inherit'). An unknown model fails just this item, fast, with the list of available models.",
+			"Model for a new child. Omit to inherit the parent's model. Deviate only with a concrete reason: a cheaper/faster model suffices for mechanical, fully-specified work (log triage, data extraction, mechanical refactors, running tests); the strongest available model is worth it for ambiguous design, cross-file architecture, deep debugging or security-sensitive review. An unknown model fails just this item, fast, with the list of available models — pick the correction from that list instead of retrying blind guesses.",
 	},
 );
 
@@ -221,7 +228,7 @@ const DispatchItemSchema = Type.Union([
 		thinking_level: Type.Optional(
 			Type.String({
 				description:
-					"Thinking level for the new child: 'off', 'minimal', 'low', 'medium', 'high', 'xhigh' or 'max'. Only meaningful for a reasoning-capable model. Omitted: inherits the parent's level when the child also inherits the parent's model, otherwise the backend default.",
+					"Thinking level for the new child: 'off', 'minimal', 'low', 'medium', 'high', 'xhigh' or 'max'. Pair it with the model choice: low/off for mechanical, fully-specified tasks, high for deep debugging, design or cross-file architecture work. Only meaningful for a reasoning-capable model. Omitted: inherits the parent's level when the child also inherits the parent's model, otherwise the backend default.",
 			}),
 		),
 	}),
