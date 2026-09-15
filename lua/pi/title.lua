@@ -13,12 +13,15 @@ local M = {}
 
 --- Runtime file conveying the configured title options to already-spawned
 --- RPC processes, as JSON: {"enabled":bool,"maxChars":number,"lang":string|null}.
+--- The PID is part of the name because stdpath("run") is per-user, not
+--- per-process: without it two concurrently running nvim instances would
+--- clobber each other's title config.
 ---@return string
 function M.state_path()
     if state_path_override then
         return state_path_override
     end
-    return vim.fn.stdpath("run") .. "/pi2nvim-title-config"
+    return vim.fn.stdpath("run") .. "/pi2nvim-title-config-" .. tostring(vim.fn.getpid())
 end
 
 --- Override the state file path (tests).

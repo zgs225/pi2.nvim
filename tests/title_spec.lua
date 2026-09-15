@@ -71,6 +71,23 @@ describe("pi.title", function()
     end)
 end)
 
+describe("pi.title state_path", function()
+    after_each(function()
+        Title._set_path(nil)
+    end)
+
+    it("embeds the PID so concurrent nvim instances cannot clobber each other", function()
+        local path = Title.state_path()
+        assert.is_truthy(path:find("pi2nvim-title-config-", 1, true), "unexpected name: " .. path)
+        assert.is_truthy(path:find(tostring(vim.fn.getpid()), 1, true), "missing PID: " .. path)
+    end)
+
+    it("still honours the test override", function()
+        Title._set_path("/tmp/pi2nvim-title-test")
+        assert.are.equal("/tmp/pi2nvim-title-test", Title.state_path())
+    end)
+end)
+
 describe("pi.cli title injection", function()
     it("injects the bundled title extension before --mode rpc", function()
         local cmd = Cli.command()

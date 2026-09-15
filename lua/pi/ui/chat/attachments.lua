@@ -20,6 +20,11 @@ local Compress = require("pi.image_compress")
 
 local ns = vim.api.nvim_create_namespace("pi-attachments")
 
+--- Hard cap on one attachment's decoded size. Deliberately a constant, not a
+--- config option: reading a multi-hundred-MB file into base64 would exhaust
+--- memory long before any transfer limit is reached.
+local MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
+
 local mime_map = {
     png = "image/png",
     jpg = "image/jpeg",
@@ -200,8 +205,17 @@ function Attachments:_add_file_maybe_compressed(path, mime)
         elseif err then
             Notify.warn("Image compression failed, attaching the original: " .. err)
         end
-        local data = read_and_encode(final_path)
+        -- Size-check before read_and_encode: never load an oversized file into
+        -- memory, and always clean up the compressor's temp output.
         local stat = vim.uv.fs_stat(final_path)
+        if stat and stat.size > MAX_ATTACHMENT_BYTES then
+            if out_path then
+                vim.uv.fs_unlink(out_path)
+            end
+            Notify.error(("Image too large to attach (%s, max 25 MB): %s"):format(format_size(stat.size), path))
+            return
+        end
+        local data = stat and read_and_encode(final_path) or nil
         if out_path then
             vim.uv.fs_unlink(out_path)
         end
@@ -228,6 +242,10 @@ function Attachments:add_file(path)
     local stat = vim.uv.fs_stat(path)
     if not stat or stat.type ~= "file" then
         Notify.error("Could not read file: " .. path)
+        return false
+    end
+    if stat.size > MAX_ATTACHMENT_BYTES then
+        Notify.error(("Image too large to attach (%s, max 25 MB): %s"):format(format_size(stat.size), path))
         return false
     end
     local cfg = Config.options.prompt.image_compress
@@ -269,6 +287,11 @@ function Attachments:add_from_clipboard()
     local data = img_clip.get_base64_encoded_image()
     if not data then
         Notify.error("Failed to read image from clipboard")
+        return false
+    end
+    local decoded_size = base64_size(data)
+    if decoded_size > MAX_ATTACHMENT_BYTES then
+        Notify.error(("Image too large to attach (%s, max 25 MB): %s"):format(format_size(decoded_size), "clipboard"))
         return false
     end
 

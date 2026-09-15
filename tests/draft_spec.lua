@@ -123,4 +123,45 @@ describe("pi.draft workspace scoping", function()
         assert.is_nil(vim.uv.fs_stat(legacy))
         assert.is_nil(Draft.load()) -- legacy content is NOT migrated
     end)
+
+    it("path_for() is stable per cwd and distinct across workspaces", function()
+        local a = base .. "/proj-a"
+        local b = base .. "/proj-b"
+        vim.fn.mkdir(a, "p")
+        vim.fn.mkdir(b, "p")
+
+        local pa = Draft.path_for(a)
+        assert.are.equal(pa, Draft.path_for(a))
+        assert.are_not.equal(pa, Draft.path_for(b))
+    end)
+
+    it("explicit paths keep two tabs' drafts independent", function()
+        local a = base .. "/proj-a"
+        local b = base .. "/proj-b"
+        vim.fn.mkdir(a, "p")
+        vim.fn.mkdir(b, "p")
+        local pa = Draft.path_for(a)
+        local pb = Draft.path_for(b)
+
+        -- Tab A and tab B save concurrently; each keeps its own file.
+        Draft.save("draft in A", pa)
+        Draft.save("draft in B", pb)
+        assert.are.equal("draft in A", Draft.load(pa))
+        assert.are.equal("draft in B", Draft.load(pb))
+
+        -- Clearing/regenerating one workspace must not delete the other's file.
+        Draft.clear(pa)
+        Draft.save("", pa)
+        assert.is_nil(Draft.load(pa))
+        assert.are.equal("draft in B", Draft.load(pb))
+    end)
+
+    it("restore_once() honors an explicit path", function()
+        local a = base .. "/proj-a"
+        vim.fn.mkdir(a, "p")
+        local pa = Draft.path_for(a)
+        Draft.save("explicit", pa)
+        assert.are.equal("explicit", Draft.restore_once(pa))
+        assert.is_nil(Draft.restore_once(pa)) -- consumed once per process
+    end)
 end)

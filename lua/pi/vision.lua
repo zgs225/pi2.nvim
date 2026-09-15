@@ -24,12 +24,15 @@ M.NOTIFY_PREFIX = "[pi-vision]"
 --- RPC processes: the process env is frozen at spawn, but the bundled
 --- extension re-reads this file on every input event, so a live
 --- `setup({ vision = { model = ... } })` takes effect immediately.
+--- The PID is part of the name because stdpath("run") is per-user, not
+--- per-process: without it two concurrently running nvim instances would
+--- clobber each other's published model.
 ---@return string
 function M.state_path()
     if state_path_override then
         return state_path_override
     end
-    return vim.fn.stdpath("run") .. "/pi2nvim-vision-model"
+    return vim.fn.stdpath("run") .. "/pi2nvim-vision-model-" .. tostring(vim.fn.getpid())
 end
 
 --- Override the state file path (tests).

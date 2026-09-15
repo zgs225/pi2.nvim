@@ -16,13 +16,16 @@ local state_path_override = nil
 
 --- Per-tab state file path: sessions in different tabs may run under
 --- different cwds, so project-level `.pi/settings.json` scopes can differ.
+--- The PID is part of the name because stdpath("run") is per-user, not
+--- per-process: without it two concurrently running nvim instances would
+--- clobber each other's scope file.
 ---@param tab pi.TabId
 ---@return string
 function M.state_path(tab)
     if state_path_override then
         return state_path_override
     end
-    return vim.fn.stdpath("run") .. "/pi2nvim-scope-" .. tostring(tab)
+    return vim.fn.stdpath("run") .. "/pi2nvim-scope-" .. tostring(vim.fn.getpid()) .. "-" .. tostring(tab)
 end
 
 --- Override the state file path (tests). Passing nil restores the default.

@@ -1279,9 +1279,9 @@ function M.open(payload, callback, opts)
         if vim.api.nvim_buf_is_valid(after_buf) then
             vim.api.nvim_buf_delete(after_buf, { force = true })
         end
-        if review_tab and vim.api.nvim_tabpage_is_valid(review_tab) then
+        if review_tab and vim.api.nvim_tabpage_is_valid(review_tab) and #vim.api.nvim_list_tabpages() > 1 then
             vim.api.nvim_set_current_tabpage(review_tab)
-            vim.cmd("tabclose")
+            pcall(vim.cmd, "tabclose") -- E784 when it is the last tab
         end
         if vim.api.nvim_tabpage_is_valid(prev_tab) then
             vim.api.nvim_set_current_tabpage(prev_tab)
@@ -1342,8 +1342,9 @@ function M.open(payload, callback, opts)
         write_file(path, final_lines)
         require("pi.cache.files").invalidate()
         reload_buf_for_file(vim.fn.fnamemodify(path, ":p"))
-        close_review_tab()
 
+        -- Answer the RPC request before tearing down the review UI: a cleanup
+        -- error must never leave the backend blocked in ctx.ui.select().
         if modified then
             callback(encode_result("AcceptModified", {
                 content = table.concat(final_lines, "\n"),
@@ -1354,6 +1355,7 @@ function M.open(payload, callback, opts)
             -- plain "Accept" — the extension lets the tool run in that case.
             callback(encode_result("Accepted", nil, review_notes))
         end
+        close_review_tab()
     end
 
     local function reject()
@@ -1362,12 +1364,13 @@ function M.open(payload, callback, opts)
         end
         responded = true
         local review_notes = collect_notes()
-        close_review_tab()
+        -- Answer the RPC request before tearing down the review UI (see accept()).
         if #review_notes > 0 then
             callback(encode_result("Rejected", nil, review_notes))
         else
             callback("Reject")
         end
+        close_review_tab()
     end
 
     if type(opts.timeout) == "number" and opts.timeout > 0 then
@@ -1377,10 +1380,10 @@ function M.open(payload, callback, opts)
                     return
                 end
                 responded = true
-                close_review_tab()
                 if opts.on_timeout then
                     opts.on_timeout()
                 end
+                close_review_tab()
             end)
         end)
     end

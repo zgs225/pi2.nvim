@@ -321,8 +321,17 @@ function Rpc:_dispatch(msg)
 
     log("incoming", msg)
 
+    -- A throwing handler or pending callback must never propagate out of
+    -- _dispatch: it would abort _on_stdout before the trailing partial line is
+    -- stored in _stdout_parts, permanently desyncing line reassembly.
     if self._handler then
-        self._handler(msg)
+        local ok, err = pcall(self._handler, msg)
+        if not ok then
+            log("ERROR", "handler error: " .. tostring(err))
+            vim.schedule(function()
+                Notify.error("RPC event handler error: " .. tostring(err))
+            end)
+        end
     end
 
     -- Only responses consume pending callbacks: streamed events may carry the
@@ -331,7 +340,13 @@ function Rpc:_dispatch(msg)
     if msg.type == "response" and msg.id and self._pending[msg.id] then
         local cb = self._pending[msg.id]
         self._pending[msg.id] = nil
-        cb(msg)
+        local ok, err = pcall(cb, msg)
+        if not ok then
+            log("ERROR", "response callback error: " .. tostring(err))
+            vim.schedule(function()
+                Notify.error("RPC response callback error: " .. tostring(err))
+            end)
+        end
     end
 end
 
@@ -343,6 +358,8 @@ function Rpc:start(opts)
         return true
     end
     self._stdout_parts = {}
+    -- A stale process's pending callbacks must never survive into the new one.
+    self._pending = {}
     local cmd = Cli.command({ subagent = opts.subagent })
     -- The bundled vision extension reads its configured model from this
     -- runtime file on every input event (config.setup keeps it published).
@@ -368,7 +385,14 @@ function Rpc:start(opts)
         on_stderr = function(_, data)
             self:_on_stderr(data)
         end,
-        on_exit = function(_, code)
+        on_exit = function(job_id, code)
+            -- Guard against a stale process (e.g. one that exited just as a new
+            -- start() replaced self._job_id) settling the live one. Compare
+            -- with ~= rather than ==: after an intentional stop() self._job_id
+            -- is nil but the _process_exit dispatch must still happen.
+            if self._job_id and job_id ~= self._job_id then
+                return
+            end
             self:_on_exit(code)
         end,
         stdout_buffered = false,
@@ -525,6 +549,25 @@ end
 function Rpc:_on_exit(code)
     self._job_id = nil
     self._stdout_parts = {}
+    -- Settle every waiter so a crashed process cannot leave callers hanging:
+    -- drop the table first (a callback may re-enter send()) and reply with a
+    -- synthetic failure response. Intentional stop() clears _pending before
+    -- this runs, so those callers stay silent.
+    local pending = self._pending
+    self._pending = {}
+    for id, cb in pairs(pending) do
+        local ok, err = pcall(cb, {
+            type = "response",
+            id = id,
+            success = false,
+            error = "process exited (code " .. tostring(code) .. ")",
+        })
+        if not ok then
+            vim.schedule(function()
+                Notify.error("RPC response callback error: " .. tostring(err))
+            end)
+        end
+    end
     self:_dispatch({ type = "_process_exit", code = code })
 end
 

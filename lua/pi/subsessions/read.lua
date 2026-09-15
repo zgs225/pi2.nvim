@@ -124,6 +124,23 @@ function M.last_assistant_message(path)
     return nil
 end
 
+--- Stop reason of the last assistant message in a session file.
+---@param path string
+---@return string? stop_reason e.g. "aborted", "stop", "error"
+function M.last_stop_reason(path)
+    local entries = read_jsonl(path)
+    for i = #entries, 1, -1 do
+        local entry = entries[i]
+        if entry.type == "message" and type(entry.message) == "table" and entry.message.role == "assistant" then
+            if type(entry.message.stopReason) == "string" then
+                return entry.message.stopReason
+            end
+            return nil
+        end
+    end
+    return nil
+end
+
 --- Infer a child's run status from the last meaningful JSONL entry.
 ---@param path string
 ---@return "completed"|"interrupted"|nil
@@ -147,16 +164,18 @@ function M.infer_run_status(path)
     return nil
 end
 
+--- Resolve a session id to its JSONL path.
+---
+--- Delegates to `History.find_by_id`, which resolves by filename convention
+--- (one readdir) instead of a full `list()` scan — a full scan parses every
+--- session file in the directory and used to make callers like
+--- `rebuild_statuses` (one lookup per manifest entry) block the editor for
+--- tens of seconds on large session dirs.
 ---@param session_id string
 ---@return string?
 function M.find_path(session_id)
-    local History = require("pi.sessions.history")
-    for _, info in ipairs(History.list()) do
-        if info.id == session_id then
-            return info.path
-        end
-    end
-    return nil
+    local info = require("pi.sessions.history").find_by_id(session_id)
+    return info and info.path or nil
 end
 
 return M

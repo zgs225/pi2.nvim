@@ -401,6 +401,10 @@ local function child_filter_ctx()
         completion_seen = function(id)
             return child_completion_seen[id] == true
         end,
+        process_alive = function(id)
+            local child = Sessions.get_by_id(id)
+            return child ~= nil and child.rpc:is_running()
+        end,
         process_running = function(id)
             local child = Sessions.get_by_id(id)
             if not child or not child.rpc:is_running() then
@@ -432,7 +436,14 @@ local function get_visible_children(parent_sess, current_child_id)
         local child_id = entry._id
         local is_current = type(current_child_id) == "string" and child_id == current_child_id
         local same_epoch = (entry.parent_epoch or 0) == epoch
-        local visible = is_current or show_hidden_children or (same_epoch and ChildFilter.child_visible(entry, ctx))
+        local alive = type(child_id) == "string"
+            and entry.status == "active"
+            and ctx.process_alive
+            and ctx.process_alive(child_id)
+        local visible = is_current
+            or show_hidden_children
+            or alive
+            or (same_epoch and ChildFilter.child_visible(entry, ctx))
         if visible then
             visible_entries[#visible_entries + 1] = {
                 entry = entry,

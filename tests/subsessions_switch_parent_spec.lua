@@ -68,16 +68,17 @@ describe("switch_to_parent for_new_session", function()
 
     it("sub_close treats view_parent_id as a child view without parent_id", function()
         local tab = vim.api.nvim_get_current_tabpage()
-        local closed
-        local switched = false
+        -- Recorded order: switching back to the parent MUST run before close(),
+        -- which detaches the tab and would strand switch_to_parent.
+        local events = {}
         local orig_close = Subsessions.close
         local orig_switch = Subsessions.switch_to_parent
         Subsessions.close = function(id)
-            closed = id
+            events[#events + 1] = "close:" .. id
             return true
         end
         Subsessions.switch_to_parent = function(cb)
-            switched = true
+            events[#events + 1] = "switch"
             if cb then
                 cb(true)
             end
@@ -106,8 +107,52 @@ describe("switch_to_parent for_new_session", function()
 
         Subsessions.sub_close()
 
-        assert.are.equal("child-id", closed)
-        assert.is_true(switched)
+        assert.are.same({ "switch", "close:child-id" }, events)
+
+        Subsessions.close = orig_close
+        Subsessions.switch_to_parent = orig_switch
+    end)
+
+    it("sub_close keeps the child running when the switch back to the parent fails", function()
+        local tab = vim.api.nvim_get_current_tabpage()
+        local events = {}
+        local orig_close = Subsessions.close
+        local orig_switch = Subsessions.switch_to_parent
+        Subsessions.close = function(id)
+            events[#events + 1] = "close:" .. id
+            return true
+        end
+        Subsessions.switch_to_parent = function(cb)
+            events[#events + 1] = "switch"
+            if cb then
+                cb(false, "parent session not running")
+            end
+        end
+
+        local chat = {
+            bind_agent = function() end,
+            clear_subsession_breadcrumb = function() end,
+            clear = function() end,
+        }
+        local child = {
+            id = "child-id",
+            view_parent_id = "parent-id",
+            attached_tab = tab,
+            tab = tab,
+            chat = chat,
+            rpc = {
+                is_running = function()
+                    return true
+                end,
+                stop = function() end,
+            },
+        }
+        Sessions._register_for_test(child)
+        Sessions.bind_chat(child, chat, tab)
+
+        Subsessions.sub_close()
+
+        assert.are.same({ "switch" }, events)
 
         Subsessions.close = orig_close
         Subsessions.switch_to_parent = orig_switch

@@ -196,7 +196,17 @@ function M.materialize(name)
         return nil
     end
     if #content > MAX_CONTENT_BYTES then
-        content = content:sub(1, MAX_CONTENT_BYTES) .. "\n… (truncated)"
+        -- Back off to a UTF-8 character boundary so the truncated payload does
+        -- not end in the middle of a multi-byte sequence.
+        local cut = MAX_CONTENT_BYTES
+        while cut > 1 do
+            local b = content:byte(cut + 1)
+            if not b or b < 0x80 or b >= 0xC0 then
+                break
+            end
+            cut = cut - 1
+        end
+        content = content:sub(1, cut) .. "\n… (truncated)"
     end
     return content
 end

@@ -82,7 +82,7 @@ While the agent is **streaming** or **auto-retrying** (statusline shows "Retryin
 
 When a turn is aborted (by double-`<Esc>`, `:PiAbort`, or `pi.abort()`), the statusline center briefly shows an **Aborted** confirmation (`PiAborted` highlight) for about two seconds, and the completion marker left in the history (`· aborted`) uses that same prominent highlight rather than the muted busy color — so it's obvious the turn was cancelled.
 
-Aborting while the tab is viewing a [sub-session](sessions.md#sub-sessions) forwards the abort to the parent session as well and cancels the parent's running sub-agent batches, so a parent blocked in `wait_subagents` wakes up promptly.
+Aborting while the tab is viewing a [sub-session](sessions.md#sub-sessions) interrupts only that child (plus any sub-sessions the child itself spawned) — the abort is **not** forwarded to the parent, so the parent's own turn and the sibling children keep running, and the child's RPC process stays alive for reuse or new prompts. The parent is still woken through bookkeeping: the child's pending batch items are settled immediately as `cancelled`, so a parent blocked in `wait_subagents` returns right away instead of hanging until `subagent.batch_timeout_ms` — even if the child was already idle and would emit no further agent events. Run the abort on the parent instead and it cascades: the parent's turn, all of its sub-sessions, and their batches are interrupted together, with a child that already received its task keeping its process, while one still spawning is reclaimed.
 
 When the agent is **idle**, `<Esc>` keeps its normal behavior (leaves insert mode) and the gesture is inert — no hint, no abort.
 
@@ -314,6 +314,8 @@ Other completion plugins (nvim-cmp, etc.) aren't shipped as first-class sources,
 π supports image attachments. Anything you attach is queued in the dedicated **attachments panel** (`pi-chat-attachments`) below the prompt and sent along with your next message as base64-encoded image data. Each entry shows the image's byte size (e.g. `󰫮 shot.png (1.2 MB)`) — the size of the data that will actually be sent.
 
 Supported formats: `png`, `jpg`/`jpeg`, `gif`, `webp`, `svg`.
+
+A single attachment is capped at 25 MB (decoded); larger files are rejected with an error instead of being read into memory.
 
 There are three ways to attach an image:
 

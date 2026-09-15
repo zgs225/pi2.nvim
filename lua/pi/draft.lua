@@ -9,7 +9,9 @@
 -- Drafts are partitioned by workspace (the session cwd), exactly like prompt
 -- history: the file lives next to the workspace's history file
 -- (`<hash>.draft`), so a draft typed in one project never resurfaces in
--- another. Callers must invoke `set_workspace(cwd)` before saving/restoring.
+-- another. Callers must either invoke `set_workspace(cwd)` before
+-- saving/restoring, or resolve `path_for(cwd)` and pass the explicit path to
+-- `save`/`load`/`clear`/`restore_once` (the per-tab-safe option).
 
 local M = {}
 
@@ -30,18 +32,33 @@ function M._set_path(p)
     path_override = p
 end
 
---- Point draft persistence at a workspace cwd. Uses the same normalization and
---- hash key as prompt history, so the draft sits next to the workspace's
---- history file. The legacy global draft file is silently removed once.
+--- Resolve the draft file path for a workspace cwd, without touching module
+--- state. Uses the same normalization and hash key as prompt history, so the
+--- draft sits next to the workspace's history file. The legacy global draft
+--- file is silently removed once per process.
+---
+--- Callers that manage more than one workspace per process (e.g. one chat per
+--- tab) should keep the returned path and pass it explicitly to
+--- `save`/`load`/`clear`/`restore_once` so the tab instances cannot clobber
+--- each other.
 ---@param cwd string?
-function M.set_workspace(cwd)
+---@return string
+function M.path_for(cwd)
     local PH = require("pi.prompt_history")
     if not legacy_removed then
         legacy_removed = true
         os.remove(PH.base_dir() .. "/draft.txt")
     end
     local normalized = PH.normalize_cwd(cwd) or PH.normalize_cwd(vim.fn.getcwd()) or vim.fn.getcwd()
-    workspace_path = PH.history_dir() .. "/" .. PH.workspace_key(normalized) .. ".draft"
+    return PH.history_dir() .. "/" .. PH.workspace_key(normalized) .. ".draft"
+end
+
+--- Point draft persistence at a workspace cwd for callers that do not pass an
+--- explicit path. Prefer `path_for()` plus explicit paths when more than one
+--- workspace is alive in the same process.
+---@param cwd string?
+function M.set_workspace(cwd)
+    workspace_path = M.path_for(cwd)
 end
 
 ---@return string
@@ -59,8 +76,9 @@ end
 
 --- Persist the current draft text. An empty string clears the stored draft.
 ---@param text string
-function M.save(text)
-    local p = draft_path()
+---@param path string? explicit draft file (defaults to the resolved workspace draft)
+function M.save(text, path)
+    local p = path or draft_path()
     vim.fn.mkdir(vim.fn.fnamemodify(p, ":h"), "p")
     if text == nil or text == "" then
         os.remove(p)
@@ -74,9 +92,10 @@ function M.save(text)
     f:close()
 end
 
+---@param path string? explicit draft file (defaults to the resolved workspace draft)
 ---@return string? the stored draft, or nil when there is none
-function M.load()
-    local f = io.open(draft_path(), "r")
+function M.load(path)
+    local f = io.open(path or draft_path(), "r")
     if not f then
         return nil
     end
@@ -89,8 +108,9 @@ function M.load()
 end
 
 --- Remove the stored draft.
-function M.clear()
-    os.remove(draft_path())
+---@param path string? explicit draft file (defaults to the resolved workspace draft)
+function M.clear(path)
+    os.remove(path or draft_path())
 end
 
 --- Return the stored draft at most once per process. The first call consumes
@@ -98,13 +118,14 @@ end
 --- in-session `:PiNewSession` doesn't re-restore a stale draft). The stored
 --- file is left in place — the caller's continuous save keeps it current and
 --- clears it when the draft is sent, so an unsent draft survives restarts.
+---@param path string? explicit draft file (defaults to the resolved workspace draft)
 ---@return string?
-function M.restore_once()
+function M.restore_once(path)
     if restored then
         return nil
     end
     restored = true
-    return M.load()
+    return M.load(path)
 end
 
 --- Reset module state (used by tests).

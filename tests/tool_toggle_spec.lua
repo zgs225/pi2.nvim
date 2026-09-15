@@ -13,6 +13,7 @@
 
 local Config = require("pi.config")
 local History = require("pi.ui.chat.history")
+local Tools = require("pi.ui.chat.tools")
 
 local function pump(ms)
     vim.wait(ms or 60)
@@ -104,6 +105,52 @@ describe("tool block expand/collapse round-trip", function()
                 assert.is_true(end_alive(h, b), "end_extmark alive after round-trip")
                 -- Collapsed summary is back in the buffer.
                 assert.is_true(#rows_with(buf, "…9 lines") == 1, "collapsed summary restored")
+            end)
+
+            it("keeps the collapsed block's output anchor consistent", function()
+                -- B1: the collapse path clears the namespace over the inner
+                -- range, which deletes block.output_extmark; the stale id must
+                -- be dropped, otherwise extract_tool_sections looks up a dead
+                -- extmark on the next toggle/live update.
+                local h = History.new(970 + (engine == "builtin" and 0 or 1))
+                bash_collapsed(h)
+                local b = h._tool_blocks["b1"]
+                assert.is_false(b.expanded, "bash output must collapse")
+
+                if b.output_extmark then
+                    local row = vim.api.nvim_buf_get_extmark_by_id(h:buf(), h:ns(), b.output_extmark, {})[1]
+                    assert.is_not_nil(row, "output anchor must stay resolvable after collapsing")
+                end
+
+                local ok, input, output = pcall(Tools.extract_tool_sections, h, b)
+                assert.is_true(ok, "extract_tool_sections must survive a collapsed block")
+                assert.is_true(#input >= 1, "header row still yields the input section")
+                assert.are.same({}, output or {}, "no output section once collapsed")
+
+                -- Simulate the pre-fix stale output id while header/footer are
+                -- alive: the lookup fallback must keep this from erroring.
+                local stale_id = vim.api.nvim_buf_set_extmark(h:buf(), h:ns(), 0, 0, {})
+                vim.api.nvim_buf_del_extmark(h:buf(), h:ns(), stale_id)
+                b.output_extmark = stale_id
+                local ok_stale, sin, sout, shas = pcall(Tools.extract_tool_sections, h, b)
+                assert.is_true(ok_stale, "a stale output anchor must not raise")
+                assert.is_true(#sin >= 1)
+                assert.are.same({}, sout)
+                assert.is_true(shas, "the stale id still counts as an output section")
+                b.output_extmark = nil
+
+                -- Dead header/footer anchors yield empty sections, not an error.
+                local dead = {
+                    icon_extmark = 1000000,
+                    end_extmark = 1000001,
+                    tool_name = "bash",
+                    output_extmark = nil,
+                }
+                local ok_dead, din, dout, has = pcall(Tools.extract_tool_sections, h, dead)
+                assert.is_true(ok_dead, "dead anchors must not raise")
+                assert.are.same({}, din)
+                assert.are.same({}, dout)
+                assert.is_false(has)
             end)
 
             it("round-trips through the cursor-driven toggle_tool_block", function()

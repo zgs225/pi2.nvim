@@ -119,6 +119,27 @@ describe("mention providers", function()
             assert.is_true(content:find("… %(truncated%)$", 1, false) ~= nil)
             assert.is_true(#content < 256 * 1024 + 50)
         end)
+
+        it("truncates on a UTF-8 character boundary", function()
+            local max = 256 * 1024
+            Config.options.mention_providers = {
+                utf8 = function()
+                    -- Two bytes short of the cap, then a 4-byte character that
+                    -- a naive byte truncation would split mid-sequence.
+                    return string.rep("a", max - 2) .. "😀" .. string.rep("b", 10)
+                end,
+            }
+            local content = Providers.materialize("utf8")
+            assert.is_not_nil(content)
+            local body = content:match("^(.-)\n… %(truncated%)$")
+            assert.is_not_nil(body)
+            -- The cut backed off the whole 4-byte character.
+            assert.are.equal(max - 2, #body)
+            assert.are.equal(string.rep("a", max - 2), body)
+            -- No partial sequence is left behind: the last byte is ASCII or a
+            -- leading byte, never a continuation byte.
+            assert.is_true(body:byte(-1) < 0x80 or body:byte(-1) >= 0xC0)
+        end)
     end)
 
     describe("quickfix provider", function()

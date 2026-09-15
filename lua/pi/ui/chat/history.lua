@@ -1206,10 +1206,38 @@ function History:_agent_text_has_open_fence(text)
     return open
 end
 
+--- nvim_buf_set_lines() rejects any item containing a newline, aborting the
+--- whole render with a hard error. Foreign strings can carry them: a provider
+--- may return a tool call whose *name* is the model's reasoning text (live case:
+--- `toolName = "bash rebase --continue\n\nLet me first check ..."`), and pi
+--- forwards it verbatim. Flatten newlines at the buffer write boundary so a
+--- malformed upstream string can never take the buffer down. Only newlines are
+--- touched — leading whitespace is meaningful (code blocks, indentation).
+---@param lines string[]
+---@return string[] same table when clean, otherwise a sanitized copy
+local function flatten_newlines(lines)
+    local dirty = false
+    for _, line in ipairs(lines) do
+        if type(line) == "string" and line:find("[\r\n]") then
+            dirty = true
+            break
+        end
+    end
+    if not dirty then
+        return lines
+    end
+    local out = {}
+    for i, line in ipairs(lines) do
+        out[i] = type(line) == "string" and (line:gsub("[\r\n]+", " ")) or line
+    end
+    return out
+end
+
 ---@param lines_list string[]
 ---@return integer start_row 0-indexed row where the first line was placed
 function History:_append_lines(lines_list)
     local start_row = 0
+    lines_list = flatten_newlines(lines_list)
     self:_with_modifiable(function()
         local line_count = vim.api.nvim_buf_line_count(self._buf)
         if line_count == 1 then
@@ -1237,6 +1265,7 @@ end
 ---@return integer start_row 0-indexed row where the first line was placed
 ---@return integer next_row row after the last inserted line (for chaining)
 function History:_insert_lines(row, lines_list)
+    lines_list = flatten_newlines(lines_list)
     self:_with_modifiable(function()
         vim.api.nvim_buf_set_lines(self._buf, row, row, false, lines_list)
     end)
@@ -1324,6 +1353,10 @@ end
 function History:_insert_thinking_block(block_lines, anchor)
     local pos = vim.api.nvim_buf_get_extmark_by_id(self._buf, ns, anchor, {})
     local row = pos[1]
+    if not row then
+        -- Anchor gone (buffer wiped/rebuilt): nothing to insert against.
+        return
+    end
     self:_with_modifiable(function()
         vim.api.nvim_buf_set_lines(self._buf, row, row, false, block_lines)
     end)
@@ -1337,6 +1370,10 @@ end
 function History:_remove_thinking_block(line_count, anchor)
     local pos = vim.api.nvim_buf_get_extmark_by_id(self._buf, ns, anchor, {})
     local anchor_row = pos[1]
+    if not anchor_row then
+        -- Anchor gone (buffer wiped/rebuilt): nothing to remove.
+        return
+    end
     self:_with_modifiable(function()
         vim.api.nvim_buf_set_lines(self._buf, anchor_row, anchor_row + line_count, false, {})
     end)
@@ -1440,6 +1477,17 @@ function History:set_status(status, start_time)
                 self._spinner_rate,
                 self._spinner_rate,
                 vim.schedule_wrap(function()
+                    if not self._buf or not vim.api.nvim_buf_is_valid(self._buf) then
+                        -- The buffer was wiped while the run was busy: stop the
+                        -- timer, otherwise it would keep ticking (and re-arm)
+                        -- forever on a dead buffer.
+                        if self._spinner_timer then
+                            self._spinner_timer:stop()
+                            self._spinner_timer:close()
+                            self._spinner_timer = nil
+                        end
+                        return
+                    end
                     self._spinner_index = self._spinner_index % #self._spinner_frames + 1
                     if self._status_text then
                         self:_emit_status()
@@ -2491,11 +2539,12 @@ function History:on_tool_start(tool_name, tool_call_id, tool_input)
         local icon = Tools.get_tool_icon(tool_name)
         local renderer = Tools.get_renderer(tool_name)
         local use_inline = Tools.is_inline(renderer, tool_input)
-        local display_name = Tools.tool_display_name(tool_name, tool_input)
+        local display_name = Tools.flatten_line(Tools.tool_display_name(tool_name, tool_input))
 
         -- Inline tools render as a single line: indent + icon + display_name + detail
         if use_inline then
             local detail = renderer.inline_text and renderer.inline_text(tool_input) or nil
+            detail = detail and Tools.flatten_line(detail) or nil
             local indent = Tools.GLYPHS.INDENT
             local line = indent .. icon .. " " .. display_name .. (detail and ("  " .. detail) or "")
 
@@ -2642,7 +2691,7 @@ function History:on_tool_end(tool_name, tool_call_id, result, is_error)
             -- Update icon + name color
             local icon = Tools.get_tool_icon(tool_name)
             local indent = Tools.GLYPHS.INDENT
-            local display_name = Tools.tool_display_name(tool_name, block.tool_input)
+            local display_name = Tools.flatten_line(Tools.tool_display_name(tool_name, block.tool_input))
             local pos = vim.api.nvim_buf_get_extmark_by_id(self._buf, ns, block.icon_extmark, {})
             if not pos[1] then
                 return
@@ -2809,6 +2858,10 @@ function History:_maybe_collapse_tool(tool_call_id)
 
     -- Replace inner content
     vim.api.nvim_buf_clear_namespace(self._buf, ns, inner_start, footer_row)
+    -- The clear above falls inside the output section, so it deletes the
+    -- output extmark: drop the now-stale id or later lookups would resolve
+    -- nothing (extract_tool_sections) or resurrect a dead anchor.
+    block.output_extmark = nil
     self:_with_modifiable(function()
         vim.api.nvim_buf_set_lines(self._buf, inner_start, footer_row, false, collapsed)
     end)
@@ -3750,8 +3803,11 @@ function History:on_thinking_end()
             pcall(vim.api.nvim_buf_del_extmark, self._buf, ns, virt_id)
             virt_id = nil
         end
-        if visible then
-            local pos = vim.api.nvim_buf_get_extmark_by_id(self._buf, ns, self._thinking_accum.anchor, {})
+        -- The anchor can be gone (e.g. the buffer was cleared/rebuilt while
+        -- this block was streaming); pos[1] is then nil and the block must be
+        -- recorded as an empty one instead of indexing a missing row.
+        local pos = vim.api.nvim_buf_get_extmark_by_id(self._buf, ns, self._thinking_accum.anchor, {})
+        if visible and pos[1] then
             local header_row = pos[1] + 1
             local label = Config.options.labels.thinking
             local header_text = label .. " " .. header
@@ -3795,16 +3851,18 @@ function History:toggle_thinking()
                 local header_text = label .. " " .. block.header
                 local pos = vim.api.nvim_buf_get_extmark_by_id(self._buf, ns, block.anchor, {})
                 local row = pos[1]
-                self:_with_modifiable(function()
-                    vim.api.nvim_buf_set_lines(self._buf, row, row, false, { "", header_text })
-                end)
-                self:_apply_thinking_hl(row + 1, 1)
-                local flat = Text.thinking_flat(block.lines)
-                local pw = self:_thinking_preview_width(header_text)
-                block.virt_id = self:_set_thinking_preview(row + 1, Text.thinking_head(flat, pw), block.virt_id)
-                block.line_count = 2
-                block.visible = true
-                block.expanded = false
+                if row then
+                    self:_with_modifiable(function()
+                        vim.api.nvim_buf_set_lines(self._buf, row, row, false, { "", header_text })
+                    end)
+                    self:_apply_thinking_hl(row + 1, 1)
+                    local flat = Text.thinking_flat(block.lines)
+                    local pw = self:_thinking_preview_width(header_text)
+                    block.virt_id = self:_set_thinking_preview(row + 1, Text.thinking_head(flat, pw), block.virt_id)
+                    block.line_count = 2
+                    block.visible = true
+                    block.expanded = false
+                end
             elseif not self._show_thinking and block.visible then
                 self:_remove_thinking_block(block.line_count, block.anchor)
                 if block.virt_id then
@@ -4095,9 +4153,8 @@ function History:sync_pending_queue(steering_texts, followup_texts, active)
 end
 
 function History:clear()
-    if not self._buf or not vim.api.nvim_buf_is_valid(self._buf) then
-        return
-    end
+    -- Stop timers before the buffer guard: a wiped buffer must not leave a
+    -- ticking spinner (or a queued stream flush) behind.
     if self._spinner_timer then
         self._spinner_timer:stop()
         self._spinner_timer:close()
@@ -4107,6 +4164,9 @@ function History:clear()
         self._stream_timer:stop()
         self._stream_timer:close()
         self._stream_timer = nil
+    end
+    if not self._buf or not vim.api.nvim_buf_is_valid(self._buf) then
+        return
     end
     self._pending_stream_text = nil
     self._pending_thinking = {}

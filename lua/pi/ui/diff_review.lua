@@ -53,6 +53,17 @@ local list_jump
 ---@field status "A"|"M"|"D" File status shown in the list (added/modified/deleted).
 ---@field body string[] Diff body lines (everything after the `diff --git` header).
 
+--- Parsing intermediate: the path is only known once the `---`/`+++` body
+--- lines have been seen, so `path`/`abs` start out nil.
+---@class pi.DiffReviewSectionDraft
+---@field path string? Derived from the `+++ b/<path>` body line (fallback `--- a/<path>`).
+---@field abs string? Absolute path, filled in by the post-pass.
+---@field deleted boolean
+---@field status "A"|"M"|"D"
+---@field body string[]
+---@field header string? Raw `diff --git` remainder, used only as a last-resort
+--- path source for header-only sections (mode/binary/rename).
+
 ---@class pi.DiffReviewGroup
 ---@field toplevel string Work tree root.
 ---@field branch string Display label (branch name, short HEAD, or toplevel basename).
@@ -89,47 +100,81 @@ end
 -- Pure parsing (unit-tested) ------------------------------------------------
 
 --- Split raw `git diff` output into per-file sections.
---- The `diff --git a/... b/...` header line becomes the section itself;
---- everything after it (index / --- / +++ / @@ / ± lines) goes into `body`.
---- `a/dev/null` means the file is new, `b/dev/null` means deleted.
+--- The `diff --git a/... b/...` header line only delimits sections; the
+--- display path is derived from the `+++ b/<path>` body line (fallback
+--- `--- a/<path>`). The header cannot be parsed for the path: paths may
+--- contain `" b/"` and git C-quotes paths with special characters.
+--- Everything after the header (index / --- / +++ / @@ / ± lines) goes into
+--- `body`. `b/dev/null` means the file is deleted.
 ---@param output string Raw `git diff` output.
 ---@return pi.DiffReviewSection[]
 function M.parse_sections(output)
-    ---@type pi.DiffReviewSection[]
-    local sections = {}
-    local current = nil
+    local parsed = {} ---@type pi.DiffReviewSectionDraft[]
+    local current = nil ---@type pi.DiffReviewSectionDraft?
     for _, line in ipairs(vim.split(output or "", "\n", { plain = true })) do
-        local a_path, b_path = line:match("^diff %-%-git a/(.*) b/(.*)$")
-        if a_path then
-            local deleted = b_path == "/dev/null"
-            local display = deleted and a_path or b_path
-            current = {
-                path = display,
-                abs = vim.fn.fnamemodify(display, ":p"),
-                deleted = deleted,
-                status = "M",
-                body = {},
-            }
-            sections[#sections + 1] = current
+        if line:match("^diff %-%-git ") then
+            -- Keep the header remainder: some sections (mode-only changes,
+            -- binary diffs, content-less renames) carry no ---/+++ lines and
+            -- need it as a last-resort path source in the post-pass.
+            current = { deleted = false, status = "M", body = {}, header = line:sub(12) }
+            parsed[#parsed + 1] = current
         elseif current then
+            current.body[#current.body + 1] = line
             -- Deletions keep the same path on both sides of `diff --git`;
             -- the `+++ b/dev/null` body line marks them.
             if line == "+++ b/dev/null" then
                 current.deleted = true
                 current.status = "D"
-            elseif vim.startswith(line, "new file mode") then
+            else
+                local new_path = line:match("^%+%+%+ b/(.+)$") or line:match('^%+%+%+ "b/(.+)"$')
+                local old_path = line:match("^%-%-%- a/(.+)$") or line:match('^%-%-%- "a/(.+)"$')
+                -- Binary diffs and content-less renames carry no ---/+++ lines:
+                -- take the path from their dedicated body lines so those files
+                -- stay listed instead of silently disappearing from :PiDiff.
+                local binary_new = line:match("^Binary files .+ and b/(.*) differ$")
+                local binary_old = line:match("^Binary files a/(.*) and /dev/null differ$")
+                local rename_to = line:match('^rename to "(.*)"$') or line:match("^rename to (.+)$")
+                if new_path then
+                    current.path = new_path
+                elseif rename_to then
+                    current.path = rename_to
+                elseif binary_new then
+                    current.path = binary_new
+                elseif (old_path or binary_old) and not current.path then
+                    current.path = old_path or binary_old
+                end
+            end
+            if vim.startswith(line, "new file mode") then
                 current.status = "A"
             elseif vim.startswith(line, "deleted file mode") then
                 current.deleted = true
                 current.status = "D"
             end
-            current.body[#current.body + 1] = line
         end
     end
-    -- Drop the empty line left by the trailing newline of the output.
-    for _, section in ipairs(sections) do
-        while #section.body > 0 and section.body[#section.body] == "" do
-            section.body[#section.body] = nil
+    ---@type pi.DiffReviewSection[]
+    local sections = {}
+    for _, section in ipairs(parsed) do
+        local path = section.path
+        -- Last resort for header-only sections (mode-only change, type change):
+        -- the header is ambiguous, but git writes the *same* path on both sides
+        -- for these, so only trust it when the unquoted halves match exactly.
+        if not path and section.header and not section.header:find('"', 1, true) then
+            local a_side, b_side = section.header:match("^a/(.*) b/(.*)$")
+            if a_side and a_side == b_side then
+                path = b_side
+            end
+        end
+        -- Sections whose path cannot be derived at all are dropped rather than
+        -- shown as an empty row.
+        if path then
+            section.path = path
+            -- Drop the empty line left by the trailing newline of the output.
+            while #section.body > 0 and section.body[#section.body] == "" do
+                section.body[#section.body] = nil
+            end
+            section.abs = vim.fn.fnamemodify(path, ":p")
+            sections[#sections + 1] = section --[[@as pi.DiffReviewSection]]
         end
     end
     return sections

@@ -147,6 +147,12 @@ function M.layout()
 end
 
 --- Abort the current agent operation.
+--- In a child view only that sub-session is interrupted (its own pending batch
+--- items settle as cancelled so a parent blocked in `wait_subagents` wakes up);
+--- the parent session and its other sub-sessions are left alone. In a parent
+--- view the parent and its own sub-sessions are interrupted. Running
+--- sub-sessions keep their RPC process (abort is not stop); a sub-session that
+--- is still spawning is reclaimed instead, since it never received a task.
 function M.abort()
     local Sessions = require("pi.sessions.manager")
     local session = Sessions.get()
@@ -154,53 +160,124 @@ function M.abort()
         return
     end
 
-    local parent
-    if session.view_parent_id and session.view_parent_id ~= "" then
-        parent = Sessions.get_by_id(session.view_parent_id)
-    end
+    local Manifest = require("pi.subsessions.manifest")
+    local Batch = require("pi.subsessions.batch")
+    local Subsessions = require("pi.subsessions")
+    local Attention = require("pi.attention")
 
-    local running = {}
-    if session.rpc and session.rpc:is_running() then
-        table.insert(running, session)
-    end
-    if parent and parent ~= session and parent.rpc and parent.rpc:is_running() then
-        table.insert(running, parent)
-    end
-
-    if #running == 0 then
-        return
-    end
-
-    if session.id or (parent and parent.id) then
+    ---@param target pi.Session?
+    local function send_abort(target)
+        if not target then
+            return
+        end
+        -- Record which run is being aborted before sending it: an `agent_settled`
+        -- carries no generation of its own, and the parent may reuse this child
+        -- before the settle arrives — the watermark is what tells the two runs
+        -- apart (see Subsessions.mark_child_aborted).
+        if target.id then
+            local entry = Manifest.load()[target.id]
+            if type(entry) == "table" and type(entry.run_generation) == "number" then
+                pcall(function()
+                    Subsessions.mark_child_aborted(target.id, entry.run_generation)
+                end)
+            end
+        end
+        if target.rpc and target.rpc:is_running() then
+            target.rpc:send({ type = "abort" })
+        end
         pcall(function()
-            local Manifest = require("pi.subsessions.manifest")
-            local Batch = require("pi.subsessions.batch")
-            local seen = {}
-            local function cancel_target(target)
-                if not target or not target.id then
-                    return
-                end
-                local lineage = Manifest.lineage_for_session(target)
-                local key = lineage ~= "" and lineage or target.id
-                if key and not seen[key] then
-                    seen[key] = true
-                    Batch.cancel_for_parent(key)
-                end
-            end
-            cancel_target(session)
-            if parent and parent ~= session then
-                cancel_target(parent)
-            end
+            Attention.clear_session(target)
         end)
     end
 
-    require("pi.attention").clear_session(session)
-    if parent and parent ~= session then
-        require("pi.attention").clear_session(parent)
+    -- The manifest parent of a session, ignoring a self-referential entry (the
+    -- test fixtures write one) and ignoring `session.parent_id`, which survives
+    -- on a process object reused by :PiResume.
+    ---@param target pi.Session?
+    ---@return string?
+    local function manifest_parent_of(target)
+        if not target or not target.id then
+            return nil
+        end
+        local entry = Manifest.load()[target.id]
+        if
+            type(entry) == "table"
+            and type(entry.parent_id) == "string"
+            and entry.parent_id ~= ""
+            and entry.parent_id ~= target.id
+        then
+            return entry.parent_id
+        end
+        return nil
     end
 
-    for _, target in ipairs(running) do
-        target.rpc:send({ type = "abort" })
+    local is_child = (type(session.view_parent_id) == "string" and session.view_parent_id ~= "")
+        or manifest_parent_of(session) ~= nil
+
+    -- Interrupt every active child of `lineage` (abort only, processes stay alive).
+    ---@param lineage string
+    local function interrupt_children(lineage)
+        if type(lineage) ~= "string" or lineage == "" then
+            return
+        end
+        local ok, children = pcall(Manifest.children_of, lineage)
+        if not ok or type(children) ~= "table" then
+            return
+        end
+        local seen = {}
+        for _, entry in ipairs(children) do
+            local cid = entry._id
+            if cid and cid ~= session.id and not seen[cid] then
+                seen[cid] = true
+                if entry.status == "active" then
+                    pcall(function()
+                        send_abort(Sessions.get_by_id(cid))
+                    end)
+                end
+            end
+        end
+    end
+
+    if is_child then
+        send_abort(session)
+
+        -- Stop in-flight interactive spawns owned by this child (a grandchild
+        -- that has not received its task yet). This is the child's own lineage,
+        -- never the parent's.
+        pcall(function()
+            Subsessions.mark_lineage_aborted(Manifest.lineage_for_session(session))
+        end)
+
+        local generation
+        local entry = session.id and Manifest.load()[session.id]
+        if type(entry) == "table" and type(entry.run_generation) == "number" then
+            generation = entry.run_generation
+        end
+        pcall(function()
+            Batch.interrupt_items_for_child(session.id, {
+                generation = generation,
+                reason = "cancelled: user aborted",
+            })
+        end)
+
+        -- A child can own children of its own (:PiSubNew from its view).
+        interrupt_children(Manifest.lineage_for_session(session))
+        return
+    end
+
+    local lineage = Manifest.lineage_for_session(session)
+    local parent_key = (lineage ~= "" and lineage) or session.id
+
+    send_abort(session)
+
+    if parent_key then
+        pcall(function()
+            Subsessions.mark_lineage_aborted(parent_key)
+        end)
+        pcall(function()
+            Batch.abort_for_parent(parent_key)
+        end)
+        interrupt_children(parent_key)
     end
 end
 

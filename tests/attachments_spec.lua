@@ -156,6 +156,45 @@ describe("pi.ChatAttachments", function()
         end)
     end)
 
+    describe("size cap", function()
+        local MAX = 25 * 1024 * 1024
+
+        it("rejects files above 25 MB without reading them", function()
+            local path = vim.fn.tempname() .. ".png"
+            tmp_files[#tmp_files + 1] = path
+            local f = assert(io.open(path, "wb"))
+            f:seek("set", MAX) -- sparse: MAX zero bytes ...
+            f:write("\0") -- ... plus one more
+            f:close()
+
+            assert.is_false(att:add_file(path))
+            assert.are_equal(0, att:count())
+        end)
+
+        it("accepts a file at exactly the cap", function()
+            local path = vim.fn.tempname() .. ".png"
+            tmp_files[#tmp_files + 1] = path
+            local f = assert(io.open(path, "wb"))
+            f:seek("set", MAX - 1)
+            f:write("\0")
+            f:close()
+
+            assert.is_true(att:add_file(path))
+            assert.are_equal(1, att:count())
+            assert.are_equal(MAX, att._items[1].size)
+        end)
+
+        it("rejects oversized clipboard images", function()
+            -- base64 decoding shrinks by ~3/4, so the encoded string must be
+            -- just over 4/3 * MAX characters to decode to more than the cap.
+            -- The check runs before any decode, so nothing huge is materialized.
+            local chars = math.ceil((MAX + 1) * 4 / 3)
+            stub_img_clip(string.rep("A", chars))
+            assert.is_false(att:add_from_clipboard())
+            assert.are_equal(0, att:count())
+        end)
+    end)
+
     describe("remove/clear", function()
         it("remove re-renders the remaining items", function()
             add_file(100)

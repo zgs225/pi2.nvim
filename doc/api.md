@@ -40,9 +40,16 @@ pi.toggle_auto_compaction()   -- flip automatic compaction on/off; the statuslin
 pi.changed_files()            -- string[]: files modified by edit/write tools this session
 
 -- Agent control
-pi.abort()                    -- cancel the current agent turn, keep the session alive;
-                              -- while viewing a sub-session, also aborts the parent
-                              -- session and cancels its running sub-agent batches
+pi.abort()                    -- cancel the current agent turn, keep the session alive.
+                              -- On a parent session it cascades: all of its sub-sessions
+                              -- and their batches are interrupted too; a child that
+                              -- already received its task keeps its RPC process, while
+                              -- one still spawning is reclaimed. While viewing a
+                              -- sub-session it aborts only that child (plus any children
+                              -- it spawned);
+                              -- the parent is NOT interrupted — a parent blocked in
+                              -- wait_subagents wakes up because the child's pending
+                              -- batch items are settled as `cancelled`
 pi.abort_bash()               -- cancel the running direct bash (!) command
 pi.abort_retry()              -- cancel the auto-retry backoff ("Retrying…" state); only
                               -- takes effect while the core is between retry attempts
