@@ -2,6 +2,7 @@
 
 ## 2026-09-15
 
+- **FIXED (docs):** `doc/sessions.md` no longer says previous-conversation sub-session rows are always hidden in `:PiSessions` — children whose process is still running stay visible across conversation epochs (behavior shipped on 2026-09-11).
 - **FIXED:** The corrupt-manifest protection now covers every writer, not just the startup rebuild: `Manifest.save()` itself refuses to persist while the on-disk manifest failed to decode (warn-once), so a sub-session spawn or lineage registration can no longer overwrite a damaged `.pi2-subsessions.json` with a rebuilt, typically near-empty table. The latch clears on the next successful decode, so repairing the file by hand restores persistence without a restart.
 
 ## 2026-09-14

@@ -53,7 +53,7 @@ And mid-session management:
 
 | Command | Lua | What it does |
 | --- | --- | --- |
-| `:PiNewSession` | `pi.new_session()` | Discard the current session in this tab and start a fresh one. When viewing a sub-session, switches back to the parent first. Sub-session rows from the previous conversation are hidden in `:PiSessions` (press `H` or use `:PiSubSwitch` to recall them). Extensions can cancel this via the `session_before_switch` hook (e.g. to warn about unsaved draft state). |
+| `:PiNewSession` | `pi.new_session()` | Discard the current session in this tab and start a fresh one. When viewing a sub-session, switches back to the parent first. Settled sub-session rows from the previous conversation are hidden in `:PiSessions`, but children whose process is still running stay visible (press `H` or use `:PiSubSwitch` to recall the hidden ones). Extensions can cancel this via the `session_before_switch` hook (e.g. to warn about unsaved draft state). |
 | `:PiTree` | `pi.tree()` | Navigate the session tree: jump back to any past conversation point, optionally summarizing the abandoned branch. See [Session tree navigation](#session-tree-navigation-pitree). |
 | `:PiFork` | `pi.fork()` | Start a new session from a past user message. See [Fork and clone](#fork-and-clone). |
 | `:PiClone` | `pi.clone()` | Duplicate the current branch into a new session file. See [Fork and clone](#fork-and-clone). |
@@ -80,7 +80,7 @@ A parent session can run **sub-sessions** in parallel — each child is an indep
 
 Switching parent ↔ child or sibling children **rebinds the tab UI** and rebuilds history from `get_messages`. It does **not** send RPC `switch_session` when the target process already has that session file open, so a running agent on the target is not aborted. The statusline spinner elapsed time continues from that session's first `agent_start` for the current run (it does not restart when you switch). Dormant children are revived in a new process, which still loads the file via `switch_session`.
 
-While viewing a child, `:PiNewSession` / `pi.new_session()` or a bare `/new` in the prompt (e.g. `<C-g>n` in a typical setup) **returns to the parent first**, then starts a fresh parent conversation — same as running `/new` on the parent. Prior-conversation sub-session rows are hidden in `:PiSessions` (press `H` or use `:PiSubSwitch` to recall them).
+When viewing a child, `:PiNewSession` / `pi.new_session()` or a bare `/new` in the prompt (e.g. `<C-g>n` in a typical setup) **returns to the parent first**, then starts a fresh parent conversation — same as running `/new` on the parent. Prior-conversation sub-session rows are hidden in `:PiSessions` unless their process is still running (press `H` or use `:PiSubSwitch` to recall them).
 
 When a user-spawned child finishes, its last assistant message is injected into the parent as `[子会话「name」已完成] …` or `[Sub-session "name" completed] …` (language follows `title.lang` / UI locale). A child interrupted by a user abort is recorded as `interrupted` in the manifest instead and injects no completion report. Agent-spawned children skip this injection — they receive a synchronous tool result instead. Configure via `subagent.*` in [Configuration](configuration.md).
 
