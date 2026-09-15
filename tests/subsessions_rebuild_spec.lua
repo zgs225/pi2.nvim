@@ -303,4 +303,58 @@ describe("rebuild_statuses (issue #110)", function()
         assert.equals(raw, after, "a corrupt manifest must be left untouched, not overwritten")
         assert.is_true(Manifest.decode_failed())
     end)
+
+    it("refuses every writer while the manifest is corrupt, not just the rebuild", function()
+        local path = Manifest.path()
+        local raw = "not json at all"
+        local f = assert(io.open(path, "wb"))
+        f:write(raw)
+        f:close()
+        Manifest._reset()
+
+        local notifies = 0
+        local real_notify = vim.notify
+        vim.notify = function()
+            notifies = notifies + 1
+        end
+
+        -- Writers that would previously rebuild-and-save over the damaged file.
+        Manifest.upsert("child-a", { _id = "child-a", parent_id = "p", name = "x" })
+        Manifest.register_session_lineage("child-a", "p")
+        Manifest.patch("child-a", { status = "failed" })
+
+        vim.notify = real_notify
+
+        local g = assert(io.open(path, "rb"))
+        local after = g:read("*a")
+        g:close()
+        assert.equals(raw, after, "no writer may overwrite a corrupt manifest")
+        assert.is_true(Manifest.decode_failed(), "decode_failed must stay set until the file decodes again")
+        assert.is_true(notifies >= 1, "the refusal must surface to the user")
+    end)
+
+    it("save() works again once the manifest decodes", function()
+        local path = Manifest.path()
+        local f = assert(io.open(path, "wb"))
+        f:write("broken")
+        f:close()
+        Manifest._reset()
+        Manifest.load()
+        assert.is_true(Manifest.decode_failed())
+        assert.equals(false, Manifest.save({}))
+
+        -- The user repairs the file by hand: the next load() must clear the
+        -- latch so persistence resumes.
+        f = assert(io.open(path, "wb"))
+        f:write(vim.json.encode({}))
+        f:close()
+        Manifest._reset()
+        Manifest.load()
+        assert.is_false(Manifest.decode_failed())
+
+        assert.is_true(Manifest.save({ child = { parent_id = "p" } }))
+        local g = assert(io.open(path, "rb"))
+        assert.not_equals("broken", g:read("*a"))
+        g:close()
+    end)
 end)

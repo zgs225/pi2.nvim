@@ -3,6 +3,7 @@
 local M = {}
 
 local History = require("pi.sessions.history")
+local Notify = require("pi.notify")
 
 local MANIFEST_FILE = ".pi2-subsessions.json"
 
@@ -35,9 +36,14 @@ local cache = nil
 local cache_path = nil
 
 --- True when the last `load()` read an existing, non-empty file that failed to
---- decode. Callers that rewrite the whole manifest must check this and refuse
---- to save, or one unreadable byte would wipe every sub-session entry.
+--- decode. While set, `save()` refuses to write: the in-memory manifest is
+--- not backed by the disk file, so persisting it would overwrite the real
+--- (unreadable) manifest with a rebuilt table — typically empty, destroying
+--- all sub-session metadata the user could still salvage by hand.
 local decode_failed = false
+
+--- Warn-once guard for save() refusals (reset per test / per process).
+local decode_failed_warned = false
 
 --- In-flight spawn reservations per lineage (not yet upserted as active).
 ---@type table<string, integer>
@@ -76,6 +82,7 @@ function M._reset()
     cache = nil
     cache_path = nil
     decode_failed = false
+    decode_failed_warned = false
     occupy = {}
 end
 
@@ -120,13 +127,26 @@ function M.load()
     return {}
 end
 
+--- Persist the manifest table.
+---
+--- Refuses to write while the on-disk manifest failed to decode: `load()`
+--- returned a table not backed by the file, so saving it would replace the
+--- real (unreadable) manifest — every writer funnels through here, which is
+--- what keeps the corruption guard from being the caller's responsibility.
+--- The file stays exactly as it is so the damage can be repaired by hand.
 ---@param manifest table<string, pi.SubsessionManifestEntry>
 ---@return boolean
 function M.save(manifest)
     local path = M.path()
+    if decode_failed then
+        if not decode_failed_warned then
+            decode_failed_warned = true
+            Notify.warn("Sub-session manifest is corrupt; refusing to overwrite " .. path)
+        end
+        return false
+    end
     cache = manifest
     cache_path = path
-    decode_failed = false
     local dir = vim.fn.fnamemodify(path, ":h")
     if vim.fn.isdirectory(dir) == 0 then
         vim.fn.mkdir(dir, "p")

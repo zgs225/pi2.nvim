@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-09-15
+
+- **FIXED:** The corrupt-manifest protection now covers every writer, not just the startup rebuild: `Manifest.save()` itself refuses to persist while the on-disk manifest failed to decode (warn-once), so a sub-session spawn or lineage registration can no longer overwrite a damaged `.pi2-subsessions.json` with a rebuilt, typically near-empty table. The latch clears on the next successful decode, so repairing the file by hand restores persistence without a restart.
+
 ## 2026-09-14
 
 - **FIXED:** A tool call whose *name* contains newlines no longer aborts the turn's history render. A provider can return a `toolCall` whose name is the model's whole reasoning block (observed live: `"bash rebase --continue\n\nLet me first check …"`), and pi forwards it verbatim as `tool_execution_start.toolName`; the tool block header was built from it and `nvim_buf_set_lines` rejected the item (`'replacement string' item contains newlines`), so the scheduled render step died with a `vim.schedule callback` error and nothing after it rendered. Tool labels and inline details are now flattened to one line before they are measured for extmarks, and `_append_lines` / `_insert_lines` flatten newlines at the buffer write boundary so no future caller can reintroduce the crash.
