@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-09-17
+
+- **ADDED:** Add a `density` option (`"comfortable"` default | `"compact"`) for compact chat-history rendering. In compact density the extra breathing blank lines within a turn are dropped (turn spacing still follows `turn_separator`), the agent label becomes a bare icon, completed tool blocks auto-collapse to a one-line `⎿` summary — diff counts `(+N −M)` for `edit`/`write`, `(N lines)` otherwise — `read` and `ls` render inline, and live partial tool output is suppressed while a tool runs. Errored and aborted blocks are never auto-collapsed; direct `!` bash blocks and the `dispatch_subagents` task tree are unaffected. New `labels.tool_summary` label (default `⎿`). Existing specs were extended where the assertions encoded the comfortable-only geometry; the default density is unchanged.
+
 ## 2026-09-14
 
 - **FIXED:** A tool call whose *name* contains newlines no longer aborts the turn's history render. A provider can return a `toolCall` whose name is the model's whole reasoning block (observed live: `"bash rebase --continue\n\nLet me first check …"`), and pi forwards it verbatim as `tool_execution_start.toolName`; the tool block header was built from it and `nvim_buf_set_lines` rejected the item (`'replacement string' item contains newlines`), so the scheduled render step died with a `vim.schedule callback` error and nothing after it rendered. Tool labels and inline details are now flattened to one line before they are measured for extmarks, and `_append_lines` / `_insert_lines` flatten newlines at the buffer write boundary so no future caller can reintroduce the crash.

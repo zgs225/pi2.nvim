@@ -48,7 +48,12 @@ describe("built-in read-only tool renderers (issue #105)", function()
                 assert.is_not(r, default, name .. " must not fall through to default_renderer")
                 assert.are.equal(1, r.input_visible)
                 assert.are.equal(1, r.output_visible)
-                assert.is_nil(r.inline)
+                -- ls opts into density-aware inline (compact only); grep/find/glob stay static.
+                if name ~= "ls" then
+                    assert.is_nil(r.inline)
+                end
+                -- Comfortable density: none of them render inline.
+                assert.is_false(Tools.is_inline(r, {}), name .. " must not be inline in comfortable density")
             end
         end)
 

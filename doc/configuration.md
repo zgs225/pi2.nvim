@@ -38,6 +38,10 @@ require("pi").setup({
     show_thinking = true,
     -- Extra blank line between conversation turns (pure whitespace, no drawn rule).
     turn_separator = true,
+    -- History rendering density: "comfortable" (breathing blank lines around
+    -- message labels and tool blocks) or "compact" (no extra blank lines
+    -- within a turn; completed tool blocks collapse to a one-line summary).
+    density = "comfortable",
     -- Default expand/collapse state for the startup block
     -- (skills, extensions, startup announcements).
     expand_startup_details = true,
@@ -69,6 +73,7 @@ require("pi").setup({
         attachment = "",
         attachments = "",
         error = "",
+        tool_summary = "⎿",
     },
 
     -- Chat layout
@@ -413,6 +418,7 @@ Notes on a few fields:
 - `layout.default`, `layout.side`, and `layout.float` each also accept a **function** returning the value, so you can compute sizes from `vim.o.columns` / `vim.o.lines` at open time. A function-return for `side`/`float` is deep-merged over the defaults, so returning a partial table is fine.
 - `panels.<panel>.name` takes a `fun(tab_id): string` that computes the underlying buffer name per tab — useful for distinguishing multiple π conversations in `:buffers`, statuslines, or tab bars.
 - Several fields (`diff.keys`, `dialog.keys`, `zen.keys`) accept **key specs** — plain strings, `{ key, modes = ... }` tables, or lists of those. See [Keymaps](keymaps.md#key-specs).
+- `density` controls the vertical whitespace of the chat history: `"comfortable"` (default) keeps breathing blank lines around message labels and tool blocks; `"compact"` removes the extra blank lines within a turn and collapses completed tool blocks to a one-line summary. Turn spacing still follows `turn_separator`. See [Tool blocks → Density](usage.md#density).
 
 ## Project trust
 

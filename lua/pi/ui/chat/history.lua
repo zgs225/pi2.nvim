@@ -22,7 +22,6 @@
 ---@field _agent_start_time number?
 ---@field _show_thinking boolean
 ---@field _is_thinking boolean
----@field _needs_separator boolean
 ---@field _needs_breathing_line boolean
 ---@field _thinking_accum pi.ThinkingAccum?
 ---@field _thinking_blocks pi.ThinkingBlock[]
@@ -483,7 +482,6 @@ function History.new(tab)
     self._agent_start_time = nil
     self._show_thinking = Config.options.show_thinking
     self._is_thinking = false
-    self._needs_separator = false
     self._needs_breathing_line = false
     self._thinking_accum = nil
     self._thinking_blocks = {}
@@ -1150,7 +1148,8 @@ function History:_flush_stream_thinking()
     -- Single-line: keep the header row fixed, roll the latest thinking
     -- through its inline preview (tail window) so the block stays one line.
     local pos = vim.api.nvim_buf_get_extmark_by_id(self._buf, ns, self._thinking_accum.anchor, {})
-    local header_row = pos[1] and (pos[1] + 1) or nil
+    local header_offset = Config.density() == "compact" and 0 or 1
+    local header_row = pos[1] and (pos[1] + header_offset) or nil
     if header_row then
         local flat = Text.thinking_flat(self._thinking_accum.lines)
         local pw = self:_thinking_preview_width(self._thinking_accum.header_text or "")
@@ -1328,12 +1327,43 @@ end
 function History:_build_thinking_block(header, content)
     local label = Config.options.labels.thinking
     local indent = "  "
-    local result = { "", label .. " " .. header }
+    local compact = Config.density() == "compact"
+    -- Comfortable wraps the block in breathing blanks; compact starts the
+    -- expanded block at the header with no surrounding margins.
+    local result = compact and { label .. " " .. header } or { "", label .. " " .. header }
     for _, line in ipairs(content) do
         result[#result + 1] = indent .. line
     end
-    result[#result + 1] = ""
+    if not compact then
+        result[#result + 1] = ""
+    end
     return result
+end
+
+--- Collapsed thinking-block lines for the current density, plus the header's
+--- row offset within those lines (comfortable: a leading breathing blank;
+--- compact: the header is the first line).
+---@param header string
+---@return string[] lines
+---@return integer header_offset
+function History:_thinking_collapsed(header)
+    local header_text = Config.options.labels.thinking .. " " .. header
+    if Config.density() == "compact" then
+        return { header_text }, 0
+    end
+    return { "", header_text }, 1
+end
+
+--- Highlight offset and count for a built (expanded) thinking block relative
+--- to its base row.
+---@param block_lines string[]
+---@return integer offset
+---@return integer count
+function History:_thinking_hl_range(block_lines)
+    if Config.density() == "compact" then
+        return 0, #block_lines - 1
+    end
+    return 1, #block_lines - 2
 end
 
 ---@param start_row integer
@@ -1360,7 +1390,8 @@ function History:_insert_thinking_block(block_lines, anchor)
     self:_with_modifiable(function()
         vim.api.nvim_buf_set_lines(self._buf, row, row, false, block_lines)
     end)
-    self:_apply_thinking_hl(row + 1, #block_lines - 2)
+    local offset, count = self:_thinking_hl_range(block_lines)
+    self:_apply_thinking_hl(row + offset, count)
     self:_update_status_extmark()
     self:_maybe_scroll()
 end
@@ -1663,7 +1694,27 @@ function History:add_user_message(msg, timestamp, image_count, queue_type)
         local label_line = icon .. time_sep .. time_str .. queue_tag
         -- Turn gap: extra blank line when turn_separator is on
         local turn_gap = (had_content and Config.options.turn_separator) and "" or nil
-        local lines = turn_gap and { "", "", label_line, "" } or { "", label_line, "" }
+        local compact = Config.density() == "compact"
+        -- Compact density: no breathing blanks around the label; a turn
+        -- boundary is exactly one leading blank, skipped when the previous
+        -- line is already blank (e.g. a tool block footer).
+        local lines ---@type string[]
+        local leading ---@type integer  rows before the label row
+        if compact then
+            leading = 0
+            if turn_gap then
+                local last_line = vim.api.nvim_buf_line_count(self._buf) - 1
+                local cur = vim.api.nvim_buf_get_lines(self._buf, last_line, last_line + 1, false)[1] or ""
+                if cur ~= "" then
+                    lines = { "", label_line }
+                    leading = 1
+                end
+            end
+            lines = lines or { label_line }
+        else
+            leading = turn_gap and 2 or 1
+            lines = turn_gap and { "", "", label_line, "" } or { "", label_line, "" }
+        end
         -- Indent user body lines
         for i, line in ipairs(msg_lines) do
             msg_lines[i] = "  " .. line
@@ -1671,11 +1722,13 @@ function History:add_user_message(msg, timestamp, image_count, queue_type)
         vim.list_extend(lines, msg_lines)
         if image_count and image_count > 0 then
             local info = format_attachment_info(image_count)
-            lines[#lines + 1] = ""
+            if not compact then
+                lines[#lines + 1] = ""
+            end
             lines[#lines + 1] = info
         end
         local start = self:_append_lines(lines)
-        local label_row = start + (turn_gap and 2 or 1)
+        local label_row = start + leading
         vim.api.nvim_buf_set_extmark(self._buf, ns, label_row, 0, {
             end_col = #icon,
             hl_group = "PiUserMessageLabel",
@@ -1693,8 +1746,8 @@ function History:add_user_message(msg, timestamp, image_count, queue_type)
             })
         end
         -- Color user body text with the user role hue (Title.fg)
-        local body_start = label_row + 2
-        local body_end = label_row + 1 + #msg_lines
+        local body_start = label_row + (compact and 1 or 2)
+        local body_end = body_start + #msg_lines - 1
         for row = body_start, body_end do
             local line = vim.api.nvim_buf_get_lines(self._buf, row, row + 1, false)[1] or ""
             if #line > 0 then
@@ -1729,14 +1782,18 @@ function History:on_agent_start(timestamp)
         self._agent_start_time = vim.uv.hrtime() / 1e9
         self._first_delta = true
         self._agent_text_chunks = {}
-        self._needs_separator = false
         self._last_was_inline = false
         self:_pick_spinner()
         local icon = Config.options.labels.agent_response
         local time = timestamp or (os.time() * 1000)
         local time_str = format_time(time)
         local time_sep = " "
-        local label_line = icon .. time_sep .. time_str
+        local compact = Config.density() == "compact"
+        -- Compact density: a bare icon label (no timestamp), no leading
+        -- turn gap (the response follows the user message mid-turn) and no
+        -- trailing blank; the breathing-line flag makes the first text delta
+        -- start on a fresh line directly below the label.
+        local label_line = compact and icon or (icon .. time_sep .. time_str)
         local turn_gap = (had_content and Config.options.turn_separator) and "" or nil
         -- If the buffer already ends with a blank line (e.g. a thinking block's
         -- trailing margin, or a tool block's footer), skip one leading blank so
@@ -1753,13 +1810,18 @@ function History:on_agent_start(timestamp)
         -- block follower rendered a two-line gap under the label.
         self._needs_breathing_line = true
         local lines
-        if turn_gap then
+        local label_offset
+        if compact then
+            lines = { label_line }
+            label_offset = 0
+        elseif turn_gap then
             lines = ends_blank and { "", label_line, "" } or { "", "", label_line, "" }
+            label_offset = ends_blank and 1 or 2
         else
             lines = ends_blank and { label_line, "" } or { "", label_line, "" }
+            label_offset = ends_blank and 0 or 1
         end
         local start = self:_append_lines(lines)
-        local label_offset = turn_gap and (ends_blank and 1 or 2) or (ends_blank and 0 or 1)
         local label_row = start + label_offset
         local response_extmark_id = vim.api.nvim_buf_set_extmark(self._buf, ns, label_row, 0, {})
         if not self._current_turn_first_agent_response_extmark_id then
@@ -1770,12 +1832,14 @@ function History:on_agent_start(timestamp)
             end_col = #icon,
             hl_group = "PiAgentResponseLabel",
         })
-        local time_start = #icon + #time_sep
-        vim.api.nvim_buf_set_extmark(self._buf, ns, label_row, time_start, {
-            end_col = #label_line,
-            hl_group = "PiMessageDateTime",
-        })
-        self._agent_text_start_row = label_row + 2
+        if not compact then
+            local time_start = #icon + #time_sep
+            vim.api.nvim_buf_set_extmark(self._buf, ns, label_row, time_start, {
+                end_col = #label_line,
+                hl_group = "PiMessageDateTime",
+            })
+        end
+        self._agent_text_start_row = label_row + (compact and 1 or 2)
     end)
 end
 
@@ -2534,7 +2598,6 @@ function History:on_tool_start(tool_name, tool_call_id, tool_input)
             return
         end
         self:_begin_conversation_content()
-        self._needs_separator = false
         self._needs_breathing_line = false
         local icon = Tools.get_tool_icon(tool_name)
         local renderer = Tools.get_renderer(tool_name)
@@ -2548,8 +2611,9 @@ function History:on_tool_start(tool_name, tool_call_id, tool_input)
             local indent = Tools.GLYPHS.INDENT
             local line = indent .. icon .. " " .. display_name .. (detail and ("  " .. detail) or "")
 
-            -- Skip blank line between consecutive inline tools
-            local need_gap = not self._last_was_inline
+            -- Skip blank line between consecutive inline tools; compact
+            -- density never inserts the gap at all (zero extra blank lines).
+            local need_gap = Config.density() == "comfortable" and not self._last_was_inline
             local last_line = vim.api.nvim_buf_line_count(self._buf) - 1
             local cur = vim.api.nvim_buf_get_lines(self._buf, last_line, last_line + 1, false)[1] or ""
             local lines = (cur == "" or not need_gap) and { line } or { "", line }
@@ -2599,8 +2663,10 @@ function History:on_tool_start(tool_name, tool_call_id, tool_input)
 
         local last_line = vim.api.nvim_buf_line_count(self._buf) - 1
         local cur = vim.api.nvim_buf_get_lines(self._buf, last_line, last_line + 1, false)[1] or ""
-        -- Ensure exactly one blank line before block tool header
-        local lines = cur == "" and { header } or { "", header }
+        -- Ensure exactly one blank line before block tool header; compact
+        -- density never adds a leading blank (an existing trailing blank,
+        -- e.g. a tool block footer, still provides one-line separation).
+        local lines = (cur ~= "" and Config.density() == "comfortable") and { "", header } or { header }
         local start = self:_append_lines(lines)
         local header_row = lines[1] == "" and start + 1 or start
         Tools.set_line_bg(self, header_row)
@@ -2800,7 +2866,7 @@ function History:on_tool_end(tool_name, tool_call_id, result, is_error)
             block.end_extmark = footer_extmark
             block.end_hl_group = footer_hl
             block.expanded = true
-            self:_maybe_collapse_tool(tool_call_id)
+            self:_maybe_collapse_tool(tool_call_id, result, is_error)
         end
 
         self._needs_breathing_line = true
@@ -2812,8 +2878,13 @@ function History:on_tool_end(tool_name, tool_call_id, result, is_error)
 end
 
 --- Collapse a tool block based on per-renderer visible line thresholds.
+--- In compact density, completed blocks always collapse to a one-line
+--- summary (renderer-provided diff counts when available), and errored /
+--- aborted blocks stay expanded so the error remains visible.
 ---@param tool_call_id string
-function History:_maybe_collapse_tool(tool_call_id)
+---@param result table?
+---@param is_error? boolean
+function History:_maybe_collapse_tool(tool_call_id, result, is_error)
     local block = self._tool_blocks[tool_call_id]
     if not block or not block.end_extmark then
         return
@@ -2829,8 +2900,18 @@ function History:_maybe_collapse_tool(tool_call_id)
     local inner_start = header_row + 1
 
     local renderer = Tools.get_renderer(block.tool_name)
-    local input_vis = renderer.input_visible or math.huge
-    local output_vis = renderer.output_visible or math.huge
+    local compact = Config.density() == "compact"
+        and renderer.compact_collapse ~= false
+        and Tools.resolve_status(result, is_error) == "completed"
+    local input_vis ---@type integer
+    local output_vis ---@type integer
+    if compact then
+        input_vis = 1
+        output_vis = math.huge
+    else
+        input_vis = renderer.input_visible or math.huge
+        output_vis = renderer.output_visible or math.huge
+    end
 
     local input_lines, output_lines, has_output = Tools.extract_tool_sections(self, block)
     -- Subtract indent width so truncation accounts for body line prefix
@@ -2839,11 +2920,20 @@ function History:_maybe_collapse_tool(tool_call_id)
     local gutters = (self._win and vim.wo[self._win].foldcolumn or "0")
     local gutter_w = tonumber(gutters) or 0
     local max_width = win_width > 0 and (win_width - indent_w - gutter_w) or 0
-    if not Tools.should_collapse(input_lines, output_lines, input_vis, output_vis, max_width) then
+    if not Tools.should_collapse(input_lines, output_lines, input_vis, output_vis, max_width, compact) then
         return
     end
+    -- Compact density: completed blocks show a one-line output summary
+    -- ("⎿ (+N −M)" when the renderer can count the change, else "(N lines)").
+    local opts ---@type { summary: string?, no_separator: boolean? }
+    if compact then
+        local labels = Config.options.labels
+        local counts = renderer.summary_counts and renderer.summary_counts(block.tool_input, result)
+        local summary = counts or ("(%d lines)"):format(#output_lines)
+        opts = { summary = labels.tool_summary .. " " .. summary, no_separator = true } --[[@as { summary: string?, no_separator: boolean? }]]
+    end
     local collapsed, specs =
-        Tools.build_collapsed_view(input_lines, output_lines, has_output, input_vis, output_vis, max_width)
+        Tools.build_collapsed_view(input_lines, output_lines, has_output, input_vis, output_vis, max_width, opts)
 
     -- Save expanded state
     block.expanded_inner_lines = vim.api.nvim_buf_get_lines(self._buf, inner_start, footer_row, false)
@@ -3032,29 +3122,26 @@ function History:set_blocks_expanded(expanded)
                             block_lines
                         )
                     end)
-                    self:_apply_thinking_hl(anchor_row + 1, #block_lines - 2)
+                    local hl_offset, hl_count = self:_thinking_hl_range(block_lines)
+                    self:_apply_thinking_hl(anchor_row + hl_offset, hl_count)
                     block.line_count = #block_lines
                     block.expanded = true
                     changed = true
                 else
                     -- Collapse
-                    local label = Config.options.labels.thinking
-                    local header_text = label .. " " .. block.header
+                    local lines, header_offset = self:_thinking_collapsed(block.header)
                     self:_with_modifiable(function()
-                        vim.api.nvim_buf_set_lines(
-                            self._buf,
-                            anchor_row,
-                            anchor_row + block.line_count,
-                            false,
-                            { "", header_text }
-                        )
+                        vim.api.nvim_buf_set_lines(self._buf, anchor_row, anchor_row + block.line_count, false, lines)
                     end)
-                    self:_apply_thinking_hl(anchor_row + 1, 1)
+                    self:_apply_thinking_hl(anchor_row + header_offset, 1)
                     local flat = Text.thinking_flat(block.lines)
-                    local pw = self:_thinking_preview_width(header_text)
-                    block.virt_id =
-                        self:_set_thinking_preview(anchor_row + 1, Text.thinking_head(flat, pw), block.virt_id)
-                    block.line_count = 2
+                    local pw = self:_thinking_preview_width(lines[#lines])
+                    block.virt_id = self:_set_thinking_preview(
+                        anchor_row + header_offset,
+                        Text.thinking_head(flat, pw),
+                        block.virt_id
+                    )
+                    block.line_count = #lines
                     block.expanded = false
                     changed = true
                 end
@@ -3179,6 +3266,14 @@ end
 function History:_apply_tool_update(tool_call_id, msg)
     local block = self._tool_blocks[tool_call_id]
     if not block or block.finished or block.inline then
+        return
+    end
+
+    -- Compact density suppresses live partial output: a running block stays
+    -- header(+input)-only ("collapsed from the start"); the final result
+    -- lands via on_tool_end. Pending updates are already drained by
+    -- _flush_tool_updates before this call, so nothing leaks.
+    if Config.density() == "compact" then
         return
     end
 
@@ -3338,7 +3433,6 @@ function History:on_bash_start(id, command, exclude_from_context)
             return
         end
         self:_begin_conversation_content()
-        self._needs_separator = false
         self._needs_breathing_line = false
         self._last_was_inline = false
 
@@ -3719,17 +3813,29 @@ function History:on_thinking_start(opts)
             -- When the buffer already ended in a breathing blank, that blank is
             -- the one trailing line (insert none); after real content (e.g. an
             -- inline tool) we insert it.
-            local margin = last_text == "" and 0 or 1
-            local block = { "", header_text }
+            -- Compact density: a bare header line with no leading breathing
+            -- blank and no trailing margin; the flag makes a following text
+            -- delta start on a fresh line directly below the header.
+            local compact_thinking = Config.density() == "compact"
+            local margin = (last_text == "" or compact_thinking) and 0 or 1
+            local block
+            local header_offset
+            if compact_thinking then
+                block = { header_text }
+                header_offset = 0
+            else
+                block = { "", header_text }
+                header_offset = 1
+            end
             for _ = 1, margin do
                 block[#block + 1] = ""
             end
             self:_with_modifiable(function()
                 vim.api.nvim_buf_set_lines(self._buf, row, row, false, block)
             end)
-            self:_apply_thinking_hl(row + 1, 1)
+            self:_apply_thinking_hl(row + header_offset, 1)
             self._needs_breathing_line = true
-            self._thinking_accum.buf_lines = 2
+            self._thinking_accum.buf_lines = #block
             self._thinking_accum.header_text = header_text
         end
         -- Deltas that arrived before the accumulator existed land now.
@@ -3808,18 +3914,17 @@ function History:on_thinking_end()
         -- recorded as an empty one instead of indexing a missing row.
         local pos = vim.api.nvim_buf_get_extmark_by_id(self._buf, ns, self._thinking_accum.anchor, {})
         if visible and pos[1] then
-            local header_row = pos[1] + 1
-            local label = Config.options.labels.thinking
-            local header_text = label .. " " .. header
+            local lines, header_offset = self:_thinking_collapsed(header)
+            local header_row = pos[1] + header_offset
             self:_with_modifiable(function()
-                vim.api.nvim_buf_set_lines(self._buf, header_row, header_row + 1, false, { header_text })
+                vim.api.nvim_buf_set_lines(self._buf, pos[1], pos[1] + #lines, false, lines)
             end)
             self:_apply_thinking_hl(header_row, 1)
             -- Freeze the rolling preview into a static head summary.
             local flat = Text.thinking_flat(self._thinking_accum.lines)
-            local pw = self:_thinking_preview_width(header_text)
+            local pw = self:_thinking_preview_width(lines[#lines])
             virt_id = self:_set_thinking_preview(header_row, Text.thinking_head(flat, pw), virt_id)
-            line_count = 2
+            line_count = #lines
         else
             line_count = 0
         end
@@ -3847,19 +3952,19 @@ function History:toggle_thinking()
         for _, block in ipairs(self._thinking_blocks) do
             if self._show_thinking and not block.visible then
                 -- Show as single-line header + preview (not expanded)
-                local label = Config.options.labels.thinking
-                local header_text = label .. " " .. block.header
                 local pos = vim.api.nvim_buf_get_extmark_by_id(self._buf, ns, block.anchor, {})
                 local row = pos[1]
                 if row then
+                    local lines, header_offset = self:_thinking_collapsed(block.header)
                     self:_with_modifiable(function()
-                        vim.api.nvim_buf_set_lines(self._buf, row, row, false, { "", header_text })
+                        vim.api.nvim_buf_set_lines(self._buf, row, row, false, lines)
                     end)
-                    self:_apply_thinking_hl(row + 1, 1)
+                    self:_apply_thinking_hl(row + header_offset, 1)
                     local flat = Text.thinking_flat(block.lines)
-                    local pw = self:_thinking_preview_width(header_text)
-                    block.virt_id = self:_set_thinking_preview(row + 1, Text.thinking_head(flat, pw), block.virt_id)
-                    block.line_count = 2
+                    local pw = self:_thinking_preview_width(lines[#lines])
+                    block.virt_id =
+                        self:_set_thinking_preview(row + header_offset, Text.thinking_head(flat, pw), block.virt_id)
+                    block.line_count = #lines
                     block.visible = true
                     block.expanded = false
                 end
@@ -3899,22 +4004,16 @@ function History:toggle_thinking_block()
         if cursor_row >= block_start and cursor_row <= block_end then
             if block.expanded then
                 -- Collapse: replace multi-line with single-line + preview
-                local label = Config.options.labels.thinking
-                local header_text = label .. " " .. block.header
+                local lines, header_offset = self:_thinking_collapsed(block.header)
                 self:_with_modifiable(function()
-                    vim.api.nvim_buf_set_lines(
-                        self._buf,
-                        anchor_row,
-                        anchor_row + block.line_count,
-                        false,
-                        { "", header_text }
-                    )
+                    vim.api.nvim_buf_set_lines(self._buf, anchor_row, anchor_row + block.line_count, false, lines)
                 end)
-                self:_apply_thinking_hl(anchor_row + 1, 1)
+                self:_apply_thinking_hl(anchor_row + header_offset, 1)
                 local flat = Text.thinking_flat(block.lines)
-                local pw = self:_thinking_preview_width(header_text)
-                block.virt_id = self:_set_thinking_preview(anchor_row + 1, Text.thinking_head(flat, pw), block.virt_id)
-                block.line_count = 2
+                local pw = self:_thinking_preview_width(lines[#lines])
+                block.virt_id =
+                    self:_set_thinking_preview(anchor_row + header_offset, Text.thinking_head(flat, pw), block.virt_id)
+                block.line_count = #lines
                 block.expanded = false
             else
                 -- Expand: replace single-line with multi-line block
@@ -3926,7 +4025,8 @@ function History:toggle_thinking_block()
                 self:_with_modifiable(function()
                     vim.api.nvim_buf_set_lines(self._buf, anchor_row, anchor_row + block.line_count, false, block_lines)
                 end)
-                self:_apply_thinking_hl(anchor_row + 1, #block_lines - 2)
+                local hl_offset, hl_count = self:_thinking_hl_range(block_lines)
+                self:_apply_thinking_hl(anchor_row + hl_offset, hl_count)
                 block.line_count = #block_lines
                 block.expanded = true
             end

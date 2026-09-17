@@ -227,6 +227,11 @@ require("pi").setup({
     -- Where search results land (:cnext / :cprev); see doc/usage.md#quickfix.
     quickfix = { grep = true, find = false },
 
+    -- History density: "comfortable" (default) or "compact" — no blank-line
+    -- padding and completed tool blocks collapsed to a one-line summary;
+    -- see doc/usage.md#density.
+    -- density = "compact",
+
     -- Everything else (statusline, diff keys, prompt behavior, zen, …):
     -- see doc/configuration.md
 })

@@ -112,6 +112,7 @@
 ---@field attachment string
 ---@field attachments string
 ---@field error string
+---@field tool_summary string
 
 ---@alias pi.StatusLineItem string|pi.StatusLineComponentFn
 
@@ -312,6 +313,7 @@
 ---@field models? pi.ModelEntry[] Preferred models for cycling and :PiSelectModel
 ---@field spinner pi.SpinnerPreset|string[]|{ refresh_rate?: integer, frames: string[] } preset name or custom
 ---@field show_thinking boolean
+---@field density? "comfortable"|"compact" History rendering density: "comfortable" keeps breathing blank lines and default tool thresholds; "compact" removes extra blank lines within a turn and collapses tool output to a one-line summary (default: "comfortable")
 ---@field turn_separator? boolean Extra blank line between conversation turns (default: true)
 ---@field expand_startup_details boolean Default expand/collapse state for the startup block (skills, extensions, startup announcements). Always rendered; Tab on the block or API call toggles.
 ---@field timestamp_format string Format string passed to os.date for chat message timestamps. Defaults to a non-padded day format using the platform-specific os.date flag.
@@ -361,6 +363,7 @@ local defaults = {
     models = nil,
     spinner = "robot",
     show_thinking = true,
+    density = "comfortable",
     turn_separator = true,
     expand_startup_details = true,
     timestamp_format = Os.is_windows() and "%b %#d %Y, %H:%M" or "%b %-d %Y, %H:%M",
@@ -376,6 +379,7 @@ local defaults = {
         tool = "󰻂",
         tool_success = "",
         tool_failure = "",
+        tool_summary = "⎿",
         steer_message = "󰾘",
         follow_up_message = "󱇼",
         vision_pending = "󰈈",
@@ -678,6 +682,13 @@ function M.random_verbs()
         return M.random_verbs()
     end
     return pick
+end
+
+--- Resolve the history rendering density ("comfortable" or "compact").
+--- Unknown values fall back to "comfortable".
+---@return "comfortable"|"compact"
+function M.density()
+    return M.options.density == "compact" and "compact" or "comfortable"
 end
 
 return M

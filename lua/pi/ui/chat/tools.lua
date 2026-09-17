@@ -1,5 +1,6 @@
 --- Tool call rendering for chat history.
 
+local Config = require("pi.config")
 local Render = require("pi.ui.render")
 local SubToolUi = require("pi.subsessions.tool_ui")
 
@@ -586,15 +587,21 @@ end
 --- Separator + output hidden entirely when output_visible = 0.
 --- Output: ≤ output_visible as-is, otherwise "…N lines" + last output_visible line(s).
 --- Lines longer than max_width are truncated with "…".
+---
+--- opts:
+---   summary      when set and the block has output, the output section is a single
+---                summary line (e.g. "⎿ (+12 −3)") instead of visible output lines
+---   no_separator when true, omit the blank separator between input and output
 ---@param input_lines string[]
 ---@param output_lines string[] actual output (no separator/code fences)
 ---@param has_output boolean
 ---@param input_visible integer
 ---@param output_visible integer
 ---@param max_width? integer  truncate lines wider than this (0 = no limit)
+---@param opts? { summary: string?, no_separator: boolean? }
 ---@return string[] lines
 ---@return string[] specs  parallel array: "input"|"summary"|"separator"|"output"
-function M.build_collapsed_view(input_lines, output_lines, has_output, input_visible, output_visible, max_width)
+function M.build_collapsed_view(input_lines, output_lines, has_output, input_visible, output_visible, max_width, opts)
     local lines, specs = {}, {}
     max_width = max_width or 0
 
@@ -641,9 +648,19 @@ function M.build_collapsed_view(input_lines, output_lines, has_output, input_vis
     end
 
     -- Separator + Output (hidden entirely when output_visible = 0)
+    local no_sep = opts and opts.no_separator == true
     if has_output and output_visible > 0 then
-        lines[#lines + 1] = ""
-        specs[#specs + 1] = "separator"
+        if not no_sep then
+            lines[#lines + 1] = ""
+            specs[#specs + 1] = "separator"
+        end
+
+        -- Compact summary mode: one summary line replaces visible output.
+        local summary = opts and opts.summary
+        if summary and #output_lines > 0 then
+            add(summary, "summary")
+            return lines, specs
+        end
 
         -- Collect visible output lines
         local visible_output = {}
@@ -778,9 +795,14 @@ end
 ---@param input_visible integer
 ---@param output_visible integer
 ---@param max_width? integer
+---@param compact? boolean compact density: collapse whenever there is any output or more than one input line
 ---@return boolean
-function M.should_collapse(input_lines, output_lines, input_visible, output_visible, max_width)
-    if #input_lines > input_visible or #output_lines > output_visible then
+function M.should_collapse(input_lines, output_lines, input_visible, output_visible, max_width, compact)
+    if compact then
+        if #input_lines > input_visible or #output_lines > 0 then
+            return true
+        end
+    elseif #input_lines > input_visible or #output_lines > output_visible then
         return true
     end
     if max_width and max_width > 0 then
@@ -798,7 +820,98 @@ function M.should_collapse(input_lines, output_lines, input_visible, output_visi
     return false
 end
 
---- Renderers ---
+---- Count added/deleted lines of a unified diff between two texts.
+---@param old_text string
+---@param new_text string
+---@return integer add
+---@return integer del
+local function diff_counts(old_text, new_text)
+    local ok, diff_text = pcall(vim.diff, old_text .. "\n", new_text .. "\n")
+    if not ok or not diff_text then
+        return 0, 0
+    end
+    local add, del = 0, 0
+    for line in diff_text:gmatch("[^\n]*") do
+        local c = line:sub(1, 1)
+        -- Skip ---/+++ file headers and @@ hunks; only +/- payload lines count.
+        if c == "+" and not line:match("^%+%+%+") then
+            add = add + 1
+        elseif c == "-" and not line:match("^%-%-%-") then
+            del = del + 1
+        end
+    end
+    return add, del
+end
+
+--- Read the current content of a path from a loaded buffer or from disk.
+---@param path string
+---@return string?
+function M.read_path_content(path)
+    local abs = vim.fn.fnamemodify(path, ":p")
+    for _, b in ipairs(vim.api.nvim_list_bufs()) do
+        if vim.api.nvim_buf_is_loaded(b) and vim.api.nvim_buf_get_name(b) == abs then
+            return table.concat(vim.api.nvim_buf_get_lines(b, 0, -1, false), "\n")
+        end
+    end
+    local f = io.open(abs, "r")
+    if f then
+        local content = f:read("*a")
+        f:close()
+        return content
+    end
+    return nil
+end
+
+--- Locate non-overlapping old→new replacements of edit operations in content.
+--- Mirrors the matcher used by the edit renderer's diff output.
+---@param content? string
+---@param edits { oldText?: string, newText?: string }[]
+---@return { start_pos: integer, end_pos: integer, old_text: string, new_text: string }[]
+function M.locate_edits(content, edits)
+    local replacements = {}
+    if type(content) ~= "string" or type(edits) ~= "table" then
+        return replacements
+    end
+    for _, edit in ipairs(edits) do
+        local old_text = edit.oldText
+        if type(old_text) == "string" and old_text ~= "" then
+            local search_from = 1
+            while true do
+                local s, e = content:find(old_text, search_from, true)
+                if not s then
+                    break
+                end
+
+                local overlaps = false
+                for _, existing in ipairs(replacements) do
+                    if not (e < existing.start_pos or s > existing.end_pos) then
+                        overlaps = true
+                        break
+                    end
+                end
+
+                if not overlaps then
+                    replacements[#replacements + 1] = {
+                        start_pos = s,
+                        end_pos = e,
+                        old_text = old_text,
+                        new_text = edit.newText or "",
+                    }
+                    break
+                end
+
+                search_from = s + 1
+            end
+        end
+    end
+
+    table.sort(replacements, function(a, b)
+        return a.start_pos < b.start_pos
+    end)
+    return replacements
+end
+
+-- Renderers ---
 
 --- Shared on_end for tools whose output is plain result text: render the
 --- extracted result text as output. Same behavior as default_renderer.on_end.
@@ -823,6 +936,8 @@ end
 ---@field display_name? fun(args: table?): string?  user-facing tool label (defaults to RPC tool name)
 ---@field inline_text? fun(args: table?): string?  text to show after tool name
 ---@field inline_status? fun(result: table?, is_error: boolean?): string?  extra text next to status icon
+---@field summary_counts? fun(args: table?, result: table?): string?  compact collapsed summary counts, e.g. "(+12 −3)"; nil falls back to the generic "(N lines)"
+---@field compact_collapse? boolean when false, opt this renderer out of the compact-density summary collapse (default: true)
 
 ---@type table<string, pi.ToolRenderer>
 local renderers = {
@@ -895,67 +1010,12 @@ local renderers = {
                 return insert_at
             end
 
-            local content = nil
-            if path then
-                local abs = vim.fn.fnamemodify(path, ":p")
-                for _, b in ipairs(vim.api.nvim_list_bufs()) do
-                    if vim.api.nvim_buf_is_loaded(b) and vim.api.nvim_buf_get_name(b) == abs then
-                        content = table.concat(vim.api.nvim_buf_get_lines(b, 0, -1, false), "\n")
-                        break
-                    end
-                end
-                if not content then
-                    local f = io.open(abs, "r")
-                    if f then
-                        content = f:read("*a")
-                        f:close()
-                    end
-                end
-            end
-
-            local replacements = {}
-            if content then
-                for _, edit in ipairs(edits) do
-                    local old_text = edit.oldText
-                    if type(old_text) == "string" and old_text ~= "" then
-                        local search_from = 1
-                        while true do
-                            local s, e = content:find(old_text, search_from, true)
-                            if not s then
-                                break
-                            end
-
-                            local overlaps = false
-                            for _, existing in ipairs(replacements) do
-                                if not (e < existing.start_pos or s > existing.end_pos) then
-                                    overlaps = true
-                                    break
-                                end
-                            end
-
-                            if not overlaps then
-                                replacements[#replacements + 1] = {
-                                    start_pos = s,
-                                    end_pos = e,
-                                    old_text = old_text,
-                                    new_text = edit.newText or "",
-                                }
-                                break
-                            end
-
-                            search_from = s + 1
-                        end
-                    end
-                end
-
-                table.sort(replacements, function(a, b)
-                    return a.start_pos < b.start_pos
-                end)
-            end
+            local content = path and M.read_path_content(path) or nil
+            local replacements = M.locate_edits(content, edits)
 
             if #replacements > 0 then
                 for _, replacement in ipairs(replacements) do
-                    local _, count = content:sub(1, replacement.start_pos - 1):gsub("\n", "\n")
+                    local _, count = (content or ""):sub(1, replacement.start_pos - 1):gsub("\n", "\n")
                     insert_at = render_diff(history, replacement.old_text, replacement.new_text, count, path, insert_at)
                 end
                 return insert_at
@@ -968,6 +1028,28 @@ local renderers = {
             end
 
             return insert_at
+        end,
+        -- Compact collapsed summary: (+N −M) from the matched edits against
+        -- the current file content (same matcher as the diff renderer).
+        summary_counts = function(args)
+            if not args or not args.edits or type(args.edits) ~= "table" then
+                return nil
+            end
+            local path = args.path or args.file_path
+            if not path then
+                return nil
+            end
+            local content = M.read_path_content(path)
+            local replacements = M.locate_edits(content, args.edits)
+            local add, del = 0, 0
+            for _, replacement in ipairs(replacements) do
+                local a, d = diff_counts(replacement.old_text, replacement.new_text)
+                add, del = add + a, del + d
+            end
+            if add == 0 and del == 0 then
+                return nil
+            end
+            return ("(+%d −%d)"):format(add, del)
         end,
     },
     write = {
@@ -985,22 +1067,7 @@ local renderers = {
                 if history._replaying then
                     return
                 end
-                local abs_path = vim.fn.fnamemodify(path, ":p")
-                local original
-                for _, b in ipairs(vim.api.nvim_list_bufs()) do
-                    if vim.api.nvim_buf_is_loaded(b) and vim.api.nvim_buf_get_name(b) == abs_path then
-                        original = table.concat(vim.api.nvim_buf_get_lines(b, 0, -1, false), "\n")
-                        break
-                    end
-                end
-                if not original then
-                    local f = io.open(abs_path, "r")
-                    if f then
-                        original = f:read("*a")
-                        f:close()
-                    end
-                end
-                args._original_content = original or ""
+                args._original_content = M.read_path_content(path) or ""
             end
         end,
         on_end = function(history, args, _, _, insert_at)
@@ -1013,6 +1080,19 @@ local renderers = {
             end
             local path = args.path or args.file_path
             return render_diff(history, original, args.content, 0, path, insert_at)
+        end,
+        -- Compact collapsed summary: whole-file diff counts against the
+        -- on_start snapshot. Replayed sessions have no snapshot (file state
+        -- no longer matches), so degrade to the generic line-count summary.
+        summary_counts = function(args)
+            if not args or not args.content or not args._original_content then
+                return nil
+            end
+            local add, del = diff_counts(args._original_content, args.content)
+            if add == 0 and del == 0 then
+                return nil
+            end
+            return ("(+%d −%d)"):format(add, del)
         end,
     },
     -- pi-web-access extension tools: compact input summary + collapse
@@ -1177,6 +1257,8 @@ local renderers = {
         inline_status = function(result)
             return SubToolUi.batch_status_text(SubToolUi.result_details(result))
         end,
+        -- Keep the per-item task/result tree fully visible in compact density.
+        compact_collapse = false,
         -- No input_visible/output_visible thresholds: the item task tree (on_start)
         -- and the per-item result list + status line (on_end) are the signal
         -- content (edit-like), so the block stays fully expanded by default in
@@ -1341,6 +1423,20 @@ local renderers = {
         on_end = render_result_output,
     },
     ls = {
+        -- Compact density: render as a single inline line (like read).
+        inline = function()
+            return Config.density() == "compact"
+        end,
+        inline_text = function(args)
+            return args and args.path or nil
+        end,
+        inline_status = function(result)
+            local text = extract_result_text(result)
+            if text then
+                local n = select(2, text:gsub("\n", "\n")) + 1
+                return "(" .. n .. " lines)"
+            end
+        end,
         input_visible = 1,
         output_visible = 1,
         on_start = function(history, args)
