@@ -2,7 +2,7 @@
 
 ## 2026-09-17
 
-- **ADDED:** Add a `density` option (`"comfortable"` default | `"compact"`) for compact chat-history rendering. In compact density the extra breathing blank lines within a turn are dropped (turn spacing still follows `turn_separator`), the agent label becomes a bare icon, completed tool blocks auto-collapse to a one-line `⎿` summary — diff counts `(+N −M)` for `edit`/`write`, `(N lines)` otherwise — `read` and `ls` render inline, and live partial tool output is suppressed while a tool runs. Errored and aborted blocks are never auto-collapsed; direct `!` bash blocks and the `dispatch_subagents` task tree are unaffected. New `labels.tool_summary` label (default `⎿`). Existing specs were extended where the assertions encoded the comfortable-only geometry; the default density is unchanged.
+- **ADDED:** Add a `density` option (`"comfortable"` default | `"compact"`) for compact chat-history rendering. In compact density the extra breathing blank lines within a turn are dropped (turn spacing still follows `turn_separator`), the agent label renders once per turn on the first assistant message (icon + timestamp), completed tool blocks auto-collapse to a one-line `⎿` summary — diff counts `(+N −M)` for `edit`/`write`, `(N lines)` otherwise — `read` and `ls` render inline, and live partial tool output is suppressed while a tool runs. Errored and aborted blocks are never auto-collapsed; direct `!` bash blocks and the `dispatch_subagents` task tree are unaffected. New `labels.tool_summary` label (default `⎿`). Existing specs were extended where the assertions encoded the comfortable-only geometry; the default density is unchanged.
 
 ## 2026-09-14
 

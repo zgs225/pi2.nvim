@@ -23,6 +23,7 @@
 ---@field _show_thinking boolean
 ---@field _is_thinking boolean
 ---@field _needs_breathing_line boolean
+---@field _compact_agent_labeled boolean compact density: whether the current turn already rendered its agent label
 ---@field _thinking_accum pi.ThinkingAccum?
 ---@field _thinking_blocks pi.ThinkingBlock[]
 ---@field _tool_blocks table<string, pi.ToolBlock>
@@ -483,6 +484,7 @@ function History.new(tab)
     self._show_thinking = Config.options.show_thinking
     self._is_thinking = false
     self._needs_breathing_line = false
+    self._compact_agent_labeled = false
     self._thinking_accum = nil
     self._thinking_blocks = {}
     self._tool_blocks = {}
@@ -1666,6 +1668,9 @@ function History:add_user_message(msg, timestamp, image_count, queue_type)
         end
         self._current_turn_first_agent_response_extmark_id = nil
         self._current_turn_last_agent_response_extmark_id = nil
+        -- A new user message starts a new turn: the next agent start renders
+        -- the turn's compact label again.
+        self._compact_agent_labeled = false
         local had_content = self._has_conversation_content
         self:_begin_conversation_content()
         local icon = Config.options.labels.user_message
@@ -1789,11 +1794,7 @@ function History:on_agent_start(timestamp)
         local time_str = format_time(time)
         local time_sep = " "
         local compact = Config.density() == "compact"
-        -- Compact density: a bare icon label (no timestamp), no leading
-        -- turn gap (the response follows the user message mid-turn) and no
-        -- trailing blank; the breathing-line flag makes the first text delta
-        -- start on a fresh line directly below the label.
-        local label_line = compact and icon or (icon .. time_sep .. time_str)
+        local label_line = icon .. time_sep .. time_str
         local turn_gap = (had_content and Config.options.turn_separator) and "" or nil
         -- If the buffer already ends with a blank line (e.g. a thinking block's
         -- trailing margin, or a tool block's footer), skip one leading blank so
@@ -1809,9 +1810,18 @@ function History:on_agent_start(timestamp)
         -- left two trailing blanks that only a text delta reused, so a
         -- block follower rendered a two-line gap under the label.
         self._needs_breathing_line = true
+        if compact and self._compact_agent_labeled then
+            -- Compact density: one label per turn. Later assistant messages
+            -- of the same turn (typically tool-only) render no label row at
+            -- all; the first text delta still starts on a fresh line via the
+            -- breathing-line flag.
+            self._agent_text_start_row = ends_blank and last_line or (last_line + 1)
+            return
+        end
         local lines
         local label_offset
         if compact then
+            self._compact_agent_labeled = true
             lines = { label_line }
             label_offset = 0
         elseif turn_gap then
@@ -1832,13 +1842,11 @@ function History:on_agent_start(timestamp)
             end_col = #icon,
             hl_group = "PiAgentResponseLabel",
         })
-        if not compact then
-            local time_start = #icon + #time_sep
-            vim.api.nvim_buf_set_extmark(self._buf, ns, label_row, time_start, {
-                end_col = #label_line,
-                hl_group = "PiMessageDateTime",
-            })
-        end
+        local time_start = #icon + #time_sep
+        vim.api.nvim_buf_set_extmark(self._buf, ns, label_row, time_start, {
+            end_col = #label_line,
+            hl_group = "PiMessageDateTime",
+        })
         self._agent_text_start_row = label_row + (compact and 1 or 2)
     end)
 end
@@ -4284,6 +4292,7 @@ function History:clear()
     self._pending_queue_extmark_id = nil
     self._thinking_accum = nil
     self._unmeasured_thinking = {}
+    self._compact_agent_labeled = false
     self._thinking_blocks = {}
     self._tool_blocks = {}
     self._bash_blocks = {}

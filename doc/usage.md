@@ -712,6 +712,7 @@ The top-level `density` config controls how much vertical space the history uses
 `density = "compact"` trades breathing room for information density, in the style of Claude Code / Cursor:
 
 - No extra blank lines between elements within a turn — message labels, thinking blocks and tool blocks sit directly below each other. The gap between turns is one blank line, still gated by `turn_separator` (set it to `false` for zero gap).
+- One agent label per turn: only the first assistant message after your message carries the `agent_response` icon + timestamp row; later assistant messages of the same turn (typically tool-only) render no label row, so there are no bare icon-only lines.
 - Every completed tool block auto-collapses to its header plus a one-line result summary (`labels.tool_summary`, `⎿` by default): `⎿ (+N −M)` for `edit`/`write` (counted from the applied diff), `⎿ (N lines)` for everything else. Expand with `<Tab>` / `pi.toggle_history_blocks()` as usual.
 - `read` and `ls` render inline (single line) even when other densities keep them as blocks.
 - Live partial output is suppressed while a tool runs — the block stays header-plus-input only until it completes, with the spinner as the progress signal. Toggling a running block is a no-op.
