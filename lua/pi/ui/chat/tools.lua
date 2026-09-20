@@ -1,5 +1,6 @@
 --- Tool call rendering for chat history.
 
+local Path = require("pi.path")
 local Render = require("pi.ui.render")
 local SubToolUi = require("pi.subsessions.tool_ui")
 
@@ -238,6 +239,17 @@ local function render_body_line(history, text, hl_group, insert_at)
         })
     end
     return insert_at
+end
+
+--- Shorten a file path for display: the workspace prefix is stripped so tool
+--- blocks show `apps/web/src/Foo.vue` instead of the model's absolute path.
+--- Lossless (see `pi.path`), so the rendered text still resolves against the
+--- session cwd for `gf`.
+---@param history pi.ChatHistory
+---@param path string
+---@return string
+local function display_path(history, path)
+    return Path.display(path, { base = history and history._cwd })
 end
 
 --- Render input lines, wrapping in a fenced code block when render-markdown
@@ -564,7 +576,50 @@ local function render_diff(history, old_text, new_text, line_offset, path, inser
     return insert_at
 end
 
---- Truncate a line to max_width, appending "…" if truncated.
+--- Longest prefix of `line` fitting in `width` display cells.
+---@param line string
+---@param width integer
+---@return string
+local function cut_prefix(line, width)
+    local chars = vim.fn.strchars(line)
+    local used = 0
+    local n = 0
+    while n < chars do
+        local w = vim.fn.strdisplaywidth(vim.fn.strcharpart(line, n, 1))
+        if used + w > width then
+            break
+        end
+        used = used + w
+        n = n + 1
+    end
+    return vim.fn.strcharpart(line, 0, n)
+end
+
+--- Longest suffix of `line` fitting in `width` display cells.
+---@param line string
+---@param width integer
+---@return string
+local function cut_suffix(line, width)
+    local chars = vim.fn.strchars(line)
+    local used = 0
+    local n = 0
+    while n < chars do
+        local w = vim.fn.strdisplaywidth(vim.fn.strcharpart(line, chars - n - 1, 1))
+        if used + w > width then
+            break
+        end
+        used = used + w
+        n = n + 1
+    end
+    return vim.fn.strcharpart(line, chars - n, n)
+end
+
+--- Truncate a line to max_width, eliding the middle with "…".
+---
+--- The tail keeps a larger share than the head: collapsed lines are summaries,
+--- and what a reader looks for sits at the end — the file name of a path, the
+--- end of a command. Cutting only the right edge (the old behaviour) left
+--- `…/resource-center/report-me…`, i.e. exactly the information-free part.
 ---@param line string
 ---@param max_width integer
 ---@return string
@@ -573,19 +628,17 @@ local function truncate_line(line, max_width)
     if max_width <= 0 or vim.fn.strdisplaywidth(line) <= max_width then
         return line
     end
-    -- Binary-ish search for the cut point in bytes
-    local cut = max_width - 1 -- leave room for …
-    while cut > 0 and vim.fn.strdisplaywidth(line:sub(1, cut)) > cut do
-        cut = cut - 1
-    end
-    return line:sub(1, cut) .. "…"
+    local budget = max_width - 1 -- leave room for …
+    local tail_width = math.min(math.max(math.floor(budget * 0.6), 12), budget)
+    local head_width = budget - tail_width
+    return cut_prefix(line, head_width) .. "…" .. cut_suffix(line, tail_width)
 end
 
 --- Build a structured collapsed view for a tool block.
 --- Input: ≤ input_visible as-is, otherwise first input_visible line(s) + "+N lines".
 --- Separator + output hidden entirely when output_visible = 0.
 --- Output: ≤ output_visible as-is, otherwise "…N lines" + last output_visible line(s).
---- Lines longer than max_width are truncated with "…".
+--- Lines longer than max_width are elided in the middle with "…".
 ---@param input_lines string[]
 ---@param output_lines string[] actual output (no separator/code fences)
 ---@param has_output boolean
@@ -821,7 +874,7 @@ end
 ---@field output_visible? integer lines to show when collapsed (default: show all)
 ---@field inline? boolean|fun(args: table?): boolean  render as a single line (no header/footer)
 ---@field display_name? fun(args: table?): string?  user-facing tool label (defaults to RPC tool name)
----@field inline_text? fun(args: table?): string?  text to show after tool name
+---@field inline_text? fun(history: pi.ChatHistory, args: table?): string?  text to show after tool name
 ---@field inline_status? fun(result: table?, is_error: boolean?): string?  extra text next to status icon
 
 ---@type table<string, pi.ToolRenderer>
@@ -858,8 +911,15 @@ local renderers = {
     },
     read = {
         inline = true,
-        inline_text = function(args)
-            return args and (args.path or args.file_path) or nil
+        -- The inline line is the highest-frequency path in the history, so it
+        -- shows the file name only. Lossy: `gf` resolves the real path from the
+        -- block's arguments, not from this text.
+        inline_text = function(history, args)
+            local path = args and (args.path or args.file_path)
+            if not path then
+                return nil
+            end
+            return Path.display(path, { base = history and history._cwd, basename = true })
         end,
         inline_status = function(result)
             local text = extract_result_text(result)
@@ -873,7 +933,7 @@ local renderers = {
         output_visible = 0,
         on_start = function(history, args)
             if args and (args.path or args.file_path) then
-                render_body_line(history, args.path or args.file_path)
+                render_body_line(history, display_path(history, args.path or args.file_path))
             end
         end,
         on_end = function(history, args, _, _, insert_at)
@@ -897,7 +957,7 @@ local renderers = {
 
             local content = nil
             if path then
-                local abs = vim.fn.fnamemodify(path, ":p")
+                local abs = Path.resolve(path, history and history._cwd)
                 for _, b in ipairs(vim.api.nvim_list_bufs()) do
                     if vim.api.nvim_buf_is_loaded(b) and vim.api.nvim_buf_get_name(b) == abs then
                         content = table.concat(vim.api.nvim_buf_get_lines(b, 0, -1, false), "\n")
@@ -978,14 +1038,14 @@ local renderers = {
             end
             local path = args.path or args.file_path
             if path then
-                render_body_line(history, path)
+                render_body_line(history, display_path(history, path))
                 -- Snapshot original content before the tool writes the file.
                 -- Stash on args so on_end can diff against it.
                 -- Skip during replay — file state no longer matches the original session.
                 if history._replaying then
                     return
                 end
-                local abs_path = vim.fn.fnamemodify(path, ":p")
+                local abs_path = Path.resolve(path, history and history._cwd)
                 local original
                 for _, b in ipairs(vim.api.nvim_list_bufs()) do
                     if vim.api.nvim_buf_is_loaded(b) and vim.api.nvim_buf_get_name(b) == abs_path then
@@ -1125,7 +1185,7 @@ local renderers = {
         display_name = function()
             return SubToolUi.display_name("read_subagent")
         end,
-        inline_text = function(args)
+        inline_text = function(_, args)
             if not args or type(args.target) ~= "string" then
                 return nil
             end
@@ -1159,7 +1219,7 @@ local renderers = {
         display_name = function()
             return SubToolUi.display_name("dispatch_subagents")
         end,
-        inline_text = function(args)
+        inline_text = function(_, args)
             if SubToolUi.dispatch_inline(args) then
                 local item = args and args.items and args.items[1]
                 if not item then
@@ -1232,7 +1292,7 @@ local renderers = {
         display_name = function()
             return SubToolUi.display_name("poll_subagents")
         end,
-        inline_text = function(args)
+        inline_text = function(_, args)
             if not args or type(args.batch_id) ~= "string" then
                 return nil
             end
@@ -1247,7 +1307,7 @@ local renderers = {
         display_name = function()
             return SubToolUi.display_name("wait_subagents")
         end,
-        inline_text = function(args)
+        inline_text = function(_, args)
             if not args or type(args.batch_id) ~= "string" then
                 return nil
             end
@@ -1271,7 +1331,7 @@ local renderers = {
         display_name = function()
             return SubToolUi.display_name("stop_subagents")
         end,
-        inline_text = function(args)
+        inline_text = function(_, args)
             if type(args) ~= "table" or type(args.targets) ~= "table" or #args.targets == 0 then
                 return nil
             end

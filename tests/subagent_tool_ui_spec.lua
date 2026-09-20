@@ -269,7 +269,7 @@ describe("subagent tool_ui", function()
 
         it("inline_text includes model and thinking level for single item", function()
             local renderer = Tools.get_renderer("dispatch_subagents")
-            local text = renderer.inline_text({
+            local text = renderer.inline_text(nil, {
                 items = {
                     {
                         task = "single task",

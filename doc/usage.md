@@ -653,7 +653,7 @@ Tool blocks print the paths they touch, and agent prose often references files. 
 pi.goto_file_under_cursor() -- returns true when a file was opened
 ```
 
-It recognizes a bare path (the tool body lines contain exactly the path), an `@path` mention with an optional `#L<line>`, and a `path:line` suffix, and jumps to the indicated line when present. Lines that don't resolve to a real file are ignored. Windows pinned with `winfixbuf` are skipped; when no regular window is usable, π falls back to a fresh split.
+It recognizes a bare path (the tool body lines contain the path — shortened as described in [Path display](#path-display)), an `@path` mention with an optional `#L<line>`, and a `path:line` suffix, and jumps to the indicated line when present. Inside a tool block the real path comes from the tool call's own arguments, so it resolves even when the rendered line shows only a file name; relative paths are resolved against the session cwd first and then against Neovim's cwd. Lines that don't resolve to a real file are ignored. Windows pinned with `winfixbuf` are skipped; when no regular window is usable, π falls back to a fresh split.
 
 `gf` is bound to this on the history buffer by default, so once you move into the history (e.g. `<C-g>h`) you can just `gf` on a path to jump to it.
 
@@ -691,8 +691,17 @@ Successful tool calls end silently (a blank breathing line); only errors print a
 
 Tools come in two rendering styles:
 
-- **Inline tools** render as a single line. `read` is the canonical example — it shows `read path/to/file (42 lines)` and stays on one line even when the file is huge, because inlining the content would just be noise. Consecutive inline tool calls are grouped without blank lines between them.
+- **Inline tools** render as a single line. `read` is the canonical example — it shows `read tools.lua (42 lines)` and stays on one line even when the file is huge, because inlining the content would just be noise. Consecutive inline tool calls are grouped without blank lines between them.
 - **Full-block tools** get the multi-line indented block shown above. `bash`, `edit`, `write`, the built-in read-only search tools (`grep`, `find`, `ls`), the four [pi-web-access](https://github.com/nicobailon/pi-web-access) tools (`web_search`, `fetch_content`, `source_check`, `get_search_content`), and any tool pi2.nvim doesn't have a dedicated renderer for fall into this category.
+
+### Path display
+
+Models usually refer to files by absolute path (`/home/you/proj/apps/web/src/Foo.vue`). The workspace prefix is implied by the session, so tool blocks strip it:
+
+- `read` shows the **file name only** — `read tools.lua (42 lines)`. It is the highest-frequency path in the history, and the line count carries the rest of the signal.
+- `edit` and `write` show the path **relative to the session cwd** — `lua/pi/ui/chat/tools.lua`. A path outside the workspace falls back to `~/…`, and one outside your home directory stays absolute.
+
+This is display-only. `gf` / [`pi.goto_file_under_cursor()`](#open-file-under-cursor) resolves the real path from the **tool call's arguments**, not from the rendered text, so a shortened (or file-name-only) line still opens the right file. Only `read`/`edit`/`write` are shortened; the search tools (`grep`, `find`, `ls`) print their arguments verbatim.
 
 ### Auto-collapse and `<Tab>`
 
@@ -702,6 +711,8 @@ Every full-block tool has two collapse thresholds:
 - `output_visible` — how many lines of the tool output to show when collapsed. `output_visible = 0` hides the output section entirely when collapsed (used for `edit`/`write` where the diff is the input).
 
 When a tool's input or output exceeds its threshold, the block is auto-collapsed on first render (the fold indicator changes from `▾` to `▸`). You can toggle between the collapsed and fully-expanded view with `<Tab>` while the cursor is on the block in the history buffer. The same `<Tab>` also toggles the [startup block](#startup-block) and [thinking blocks](#thinking) when the cursor is on one of those instead — pi2.nvim dispatches based on what you're hovering over.
+
+A collapsed line that is still wider than the window is elided in the **middle** (`apps/web-antd/src/views…/ReportMetricsFormDrawer.vue`) rather than cut off at the right edge, so the file name of a path — or the end of a command — stays readable. Expanding the block (`<Tab>`) always shows the full line.
 
 Bind `pi.toggle_history_blocks()` to expand/collapse all expandable history blocks at once; the [Keymaps](keymaps.md) example uses `<C-o>`.
 
