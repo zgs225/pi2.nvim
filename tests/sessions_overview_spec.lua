@@ -454,9 +454,55 @@ describe("sessions overview", function()
             assert.are.equal("child-sleep", rows[3].child_id)
         end)
 
+        it("h toggle (per-parent) shows hidden children of that parent only", function()
+            local Manifest = require("pi.subsessions.manifest")
+            local orig_children = Manifest.children_of
+            Manifest.children_of = function(parent_id)
+                if parent_id == "parent-a" then
+                    return {
+                        {
+                            _id = "child-a-sleep",
+                            name = "A sleeping",
+                            status = "dormant",
+                            parent_id = "parent-a",
+                            config = {},
+                        },
+                    }
+                end
+                if parent_id == "parent-b" then
+                    return {
+                        {
+                            _id = "child-b-sleep",
+                            name = "B sleeping",
+                            status = "dormant",
+                            parent_id = "parent-b",
+                            config = {},
+                        },
+                    }
+                end
+                return {}
+            end
+
+            local parent_a = fake_session({ tab = 41 })
+            parent_a.id = "parent-a"
+            local parent_b = fake_session({ tab = 42 })
+            parent_b.id = "parent-b"
+
+            SessionList.toggle_show_hidden_children(parent_a)
+            local rows = SessionList.build_rows({ parent_a, parent_b }, function()
+                return 0
+            end, function()
+                return "parent"
+            end)
+
+            Manifest.children_of = orig_children
+
+            assert.are.equal(3, #rows)
+            assert.are.equal("child-a-sleep", rows[2].child_id)
+        end)
+
         it("hides prior-conversation children after on_parent_new_conversation", function()
             local Manifest = require("pi.subsessions.manifest")
-            local Subsessions = require("pi.subsessions")
             local orig_children = Manifest.children_of
             Manifest.children_of = function(lineage_id)
                 if lineage_id ~= "parent-uuid" then

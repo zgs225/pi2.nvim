@@ -194,6 +194,12 @@ end
 ---@type table<string, boolean>
 local parent_folds = {}
 
+--- Per-lineage "show hidden sub-sessions" state. true = show this parent's
+--- hidden children; `show_hidden_children` is the global H switch (all
+--- sessions) while this is the per-session `h` switch.
+---@type table<string, boolean>
+local parent_hidden = {}
+
 --- Key for tracking fold state of a parent session.
 ---@param parent_sess pi.Session|string?
 ---@return string?
@@ -432,6 +438,7 @@ local function get_visible_children(parent_sess, current_child_id)
     local epoch = parent_sess.conversation_epoch or 0
     local ctx = child_filter_ctx()
     local visible_entries = {}
+    local hidden_shown = show_hidden_children or (parent_hidden[parent_key(parent_sess) or lineage] == true)
     for _, entry in ipairs(Manifest.children_of(lineage)) do
         local child_id = entry._id
         local is_current = type(current_child_id) == "string" and child_id == current_child_id
@@ -440,10 +447,7 @@ local function get_visible_children(parent_sess, current_child_id)
             and entry.status == "active"
             and ctx.process_alive
             and ctx.process_alive(child_id)
-        local visible = is_current
-            or show_hidden_children
-            or alive
-            or (same_epoch and ChildFilter.child_visible(entry, ctx))
+        local visible = is_current or hidden_shown or alive or (same_epoch and ChildFilter.child_visible(entry, ctx))
         if visible then
             visible_entries[#visible_entries + 1] = {
                 entry = entry,
@@ -455,11 +459,23 @@ local function get_visible_children(parent_sess, current_child_id)
 end
 
 --- Toggle whether hidden sub-session rows are shown in :PiSessions.
+--- Without a parent session this is the global `H` switch (every session);
+--- with one, only that lineage's hidden rows toggle (the `h` key).
+---@param parent_sess? pi.Session|string
 ---@return boolean new_state
-function M.toggle_show_hidden_children()
-    show_hidden_children = not show_hidden_children
+function M.toggle_show_hidden_children(parent_sess)
+    if parent_sess == nil then
+        show_hidden_children = not show_hidden_children
+        M.request_refresh()
+        return show_hidden_children
+    end
+    local key = parent_key(parent_sess)
+    if not key then
+        return false
+    end
+    parent_hidden[key] = not (parent_hidden[key] == true)
     M.request_refresh()
-    return show_hidden_children
+    return parent_hidden[key]
 end
 
 ---@return boolean
@@ -1034,7 +1050,8 @@ local HELP_ENTRIES = {
     { "x", "Close sub-session process (:PiSubClose)" },
     { "<Tab>, za", "Fold / unfold sub-sessions" },
     { "zM, zR", "Collapse / expand all sub-sessions" },
-    { "H", "Toggle hidden / prior-conversation sub-sessions" },
+    { "H", "Toggle hidden / prior-conversation sub-sessions (all sessions)" },
+    { "h", "Toggle hidden / prior-conversation sub-sessions of this session" },
     { "R", "Refresh the list" },
     { "q", "Close the list" },
     { "?", "Toggle this help" },
@@ -1410,6 +1427,46 @@ local function toggle_fold_under_cursor()
     end
 end
 
+--- Toggle hidden sub-session rows for the row under the cursor's parent
+--- lineage: on a parent row toggles that parent's hidden children; on a child
+--- row toggles its parent's (the subagent's own rows live under the parent).
+--- `H` remains the global switch across all sessions.
+local function toggle_hidden_under_cursor()
+    local lnum = vim.api.nvim_win_get_cursor(0)[1]
+    local row = rows[lnum]
+    if not row then
+        return
+    end
+
+    local parent_sess = nil
+    if is_child_row(row) then
+        for p = lnum - 1, 1, -1 do
+            if rows[p] and (rows[p].depth == nil or rows[p].depth == 0) then
+                parent_sess = rows[p].session
+                if not parent_sess and rows[p].session_id then
+                    local Sessions = require("pi.sessions.manager")
+                    parent_sess = Sessions.get_by_id(rows[p].session_id)
+                end
+                break
+            end
+        end
+        if not parent_sess then
+            return
+        end
+    else
+        parent_sess = row.session
+        if not parent_sess and row.session_id then
+            local Sessions = require("pi.sessions.manager")
+            parent_sess = Sessions.get_by_id(row.session_id)
+        end
+    end
+    if not parent_sess then
+        return
+    end
+    M.toggle_show_hidden_children(parent_sess)
+    M._render()
+end
+
 --- Collapse all parent sessions with children.
 local function collapse_all_folds()
     local Sessions = require("pi.sessions.manager")
@@ -1571,6 +1628,12 @@ local function ensure_buf()
         M.toggle_show_hidden_children()
         M._render()
     end, vim.tbl_extend("force", map_opts, { desc = "Toggle hidden sub-sessions" }))
+    vim.keymap.set(
+        "n",
+        "h",
+        toggle_hidden_under_cursor,
+        vim.tbl_extend("force", map_opts, { desc = "Toggle hidden sub-sessions of this session" })
+    )
     vim.keymap.set("n", "R", function()
         name_cache = setmetatable({}, { __mode = "k" })
         M._render()
@@ -1716,6 +1779,7 @@ end
 --- Close the sessions list window in the current tab (no-op when absent).
 function M.close()
     show_hidden_children = false
+    parent_hidden = {}
     local tab = current_tab()
     local win = win_for(tab)
     if not win then
@@ -1821,6 +1885,7 @@ function M._reset()
     refresh_scheduled = false
     child_completion_seen = {}
     parent_folds = {}
+    parent_hidden = {}
 end
 
 return M

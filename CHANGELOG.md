@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-09-20
+
+- **ADDED:** Lowercase `h` in `:PiSessions` toggles hidden sub-session rows for the session under the cursor only — on a child row it toggles that child's parent (the subagent's own rows live under its parent). Uppercase `H` keeps toggling hidden rows for every session at once. Per-session state resets when the list window closes, same as `H`.
+
 ## 2026-09-14
 
 - **FIXED:** A tool call whose *name* contains newlines no longer aborts the turn's history render. A provider can return a `toolCall` whose name is the model's whole reasoning block (observed live: `"bash rebase --continue\n\nLet me first check …"`), and pi forwards it verbatim as `tool_execution_start.toolName`; the tool block header was built from it and `nvim_buf_set_lines` rejected the item (`'replacement string' item contains newlines`), so the scheduled render step died with a `vim.schedule callback` error and nothing after it rendered. Tool labels and inline details are now flattened to one line before they are measured for extmarks, and `_append_lines` / `_insert_lines` flatten newlines at the buffer write boundary so no future caller can reintroduce the crash.
