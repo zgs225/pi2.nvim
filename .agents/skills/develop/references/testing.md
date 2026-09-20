@@ -20,7 +20,7 @@ The repo ships `tests/minimal_init.lua` and a `Makefile` with `test` (hermetic p
 
 **What it's for:** the real plugin loading under the real config, the real chat opening, the RPC backend spawning, buffer/extmark wiring, keymap *registration*, and method-level behavior — everything that doesn't need pixels or real key events.
 
-**How it runs:** `nvim --headless -u ~/.config/nvim/init.lua -l script.lua`. The script drives `require("pi").show{layout="side"}`, `vim.wait(...)` for buffers, mutates buffers, calls chat methods, and exits `cq 0`/`cq 1`. `make smoke` is the minimal version of this (load + assert the two chat buffers exist). **Worktree caveat:** this boots the user's real config, so lazy loads pi from the **main checkout** (`~/.local/share/nvim/lazy/pi2.nvim`), not a feature worktree. To exercise worktree code headless, run the script under `-u tests/minimal_init.lua` instead (path-relative, worktree-safe); see G23.
+**How it runs:** `nvim --headless -u ~/.config/nvim/init.lua -l script.lua`. The script drives `require("pi").show{layout="side"}`, `vim.wait(...)` for buffers, mutates buffers, calls chat methods, and exits `cq 0`/`cq 1`. `make smoke` is the minimal version of this, committed at `scripts/smoke.lua` (open the chat, assert the history/prompt buffers exist and the session's RPC backend process started). **Worktree caveat:** this boots the user's real config, so lazy loads pi from the **main checkout** (`~/.local/share/nvim/lazy/pi2.nvim`), not a feature worktree. To exercise worktree code headless, run the script under `-u tests/minimal_init.lua` instead (path-relative, worktree-safe); see G23.
 
 **Stub the backend** at the top of any script that submits: `chat._agent.send = function(_) end` (get `chat` via `require("pi.sessions.manager").get().chat`). This prevents real model calls *and*, because the stub returns before the RPC send, prevents the pi backend from writing a session transcript — so sessions stay clean.
 
@@ -124,6 +124,7 @@ When in doubt, add the cheaper test *and* the GUI screenshot; the screenshot is 
 The `scripts/` directory holds **templates** — copy into `/tmp/<run>/`, fill the few placeholders, run. They are deliberately parameterized (socket path, window id, workspace come from env/files, never hard-coded) so they are reusable across runs and machines.
 
 - `scripts/unit_spec_template.lua` — plenary spec skeleton (note the `describe`-scoping rule, G14).
+- `scripts/smoke.lua` — the committed smoke script behind `make smoke` (open chat + assert buffers and the RPC backend; no submit, no transcript write).
 - `scripts/headless_e2e_template.lua` — headless `-l` skeleton (stub backend, `find_buf`, callable-save pattern for G4).
 - `scripts/gui_harness.sh` — `source` this; gives `q`/`qlua`/`runlua`/`find_buf`/`send`/`normal`/`type_text`/`shot`/`check`/`wait_for` over the RPC socket. Lua goes through files (`:luafile`) to dodge shell-quoting hell.
 - `scripts/gui_launch.sh` — starts a **dedicated, full-screen** WezTerm+nvim (`--listen`) on its own i3 workspace so screenshots are large; remembers the user's workspace to restore later.

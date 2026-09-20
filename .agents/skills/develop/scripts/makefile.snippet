@@ -21,8 +21,9 @@ test:
 		-c "lua require('plenary.test_harness').test_directory('tests', { minimal_init = '$(MIN_INIT)' })"
 
 smoke:
-	$(NVIM_BIN) --headless -u $(HOME)/.config/nvim/init.lua -l /tmp/pi_smoke.lua
-
-# Add a per-feature headless e2e as a one-off, e.g.:
+	$(NVIM_BIN) --headless -u $(HOME)/.config/nvim/init.lua -l scripts/smoke.lua
+# The smoke script is committed at `scripts/smoke.lua` (open chat + assert the
+# history/prompt buffers and the RPC backend process). Per-feature headless
+# e2e scripts stay run-specific one-offs in /tmp — copy
+# `headless_e2e_template.lua` to /tmp/<run>/e2e.lua and drive your feature:
 #   $(NVIM_BIN) --headless -u $(HOME)/.config/nvim/init.lua -l /tmp/<run>/e2e.lua
-# (kept out of the Makefile because e2e scripts live in /tmp and are run-specific.)

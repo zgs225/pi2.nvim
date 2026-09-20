@@ -30,7 +30,7 @@ e2e:
 	done
 
 smoke:
-	$(NVIM_BIN) --headless -u $(HOME)/.config/nvim/init.lua -l /tmp/pi_smoke.lua
+	$(NVIM_BIN) --headless -u $(HOME)/.config/nvim/init.lua -l scripts/smoke.lua
 
 # NOTE: stylua's built-in default indent is Tabs; .stylua.toml pins the 4-space
 # convention used here, so always format through this target (or `stylua .` with
