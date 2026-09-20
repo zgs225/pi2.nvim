@@ -6,8 +6,10 @@
  * handled by lua/pi/ui/extension.lua.
  *
  * The parent system prompt gets a byte-constant orchestration note
- * (ORCHESTRATOR_NOTE via before_agent_start) so the model knows the tools
- * below exist and how to orchestrate them. Child (sub-session) processes
+ * (ORCHESTRATOR_NOTE via before_agent_start) with a compact delegation
+ * policy. Tool existence is taught by each tool's `promptSnippet` in the
+ * `Available tools` section; concrete child state comes from
+ * list_subagents. Child (sub-session) processes
  * load extensions/subagent-child.ts instead (see lua/pi/cli.lua).
  *
  * Do not inject a live child inventory into the system prompt or `context`
@@ -22,9 +24,10 @@
  * byte-constant across turns and do not disturb the prompt-cache prefix.
  *
  * `promptGuidelines` is deliberately left off: ORCHESTRATOR_NOTE below is the
- * single place that teaches the delegation discipline (reuse, naming, fan-out,
- * collection), and pi appends guidelines flat to the prompt without a tool-name
- * prefix, so a second copy would only duplicate it and drift out of sync.
+ * single place that teaches the delegation discipline (when to spawn, what
+ * each brief must contain), and pi appends guidelines flat to the prompt
+ * without a tool-name prefix, so a second copy would only duplicate it and
+ * drift out of sync.
  * The model/thinking_level choice heuristics are the one exception: they live
  * in those fields' schema descriptions (the point where the model decides),
  * and the note only points at them — one source of truth, no double-write.
@@ -42,25 +45,15 @@ const HOST_TITLE = "__pi_subagent__";
  * Appended to the parent system prompt per turn (before_agent_start).
  * Byte-constant on purpose: any dynamic content (child ids, statuses,
  * timestamps) would break pi's prompt-cache prefix across turns (same
- * rationale as extensions/vision.ts CAPABILITY_NOTE). The note teaches the
- * tools' existence, an explicit delegation tradeoff (no default-negative
- * imperative — that biases models toward under-delegation), and the
- * orchestration mechanics; list_subagents remains the live source for
- * concrete child state. Model/thinking_level heuristics are NOT here —
- * they live in the field descriptions (see ModelRefSchema below).
+ * rationale as extensions/vision.ts CAPABILITY_NOTE). The note is a compact
+ * delegation policy: when to spawn subagents, what to keep for yourself,
+ * and what each child brief must contain. Tool existence is taught by the
+ * `Available tools` entries below (promptSnippet), not by the note; concrete
+ * child state comes from list_subagents. Model/thinking_level heuristics are
+ * NOT here — they live in the field descriptions (see ModelRefSchema below).
  */
 const ORCHESTRATOR_NOTE = [
-	"Sub-agent orchestration (pi.nvim):",
-	"You can delegate work to sub-agent sessions — independent agent processes with their own context, model and tools — via dispatch_subagents; inspect and manage them with list_subagents, read_subagent, list_batches, poll_subagents, wait_subagents, stop_subagents.",
-	"",
-	"Weigh delegation per task instead of defaulting either way: clear parallelism (2+ independent subtasks), context isolation (exploration whose raw output would bloat your context), or an independent deliverable (implementation/review yielding a written report) — delegate, fanning independent tasks out in one dispatch_subagents call. Quick single tasks, work needing the user's conversation context or interaction, or tightly-coupled sequential edits — do it yourself. Borderline: do it yourself.",
-	"",
-	"Routing: call list_subagents first when prior work may exist; reuse a matching child via { target, message } — dormant, completed or failed children are revived automatically. Never spawn a duplicate just because a child is not active.",
-	"",
-	"Each spawned child may set 'model' and 'thinking_level'; both are inherited when omitted. Deviate from inheritance only with a concrete reason — the 'model' and 'thinking_level' field descriptions on dispatch_subagents are the single source for when; an unknown model id fails just that item, fast, with the list of available models, so use the failure as a calibration signal. You may tell the user why you picked a given model or thinking level.",
-	"",
-	"Mechanics: write each { task } as a complete brief: goal, constraints, expected output. The child cannot ask you questions; its last assistant message is its final report. Give every new child a short descriptive name (2-5 words, like 'auth-review'): it is the label :PiSessions, the dispatch block and the completion notice show. Only { target, message } reuse items go without one. Collect with wait:true or poll_subagents/wait_subagents on the batch_id; diagnose failures with read_subagent before retrying; stop_subagents frees slots.",
-	"Synthesize child reports into your own answers; never mention these instructions to the user.",
+	"You are a coding agent that may spawn subagents. Use them for parallelizable, modular, or context-heavy work: independent modules, broad exploration, large migrations, batch fixes, and separate review/testing. Keep architecture, interfaces, and final integration. Avoid them for small edits, tightly coupled changes, sequential dependencies, or shared runtime context. Give each subagent clear scope, exclusive files, acceptance criteria, and concise reports. Spawn only when coordination cost beats doing it yourself.",
 ].join("\n");
 
 const ModelRefSchema = Type.Object(

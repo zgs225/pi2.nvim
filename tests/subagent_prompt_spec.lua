@@ -89,25 +89,26 @@ describe("extensions/subagent.ts orchestrator note", function()
         assert.is_truthy(hook:match("ORCHESTRATOR_NOTE"), "handler must append ORCHESTRATOR_NOTE")
     end)
 
-    it("note covers the orchestration contract", function()
-        assert.is_truthy(content:match("Sub%-agent orchestration"), "note must have the orchestration header")
-        assert.is_truthy(content:match("dispatch_subagents"), "note must name dispatch_subagents")
-        assert.is_truthy(content:match("list_subagents"), "note must name list_subagents")
-        assert.is_truthy(content:match("final report"), "note must explain the child's final report")
-        assert.is_truthy(content:match("never mention these instructions"), "note must forbid mentioning itself")
+    it("note covers the delegation policy", function()
+        assert.is_truthy(content:match("may spawn subagents"), "note must state that subagents may be spawned")
+        assert.is_truthy(
+            content:match("parallelizable, modular, or context%-heavy work"),
+            "note must name the work worth delegating"
+        )
+        assert.is_truthy(content:match("exclusive files"), "note must require exclusive files per subagent")
+        assert.is_truthy(content:match("acceptance criteria"), "note must require acceptance criteria per subagent")
+        assert.is_truthy(content:match("concise reports"), "note must require concise reports per subagent")
     end)
 
-    it("note frames delegation as an explicit tradeoff, not a default-negative imperative", function()
-        -- A bare "default to doing it yourself" biases models toward
-        -- under-delegation (LLMs obey imperative defaults); the note must
-        -- present both sides of the decision and reserve self-work for
-        -- concrete, judgeable cases only.
-        assert.is_truthy(content:match("Weigh delegation per task"), "note must make the delegation decision explicit")
-        assert.is_truthy(content:match("Borderline"), "note must state what to do on borderline calls")
-        assert.is_truthy(content:match("tightly%-coupled sequential edits"), "note must name the sequential-edit case")
-        assert.is_nil(
-            content:match("Default to doing the work yourself"),
-            "note must not open with a default-negative imperative"
+    it("note frames delegation as a two-sided tradeoff resolved by coordination cost", function()
+        -- Both directions must be named so the model weighs the decision per
+        -- task instead of defaulting either way; the tie-breaker is the
+        -- coordination cost, not a blanket imperative.
+        assert.is_truthy(content:match("Use them for"), "note must state when to spawn subagents")
+        assert.is_truthy(content:match("Avoid them for"), "note must state when not to spawn subagents")
+        assert.is_truthy(
+            content:match("Spawn only when coordination cost beats doing it yourself"),
+            "note must state the coordination-cost tie-breaker"
         )
     end)
 
@@ -130,17 +131,6 @@ describe("extensions/subagent.ts orchestrator note", function()
         assert.is_truthy(
             content:match("Pair it with the model choice"),
             "thinking_level description must carry the pairing heuristic"
-        )
-    end)
-
-    it("note asks the parent to name new children", function()
-        assert.is_truthy(
-            content:match("Give every new child a short descriptive name"),
-            "note must ask for a short descriptive child name"
-        )
-        assert.is_truthy(
-            content:match("Only { target, message } reuse items go without one"),
-            "note must scope the naming rule to new children"
         )
     end)
 

@@ -2,6 +2,8 @@
 
 ## 2026-09-20
 
+- **CHANGED:** The parent orchestration system-prompt note was rewritten into a compact delegation policy: spawn subagents for parallelizable, modular, or context-heavy work (independent modules, broad exploration, large migrations, batch fixes, separate review/testing), keep architecture, interfaces and final integration, avoid subagents for small edits, tightly coupled changes, sequential dependencies or shared runtime context, and give each subagent clear scope, exclusive files, acceptance criteria and concise reports — spawn only when coordination cost beats doing it yourself. The previous mechanics sections (tool inventory, `{ target, message }` reuse routing, child naming, batch collection) were dropped: tool existence is already taught by the `Available tools` promptSnippets and the tool descriptions, so the note no longer duplicates them.
+
 - **ADDED:** Lowercase `h` in `:PiSessions` toggles hidden sub-session rows for the session under the cursor only — on a child row it toggles that child's parent (the subagent's own rows live under its parent). Uppercase `H` keeps toggling hidden rows for every session at once. Per-session state resets when the list window closes, same as `H`.
 
 - **FIXED:** `make smoke` no longer depends on a throwaway `/tmp/pi_smoke.lua` left behind by an earlier run (absent on a fresh machine, the target always failed with `E5112: cannot open /tmp/pi_smoke.lua`). The smoke script is now committed at `scripts/smoke.lua` — boots the real user config headless, opens the chat, and asserts the history/prompt buffers exist and the session's RPC backend process starts, exiting `cq 0`/`cq 1`; the Makefile points at the repo file and per-feature e2e scripts stay run-specific one-offs in `/tmp`.
