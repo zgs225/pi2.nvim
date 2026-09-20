@@ -518,6 +518,10 @@ local function load_messages_from_jsonl(path)
                     }
                 elseif t == "session_info" and type(entry.name) == "string" and entry.name ~= "" then
                     session_name = entry.name
+                elseif t == "session" and type(entry.cwd) == "string" then
+                    -- Workspace anchor for path shortening/resolution: a child
+                    -- session's cwd is usually a worktree, not ours.
+                    status.cwd = entry.cwd
                 end
             end
         end
@@ -889,6 +893,10 @@ function M.open(child_id, opts)
 
     -- For dormant sessions, verify the session file exists before opening window
     local dormant_messages = nil
+    -- Tool paths replayed into the viewer resolve against the directory the
+    -- viewed session ran in, which can differ from Neovim's cwd (a tab-local
+    -- cwd, or a session file opened by id).
+    local session_cwd = (session and session.cwd) or nil
     if not is_live then
         local path = (session and session.session_file) or Read.find_path(child_id)
         if not path and vim.fn.filereadable(child_id) == 1 then
@@ -900,6 +908,7 @@ function M.open(child_id, opts)
         end
         local msgs, session_name, jsonl_status = load_messages_from_jsonl(path)
         dormant_messages = msgs
+        session_cwd = (jsonl_status and jsonl_status.cwd) or session_cwd
         -- The JSONL fallback only applies while no name is known yet.
         if session_name and session_name ~= "" and not opts_name and not entry_name then
             name = session_name
@@ -929,6 +938,9 @@ function M.open(child_id, opts)
     viewer_tab_counter = viewer_tab_counter - 1
     local fake_tab = viewer_tab_counter
     local history = History.new(fake_tab)
+    if session_cwd then
+        history:set_cwd(session_cwd)
+    end
     local buf = history:buf()
     vim.bo[buf].bufhidden = "wipe"
 

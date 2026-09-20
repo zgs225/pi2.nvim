@@ -37,7 +37,7 @@ describe("pi.ui.subsession_viewer", function()
     it("parses dormant session JSONL entries including session_info and compaction_summary", function()
         local file_path = tmp_dir .. "/session.jsonl"
         local lines = {
-            vim.json.encode({ type = "session", sessionId = "sess-123" }),
+            vim.json.encode({ type = "session", sessionId = "sess-123", cwd = "/tmp/some-worktree" }),
             vim.json.encode({ type = "session_info", name = "Test Worker Session" }),
             vim.json.encode({ type = "message", message = { role = "user", content = "Hello world" } }),
             vim.json.encode({
@@ -73,8 +73,9 @@ describe("pi.ui.subsession_viewer", function()
         f:write(table.concat(lines, "\n"))
         f:close()
 
-        local msgs, session_name = Viewer._load_messages_from_jsonl(file_path)
+        local msgs, session_name, status = Viewer._load_messages_from_jsonl(file_path)
         assert.equals("Test Worker Session", session_name)
+        assert.equals("/tmp/some-worktree", status.cwd)
         assert.equals(4, #msgs)
         assert.equals("user", msgs[1].role)
         assert.equals("Hello world", msgs[1].content)

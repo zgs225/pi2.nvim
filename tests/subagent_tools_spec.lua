@@ -26,7 +26,7 @@ describe("subagent tool icons", function()
 
     it("dispatch block mode shows mixed item summary", function()
         local renderer = Tools.get_renderer("dispatch_subagents")
-        local detail = renderer.inline_text({
+        local detail = renderer.inline_text(nil, {
             items = {
                 { task = "a" },
                 { target = "id", message = "m" },

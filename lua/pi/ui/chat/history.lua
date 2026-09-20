@@ -45,6 +45,7 @@
 ---@field _pending_queue pi.PendingQueueEntry[]
 ---@field _pending_queue_extmark_id integer?
 ---@field _replaying boolean
+---@field _cwd string? workspace cwd: base for shortening displayed tool paths and resolving them (see pi.path)
 ---@field _agent_text_start_row integer?
 ---@field _current_turn_first_agent_response_extmark_id integer?
 ---@field _current_turn_last_agent_response_extmark_id integer?
@@ -140,6 +141,7 @@ History._stream_flush_ms = 30
 
 local Ft = require("pi.filetypes")
 local Config = require("pi.config")
+local Path = require("pi.path")
 local Tools = require("pi.ui.chat.tools")
 local Render = require("pi.ui.render")
 local Text = require("pi.ui.chat.text")
@@ -492,6 +494,7 @@ function History.new(tab)
     self._bash_replay_counter = 0
     self._compaction_blocks = {}
     self._blocks_expanded = false
+    self._cwd = nil
     self._placeholder_extmark = nil
     self._placeholder_mode = nil
     self._has_conversation_content = false
@@ -2543,7 +2546,7 @@ function History:on_tool_start(tool_name, tool_call_id, tool_input)
 
         -- Inline tools render as a single line: indent + icon + display_name + detail
         if use_inline then
-            local detail = renderer.inline_text and renderer.inline_text(tool_input) or nil
+            local detail = renderer.inline_text and renderer.inline_text(self, tool_input) or nil
             detail = detail and Tools.flatten_line(detail) or nil
             local indent = Tools.GLYPHS.INDENT
             local line = indent .. icon .. " " .. display_name .. (detail and ("  " .. detail) or "")
@@ -4216,20 +4219,47 @@ function History:clear()
 end
 
 -- ---------------------------------------------------------------------------
+-- Workspace cwd
+-- ---------------------------------------------------------------------------
+
+--- Point this history at the workspace cwd of its session. Tool paths are
+--- displayed relative to it (see `pi.path`) and relative paths are resolved
+--- against it, which matters when the session cwd differs from Neovim's (a
+--- sub-agent's worktree, a resumed session).
+---@param cwd string?
+function History:set_cwd(cwd)
+    self._cwd = (type(cwd) == "string" and cwd ~= "") and cwd or nil
+end
+
+-- ---------------------------------------------------------------------------
 -- Open file under cursor
 -- ---------------------------------------------------------------------------
 
 --- Resolve a path candidate to an absolute path when it exists as a file.
+--- Relative candidates are tried against the session cwd first, then Neovim's
+--- cwd (a `@mention` is workspace-relative; a stale session cwd must not make a
+--- working path unresolvable).
 ---@param candidate string
 ---@return string?
-local function resolve_file(candidate)
+function History:_resolve_file(candidate)
     if candidate == "" then
         return nil
     end
-    local abs = vim.fn.fnamemodify(candidate, ":p")
-    local stat = vim.uv.fs_stat(abs)
-    if stat and stat.type == "file" then
-        return abs
+    local seen = {}
+    local bases = {}
+    if self._cwd then
+        bases[#bases + 1] = self._cwd
+    end
+    bases[#bases + 1] = vim.fn.getcwd()
+    for _, base in ipairs(bases) do
+        local abs = Path.resolve(candidate, base)
+        if abs ~= "" and not seen[abs] then
+            seen[abs] = true
+            local stat = vim.uv.fs_stat(abs)
+            if stat and stat.type == "file" then
+                return abs
+            end
+        end
     end
     return nil
 end
@@ -4269,6 +4299,37 @@ local function extract_path(line)
     return trimmed, nil
 end
 
+--- Path argument of the tool block covering `row` (0-indexed), when that block
+--- carries one. Display shortening must never break `gf`: the inline `read`
+--- line shows a bare file name, and an absolute path is rendered relative to
+--- the session cwd — neither is reliably recoverable from the rendered text, so
+--- the block's own arguments are the source of truth.
+---@param row integer 0-indexed
+---@return string? path
+function History:_tool_block_path_at_row(row)
+    local found ---@type string?
+    local found_span = math.huge
+    for _, block in pairs(self._tool_blocks) do
+        local input = block.tool_input
+        local path = type(input) == "table" and (input.path or input.file_path) or nil
+        if type(path) == "string" and path ~= "" and block.icon_extmark then
+            local header = vim.api.nvim_buf_get_extmark_by_id(self._buf, ns, block.icon_extmark, {})[1]
+            if header then
+                -- Inline tools (read) are a single row with no end anchor.
+                local footer = header
+                if block.end_extmark then
+                    footer = vim.api.nvim_buf_get_extmark_by_id(self._buf, ns, block.end_extmark, {})[1] or header
+                end
+                local span = footer - header
+                if row >= header and row <= footer and span < found_span then
+                    found, found_span = path, span
+                end
+            end
+        end
+    end
+    return found
+end
+
 local PI_PANEL_FILETYPES = {
     [Ft.history] = true,
     [Ft.prompt] = true,
@@ -4291,11 +4352,20 @@ function History:goto_path_at_cursor()
     end
     local row = vim.api.nvim_win_get_cursor(win)[1]
     local line = vim.api.nvim_buf_get_lines(self._buf, row - 1, row, false)[1] or ""
-    local candidate, lnum = extract_path(line)
+    -- A tool block knows the path it was called with; the rendered line may be
+    -- shortened (basename for `read`, workspace-relative for `edit`/`write`).
+    -- Fall back to parsing the text, which is what covers prose and @mentions.
+    local candidate, lnum
+    local block_path = self:_tool_block_path_at_row(row - 1)
+    if block_path then
+        candidate = block_path
+    else
+        candidate, lnum = extract_path(line)
+    end
     if not candidate then
         return false
     end
-    local abs = resolve_file(candidate)
+    local abs = self:_resolve_file(candidate)
     if not abs then
         return false
     end
