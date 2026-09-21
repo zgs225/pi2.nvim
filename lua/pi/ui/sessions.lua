@@ -1739,7 +1739,9 @@ local function resolve_mode()
     end
     local Sessions = require("pi.sessions.manager")
     local session = Sessions.get()
-    if session then
+    -- A session without a bound chat (shim/fake sessions in tests, sessions
+    -- mid-attach) has no layout to follow; fall back to the default.
+    if session and session.chat then
         return session.chat:layout()
     end
     return Config.resolve_default_layout_mode()

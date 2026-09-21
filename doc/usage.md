@@ -785,13 +785,13 @@ Each `todo_write` call renders as a [tool block](#tool-blocks) with a checklist 
 
 ### The `:PiTodo` panel
 
-`:PiTodo` toggles a read-only side panel with the session's current list — the same three-state checklist, mirrored live from every `todo_write` result, including replayed history.
+`:PiTodo` toggles a read-only side panel with the viewed session's current list — the same three-state checklist, mirrored live from every `todo_write` result, including replayed history.
 
 When the [sessions overview](sessions.md#sessions-overview-pisessions) is open in the current tab, the panel stacks in the same column — `todo.panel.position` picks `below` (default) or `above` the sessions window — and the column is split evenly by default: `todo.panel.height < 1` is the panel's fraction of the shared column height (default `0.5`, re-evaluated on every refresh so manual resizes of either window snap back to the configured split), while `todo.panel.height >= 1` pins a fixed line count. Content taller than the panel scrolls. Without the sessions list, the panel opens as its own full-height vertical split sized after `sessions_list.position` / `sessions_list.width`. `q` closes the panel.
 
 With `todo.panel.hide_when_empty` (default), the panel is hidden while the list is empty; an explicitly opened panel shows a `no todos` placeholder instead. With `todo.panel.auto_open`, the panel opens automatically when the session's todo list becomes non-empty (the first write, or a re-added list after a clear).
 
-The mirror is keyed to the tab that owns the session, not to whichever tab has keyboard focus: `todo_write` results update that tab's panel even while you work elsewhere, and other tabs never capture the session's state. Since a split window can only be created in the current tab, an auto-open that fires while the session's tab is in the background is deferred — the panel opens as soon as you enter that tab.
+The mirror is keyed per session, and a tab's panel shows the session that tab is currently viewing: a tab can host several sessions over time (parent + subagent children), and each keeps its own list. Viewing a child shows the child's todos, and switching back to the parent re-renders the parent's list immediately — no stale child list lingers. A detached subagent's todos are stored the same way, but they never steal the panel or auto-open it: they surface only when you view that child (for example with `:PiTodo` opened there), and an auto-open fires only when the currently viewed session's own list transitions empty→non-empty. Since a split window can only be created in the current tab, an auto-open that fires while the viewed session's tab is in the background is deferred — the panel opens as soon as you enter that tab, and only if the then-viewed session still has todos. Closing a session drops its todo state.
 
 ## Models
 

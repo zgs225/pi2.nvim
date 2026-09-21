@@ -1,19 +1,27 @@
---- Todo panel (:PiTodo) — persistent sidebar view of the session's todo list.
+--- Todo panel (:PiTodo) — persistent sidebar view of the viewed session's todo
+--- list.
 ---
 --- The state is a read-only mirror of the agent's `todo_write` tool results:
 --- sessions/manager.lua routes every tool_execution_end (live and replay) with
 --- a todo tool through update_from_details(), which stores the latest
 --- { todos, completed, total } snapshot and re-renders any open panel window.
 ---
---- The mirror is keyed to the tab that OWNS the session (its attached tab),
---- not the tab the keyboard focus happens to be on: RPC events are processed
---- while any tab may be focused. Callers pass the session's tab explicitly;
---- direct/legacy callers omit it and get the current tab. Auto-open on the
---- empty→non-empty transition is per-tab too: a panel window can only be
---- created in the CURRENT tab (a split in another tabpage would steal focus),
---- so when the event arrives while the session's tab is in the background the
---- pending marker stays set and the TabEnter autocmd below opens the panel as
---- soon as the user enters that tab.
+--- The mirror is keyed per SESSION object, and a tab's panel always renders
+--- the session that tab is currently VIEWING (sessions/manager.lua binds one
+--- session per tab at a time; viewing a subagent child rebinds the tab, and
+--- switching back to the parent rebinds the parent). Keying by session object
+--- — not by session id, which mutates (`tmp-N` → backend id via
+--- `migrate_session_id`), and not per tab, since a tab hosts several sessions
+--- over time — is what keeps a child's todos from overwriting or mixing into
+--- its parent's list. A detached session's writes are stored silently: they
+--- never steal the panel or auto-open it. Auto-open on the empty→non-empty
+--- transition fires only when the WRITING session is the viewed session of
+--- its tab, and it is per-tab: a panel window can only be created in the
+--- CURRENT tab (a split in another tabpage would steal focus), so when the
+--- event arrives while that tab is in the background the pending marker stays
+--- set and the TabEnter autocmd below opens the panel as soon as the user
+--- enters that tab — consuming the marker only if the tab's then-viewed
+--- session still has todos (re-resolved at consumption time).
 ---
 --- Window layout mirrors pi.ui.sessions: one window per tab in `wins[tab]`.
 --- Unlike the sessions list (whose rows are global, so one shared buffer
@@ -63,8 +71,10 @@ local Ft = require("pi.filetypes")
 ---           hide_when_empty is true, the panel closes instead of lingering.
 ---@alias pi.TodoOpenedBy "auto"|"manual"
 
---- Latest todo snapshot per tab (one state per session, one session per tab).
----@type table<pi.TabId, pi.TodoDetails>
+--- Latest todo snapshot per SESSION (a tab can host several sessions over
+--- time — parent + subagent children — and each keeps its own list; a tab's
+--- panel renders whichever of them the tab is currently viewing).
+---@type table<pi.Session, pi.TodoDetails>
 local state = {}
 
 ---@type table<pi.TabId, integer> panel window per tab
@@ -112,6 +122,29 @@ local function has_todos(details)
     return details ~= nil and details.total ~= nil and details.total > 0 and type(details.todos) == "table"
 end
 
+--- Resolve the session whose state a tab's panel renders: the session the
+--- manager currently has bound to that tab (its VIEWED session). Lazy require
+--- keeps the manager out of the todo module's load path (the manager itself
+--- requires pi.todo lazily). Nil when the tab hosts no session.
+---@param tab pi.TabId
+---@return pi.Session?
+local function viewed_session(tab)
+    local ok, Manager = pcall(require, "pi.sessions.manager")
+    if ok and type(Manager) == "table" and type(Manager.get_for_tab) == "function" then
+        return Manager.get_for_tab(tab)
+    end
+    return nil
+end
+
+--- The todo snapshot of `tab`'s viewed session (nil when the tab hosts no
+--- session, or that session never wrote todos).
+---@param tab pi.TabId
+---@return pi.TodoDetails?
+local function state_for_tab(tab)
+    local session = viewed_session(tab)
+    return session ~= nil and state[session] or nil
+end
+
 --- Content lines of the panel for the current state, with the DESIGN.md
 --- "whitespace over lines" treatment applied:
 ---
@@ -131,14 +164,19 @@ end
 ---@param tab pi.TabId
 ---@return string[]?
 local function panel_lines(tab)
-    local details = state[tab]
+    local details = state_for_tab(tab)
     local cfg = panel_config()
-    if not has_todos(details) then
+    -- The explicit nil check doubles as LuaLS's narrowing (a helper function
+    -- like has_todos is not treated as a type guard).
+    if details == nil or not has_todos(details) then
         if cfg.hide_when_empty and opened_by[tab] ~= "manual" then
             return nil
         end
         return { "", "  no todos" }
     end
+    local todos = details.todos
+    local completed = details.completed or 0
+    local total = details.total or #todos
     -- pi.todo.tool_ui is developed in a separate change; degrade gracefully
     -- (plain list) instead of erroring while it is absent or broken.
     local lines
@@ -149,15 +187,14 @@ local function panel_lines(tab)
         lines = result
     else
         lines = {}
-        local header = tostring(details.completed or 0) .. "/" .. tostring(details.total or #details.todos)
-        lines[#lines + 1] = header
-        for _, t in ipairs(details.todos) do
+        lines[#lines + 1] = tostring(completed) .. "/" .. tostring(total)
+        for _, t in ipairs(todos) do
             lines[#lines + 1] = t.content
         end
     end
     -- format_lines leads with its own progress header; the panel replaces it
     -- with the calmer "Todo · <progress>" title line and keeps the rows.
-    local progress = tostring(details.completed or 0) .. "/" .. tostring(details.total or #details.todos)
+    local progress = tostring(completed) .. "/" .. tostring(total)
     local p_ok, text = pcall(function()
         return require("pi.todo.tool_ui").progress_text(details)
     end)
@@ -187,8 +224,8 @@ function M._height_for(cfg, column_height)
     return math.max(1, math.min(target, math.max(1, column_height - 1)))
 end
 
---- Rebuild `tab`'s panel buffer contents from `tab`'s state (no-op when there
---- is nothing to show).
+--- Rebuild `tab`'s panel buffer contents from `tab`'s viewed session's state
+--- (no-op when there is nothing to show).
 ---@param tab pi.TabId
 ---@return boolean true when lines were written
 local function render_buf(tab)
@@ -404,70 +441,125 @@ function M.toggle()
     end
 end
 
---- Coalesced re-render of all open panel windows; each window renders its own
---- tab's state into its own buffer. Auto-opened panels whose list has cleared
---- (and hide_when_empty is on) are closed instead of showing an empty list.
---- Called from update_from_details (after vim.schedule) and after open().
+--- Re-render one open panel window under its tab's VIEWED session's state.
+--- Auto-opened panels whose viewed session has no todos (and
+--- hide_when_empty is on) close instead of showing an empty list;
+--- manually-opened panels keep showing the placeholder. Stacked windows:
+--- re-assert the pinned height after every render, computed from the column
+--- total (sessions + todo as they stand now). The :split count is not sticky
+--- ('equalalways' can re-equalize the column; a neighbor resize can
+--- redistribute it), and re-deriving the ratio from the current column height
+--- also corrects manual :resize drift back to the configured split (absolute
+--- heights stay absolute). Standalone columns stay full-height — no height is
+--- forced there.
+---@param tab pi.TabId
+---@param win integer
+local function refresh_tab(tab, win)
+    local cfg = panel_config()
+    local cleared = not has_todos(state_for_tab(tab))
+    if cleared and cfg.hide_when_empty and opened_by[tab] ~= "manual" then
+        close_for_tab(tab)
+        return
+    end
+    render_buf(tab)
+    local sess = sessions_win(tab)
+    if sess then
+        local column = vim.api.nvim_win_get_height(sess) + vim.api.nvim_win_get_height(win)
+        pcall(vim.api.nvim_win_set_height, win, M._height_for(cfg, column))
+    end
+end
+
+--- Coalesced re-render of all open panel windows; each window renders the
+--- state of the session its tab is currently VIEWING into its own buffer.
+--- Auto-opened panels whose viewed session has no todos (and hide_when_empty
+--- is on) are closed instead of showing an empty list. Called from
+--- update_from_details (after vim.schedule), after open(), and from
+--- on_session_closed().
 function M.refresh()
     for tab, win in pairs(wins) do
         if vim.api.nvim_win_is_valid(win) then
-            local cfg = panel_config()
-            local cleared = not has_todos(state[tab])
-            if cleared and cfg.hide_when_empty and opened_by[tab] ~= "manual" then
-                close_for_tab(tab)
-            else
-                render_buf(tab)
-                -- Stacked windows: re-assert the pinned height after EVERY
-                -- render, computed from the column total (sessions + todo as
-                -- they stand now). The :split count is not sticky
-                -- ('equalalways' can re-equalize the column; a neighbor resize
-                -- can redistribute it), and re-deriving the ratio from the
-                -- current column height also corrects manual :resize drift
-                -- back to the configured split (absolute heights stay
-                -- absolute). Standalone columns stay full-height — no height
-                -- is forced there.
-                local sess = sessions_win(tab)
-                if sess then
-                    local column = vim.api.nvim_win_get_height(sess) + vim.api.nvim_win_get_height(win)
-                    pcall(vim.api.nvim_win_set_height, win, M._height_for(cfg, column))
-                end
-            end
+            refresh_tab(tab, win)
         end
     end
 end
 
+--- The tab's viewed session changed (bind_chat rebind, tab detach): re-render
+--- that tab's open panel under the NEW viewed session's state — closing it
+--- when the new session has no todos (hide_when_empty, auto-opened panel) or
+--- keeping the "no todos" placeholder for a manually-opened one. A closed
+--- panel is not popped open here. Deferred via vim.schedule: safe from RPC
+--- callbacks and session-switch flows.
+---@param tab pi.TabId
+function M.on_viewed_session_changed(tab)
+    vim.schedule(function()
+        local win = M.win(tab)
+        if win then
+            refresh_tab(tab, win)
+        end
+    end)
+end
+
+--- A session was removed (close_session/stop/process exit): drop its todo
+--- state. Detached-but-alive sessions KEEP their state (a background child
+--- may still be writing todos); only removed sessions are pruned. A refresh
+--- is scheduled so any panel that was rendering the closed session converges.
+---@param session pi.Session
+function M.on_session_closed(session)
+    if type(session) == "table" then
+        state[session] = nil
+    end
+    if refresh_scheduled then
+        return
+    end
+    refresh_scheduled = true
+    vim.schedule(function()
+        refresh_scheduled = false
+        M.refresh()
+    end)
+end
+
 --- Update the mirror from parsed tool-result details and refresh/open panels.
 --- Called from sessions/manager.lua on tool_execution_end (live and replay)
---- for todo tools, keyed to the tab that owns the session. Safe to call from
---- an RPC callback: UI work is scheduled.
+--- for todo tools, keyed to the ROUTING SESSION — including detached sessions,
+--- whose state is stored silently and only surfaces when the session becomes
+--- the viewed session of a tab. Safe to call from an RPC callback: UI work is
+--- scheduled.
 ---
---- Transitions:
----   - non-empty details: store + refresh open panels; on empty→non-empty with
----     todo.panel.auto_open, open the panel in `tab` (opened_by = "auto") —
----     immediately when `tab` is also the current tab, otherwise deferred to
----     the TabEnter autocmd (a split window cannot be created in a
----     non-current tabpage without stealing focus).
+--- Transitions (per SESSION):
+---   - non-empty details: store + refresh open panels; on the session's own
+---     empty→non-empty transition with todo.panel.auto_open, mark the
+---     session's attached tab's panel for auto-open — but only when the
+---     writing session IS the viewed session of that tab (a detached child's
+---     first todo write never pops a panel) — immediately when the tab is
+---     also the current tab, otherwise deferred to the TabEnter autocmd (a
+---     split window cannot be created in a non-current tabpage without
+---     stealing focus). The marker is consumed only if the tab's then-viewed
+---     session still has todos (re-resolved at consumption time).
 ---   - total == 0 (cleared): store the empty state. Auto-opened panels then
 ---     close on the next refresh (when hide_when_empty is true); panels the
 ---     user opened explicitly stay open and show a one-line "no todos"
 ---     placeholder instead of an empty list.
 ---@param details pi.TodoDetails
----@param tab? pi.TabId tab the details belong to (the session's attached tab
----   when routed through sessions/manager.lua); nil defaults to the current
----   tab (single-tab behavior for direct/legacy callers)
-function M.update_from_details(details, tab)
+---@param session pi.Session the session the event belongs to; its own state
+---   bucket is replaced (per-session keying), and auto-open keys off the tab
+---   the session is attached to
+function M.update_from_details(details, session)
     if type(details) ~= "table" or type(details.todos) ~= "table" then
         return
     end
-    tab = tab or current_tab()
-    local was_empty = not has_todos(state[tab])
-    state[tab] = {
+    if type(session) ~= "table" then
+        return
+    end
+    local tab = session.attached_tab or session.tab
+    local is_viewed = tab ~= nil and viewed_session(tab) == session
+    local was_empty = not has_todos(state[session])
+    state[session] = {
         todos = details.todos,
         completed = tonumber(details.completed) or 0,
         total = tonumber(details.total) or #details.todos,
     }
-    if was_empty and has_todos(state[tab]) and panel_config().auto_open then
-        auto_open_pending[tab] = true
+    if is_viewed and was_empty and has_todos(state[session]) and panel_config().auto_open then
+        auto_open_pending[session.attached_tab] = true
     end
     if refresh_scheduled then
         return
@@ -477,12 +569,16 @@ function M.update_from_details(details, tab)
         refresh_scheduled = false
         -- Consume an auto_open transition even though the details arrived from
         -- an RPC callback (update_from_details itself is a fast event). Only
-        -- when the owning tab is also the current tab, though: a split window
-        -- cannot be created in a non-current tabpage without stealing focus, so
-        -- a background tab keeps its marker pending for the TabEnter autocmd.
-        if auto_open_pending[tab] and tab == current_tab() then
+        -- when the writing session's tab is also the current tab, though: a
+        -- split window cannot be created in a non-current tabpage without
+        -- stealing focus, so a background tab keeps its marker pending for the
+        -- TabEnter autocmd. And re-resolve at consumption time: the writing
+        -- session was viewed here when it wrote; if the tab's currently viewed
+        -- session has no todos anymore (the view switched to another session,
+        -- or the list cleared since), the panel must not open.
+        if tab and auto_open_pending[tab] and tab == current_tab() then
             auto_open_pending[tab] = nil
-            if not M.win(tab) then
+            if not M.win(tab) and has_todos(state_for_tab(tab)) then
                 M.open("auto")
             end
         end
@@ -490,10 +586,11 @@ function M.update_from_details(details, tab)
     end)
 end
 
---- The latest todo snapshot of the current tab's session.
+--- The latest todo snapshot of the current tab's VIEWED session (nil when the
+--- tab hosts no session, or that session never wrote todos).
 ---@return pi.TodoDetails?
 function M.current()
-    return state[current_tab()]
+    return state_for_tab(current_tab())
 end
 
 --- Test hook: how the current tab's open panel came to be open.
@@ -530,7 +627,10 @@ local augroup = vim.api.nvim_create_augroup("pi-todo-panel", { clear = true })
 --- Deferred auto-open: entering a tab consumes its pending auto_open marker.
 --- The marker is only left pending when the event arrived while the tab was
 --- in the background (the scheduled refresh cannot open a split there), so
---- the panel opens exactly here, with the tab as the current one.
+--- the panel opens exactly here, with the tab as the current one — but only
+--- if the tab's then-viewed session still has todos: the marker was left by
+--- a session that WAS viewed here when it wrote, and the view may have
+--- switched to another session (or the list cleared) since.
 vim.api.nvim_create_autocmd("TabEnter", {
     group = augroup,
     callback = function()
@@ -542,7 +642,9 @@ vim.api.nvim_create_autocmd("TabEnter", {
         if M.win(tab) or not panel_config().auto_open then
             return
         end
-        M.open("auto")
+        if has_todos(state_for_tab(tab)) then
+            M.open("auto")
+        end
     end,
 })
 

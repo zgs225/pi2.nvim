@@ -219,6 +219,35 @@ local function capture_detached_run_state(session)
     end
 end
 
+--- Notify the todo panel that a tab's viewed session changed (bind/detach):
+--- an open panel in that tab re-renders under the newly viewed session's
+--- state. Nil-safe and pcall'd like update_todo_mirror: the manager must
+--- never depend on the todo module's load state, and a failing hook must
+--- never break session binding.
+---@param tab pi.TabId
+local function notify_todo_view_changed(tab)
+    local ok, err = pcall(function()
+        require("pi.todo").on_viewed_session_changed(tab)
+    end)
+    if not ok then
+        Notify.warn("todo panel view update failed: " .. tostring(err))
+    end
+end
+
+--- Prune the todo panel's per-session state for a REMOVED session (closed or
+--- process-exited). Detached-but-alive sessions keep their state — a
+--- background child may still be writing todos. Nil-safe and pcall'd like
+--- the other todo hooks.
+---@param session pi.Session
+local function prune_todo_state(session)
+    local ok, err = pcall(function()
+        require("pi.todo").on_session_closed(session)
+    end)
+    if not ok then
+        Notify.warn("todo panel cleanup failed: " .. tostring(err))
+    end
+end
+
 --- Bind a tab's chat UI to a session process. Detaches any prior bindings on
 --- either side without stopping RPC processes.
 ---@param session pi.Session
@@ -249,6 +278,10 @@ local function bind_chat_to_session(session, chat, tab)
     session.tab = tab
     tab_chats[tab] = chat
     tab_session_id[tab] = session.id
+    -- The tab's viewed session changed (viewed a child, switched back to the
+    -- parent, ...): the todo panel re-renders under the NEW session's state
+    -- (deferred inside the todo module).
+    notify_todo_view_changed(tab)
 end
 
 --- Detach a tab's chat from its session without stopping the backend process.
@@ -274,6 +307,10 @@ local function detach_tab(tab)
         chat:clear()
         tab_chats[tab] = nil
     end
+    -- The tab no longer views any session: an open todo panel in it
+    -- re-renders under "no session" (closes when auto-opened, placeholder
+    -- when manual; deferred inside the todo module).
+    notify_todo_view_changed(tab)
 end
 
 ---@param session pi.Session
@@ -388,12 +425,16 @@ end
 --- path for every other tool and avoid load-order/circular issues. A failing
 --- hook must never break event routing.
 ---
---- The mirror is keyed to the tab that OWNS the session, not the tab the
---- keyboard focus happens to be on: RPC events are processed while any tab
---- may be focused, so keying to nvim_get_current_tabpage() would store the
---- list under (and auto-open the panel in) a session-less tab.
+--- The mirror is keyed per SESSION: the event is stored under the session the
+--- event belongs to, and the tab's panel renders whichever session that tab
+--- currently views. Detached sessions (owning no tab) are NOT skipped: their
+--- todo state is stored under the session object itself and surfaces when
+--- the session becomes the viewed session of a tab — deliberately NOT
+--- falling back to the current tab (that fallback is exactly the
+--- focus-keying bug 000c0ba fixed).
 ---@param session pi.Session? session the event belongs to; nil only from the
----   test hook (M._update_todo_mirror), which then keys to the current tab
+---   test hook (M._update_todo_mirror), which then keys to a shim session for
+---   the current tab
 ---@param tool_name string?
 ---@param result any tool result message (details are read off result.details
 --- or off result itself for replayed toolResult messages, which carry details
@@ -408,20 +449,11 @@ local function update_todo_mirror(session, tool_name, result)
             return
         end
         local details = ToolUi.result_details(result)
-        if details then
-            local tab
-            if session then
-                tab = session.attached_tab or session.tab
-                -- Detached session (owns no tab): skip. Deliberately NOT falling
-                -- back to the current tab here — that fallback is exactly the
-                -- focus-keying bug this guard prevents.
-                if tab == nil then
-                    return
-                end
-            end
-            -- `tab` is nil only when `session` is nil (test hook without a
-            -- tab); update_from_details then defaults to the current tab.
-            require("pi.todo").update_from_details(details, tab)
+        if details and session then
+            -- Keyed to the session OBJECT (per-session state): detached
+            -- sessions store silently; auto-open only fires when this session
+            -- is the viewed session of its tab (checked by the todo module).
+            require("pi.todo").update_from_details(details, session)
         end
     end)
     if not ok then
@@ -912,6 +944,8 @@ function M.handle_event(session, msg)
                 end
             end)
         end
+        -- The session object is gone from the registry; drop its todo state.
+        prune_todo_state(session)
     elseif t == "response" then
         -- Normally handled by rpc:send() one-shot callbacks. Late error
         -- responses (e.g. async prompt failures like auth errors) arrive
@@ -1191,6 +1225,7 @@ function M.close_session(session)
     if session.id then
         registry[session.id] = nil
     end
+    prune_todo_state(session)
     require("pi.ui.sessions").request_refresh()
 end
 
@@ -1297,6 +1332,7 @@ function M.stop()
     session.rpc:stop()
     detach_tab(tab)
     registry[session_id] = nil
+    prune_todo_state(session)
     require("pi.ui.sessions").request_refresh()
 end
 
@@ -2259,36 +2295,108 @@ function M._register_for_test(session)
     registry[session.id] = session
 end
 
---- Test-hook shim: a minimal session-like table carrying exactly the tab
---- fields update_todo_mirror reads (a real pi.Session satisfies the same
---- contract). Typed as `any` so the partial table does not trip the
---- missing-fields check against the full pi.Session class.
----@param tab? pi.TabId
+--- Test-only: bind a chat-less fake session to a tab so get_for_tab(tab)
+--- resolves it (todo panel specs exercise per-session state without real RPC
+--- processes or chat UIs). No chat is bound; cleaned up by M._reset.
+---@param session pi.Session
+---@param tab pi.TabId
+function M._bind_shim_for_test(session, tab)
+    registry[session.id] = session
+    tab_session_id[tab] = session.id
+    session.attached_tab = tab
+    session.tab = tab
+end
+
+--- Test-hook shim: a minimal session-like table carrying exactly the fields
+--- update_todo_mirror reads (a real pi.Session satisfies the same contract).
+--- Typed as `any` so the partial table does not trip the missing-fields check
+--- against the full pi.Session class.
+---
+--- Per-session todo state means the shim must be a REAL object identity: one
+--- stable shim per tab (so repeated calls key to the same state, like a tab's
+--- real session would), registered in the registry + tab_session_id so the
+--- todo panel's viewed-session resolution (get_for_tab) finds it. Cleared by
+--- M._reset.
+---@type table<pi.TabId, any>
+local mirror_shims = {}
+
+---@param tab pi.TabId
 ---@return any
 local function mirror_session_shim(tab)
-    return { attached_tab = tab, tab = tab }
+    local session = mirror_shims[tab]
+    if not session then
+        session = {
+            id = "mirror-shim-" .. tostring(tab),
+            attached_tab = tab,
+            tab = tab,
+            rpc = {
+                is_running = function()
+                    return false
+                end,
+                stop = function() end,
+            },
+        }
+        registry[session.id] = session
+        tab_session_id[tab] = session.id
+        mirror_shims[tab] = session
+    end
+    return session
+end
+
+--- Stable detached shim: never bound to a tab, writes land under its own
+--- per-session state and are visible in no tab. Also cleared by M._reset.
+---@type any?
+local detached_shim
+
+---@return any
+local function detached_mirror_shim()
+    if not detached_shim then
+        detached_shim = {
+            id = "mirror-shim-detached",
+            rpc = {
+                is_running = function()
+                    return false
+                end,
+                stop = function() end,
+            },
+        }
+    end
+    return detached_shim
 end
 
 --- Test-only hook for the todo-panel mirror (tests/todo_panel_e2e.lua): route
 --- a tool result through the same guarded path the event handlers use.
 ---
---- Variadic so callers can distinguish an absent tab from an explicit nil
---- (impossible with named parameters, where absent and nil are identical):
----   M._update_todo_mirror(tool, result)       — legacy: keyed to the current
----     tab, exactly like the pre-fix hook (existing callers/tests).
----   M._update_todo_mirror(tool, result, nil)  — detached session: the update
----     is skipped, with no current-tab fallback.
----   M._update_todo_mirror(tool, result, tab)  — keyed to that tab.
+--- Variadic so callers can distinguish an absent argument from an explicit
+--- nil (impossible with named parameters, where absent and nil are identical):
+---   M._update_todo_mirror(tool, result)          — legacy: keyed to a shim
+---     session for the current tab (existing callers/tests).
+---   M._update_todo_mirror(tool, result, nil)     — detached session (stable
+---     shim, never bound to a tab): the state is stored under the shim, so
+---     visible in no tab.
+---   M._update_todo_mirror(tool, result, tab)     — keyed to a shim session
+---     bound to that tab.
+---   M._update_todo_mirror(tool, result, session) — a table argument is
+---     treated as the session itself (e.g. a real pi.Session object).
 ---
 --- tool_name: string? — tool name, gated through ToolUi.is_todo_tool.
 --- result: any — tool result message (details read off result.details, or off
 ---   the result itself for replayed toolResult messages).
---- tab: pi.TabId? — session tab; see the resolution table above.
+--- tab: pi.TabId|pi.Session|nil — session tab, session object, or nil; see
+---   the resolution table above.
 function M._update_todo_mirror(...)
-    local tool_name, result, tab = ... ---@type string?, any, pi.TabId?
+    local tool_name, result, tab_or_session = ... ---@type string?, any, any
     local session ---@type pi.Session?
     if select("#", ...) >= 3 then
-        session = mirror_session_shim(tab)
+        if type(tab_or_session) == "table" then
+            session = tab_or_session
+        elseif tab_or_session == nil then
+            session = detached_mirror_shim()
+        else
+            session = mirror_session_shim(tab_or_session)
+        end
+    else
+        session = mirror_session_shim(current_tab())
     end
     update_todo_mirror(session, tool_name, result)
 end
@@ -2296,7 +2404,7 @@ end
 --- Test-only reset: stop all sessions and clear registry state.
 function M._reset()
     for id, session in pairs(registry) do
-        if session.rpc:is_running() then
+        if session.rpc and session.rpc:is_running() then
             session.rpc:stop()
         end
         registry[id] = nil
@@ -2307,6 +2415,8 @@ function M._reset()
     for tab in pairs(tab_session_id) do
         tab_session_id[tab] = nil
     end
+    mirror_shims = {}
+    detached_shim = nil
     next_temp_id = 0
 end
 

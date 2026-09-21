@@ -12,7 +12,8 @@
 --   8. per-tab buffers: two tabs with open panels each show their own list
 --   9. opened_by semantics: auto-opened panel closes on clear, manual keeps
 --  10. session-tab keying: event routed to the session's tab while another
---      tab is focused; auto-open defers to TabEnter; detached (nil tab) skips
+--      tab is focused; auto-open defers to TabEnter; detached (nil session)
+--      writes store under the session, visible in no tab
 
 local Todo = require("pi.todo")
 local Manager = require("pi.sessions.manager")
@@ -306,6 +307,7 @@ check(Todo.current() == nil, "detached session (explicit nil tab) writes no stat
 
 -- Cleanup ------------------------------------------------------------------
 Todo._reset()
+Manager._reset()
 if vim.fn.tabpagenr("$") > 1 then
     vim.cmd("tabclose") -- back to the first tab
 end

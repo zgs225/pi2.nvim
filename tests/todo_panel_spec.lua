@@ -74,6 +74,49 @@ end
 stub_tool_ui()
 local Todo = require("pi.todo")
 local Config = require("pi.config")
+local Manager = require("pi.sessions.manager")
+
+--- Chat-less fake sessions bound to tabs, so the todo panel's per-session
+--- state has a routing session and its viewed-session resolution
+--- (manager.get_for_tab) finds it. Keyed by tab handle: each tab gets its own
+--- session, like the real manager would.
+---@type table<integer, table>
+local bound_sessions = {}
+local next_fake_id = 0
+
+--- The tab's fake session, creating + binding one on first use.
+---@param tab integer
+---@return table
+local function session_for_tab(tab)
+    local session = bound_sessions[tab]
+    if not session then
+        next_fake_id = next_fake_id + 1
+        session = {
+            id = "todo-spec-" .. tostring(next_fake_id),
+            rpc = {
+                is_running = function()
+                    return false
+                end,
+                stop = function() end,
+            },
+            attention = { pending = {} },
+            startup_announcements = {},
+            system_errors = {},
+            cwd = vim.fn.getcwd(),
+            changed_files = {},
+        }
+        Manager._bind_shim_for_test(session, tab)
+        bound_sessions[tab] = session
+    end
+    return session
+end
+
+--- Update the mirror under the current tab's fake session (per-session
+--- keying: direct callers must name the routing session).
+---@param d table?
+local function update(d)
+    Todo.update_from_details(d, session_for_tab(vim.api.nvim_get_current_tabpage()))
+end
 
 --- Build a details payload as the todo_write tool would produce.
 ---@param items { content: string, status: string }[]
@@ -101,6 +144,8 @@ describe("todo panel", function()
     after_each(function()
         pcall(Todo.close)
         Todo._reset()
+        Manager._reset()
+        bound_sessions = {}
         Config.options = saved_options
     end)
 
@@ -110,7 +155,7 @@ describe("todo panel", function()
         end)
 
         it("stores the latest details", function()
-            Todo.update_from_details(details({ { content = "a", status = "pending" } }))
+            update(details({ { content = "a", status = "pending" } }))
             local cur = Todo.current()
             assert.is_truthy(cur)
             assert.are.equal(1, cur.total)
@@ -119,8 +164,8 @@ describe("todo panel", function()
         end)
 
         it("replaces the list on every update (full-replace semantics)", function()
-            Todo.update_from_details(details({ { content = "a", status = "pending" } }))
-            Todo.update_from_details(details({
+            update(details({ { content = "a", status = "pending" } }))
+            update(details({
                 { content = "a", status = "completed" },
                 { content = "b", status = "in_progress" },
             }))
@@ -131,17 +176,17 @@ describe("todo panel", function()
         end)
 
         it("keeps an empty state after a clear (total == 0)", function()
-            Todo.update_from_details(details({ { content = "a", status = "pending" } }))
-            Todo.update_from_details({ todos = {}, completed = 0, total = 0 })
+            update(details({ { content = "a", status = "pending" } }))
+            update({ todos = {}, completed = 0, total = 0 })
             local cur = Todo.current()
             assert.is_truthy(cur)
             assert.are.equal(0, cur.total)
         end)
 
         it("ignores malformed details", function()
-            Todo.update_from_details(nil)
-            Todo.update_from_details({})
-            Todo.update_from_details({ nope = true })
+            update(nil)
+            update({})
+            update({ nope = true })
             assert.is_nil(Todo.current())
         end)
     end)
@@ -197,7 +242,7 @@ describe("todo panel", function()
         end)
 
         it("open when no todos still shows the placeholder (explicit toggle)", function()
-            Todo.update_from_details({ todos = {}, completed = 0, total = 0 })
+            update({ todos = {}, completed = 0, total = 0 })
             Todo.open()
             assert.is_true(Todo.is_open())
             local bufnr = vim.api.nvim_win_get_buf(vim.api.nvim_get_current_win())
@@ -223,7 +268,7 @@ describe("todo panel", function()
 
     describe("rendering", function()
         it("renders header line and todo items from format_lines", function()
-            Todo.update_from_details(details({
+            update(details({
                 { content = "write code", status = "completed" },
                 { content = "run tests", status = "in_progress" },
                 { content = "review", status = "pending" },
@@ -242,7 +287,7 @@ describe("todo panel", function()
 
         it("refresh re-renders after a details update", function()
             Todo.open()
-            Todo.update_from_details(details({ { content = "only item", status = "pending" } }))
+            update(details({ { content = "only item", status = "pending" } }))
             -- update schedules the refresh; pump the event loop.
             vim.wait(200, function()
                 return false
@@ -301,7 +346,7 @@ describe("todo panel", function()
         it("stacks below the sessions window with winfixheight", function()
             local sess = open_fake_sessions()
             local col = vim.fn.winheight(sess)
-            Todo.update_from_details(details({ { content = "a", status = "pending" } }))
+            update(details({ { content = "a", status = "pending" } }))
             Todo.open()
             local todo_win = vim.api.nvim_get_current_win()
             assert.are_not.equal(sess, todo_win)
@@ -319,7 +364,7 @@ describe("todo panel", function()
                 { panel = { auto_open = false, height = 0.25, position = "below", hide_when_empty = true } }
             local sess = open_fake_sessions()
             local col = vim.fn.winheight(sess)
-            Todo.update_from_details(details({ { content = "a", status = "pending" } }))
+            update(details({ { content = "a", status = "pending" } }))
             Todo.open()
             local todo_win = vim.api.nvim_get_current_win()
             assert.are.equal(math.floor(col * 0.25), vim.fn.winheight(todo_win))
@@ -331,7 +376,7 @@ describe("todo panel", function()
             Config.options.todo =
                 { panel = { auto_open = false, height = 6, position = "below", hide_when_empty = true } }
             local sess = open_fake_sessions()
-            Todo.update_from_details(details({ { content = "a", status = "pending" } }))
+            update(details({ { content = "a", status = "pending" } }))
             Todo.open()
             local todo_win = vim.api.nvim_get_current_win()
             assert.are.equal(6, vim.fn.winheight(todo_win))
@@ -341,7 +386,7 @@ describe("todo panel", function()
         it("content taller than the panel does not grow it (scrolls instead)", function()
             local sess = open_fake_sessions()
             local col = vim.fn.winheight(sess)
-            Todo.update_from_details(details({
+            update(details({
                 { content = "a", status = "pending" },
                 { content = "b", status = "pending" },
                 { content = "c", status = "pending" },
@@ -361,7 +406,7 @@ describe("todo panel", function()
             Config.options.todo =
                 { panel = { auto_open = false, height = 0.5, position = "above", hide_when_empty = true } }
             local sess = open_fake_sessions()
-            Todo.update_from_details(details({ { content = "a", status = "pending" } }))
+            update(details({ { content = "a", status = "pending" } }))
             Todo.open()
             local todo_win = vim.api.nvim_get_current_win()
             assert.is_true(vim.fn.win_screenpos(todo_win)[1] < vim.fn.win_screenpos(sess)[1])
@@ -370,7 +415,7 @@ describe("todo panel", function()
         it("refresh re-asserts the stacked height after it is disturbed", function()
             local sess = open_fake_sessions()
             local col = vim.fn.winheight(sess)
-            Todo.update_from_details(details({ { content = "a", status = "pending" } }))
+            update(details({ { content = "a", status = "pending" } }))
             Todo.open()
             local todo_win = vim.api.nvim_get_current_win()
             assert.are.equal(math.floor(col * 0.5), vim.fn.winheight(todo_win))
@@ -387,7 +432,7 @@ describe("todo panel", function()
 
         it("refresh re-asserts the ratio after the sessions window is resized", function()
             local sess = open_fake_sessions()
-            Todo.update_from_details(details({ { content = "a", status = "pending" } }))
+            update(details({ { content = "a", status = "pending" } }))
             Todo.open()
             local todo_win = vim.api.nvim_get_current_win()
             -- Manual resize of the sessions window redistributes the column.
@@ -403,14 +448,14 @@ describe("todo panel", function()
 
     describe("per-tab buffers", function()
         it("two tabs with open panels each show their own list (no cross-talk)", function()
-            Todo.update_from_details(details({ { content = "tab one", status = "pending" } }))
+            update(details({ { content = "tab one", status = "pending" } }))
             Todo.open()
             local tab1 = vim.api.nvim_get_current_tabpage()
             local win1 = vim.api.nvim_get_current_win()
             local buf1 = vim.api.nvim_win_get_buf(win1)
 
             vim.cmd("tabnew")
-            Todo.update_from_details(details({ { content = "tab two", status = "pending" } }))
+            update(details({ { content = "tab two", status = "pending" } }))
             Todo.open()
             local tab2 = vim.api.nvim_get_current_tabpage()
             local win2 = vim.api.nvim_get_current_win()
@@ -435,13 +480,13 @@ describe("todo panel", function()
         end)
 
         it("refresh on one tab does not clobber the other tab's buffer", function()
-            Todo.update_from_details(details({ { content = "alpha", status = "pending" } }))
+            update(details({ { content = "alpha", status = "pending" } }))
             Todo.open()
             local tab1 = vim.api.nvim_get_current_tabpage()
             local buf1 = vim.api.nvim_win_get_buf(vim.api.nvim_get_current_win())
 
             vim.cmd("tabnew")
-            Todo.update_from_details(details({ { content = "beta", status = "in_progress" } }))
+            update(details({ { content = "beta", status = "in_progress" } }))
             Todo.open()
             local buf2 = vim.api.nvim_win_get_buf(vim.api.nvim_get_current_win())
             -- Refresh scheduled by tab 2's update must not rewrite buf1.
@@ -466,7 +511,7 @@ describe("todo panel", function()
         it("auto_open transition marks the panel auto", function()
             Config.options.todo =
                 { panel = { auto_open = true, height = 0.5, position = "below", hide_when_empty = true } }
-            Todo.update_from_details(details({ { content = "first", status = "pending" } }))
+            update(details({ { content = "first", status = "pending" } }))
             vim.wait(300, function()
                 return Todo.is_open()
             end)
@@ -476,12 +521,12 @@ describe("todo panel", function()
         it("auto-opened panel closes when the list clears (hide_when_empty)", function()
             Config.options.todo =
                 { panel = { auto_open = true, height = 0.5, position = "below", hide_when_empty = true } }
-            Todo.update_from_details(details({ { content = "first", status = "pending" } }))
+            update(details({ { content = "first", status = "pending" } }))
             vim.wait(300, function()
                 return Todo.is_open()
             end)
             assert.is_true(Todo.is_open())
-            Todo.update_from_details({ todos = {}, completed = 0, total = 0 })
+            update({ todos = {}, completed = 0, total = 0 })
             vim.wait(300, function()
                 return not Todo.is_open()
             end)
@@ -492,11 +537,11 @@ describe("todo panel", function()
         it("auto-opened panel stays when hide_when_empty=false", function()
             Config.options.todo =
                 { panel = { auto_open = true, height = 0.5, position = "below", hide_when_empty = false } }
-            Todo.update_from_details(details({ { content = "first", status = "pending" } }))
+            update(details({ { content = "first", status = "pending" } }))
             vim.wait(300, function()
                 return Todo.is_open()
             end)
-            Todo.update_from_details({ todos = {}, completed = 0, total = 0 })
+            update({ todos = {}, completed = 0, total = 0 })
             vim.wait(300, function()
                 return false
             end)
@@ -510,7 +555,7 @@ describe("todo panel", function()
         it("open with hide_when_empty=false keeps the empty panel usable", function()
             Config.options.todo =
                 { panel = { auto_open = false, height = 0.5, position = "below", hide_when_empty = false } }
-            Todo.update_from_details({ todos = {}, completed = 0, total = 0 })
+            update({ todos = {}, completed = 0, total = 0 })
             Todo.open()
             assert.is_true(Todo.is_open())
         end)
@@ -518,10 +563,10 @@ describe("todo panel", function()
         it("default hide_when_empty=true hides the panel on clear", function()
             Config.options.todo =
                 { panel = { auto_open = false, height = 0.5, position = "below", hide_when_empty = true } }
-            Todo.update_from_details(details({ { content = "a", status = "pending" } }))
+            update(details({ { content = "a", status = "pending" } }))
             Todo.open()
             assert.is_true(Todo.is_open())
-            Todo.update_from_details({ todos = {}, completed = 0, total = 0 })
+            update({ todos = {}, completed = 0, total = 0 })
             vim.wait(200, function()
                 return false
             end)
@@ -536,7 +581,7 @@ describe("todo panel", function()
         it("auto_open=true opens the panel on empty to non-empty transition", function()
             Config.options.todo =
                 { panel = { auto_open = true, height = 0.5, position = "below", hide_when_empty = true } }
-            Todo.update_from_details(details({ { content = "first", status = "pending" } }))
+            update(details({ { content = "first", status = "pending" } }))
             vim.wait(300, function()
                 return Todo.is_open()
             end)
@@ -544,7 +589,7 @@ describe("todo panel", function()
         end)
 
         it("auto_open=false (default) keeps the panel closed", function()
-            Todo.update_from_details(details({ { content = "first", status = "pending" } }))
+            update(details({ { content = "first", status = "pending" } }))
             vim.wait(200, function()
                 return false
             end)
@@ -554,12 +599,12 @@ describe("todo panel", function()
         it("does not re-trigger auto_open on later updates", function()
             Config.options.todo =
                 { panel = { auto_open = true, height = 0.5, position = "below", hide_when_empty = true } }
-            Todo.update_from_details(details({ { content = "a", status = "pending" } }))
+            update(details({ { content = "a", status = "pending" } }))
             vim.wait(300, function()
                 return Todo.is_open()
             end)
             Todo.close()
-            Todo.update_from_details(details({ { content = "a", status = "completed" } }))
+            update(details({ { content = "a", status = "completed" } }))
             vim.wait(200, function()
                 return false
             end)
