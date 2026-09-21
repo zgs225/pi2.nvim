@@ -387,11 +387,18 @@ end
 --- re-renders itself). Lazy requires keep the todo modules out of the hot
 --- path for every other tool and avoid load-order/circular issues. A failing
 --- hook must never break event routing.
+---
+--- The mirror is keyed to the tab that OWNS the session, not the tab the
+--- keyboard focus happens to be on: RPC events are processed while any tab
+--- may be focused, so keying to nvim_get_current_tabpage() would store the
+--- list under (and auto-open the panel in) a session-less tab.
+---@param session pi.Session? session the event belongs to; nil only from the
+---   test hook (M._update_todo_mirror), which then keys to the current tab
 ---@param tool_name string?
 ---@param result any tool result message (details are read off result.details
 --- or off result itself for replayed toolResult messages, which carry details
 --- at the top level)
-local function update_todo_mirror(tool_name, result)
+local function update_todo_mirror(session, tool_name, result)
     if type(tool_name) ~= "string" then
         return
     end
@@ -402,7 +409,19 @@ local function update_todo_mirror(tool_name, result)
         end
         local details = ToolUi.result_details(result)
         if details then
-            require("pi.todo").update_from_details(details)
+            local tab
+            if session then
+                tab = session.attached_tab or session.tab
+                -- Detached session (owns no tab): skip. Deliberately NOT falling
+                -- back to the current tab here — that fallback is exactly the
+                -- focus-keying bug this guard prevents.
+                if tab == nil then
+                    return
+                end
+            end
+            -- `tab` is nil only when `session` is nil (test hook without a
+            -- tab); update_from_details then defaults to the current tab.
+            require("pi.todo").update_from_details(details, tab)
         end
     end)
     if not ok then
@@ -723,7 +742,7 @@ function M.handle_event(session, msg)
                 require("pi.quickfix").on_tool_end(msg.toolName, msg.toolCallId, msg.result, msg.isError)
             end)
         end
-        update_todo_mirror(msg.toolName, msg.result)
+        update_todo_mirror(session, msg.toolName, msg.result)
         if session._pending_file_change_args and not msg.isError then
             local args = session._pending_file_change_args[msg.toolCallId]
             track_changed_file(session, args)
@@ -1500,7 +1519,7 @@ local function replay_messages(session, messages)
             local is_error = msg.isError == true
             -- msg itself has .content, matching what on_tool_end expects as result
             session.chat:on_tool_end(tool_name, tool_call_id, msg, is_error)
-            update_todo_mirror(tool_name, msg)
+            update_todo_mirror(session, tool_name, msg)
             -- Track files changed by edit/write tools during replay.
             local tc_args = not is_error and tool_call_args[tool_call_id]
             if tc_args then
@@ -2240,12 +2259,38 @@ function M._register_for_test(session)
     registry[session.id] = session
 end
 
+--- Test-hook shim: a minimal session-like table carrying exactly the tab
+--- fields update_todo_mirror reads (a real pi.Session satisfies the same
+--- contract). Typed as `any` so the partial table does not trip the
+--- missing-fields check against the full pi.Session class.
+---@param tab? pi.TabId
+---@return any
+local function mirror_session_shim(tab)
+    return { attached_tab = tab, tab = tab }
+end
+
 --- Test-only hook for the todo-panel mirror (tests/todo_panel_e2e.lua): route
 --- a tool result through the same guarded path the event handlers use.
----@param tool_name string?
----@param result any
-function M._update_todo_mirror(tool_name, result)
-    update_todo_mirror(tool_name, result)
+---
+--- Variadic so callers can distinguish an absent tab from an explicit nil
+--- (impossible with named parameters, where absent and nil are identical):
+---   M._update_todo_mirror(tool, result)       — legacy: keyed to the current
+---     tab, exactly like the pre-fix hook (existing callers/tests).
+---   M._update_todo_mirror(tool, result, nil)  — detached session: the update
+---     is skipped, with no current-tab fallback.
+---   M._update_todo_mirror(tool, result, tab)  — keyed to that tab.
+---
+--- tool_name: string? — tool name, gated through ToolUi.is_todo_tool.
+--- result: any — tool result message (details read off result.details, or off
+---   the result itself for replayed toolResult messages).
+--- tab: pi.TabId? — session tab; see the resolution table above.
+function M._update_todo_mirror(...)
+    local tool_name, result, tab = ... ---@type string?, any, pi.TabId?
+    local session ---@type pi.Session?
+    if select("#", ...) >= 3 then
+        session = mirror_session_shim(tab)
+    end
+    update_todo_mirror(session, tool_name, result)
 end
 
 --- Test-only reset: stop all sessions and clear registry state.

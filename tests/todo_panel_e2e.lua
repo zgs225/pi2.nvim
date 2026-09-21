@@ -11,6 +11,8 @@
 --   7. replay-style toolResult + non-todo tool gating
 --   8. per-tab buffers: two tabs with open panels each show their own list
 --   9. opened_by semantics: auto-opened panel closes on clear, manual keeps
+--  10. session-tab keying: event routed to the session's tab while another
+--      tab is focused; auto-open defers to TabEnter; detached (nil tab) skips
 
 local Todo = require("pi.todo")
 local Manager = require("pi.sessions.manager")
@@ -267,6 +269,40 @@ Manager._update_todo_mirror("todo_write", { details = { todos = {}, completed = 
 pump()
 check(Todo.win(tab2) == nil, "auto panel closed after clear")
 check(Todo._opened_by() == nil, "opened_by cleared with the auto panel")
+
+-- 10. Session-tab keying: event for tab 1 routed while tab 2 is focused ------
+Todo._reset()
+tab1 = vim.api.nvim_get_current_tabpage()
+vim.cmd("tabnew")
+tab2 = vim.api.nvim_get_current_tabpage()
+-- The keyboard focus is on session-less tab 2, but the session lives in tab 1:
+-- the mirror is keyed to tab 1 and the auto-open defers to TabEnter.
+Manager._update_todo_mirror(
+    "todo_write",
+    { details = { todos = { { content = "session tab item", status = "pending" } }, completed = 0, total = 1 } },
+    tab1
+)
+pump()
+check(Todo.win(tab2) == nil, "session-less focused tab captured no panel")
+check(Todo.current() == nil, "session-less focused tab captured no state")
+check(Todo.win(tab1) == nil, "background session tab has no panel yet (auto-open deferred)")
+vim.api.nvim_set_current_tabpage(tab1)
+local win_deferred = Todo.win(tab1)
+check(win_deferred ~= nil, "entering the session tab consumes the deferred auto-open")
+eq("auto", Todo._opened_by(), "deferred auto-open marks the panel auto")
+eq(
+    "  Todo · 0/1 completed",
+    vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(win_deferred), 0, -1, false)[2],
+    "session tab panel shows the session's todos"
+)
+-- Detached session (explicit nil third argument): update skipped, no state.
+vim.api.nvim_set_current_tabpage(tab2)
+Manager._update_todo_mirror(
+    "todo_write",
+    { details = { todos = { { content = "detached item", status = "pending" } }, completed = 0, total = 1 } },
+    nil
+)
+check(Todo.current() == nil, "detached session (explicit nil tab) writes no state")
 
 -- Cleanup ------------------------------------------------------------------
 Todo._reset()

@@ -5,6 +5,16 @@
 --- a todo tool through update_from_details(), which stores the latest
 --- { todos, completed, total } snapshot and re-renders any open panel window.
 ---
+--- The mirror is keyed to the tab that OWNS the session (its attached tab),
+--- not the tab the keyboard focus happens to be on: RPC events are processed
+--- while any tab may be focused. Callers pass the session's tab explicitly;
+--- direct/legacy callers omit it and get the current tab. Auto-open on the
+--- empty→non-empty transition is per-tab too: a panel window can only be
+--- created in the CURRENT tab (a split in another tabpage would steal focus),
+--- so when the event arrives while the session's tab is in the background the
+--- pending marker stays set and the TabEnter autocmd below opens the panel as
+--- soon as the user enters that tab.
+---
 --- Window layout mirrors pi.ui.sessions: one window per tab in `wins[tab]`.
 --- Unlike the sessions list (whose rows are global, so one shared buffer
 --- serves every window), todo state is per-tab: each tab gets its own scratch
@@ -71,9 +81,11 @@ local opened_by = {}
 --- Non-nil while a scheduled refresh is pending.
 local refresh_scheduled = false
 
---- Set when an empty→non-empty transition should auto-open the panel; consumed
---- (and cleared) by the scheduled refresh below.
-local auto_open_pending = false
+--- Set per tab when an empty→non-empty transition should auto-open that tab's
+--- panel. Consumed by the scheduled refresh when the tab is also the current
+--- tab, or by the TabEnter autocmd below once the user enters the tab.
+---@type table<pi.TabId, boolean>
+local auto_open_pending = {}
 
 ---@return pi.TabId
 local function current_tab()
@@ -426,21 +438,28 @@ end
 
 --- Update the mirror from parsed tool-result details and refresh/open panels.
 --- Called from sessions/manager.lua on tool_execution_end (live and replay)
---- for todo tools. Safe to call from an RPC callback: UI work is scheduled.
+--- for todo tools, keyed to the tab that owns the session. Safe to call from
+--- an RPC callback: UI work is scheduled.
 ---
 --- Transitions:
 ---   - non-empty details: store + refresh open panels; on empty→non-empty with
----     todo.panel.auto_open, open the panel in the tab (opened_by = "auto").
+---     todo.panel.auto_open, open the panel in `tab` (opened_by = "auto") —
+---     immediately when `tab` is also the current tab, otherwise deferred to
+---     the TabEnter autocmd (a split window cannot be created in a
+---     non-current tabpage without stealing focus).
 ---   - total == 0 (cleared): store the empty state. Auto-opened panels then
 ---     close on the next refresh (when hide_when_empty is true); panels the
 ---     user opened explicitly stay open and show a one-line "no todos"
 ---     placeholder instead of an empty list.
 ---@param details pi.TodoDetails
-function M.update_from_details(details)
+---@param tab? pi.TabId tab the details belong to (the session's attached tab
+---   when routed through sessions/manager.lua); nil defaults to the current
+---   tab (single-tab behavior for direct/legacy callers)
+function M.update_from_details(details, tab)
     if type(details) ~= "table" or type(details.todos) ~= "table" then
         return
     end
-    local tab = current_tab()
+    tab = tab or current_tab()
     local was_empty = not has_todos(state[tab])
     state[tab] = {
         todos = details.todos,
@@ -448,7 +467,7 @@ function M.update_from_details(details)
         total = tonumber(details.total) or #details.todos,
     }
     if was_empty and has_todos(state[tab]) and panel_config().auto_open then
-        auto_open_pending = true
+        auto_open_pending[tab] = true
     end
     if refresh_scheduled then
         return
@@ -457,10 +476,13 @@ function M.update_from_details(details)
     vim.schedule(function()
         refresh_scheduled = false
         -- Consume an auto_open transition even though the details arrived from
-        -- an RPC callback (update_from_details itself is a fast event).
-        if auto_open_pending then
-            auto_open_pending = false
-            if not M.win(current_tab()) then
+        -- an RPC callback (update_from_details itself is a fast event). Only
+        -- when the owning tab is also the current tab, though: a split window
+        -- cannot be created in a non-current tabpage without stealing focus, so
+        -- a background tab keeps its marker pending for the TabEnter autocmd.
+        if auto_open_pending[tab] and tab == current_tab() then
+            auto_open_pending[tab] = nil
+            if not M.win(tab) then
                 M.open("auto")
             end
         end
@@ -497,7 +519,49 @@ function M._reset()
     state = {}
     opened_by = {}
     refresh_scheduled = false
-    auto_open_pending = false
+    auto_open_pending = {}
 end
+
+--- Autocmd group for the per-tab auto-open bookkeeping. Created at module
+--- load; clear = true makes a re-require (tests drop package.loaded) replace
+--- the previous group's autocmds instead of stacking duplicates.
+local augroup = vim.api.nvim_create_augroup("pi-todo-panel", { clear = true })
+
+--- Deferred auto-open: entering a tab consumes its pending auto_open marker.
+--- The marker is only left pending when the event arrived while the tab was
+--- in the background (the scheduled refresh cannot open a split there), so
+--- the panel opens exactly here, with the tab as the current one.
+vim.api.nvim_create_autocmd("TabEnter", {
+    group = augroup,
+    callback = function()
+        local tab = current_tab()
+        if not auto_open_pending[tab] then
+            return
+        end
+        auto_open_pending[tab] = nil
+        if M.win(tab) or not panel_config().auto_open then
+            return
+        end
+        M.open("auto")
+    end,
+})
+
+--- TabClosed reports the closed tab's NUMBER, not its handle (the key used
+--- here), so prune pending markers whose handle is no longer alive. Only the
+--- pending markers are cleaned up here — full per-tab state cleanup is not.
+vim.api.nvim_create_autocmd("TabClosed", {
+    group = augroup,
+    callback = function()
+        local alive = {}
+        for _, t in ipairs(vim.api.nvim_list_tabpages()) do
+            alive[t] = true
+        end
+        for t in pairs(auto_open_pending) do
+            if not alive[t] then
+                auto_open_pending[t] = nil
+            end
+        end
+    end,
+})
 
 return M
