@@ -190,7 +190,8 @@ describe("todo panel", function()
             assert.is_true(Todo.is_open())
             local bufnr = vim.api.nvim_win_get_buf(vim.api.nvim_get_current_win())
             local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
-            assert.are.equal("no todos", lines[1])
+            assert.are.equal("", lines[1])
+            assert.are.equal("  no todos", lines[2])
         end)
 
         it("close is a safe no-op when nothing is open", function()
@@ -218,10 +219,13 @@ describe("todo panel", function()
             Todo.open()
             local bufnr = vim.api.nvim_win_get_buf(vim.api.nvim_get_current_win())
             local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
-            assert.are.equal("1/3", lines[1])
-            assert.are.equal("✓ write code", lines[2])
-            assert.are.equal("◐ run tests", lines[3])
-            assert.are.equal("○ review", lines[4])
+            -- DESIGN.md padding: blank spacer, calm header, blank, indented rows.
+            assert.are.equal("", lines[1])
+            assert.are.equal("  Todo · 1/3 completed", lines[2])
+            assert.are.equal("", lines[3])
+            assert.are.equal("  ✓ write code", lines[4])
+            assert.are.equal("  ◐ run tests", lines[5])
+            assert.are.equal("  ○ review", lines[6])
         end)
 
         it("refresh re-renders after a details update", function()
@@ -233,8 +237,8 @@ describe("todo panel", function()
             end)
             local bufnr = vim.api.nvim_win_get_buf(vim.api.nvim_get_current_win())
             local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
-            assert.are.equal("0/1", lines[1])
-            assert.are.equal("○ only item", lines[2])
+            assert.are.equal("  Todo · 0/1 completed", lines[2])
+            assert.are.equal("  ○ only item", lines[4])
         end)
     end)
 
@@ -250,7 +254,8 @@ describe("todo panel", function()
             vim.cmd("topleft 10split")
             local b = vim.api.nvim_create_buf(false, true)
             vim.api.nvim_win_set_buf(0, b)
-            vim.wo.winfixheight = true
+            -- The real :PiSessions left/right column fixes WIDTH only; the
+            -- todo split's height must survive without a fixed neighbor.
             fake_sess_win = vim.api.nvim_get_current_win()
             -- Point pi.ui.sessions at a fake exposing the same M.win(tab)
             -- accessor the panel uses to find the sidebar column.
@@ -282,8 +287,10 @@ describe("todo panel", function()
             local todo_win = vim.api.nvim_get_current_win()
             assert.are_not.equal(sess, todo_win)
             assert.is_true(vim.wo[todo_win].winfixheight)
-            -- The sessions window keeps its configured height.
-            assert.are.equal(10, vim.fn.winheight(sess))
+            -- RIGHT AFTER open the panel must be at min(lines, max height):
+            -- spacer + header + blank + 1 item = 4 lines. Catches the
+            -- 'equalalways' 50/50 collapse regression.
+            assert.are.equal(4, vim.fn.winheight(todo_win))
             -- The todo panel sits below the sessions window.
             assert.is_true(vim.fn.win_screenpos(sess)[1] < vim.fn.win_screenpos(todo_win)[1])
         end)
@@ -296,6 +303,22 @@ describe("todo panel", function()
             Todo.open()
             local todo_win = vim.api.nvim_get_current_win()
             assert.is_true(vim.fn.win_screenpos(todo_win)[1] < vim.fn.win_screenpos(sess)[1])
+        end)
+
+        it("refresh re-asserts the stacked height after it is disturbed", function()
+            local sess = open_fake_sessions()
+            Todo.update_from_details(details({ { content = "a", status = "pending" } }))
+            Todo.open()
+            local todo_win = vim.api.nvim_get_current_win()
+            assert.are.equal(4, vim.fn.winheight(todo_win))
+            -- Simulate layout churn: grow the panel beyond its target.
+            pcall(vim.api.nvim_win_set_height, todo_win, 12)
+            assert.are.equal(12, vim.fn.winheight(todo_win))
+            local sess_disturbed = vim.fn.winheight(sess)
+            Todo.refresh()
+            assert.are.equal(4, vim.fn.winheight(todo_win))
+            -- The remainder returns to the neighbor unchanged.
+            assert.are.equal(sess_disturbed, vim.fn.winheight(sess))
         end)
     end)
 
@@ -317,14 +340,14 @@ describe("todo panel", function()
             -- Distinct buffers, each showing its own tab's list.
             assert.are_not.equal(buf1, buf2)
             local lines2 = vim.api.nvim_buf_get_lines(buf2, 0, -1, false)
-            assert.are.equal("0/1", lines2[1])
-            assert.are.equal("○ tab two", lines2[2])
+            assert.are.equal("  Todo · 0/1 completed", lines2[2])
+            assert.are.equal("  ○ tab two", lines2[4])
 
             -- Back on tab 1: its panel buffer still shows tab one's list.
             vim.api.nvim_set_current_tabpage(tab1)
             local lines1 = vim.api.nvim_buf_get_lines(buf1, 0, -1, false)
-            assert.are.equal("0/1", lines1[1])
-            assert.are.equal("○ tab one", lines1[2])
+            assert.are.equal("  Todo · 0/1 completed", lines1[2])
+            assert.are.equal("  ○ tab one", lines1[4])
 
             -- Cleanup: drop both panels, then close the extra tab.
             Todo._reset()
@@ -348,7 +371,7 @@ describe("todo panel", function()
             end)
             vim.api.nvim_set_current_tabpage(tab1)
             local lines1 = vim.api.nvim_buf_get_lines(buf1, 0, -1, false)
-            assert.are.equal("○ alpha", lines1[2])
+            assert.are.equal("  ○ alpha", lines1[4])
 
             Todo._reset()
             vim.cmd("tabclose")
@@ -400,7 +423,7 @@ describe("todo panel", function()
             end)
             assert.is_true(Todo.is_open())
             local bufnr = vim.api.nvim_win_get_buf(vim.api.nvim_get_current_win())
-            assert.are.equal("no todos", vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)[1])
+            assert.are.equal("  no todos", vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)[2])
         end)
     end)
 
@@ -426,7 +449,7 @@ describe("todo panel", function()
             -- Panel window remains (explicitly opened), but content shows the placeholder.
             local bufnr = vim.api.nvim_win_get_buf(vim.api.nvim_get_current_win())
             local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
-            assert.are.equal("no todos", lines[1])
+            assert.are.equal("  no todos", lines[2])
         end)
     end)
 

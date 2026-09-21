@@ -79,8 +79,13 @@ check(vim.wo[win].winfixwidth == true, "standalone window is winfixwidth")
 check(vim.wo[win].winfixheight == false, "standalone window is not winfixheight")
 local bufnr = vim.api.nvim_win_get_buf(win)
 local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
-check(#lines >= 4, "panel buffer has header + 3 items")
-check(lines[2]:find("write module", 1, true) ~= nil, "panel shows item content")
+-- DESIGN.md padding: blank spacer, calm header, blank, then indented rows.
+check(#lines == 6, "panel renders spacer + header + blank + 3 items (got " .. #lines .. ")")
+eq(
+    { "", "  Todo · 1/3 completed", "", "  ✓ write module", "  ◐ write tests", "  ○ review" },
+    lines,
+    "standalone panel renders the padded layout"
+)
 -- auto_open was consumed by the transition above; this open() is explicit.
 Todo.close()
 check(not Todo.is_open(), "close removes the panel")
@@ -91,6 +96,9 @@ check(not Todo.is_open(), "close removes the panel")
 SessionList.open()
 local sess_win = SessionList.win(vim.api.nvim_get_current_tabpage())
 check(sess_win ~= nil, "sessions list window registered")
+-- The real sessions left/right column fixes width only; the todo split's
+-- height must survive without a fixed-height neighbor.
+check(vim.wo[sess_win].winfixheight == false, "sessions column has no winfixheight (mimics real layout)")
 Manager._update_todo_mirror("todo_write", live_result)
 pump()
 -- auto_open fired on the mirror transition? The state was already non-empty,
@@ -99,9 +107,12 @@ Todo.open()
 local todo_win = vim.api.nvim_get_current_win()
 check(todo_win ~= sess_win, "todo window differs from sessions window")
 check(vim.wo[todo_win].winfixheight == true, "stacked todo window is winfixheight")
--- The todo split is height-pinned: winfixheight + height = content lines
--- bounded by the configured max (4 rendered lines here, max 10).
-check(vim.fn.winheight(todo_win) == 4, "stacked todo window height equals its content height")
+-- RIGHT AFTER open: spacer + header + blank + 3 items = 6 lines, max 10.
+-- Catches the 'equalalways' 50/50 collapse regression.
+check(
+    vim.fn.winheight(todo_win) == 6,
+    "stacked todo window height right after open (got " .. vim.fn.winheight(todo_win) .. ")"
+)
 check(vim.fn.win_screenpos(sess_win)[1] < vim.fn.win_screenpos(todo_win)[1], "todo panel is below the sessions window")
 check(vim.wo[todo_win].winfixwidth == true, "stacked todo window also fixes the column width")
 
@@ -121,13 +132,20 @@ Manager._update_todo_mirror("todo_write", v2)
 pump()
 local buf2 = vim.api.nvim_win_get_buf(todo_win)
 local lines2 = vim.api.nvim_buf_get_lines(buf2, 0, -1, false)
-eq("2/3 completed", lines2[1], "refresh renders the new progress header")
+eq("  Todo · 2/3 completed", lines2[2], "refresh renders the new progress header")
+-- refresh re-asserts the pinned height even after layout churn.
+vim.api.nvim_win_set_height(todo_win, 14)
+Todo.refresh()
+check(
+    vim.fn.winheight(todo_win) == 6,
+    "refresh re-asserts the stacked height (got " .. vim.fn.winheight(todo_win) .. ")"
+)
 
 -- 5. Clear + hide_when_empty: explicit panel keeps a placeholder -----------
 Manager._update_todo_mirror("todo_write", { details = { todos = {}, completed = 0, total = 0 } })
 pump()
 local lines3 = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(todo_win), 0, -1, false)
-eq({ "no todos" }, lines3, "explicit panel shows the no-todos placeholder after clear")
+eq({ "", "  no todos" }, lines3, "explicit panel shows the padded no-todos placeholder after clear")
 Todo.close()
 
 -- 6. Replay-style result (details at top level) ----------------------------
@@ -173,14 +191,14 @@ local win_b = Todo.win(tab2)
 check(win_b ~= nil and win_b ~= win_a, "tab 2 panel auto-opened independently")
 local buf_b = vim.api.nvim_win_get_buf(win_b)
 check(buf_b ~= buf_a, "each tab's panel has its own buffer")
-eq("0/1 completed", vim.api.nvim_buf_get_lines(buf_b, 0, -1, false)[1], "tab 2 panel shows its own header")
-eq({ "◐ tab two item" }, { vim.api.nvim_buf_get_lines(buf_b, 0, -1, false)[2] }, "tab 2 panel shows its own item")
+eq("  Todo · 0/1 completed", vim.api.nvim_buf_get_lines(buf_b, 0, -1, false)[2], "tab 2 panel shows its own header")
+eq({ "  ◐ tab two item" }, { vim.api.nvim_buf_get_lines(buf_b, 0, -1, false)[4] }, "tab 2 panel shows its own item")
 
 -- Back on tab 1: its buffer still shows tab one's list (no cross-talk).
 vim.api.nvim_set_current_tabpage(tab1)
 pump(200)
 eq(
-    { "0/1 completed", "○ tab one item" },
+    { "", "  Todo · 0/1 completed", "", "  ○ tab one item" },
     vim.api.nvim_buf_get_lines(buf_a, 0, -1, false),
     "tab 1 panel unaffected by tab 2 refresh"
 )
@@ -194,7 +212,7 @@ Manager._update_todo_mirror("todo_write", { details = { todos = {}, completed = 
 pump()
 check(Todo.is_open(), "manual panel stays open after clear")
 eq(
-    { "no todos" },
+    { "", "  no todos" },
     vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(Todo.win(tab1)), 0, -1, false),
     "manual panel placeholder after clear"
 )

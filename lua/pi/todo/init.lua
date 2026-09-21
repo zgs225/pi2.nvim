@@ -95,11 +95,22 @@ local function has_todos(details)
     return details ~= nil and details.total ~= nil and details.total > 0 and type(details.todos) == "table"
 end
 
---- Content lines of the panel for the current state: header + formatted list.
---- Returns nil when the panel should render nothing. An empty list renders a
---- one-line "no todos" placeholder only for manually-opened panels (or when
---- hide_when_empty is false); auto-opened panels are closed by refresh()
---- instead of showing an empty list.
+--- Content lines of the panel for the current state, with the DESIGN.md
+--- "whitespace over lines" treatment applied:
+---
+---   line 1: blank spacer — breathing room between the sessions list and the
+---           todo panel (stacked layout reads as one column; without it the
+---           todo list collides with the sessions list above)
+---   line 2: calm header — 2-space indent + title + progress count
+---   line 3: blank — breathing room between header and list
+---   line 4+: one line per todo, consistently 2-space indented
+---
+--- The empty-list placeholder follows the same shape (spacer + indented
+--- "no todos"). The returned list is the FINAL render: every height
+--- computation consumes its length, so padding is never clipped.
+--- Returns nil when the panel should render nothing. An empty list renders
+--- the placeholder only for manually-opened panels (or when hide_when_empty
+--- is false); auto-opened panels are closed by refresh() instead.
 ---@param tab pi.TabId
 ---@return string[]?
 local function panel_lines(tab)
@@ -109,7 +120,7 @@ local function panel_lines(tab)
         if cfg.hide_when_empty and opened_by[tab] ~= "manual" then
             return nil
         end
-        return { "no todos" }
+        return { "", "  no todos" }
     end
     -- pi.todo.tool_ui is developed in a separate change; degrade gracefully
     -- (plain list) instead of erroring while it is absent or broken.
@@ -127,12 +138,18 @@ local function panel_lines(tab)
             lines[#lines + 1] = t.content
         end
     end
-    local out = {}
-    for _, line in ipairs(lines) do
-        out[#out + 1] = tostring(line)
+    -- format_lines leads with its own progress header; the panel replaces it
+    -- with the calmer "Todo · <progress>" title line and keeps the rows.
+    local progress = tostring(details.completed or 0) .. "/" .. tostring(details.total or #details.todos)
+    local p_ok, text = pcall(function()
+        return require("pi.todo.tool_ui").progress_text(details)
+    end)
+    if p_ok and type(text) == "string" and text ~= "" then
+        progress = text
     end
-    if #out == 0 then
-        return nil
+    local out = { "", "  Todo · " .. progress, "" }
+    for i = 2, #lines do
+        out[#out + 1] = "  " .. tostring(lines[i])
     end
     return out
 end
@@ -257,6 +274,11 @@ local function open_stacked(tab, lines, b)
     local win = vim.api.nvim_get_current_win()
     pcall(vim.api.nvim_win_set_buf, win, b)
     set_win_opts(win, true)
+    -- The :split count is not sticky: 'equalalways' (on by default) equalizes
+    -- the column whenever the layout is (re)processed before winfixheight is
+    -- consulted, collapsing the column to 50/50. After pinning winfixheight,
+    -- re-assert the target height explicitly.
+    pcall(vim.api.nvim_win_set_height, win, height)
     return win
 end
 
@@ -368,7 +390,12 @@ function M.refresh()
                 close_for_tab(tab)
             else
                 render_buf(tab)
-                -- Shrink/grow the stacked split to the current content height.
+                -- Stacked windows: re-assert the pinned height after EVERY
+                -- render. The :split count is not sticky ('equalalways' can
+                -- re-equalize the column; a neighbor resize can redistribute
+                -- it), so the height must be re-applied each time, not only
+                -- when the line count changed. Standalone columns stay
+                -- full-height — no height is forced there.
                 if sessions_win(tab) then
                     local lines = panel_lines(tab)
                     if lines then
