@@ -373,11 +373,19 @@ function Rpc:start(opts)
     -- new process' :PiSelectModel fallback.
     local scope_path = require("pi.scoped_models").state_path(self._tab)
     os.remove(scope_path)
+    -- The todo extension reads its options (enabled / remind_after_turns /
+    -- max_items) from PI_NVIM_TODO_FILE. Republish here so a process spawned
+    -- before any setup() call still sees the resolved defaults; config.setup
+    -- republishes on every live setup() call, and the extension re-reads the
+    -- file on every context event, so option changes apply without respawning
+    -- the RPC process (same rationale as the title file).
+    require("pi.todo.tool_ui").publish(Config.options.todo)
     self._job_id = vim.fn.jobstart(cmd, {
         env = {
             PI_NVIM_VISION_FILE = require("pi.vision").state_path(),
             PI_NVIM_TITLE_FILE = require("pi.title").state_path(),
             PI_NVIM_SCOPE_FILE = scope_path,
+            PI_NVIM_TODO_FILE = require("pi.todo.tool_ui").state_path(),
         },
         on_stdout = function(_, data)
             self:_on_stdout(data)

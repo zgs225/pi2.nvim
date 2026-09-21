@@ -264,6 +264,7 @@ require("pi").setup({
 | `:PiSubParent` | Return from a child sub-session view to the parent session |
 | `:PiSubClose` | Close the current sub-session's RPC process (session file retained) |
 | `:PiSubView` | View a child sub-session in a read-only float viewer with real-time streaming |
+| `:PiTodo` | Toggle the todo side panel: the current session's `todo_write` checklist (see [doc/usage.md](doc/usage.md#todo-list)) |
 | `:PiDiff` | Review the git diff of every file changed by the current session in one panel: file list + diff, grouped per git work tree |
 | `:PiToggleStartupDetails` | Toggle the startup block between compact and expanded |
 | `:PiToggleThinking` | Show or hide thinking blocks |
@@ -288,7 +289,7 @@ Detailed guides live in [`doc/`](doc/):
 
 | Doc | What's inside |
 | --- | --- |
-| [doc/usage.md](doc/usage.md) | Chat & layouts, prompt (submit/queue/abort), direct bash mode (`!`), prompt history & drafts, `@mentions`, slash commands, completion, attachments, zen mode, statusline, navigation, quickfix, tool blocks, models, thinking, markdown rendering, buffer reload, startup block |
+| [doc/usage.md](doc/usage.md) | Chat & layouts, prompt (submit/queue/abort), direct bash mode (`!`), prompt history & drafts, `@mentions`, slash commands, completion, attachments, zen mode, statusline, navigation, quickfix, tool blocks, todo list, models, thinking, markdown rendering, buffer reload, startup block |
 | [doc/sessions.md](doc/sessions.md) | One session per tab, storage & cwd scoping, continue/resume, sub-sessions (`:PiSub*`), session tree (`:PiTree`), fork/clone (`:PiFork`/`:PiClone`), sessions overview (`:PiSessions`), compaction |
 | [doc/diff-review.md](doc/diff-review.md) | Two-way diff review of agent edits, review notes, permission-extension protocol reference, session diff review (`:PiDiff`) |
 | [doc/attention.md](doc/attention.md) | Attention queue, dialogs, notifications, queue inspection API |
@@ -323,6 +324,7 @@ Everything below is present in `pi2.nvim` and **not** in upstream `alex35mil/pi.
 **Agent control**
 
 - [Double-`<Esc>` abort](doc/usage.md#aborting-with-double-esc) — a second `<Esc>` within a timeout aborts the running turn — and, since the same gesture stays live during an auto-retry, cancels a "Retrying…" backoff too — with a persistent statusline hint.
+- [Session todo list (`todo_write` + `:PiTodo`)](doc/usage.md#todo-list) — for multi-step work the agent maintains a session todo list with a full-replacement todo tool (exactly one item in progress, stale-list reminders, list survives compaction and branch switches); tool blocks render the ✓/◐/○ checklist and `:PiTodo` toggles a live side panel (stacked in the `:PiSessions` column, with auto-open / hide-when-empty knobs).
 
 **UI & rendering**
 

@@ -1756,6 +1756,14 @@ local function win_for(tab)
     return nil
 end
 
+--- Public accessor: the sessions-list window open in `tab` (nil when none).
+--- Used by the todo panel to stack in the same sidebar column.
+---@param tab pi.TabId
+---@return integer?
+function M.win(tab)
+    return win_for(tab)
+end
+
 --- Open (or focus) the sessions list in the current tab.
 function M.open()
     local tab = current_tab()

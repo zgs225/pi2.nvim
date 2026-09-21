@@ -271,6 +271,30 @@ require("pi").setup({
         -- model = "openai/gpt-4o-mini", -- pinned generation model; nil = the session's own model
     },
 
+    -- Session todo list. When enabled (default), pi2.nvim injects the bundled
+    -- pi extension (extensions/todo.ts) into every RPC process — both parent
+    -- and sub-session children — so the Agent can maintain a session todo
+    -- list with a single `todo_write` tool (full-replacement semantics:
+    -- every call submits the complete list, an empty array clears it, items
+    -- are identified by their content). The extension keeps an unfinished
+    -- list in the model's context across turns and compaction (a byte-constant
+    -- system-prompt note, a non-destructive per-turn status injection, a
+    -- stale-list reminder) and persists it branch-correctly from tool-result
+    -- details with a checkpoint fallback. See doc/extensions.md and
+    -- doc/usage.md#todo-list. The config is re-read live, so setup() changes
+    -- apply without restarting a session.
+    todo = {
+        enabled = true,
+        remind_after_turns = 3, -- turns without a todo_write call before the stale-list reminder fires; 0 disables it
+        max_items = 20, -- maximum items per todo list; exceeding it rejects the call so the model keeps the list focused
+        panel = {
+            auto_open = false, -- open the :PiTodo panel automatically when the session's todo list becomes non-empty
+            height = 0.5, -- stacked panel height: fraction (<1) of the shared :PiSessions column (0.5 = even split), or absolute lines (>=1)
+            position = "below", -- stacking position relative to the :PiSessions panel: "below" | "above"
+            hide_when_empty = true, -- hide the panel while the todo list is empty
+        },
+    },
+
     -- Sessions overview (:PiSessions): a live list of all active sessions
     -- (one per tab) — a status dot whose color/animation encodes the state
     -- (busy/compacting/attention/done/error/idle/exited) plus the session

@@ -181,6 +181,10 @@ function M.setup()
     vim.api.nvim_create_user_command("PiSubView", function()
         Pi.sub_view()
     end, { desc = "View sub-session in a read-only float" })
+
+    vim.api.nvim_create_user_command("PiTodo", function()
+        require("pi.todo").toggle()
+    end, { desc = "Toggle the todo sidebar panel" })
 end
 
 return M

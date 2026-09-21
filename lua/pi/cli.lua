@@ -116,6 +116,13 @@ function M.title_extension_path()
     return plugin_root() .. "/extensions/title.ts"
 end
 
+--- Absolute path to the bundled pi extension backing the todo tool
+--- (todo_write + context reminders).
+---@return string
+function M.todo_extension_path()
+    return plugin_root() .. "/extensions/todo.ts"
+end
+
 --- Absolute path to the bundled pi extension reporting the backend model
 --- scope (pi --models / enabledModels) for :PiSelectModel fallback.
 ---@return string
@@ -182,6 +189,22 @@ function M.command(opts)
     if vim.fn.filereadable(scope_ext) == 1 then
         cmd[#cmd + 1] = "--extension"
         cmd[#cmd + 1] = scope_ext
+    end
+    -- Inject the todo extension unconditionally (like title.ts) except when
+    -- todo.enabled = false: the tool call itself is the only trigger, and its
+    -- options travel via a runtime file re-read on every context event
+    -- (PI_NVIM_TODO_FILE, see rpc.lua), so live setup() calls apply without
+    -- respawning the RPC process. Injected for BOTH parent and child
+    -- processes (no branching on opts.subagent): sub-sessions benefit from
+    -- todo tracking too, and unlike the subagent tool there is no nesting
+    -- risk (DESIGN-todo.md D4).
+    local todo = Config.options.todo or {}
+    if todo.enabled ~= false then
+        local todo_ext = M.todo_extension_path()
+        if vim.fn.filereadable(todo_ext) == 1 then
+            cmd[#cmd + 1] = "--extension"
+            cmd[#cmd + 1] = todo_ext
+        end
     end
     -- Sub-agent extensions, mutually exclusive per process role: parents
     -- get subagent.ts (orchestration tools + system-prompt note), children
