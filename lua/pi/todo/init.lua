@@ -12,8 +12,13 @@
 --- When the sessions sidebar (pi.ui.sessions) is open in the tab, the todo
 --- panel stacks in the same column (focus the sessions window, then `split`
 --- below/above it); otherwise it opens as its own vertical-split column sized
---- after the sessions-list config. Stacked windows are winfixheight; standalone
---- columns are winfixwidth, so the column width survives layout churn.
+--- after the sessions-list config. Stacked height follows the sessions-list
+--- dimension convention (values < 1 are fractions): todo.panel.height < 1 is
+--- the panel's fraction of the shared sessions+todo column (default 0.5, an
+--- even split), >= 1 is absolute lines; the ratio is re-evaluated on every
+--- refresh, so manual resizes of the column are corrected back to the
+--- configured split. Stacked windows are winfixheight; standalone columns are
+--- winfixwidth, so the column width survives layout churn.
 
 local M = {}
 
@@ -35,7 +40,7 @@ local Ft = require("pi.filetypes")
 --- defensive so the panel works even before the key lands in config.lua.
 ---@class pi.TodoPanelResolvedConfig
 ---@field auto_open boolean
----@field height integer
+---@field height number
 ---@field position "below"|"above"
 ---@field hide_when_empty boolean
 
@@ -82,7 +87,7 @@ local function panel_config()
     local panel = todo_cfg.panel or {}
     return {
         auto_open = panel.auto_open == true,
-        height = (type(panel.height) == "number" and panel.height > 0) and math.floor(panel.height) or 10,
+        height = (type(panel.height) == "number" and panel.height > 0) and panel.height or 0.5,
         position = panel.position == "above" and "above" or "below",
         hide_when_empty = panel.hide_when_empty ~= false,
     }
@@ -154,13 +159,20 @@ local function panel_lines(tab)
     return out
 end
 
---- Display height for the panel: content lines bounded by the configured max.
---- Exported for tests; callers pass the rendered line count.
----@param line_count integer
+--- Height of the stacked panel window inside the shared sessions+todo column.
+--- `cfg.height < 1` is a fraction of `column_height` (the column total, which
+--- is the sessions window's height at open time and sessions+todo on refresh
+--- — re-evaluating on every refresh also corrects manual :resize drift back
+--- to the configured ratio); `>= 1` is absolute lines. The result is bounded
+--- so the neighboring window keeps at least one line. Content taller than the
+--- panel just scrolls — the height is never shrink-to-content.
+--- Exported for tests.
 ---@param cfg pi.TodoPanelResolvedConfig
+---@param column_height integer total height of the shared sessions+todo column
 ---@return integer
-function M._height_for(line_count, cfg)
-    return math.max(1, math.min(line_count, cfg.height))
+function M._height_for(cfg, column_height)
+    local target = cfg.height < 1 and math.floor(column_height * cfg.height) or math.floor(cfg.height)
+    return math.max(1, math.min(target, math.max(1, column_height - 1)))
 end
 
 --- Rebuild `tab`'s panel buffer contents from `tab`'s state (no-op when there
@@ -252,12 +264,13 @@ end
 
 --- Open the panel stacked in the sessions sidebar column (same width): focus
 --- the sessions window and split below/above it according to panel.position.
---- The sessions window keeps its height; the new todo window is winfixheight.
+--- The sessions window keeps the rest of the column; the new todo window is
+--- winfixheight. The height is a fraction of the column (sessions owns the
+--- whole column before the split) or absolute lines, never content-sized.
 ---@param tab pi.TabId
----@param lines string[]
 ---@param b integer
 ---@return integer?
-local function open_stacked(tab, lines, b)
+local function open_stacked(tab, b)
     local cfg = panel_config()
     local sess = sessions_win(tab)
     if not sess then
@@ -268,7 +281,9 @@ local function open_stacked(tab, lines, b)
         require("pi.notify").warn("Cannot open todo panel: " .. tostring(err))
         return nil
     end
-    local height = M._height_for(#lines, cfg)
+    -- Sessions owns the whole column before the split, so its height IS the
+    -- column height the fraction is taken from.
+    local height = M._height_for(cfg, vim.api.nvim_win_get_height(sess))
     local cmd = (cfg.position == "above" and "leftabove " or "rightbelow ") .. height .. "split"
     vim.cmd(cmd)
     local win = vim.api.nvim_get_current_win()
@@ -343,7 +358,7 @@ function M.open(how)
         return
     end
     local sess = sessions_win(tab)
-    local win = (sess and open_stacked(tab, lines, b)) or open_standalone(tab, b)
+    local win = (sess and open_stacked(tab, b)) or open_standalone(tab, b)
     if win then
         wins[tab] = win
     end
@@ -391,16 +406,18 @@ function M.refresh()
             else
                 render_buf(tab)
                 -- Stacked windows: re-assert the pinned height after EVERY
-                -- render. The :split count is not sticky ('equalalways' can
-                -- re-equalize the column; a neighbor resize can redistribute
-                -- it), so the height must be re-applied each time, not only
-                -- when the line count changed. Standalone columns stay
-                -- full-height — no height is forced there.
-                if sessions_win(tab) then
-                    local lines = panel_lines(tab)
-                    if lines then
-                        pcall(vim.api.nvim_win_set_height, win, M._height_for(#lines, cfg))
-                    end
+                -- render, computed from the column total (sessions + todo as
+                -- they stand now). The :split count is not sticky
+                -- ('equalalways' can re-equalize the column; a neighbor resize
+                -- can redistribute it), and re-deriving the ratio from the
+                -- current column height also corrects manual :resize drift
+                -- back to the configured split (absolute heights stay
+                -- absolute). Standalone columns stay full-height — no height
+                -- is forced there.
+                local sess = sessions_win(tab)
+                if sess then
+                    local column = vim.api.nvim_win_get_height(sess) + vim.api.nvim_win_get_height(win)
+                    pcall(vim.api.nvim_win_set_height, win, M._height_for(cfg, column))
                 end
             end
         end

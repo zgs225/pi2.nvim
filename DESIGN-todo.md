@@ -277,8 +277,10 @@ L1 约 100 token（恒定）；L2 状态注入按紧凑格式渲染（每项一�
 - **窗口**：`lua/pi/todo/init.lua` 管理 per-tab 的 todo 窗口（`wins[tab]`，
   同 `sessions.lua` 的模式）。side 模式下：sessions 侧栏已开则在其窗口内
   `split` 堆叠；未开则自己开一个同宽的 vsplit 列。`winfixwidth` +
-  `winfixheight`，高度取 `min(内容行数, todo.height)`，清单为空时可折叠为
-  单行标题或直接隐藏（配置）。
+  `winfixheight`；堆叠高度遵循 sessions 的维度约定：`todo.height < 1` 取
+  共栏（sessions + todo）高度的比例——默认 `0.5` 即与 sessions 均分，且
+  每次刷新按当前栏高重新推导，手动 `:resize` 的漂移会被拉回配置比例；
+  `todo.height >= 1` 为绝对行数。内容超出面板高度时滚动，不再按内容收缩。
 - **buffer**：独立 scratch buffer，渲染三态清单 + 进度计数，内容与 §7.1
   工具块渲染共用同一个纯函数（`lua/pi/todo/tool_ui.lua` 出行字符串，
   tools.lua 与面板各取所需）。
@@ -304,7 +306,7 @@ todo = {
     max_items = 20,            -- 单项数上限（超出拒绝并提示模型精简）
     panel = {
         auto_open = false,     -- 有未完成项时自动展开面板
-        height = 10,           -- 面板最大高度（行）
+        height = 0.5,          -- 堆叠时与 sessions 共栏的配比（<1 比例，0.5 = 均分；>=1 绝对行数）
         position = "below",    -- 相对 sessions 侧栏：above | below
         hide_when_empty = true,
     },

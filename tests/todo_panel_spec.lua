@@ -147,18 +147,30 @@ describe("todo panel", function()
     end)
 
     describe("height computation", function()
-        local cfg = { auto_open = false, height = 10, position = "below", hide_when_empty = true }
-
-        it("caps at the configured height", function()
-            assert.are.equal(10, Todo._height_for(25, cfg))
+        it("fraction 0.5 of the column", function()
+            local cfg = { auto_open = false, height = 0.5, position = "below", hide_when_empty = true }
+            assert.are.equal(10, Todo._height_for(cfg, 20))
         end)
 
-        it("uses the line count when smaller than the max", function()
-            assert.are.equal(4, Todo._height_for(4, cfg))
+        it("fraction 0.25 of the column (floored)", function()
+            local cfg = { auto_open = false, height = 0.25, position = "below", hide_when_empty = true }
+            assert.are.equal(5, Todo._height_for(cfg, 20))
+            assert.are.equal(2, Todo._height_for(cfg, 10))
         end)
 
-        it("never goes below one line", function()
-            assert.are.equal(1, Todo._height_for(0, cfg))
+        it("absolute height is kept as lines", function()
+            local cfg = { auto_open = false, height = 6, position = "below", hide_when_empty = true }
+            assert.are.equal(6, Todo._height_for(cfg, 20))
+        end)
+
+        it("absolute height is bounded by the column (neighbor keeps one line)", function()
+            local cfg = { auto_open = false, height = 6, position = "below", hide_when_empty = true }
+            assert.are.equal(3, Todo._height_for(cfg, 4))
+        end)
+
+        it("fraction never goes below one line", function()
+            local cfg = { auto_open = false, height = 0.5, position = "below", hide_when_empty = true }
+            assert.are.equal(1, Todo._height_for(cfg, 1))
         end)
     end)
 
@@ -249,22 +261,28 @@ describe("todo panel", function()
         ---@type table? saved package.loaded['pi.ui.sessions']
         local saved_sessions_mod
 
-        ---@return integer sessions-like window (10-line topleft split)
+        ---@return integer sessions-like window (full-height side column)
         local function open_fake_sessions()
-            vim.cmd("topleft 10split")
+            -- Mimic the real :PiSessions geometry: a full-height side column
+            -- (vsplit) that the todo split stacks into as the column's bottom
+            -- window — row exchanges during resizes then stay between the two
+            -- windows instead of leaking into the neighboring chat column.
+            vim.cmd("topleft vsplit")
+            local sess = vim.api.nvim_get_current_win()
             local b = vim.api.nvim_create_buf(false, true)
-            vim.api.nvim_win_set_buf(0, b)
-            -- The real :PiSessions left/right column fixes WIDTH only; the
-            -- todo split's height must survive without a fixed neighbor.
-            fake_sess_win = vim.api.nvim_get_current_win()
+            vim.api.nvim_win_set_buf(sess, b)
+            -- Move the rest of the editor into its own column.
+            vim.cmd("wincmd j")
+            vim.cmd("vsplit")
             -- Point pi.ui.sessions at a fake exposing the same M.win(tab)
             -- accessor the panel uses to find the sidebar column.
+            fake_sess_win = sess
             package.loaded["pi.ui.sessions"] = {
                 win = function()
                     return fake_sess_win
                 end,
             }
-            return fake_sess_win
+            return sess
         end
 
         before_each(function()
@@ -282,22 +300,66 @@ describe("todo panel", function()
 
         it("stacks below the sessions window with winfixheight", function()
             local sess = open_fake_sessions()
+            local col = vim.fn.winheight(sess)
             Todo.update_from_details(details({ { content = "a", status = "pending" } }))
             Todo.open()
             local todo_win = vim.api.nvim_get_current_win()
             assert.are_not.equal(sess, todo_win)
             assert.is_true(vim.wo[todo_win].winfixheight)
-            -- RIGHT AFTER open the panel must be at min(lines, max height):
-            -- spacer + header + blank + 1 item = 4 lines. Catches the
-            -- 'equalalways' 50/50 collapse regression.
-            assert.are.equal(4, vim.fn.winheight(todo_win))
+            -- RIGHT AFTER open the panel must be at the default 50/50 split of
+            -- the column it was opened from. Catches the 'equalalways'
+            -- collapse and any content-sized shrink-to-fit regression.
+            assert.are.equal(math.floor(col * 0.5), vim.fn.winheight(todo_win))
             -- The todo panel sits below the sessions window.
             assert.is_true(vim.fn.win_screenpos(sess)[1] < vim.fn.win_screenpos(todo_win)[1])
         end)
 
+        it("ratio override 0.25 sizes the panel from the column height", function()
+            Config.options.todo =
+                { panel = { auto_open = false, height = 0.25, position = "below", hide_when_empty = true } }
+            local sess = open_fake_sessions()
+            local col = vim.fn.winheight(sess)
+            Todo.update_from_details(details({ { content = "a", status = "pending" } }))
+            Todo.open()
+            local todo_win = vim.api.nvim_get_current_win()
+            assert.are.equal(math.floor(col * 0.25), vim.fn.winheight(todo_win))
+            -- The sessions window keeps the (larger) rest of the column.
+            assert.is_true(vim.fn.winheight(sess) > vim.fn.winheight(todo_win))
+        end)
+
+        it("absolute height 6 is honored in lines", function()
+            Config.options.todo =
+                { panel = { auto_open = false, height = 6, position = "below", hide_when_empty = true } }
+            local sess = open_fake_sessions()
+            Todo.update_from_details(details({ { content = "a", status = "pending" } }))
+            Todo.open()
+            local todo_win = vim.api.nvim_get_current_win()
+            assert.are.equal(6, vim.fn.winheight(todo_win))
+            assert.is_true(vim.fn.winheight(sess) > 0)
+        end)
+
+        it("content taller than the panel does not grow it (scrolls instead)", function()
+            local sess = open_fake_sessions()
+            local col = vim.fn.winheight(sess)
+            Todo.update_from_details(details({
+                { content = "a", status = "pending" },
+                { content = "b", status = "pending" },
+                { content = "c", status = "pending" },
+                { content = "d", status = "pending" },
+                { content = "e", status = "pending" },
+                { content = "f", status = "pending" },
+                { content = "g", status = "pending" },
+            }))
+            Todo.open()
+            local todo_win = vim.api.nvim_get_current_win()
+            -- 3 header lines + 7 items = 10 rendered lines, but the default
+            -- 50/50 split of the column caps the window at half its height.
+            assert.are.equal(math.floor(col * 0.5), vim.fn.winheight(todo_win))
+        end)
+
         it("stacks above the sessions window with position=above", function()
             Config.options.todo =
-                { panel = { auto_open = false, height = 10, position = "above", hide_when_empty = true } }
+                { panel = { auto_open = false, height = 0.5, position = "above", hide_when_empty = true } }
             local sess = open_fake_sessions()
             Todo.update_from_details(details({ { content = "a", status = "pending" } }))
             Todo.open()
@@ -307,18 +369,35 @@ describe("todo panel", function()
 
         it("refresh re-asserts the stacked height after it is disturbed", function()
             local sess = open_fake_sessions()
+            local col = vim.fn.winheight(sess)
             Todo.update_from_details(details({ { content = "a", status = "pending" } }))
             Todo.open()
             local todo_win = vim.api.nvim_get_current_win()
-            assert.are.equal(4, vim.fn.winheight(todo_win))
+            assert.are.equal(math.floor(col * 0.5), vim.fn.winheight(todo_win))
             -- Simulate layout churn: grow the panel beyond its target.
             pcall(vim.api.nvim_win_set_height, todo_win, 12)
-            assert.are.equal(12, vim.fn.winheight(todo_win))
-            local sess_disturbed = vim.fn.winheight(sess)
             Todo.refresh()
-            assert.are.equal(4, vim.fn.winheight(todo_win))
-            -- The remainder returns to the neighbor unchanged.
-            assert.are.equal(sess_disturbed, vim.fn.winheight(sess))
+            -- The refresh recomputes the ratio from the column total as it
+            -- stands after the churn, so the drift is corrected back to the
+            -- configured 50/50 split; the sessions window keeps the rest.
+            local col2 = vim.fn.winheight(sess) + vim.fn.winheight(todo_win)
+            assert.are.equal(math.floor(col2 * 0.5), vim.fn.winheight(todo_win))
+            assert.are.equal(col2 - math.floor(col2 * 0.5), vim.fn.winheight(sess))
+        end)
+
+        it("refresh re-asserts the ratio after the sessions window is resized", function()
+            local sess = open_fake_sessions()
+            Todo.update_from_details(details({ { content = "a", status = "pending" } }))
+            Todo.open()
+            local todo_win = vim.api.nvim_get_current_win()
+            -- Manual resize of the sessions window redistributes the column.
+            pcall(vim.api.nvim_win_set_height, sess, 12)
+            Todo.refresh()
+            -- Column total as it stands after the resize; the ratio is
+            -- re-derived from it on every refresh.
+            local col = vim.fn.winheight(sess) + vim.fn.winheight(todo_win)
+            assert.are.equal(math.floor(col * 0.5), vim.fn.winheight(todo_win))
+            assert.are.equal(col - math.floor(col * 0.5), vim.fn.winheight(sess))
         end)
     end)
 
@@ -386,7 +465,7 @@ describe("todo panel", function()
 
         it("auto_open transition marks the panel auto", function()
             Config.options.todo =
-                { panel = { auto_open = true, height = 10, position = "below", hide_when_empty = true } }
+                { panel = { auto_open = true, height = 0.5, position = "below", hide_when_empty = true } }
             Todo.update_from_details(details({ { content = "first", status = "pending" } }))
             vim.wait(300, function()
                 return Todo.is_open()
@@ -396,7 +475,7 @@ describe("todo panel", function()
 
         it("auto-opened panel closes when the list clears (hide_when_empty)", function()
             Config.options.todo =
-                { panel = { auto_open = true, height = 10, position = "below", hide_when_empty = true } }
+                { panel = { auto_open = true, height = 0.5, position = "below", hide_when_empty = true } }
             Todo.update_from_details(details({ { content = "first", status = "pending" } }))
             vim.wait(300, function()
                 return Todo.is_open()
@@ -412,7 +491,7 @@ describe("todo panel", function()
 
         it("auto-opened panel stays when hide_when_empty=false", function()
             Config.options.todo =
-                { panel = { auto_open = true, height = 10, position = "below", hide_when_empty = false } }
+                { panel = { auto_open = true, height = 0.5, position = "below", hide_when_empty = false } }
             Todo.update_from_details(details({ { content = "first", status = "pending" } }))
             vim.wait(300, function()
                 return Todo.is_open()
@@ -430,7 +509,7 @@ describe("todo panel", function()
     describe("hide_when_empty", function()
         it("open with hide_when_empty=false keeps the empty panel usable", function()
             Config.options.todo =
-                { panel = { auto_open = false, height = 10, position = "below", hide_when_empty = false } }
+                { panel = { auto_open = false, height = 0.5, position = "below", hide_when_empty = false } }
             Todo.update_from_details({ todos = {}, completed = 0, total = 0 })
             Todo.open()
             assert.is_true(Todo.is_open())
@@ -438,7 +517,7 @@ describe("todo panel", function()
 
         it("default hide_when_empty=true hides the panel on clear", function()
             Config.options.todo =
-                { panel = { auto_open = false, height = 10, position = "below", hide_when_empty = true } }
+                { panel = { auto_open = false, height = 0.5, position = "below", hide_when_empty = true } }
             Todo.update_from_details(details({ { content = "a", status = "pending" } }))
             Todo.open()
             assert.is_true(Todo.is_open())
@@ -456,7 +535,7 @@ describe("todo panel", function()
     describe("auto_open", function()
         it("auto_open=true opens the panel on empty to non-empty transition", function()
             Config.options.todo =
-                { panel = { auto_open = true, height = 10, position = "below", hide_when_empty = true } }
+                { panel = { auto_open = true, height = 0.5, position = "below", hide_when_empty = true } }
             Todo.update_from_details(details({ { content = "first", status = "pending" } }))
             vim.wait(300, function()
                 return Todo.is_open()
@@ -474,7 +553,7 @@ describe("todo panel", function()
 
         it("does not re-trigger auto_open on later updates", function()
             Config.options.todo =
-                { panel = { auto_open = true, height = 10, position = "below", hide_when_empty = true } }
+                { panel = { auto_open = true, height = 0.5, position = "below", hide_when_empty = true } }
             Todo.update_from_details(details({ { content = "a", status = "pending" } }))
             vim.wait(300, function()
                 return Todo.is_open()

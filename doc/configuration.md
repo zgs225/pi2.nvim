@@ -289,7 +289,7 @@ require("pi").setup({
         max_items = 20, -- maximum items per todo list; exceeding it rejects the call so the model keeps the list focused
         panel = {
             auto_open = false, -- open the :PiTodo panel automatically when the session's todo list becomes non-empty
-            height = 10, -- maximum panel height in lines (when stacked in the :PiSessions column)
+            height = 0.5, -- stacked panel height: fraction (<1) of the shared :PiSessions column (0.5 = even split), or absolute lines (>=1)
             position = "below", -- stacking position relative to the :PiSessions panel: "below" | "above"
             hide_when_empty = true, -- hide the panel while the todo list is empty
         },

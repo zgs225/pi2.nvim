@@ -789,7 +789,7 @@ Each `todo_write` call renders as a [tool block](#tool-blocks) with a checklist 
 
 `:PiTodo` toggles a read-only side panel with the session's current list — the same three-state checklist, mirrored live from every `todo_write` result, including replayed history.
 
-When the [sessions overview](sessions.md#sessions-overview-pisessions) is open in the current tab, the panel stacks in the same column — `todo.panel.position` picks `below` (default) or `above` the sessions window — and its height fits the content up to `todo.panel.height` lines. Without the sessions list, the panel opens as its own full-height vertical split sized after `sessions_list.position` / `sessions_list.width`. `q` closes the panel.
+When the [sessions overview](sessions.md#sessions-overview-pisessions) is open in the current tab, the panel stacks in the same column — `todo.panel.position` picks `below` (default) or `above` the sessions window — and the column is split evenly by default: `todo.panel.height < 1` is the panel's fraction of the shared column height (default `0.5`, re-evaluated on every refresh so manual resizes of either window snap back to the configured split), while `todo.panel.height >= 1` pins a fixed line count. Content taller than the panel scrolls. Without the sessions list, the panel opens as its own full-height vertical split sized after `sessions_list.position` / `sessions_list.width`. `q` closes the panel.
 
 With `todo.panel.hide_when_empty` (default), the panel is hidden while the list is empty; an explicitly opened panel shows a `no todos` placeholder instead. With `todo.panel.auto_open`, the panel opens automatically when the session's todo list becomes non-empty (the first write, or a re-added list after a clear).
 

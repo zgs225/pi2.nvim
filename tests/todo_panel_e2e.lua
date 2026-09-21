@@ -3,9 +3,10 @@
 -- Exercises the real pi.todo.tool_ui + pi.ui.sessions accessor:
 --   1. manager.update_todo_mirror-equivalent routing through update_from_details
 --   2. standalone column open (winfixwidth, sessions_list width)
---   3. stacked layout below a fake registered sessions window (winfixheight)
---   4. auto_open on the empty -> non-empty transition
---   5. refresh renders new content into the open panel
+--   3. stacked layout below a fake registered sessions window (winfixheight,
+--      default even 50/50 split, ratio 0.25 override, absolute 6)
+--   4. refresh renders new content + re-asserts the configured ratio after a
+--      manual resize
 --   6. hide_when_empty: cleared list -> manual panel keeps "no todos" placeholder
 --   7. replay-style toolResult + non-todo tool gating
 --   8. per-tab buffers: two tabs with open panels each show their own list
@@ -39,7 +40,7 @@ end
 local saved_todo = vim.deepcopy(require("pi.config").options.todo)
 local saved_sl = vim.deepcopy(require("pi.config").options.sessions_list)
 require("pi.config").options.todo =
-    { panel = { auto_open = true, height = 10, position = "below", hide_when_empty = true } }
+    { panel = { auto_open = true, height = 0.5, position = "below", hide_when_empty = true } }
 require("pi.config").options.sessions_list = { position = "left", width = 40 }
 
 -- 1. Tool name routing through the manager hook -----------------------------
@@ -103,15 +104,22 @@ Manager._update_todo_mirror("todo_write", live_result)
 pump()
 -- auto_open fired on the mirror transition? The state was already non-empty,
 -- so open explicitly (the transition test is #5).
+-- Sessions owns the whole column before the split, so its height is what the
+-- fraction is taken from.
+local sess_h = vim.fn.winheight(sess_win)
 Todo.open()
 local todo_win = vim.api.nvim_get_current_win()
 check(todo_win ~= sess_win, "todo window differs from sessions window")
 check(vim.wo[todo_win].winfixheight == true, "stacked todo window is winfixheight")
--- RIGHT AFTER open: spacer + header + blank + 3 items = 6 lines, max 10.
--- Catches the 'equalalways' 50/50 collapse regression.
+-- RIGHT AFTER open: default height 0.5 = even 50/50 split of the column.
+-- Catches both the 'equalalways' collapse and a content-sized shrink-to-fit.
 check(
-    vim.fn.winheight(todo_win) == 6,
-    "stacked todo window height right after open (got " .. vim.fn.winheight(todo_win) .. ")"
+    vim.fn.winheight(todo_win) == math.floor(sess_h * 0.5),
+    "stacked todo window is the default 50/50 split (got "
+        .. vim.fn.winheight(todo_win)
+        .. ", want "
+        .. math.floor(sess_h * 0.5)
+        .. ")"
 )
 check(vim.fn.win_screenpos(sess_win)[1] < vim.fn.win_screenpos(todo_win)[1], "todo panel is below the sessions window")
 check(vim.wo[todo_win].winfixwidth == true, "stacked todo window also fixes the column width")
@@ -133,13 +141,50 @@ pump()
 local buf2 = vim.api.nvim_win_get_buf(todo_win)
 local lines2 = vim.api.nvim_buf_get_lines(buf2, 0, -1, false)
 eq("  Todo · 2/3 completed", lines2[2], "refresh renders the new progress header")
--- refresh re-asserts the pinned height even after layout churn.
+-- refresh re-asserts the configured ratio even after layout churn: it is
+-- re-derived from the current column total (sessions + todo).
 vim.api.nvim_win_set_height(todo_win, 14)
+local column = vim.fn.winheight(sess_win) + vim.fn.winheight(todo_win)
 Todo.refresh()
 check(
-    vim.fn.winheight(todo_win) == 6,
-    "refresh re-asserts the stacked height (got " .. vim.fn.winheight(todo_win) .. ")"
+    vim.fn.winheight(todo_win) == math.floor(column * 0.5),
+    "refresh re-asserts the stacked ratio after a manual resize (got "
+        .. vim.fn.winheight(todo_win)
+        .. ", want "
+        .. math.floor(column * 0.5)
+        .. ")"
 )
+
+-- 4b. Ratio and absolute overrides (close + reopen so open-time sizing runs) -
+local saved_height = require("pi.config").options.todo.panel.height
+Todo.close()
+require("pi.config").options.todo.panel.height = 0.25
+-- Sessions owns the whole column again once the panel is closed.
+local sess_h25 = vim.fn.winheight(sess_win)
+Todo.open()
+local todo_win25 = vim.api.nvim_get_current_win()
+check(
+    vim.fn.winheight(todo_win25) == math.floor(sess_h25 * 0.25),
+    "ratio override 0.25 sizes the panel from the column (got "
+        .. vim.fn.winheight(todo_win25)
+        .. ", want "
+        .. math.floor(sess_h25 * 0.25)
+        .. ")"
+)
+Todo.close()
+require("pi.config").options.todo.panel.height = 6
+Todo.open()
+local todo_win6 = vim.api.nvim_get_current_win()
+check(
+    vim.fn.winheight(todo_win6) == 6,
+    "absolute height 6 is honored in lines (got " .. vim.fn.winheight(todo_win6) .. ")"
+)
+require("pi.config").options.todo.panel.height = saved_height
+-- Reopen at the default ratio for the following sections; re-grab the window
+-- handle (the old one was closed above).
+Todo.close()
+Todo.open()
+todo_win = vim.api.nvim_get_current_win()
 
 -- 5. Clear + hide_when_empty: explicit panel keeps a placeholder -----------
 Manager._update_todo_mirror("todo_write", { details = { todos = {}, completed = 0, total = 0 } })

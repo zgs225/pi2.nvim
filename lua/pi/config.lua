@@ -210,7 +210,7 @@
 
 ---@class pi.TodoPanelConfig
 ---@field auto_open? boolean Open the todo side panel automatically when a session has unfinished items (default false)
----@field height? integer Maximum panel height in lines (default 10)
+---@field height? number Stacked panel height: fraction of the shared :PiSessions column when < 1 (default 0.5, an even split), absolute lines when >= 1
 ---@field position? "above"|"below" Stacking position relative to the :PiSessions side panel (default "below")
 ---@field hide_when_empty? boolean Hide the panel while the todo list is empty (default true)
 
@@ -519,7 +519,7 @@ local defaults = {
         max_items = 20,
         panel = {
             auto_open = false,
-            height = 10,
+            height = 0.5,
             position = "below",
             hide_when_empty = true,
         },
