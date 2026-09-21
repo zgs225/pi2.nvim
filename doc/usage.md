@@ -739,7 +739,7 @@ Built-in thresholds:
 | `poll_subagents` | — | — | Always inline |
 | `wait_subagents` | — | — | Always inline |
 | `stop_subagents` | — | — | Always inline |
-| `todo_write` | 1 | 8 | Session todo checklist — input line is the item count (`(5 items)`); collapsed output shows the progress header + first items, expanded renders the full ✓/◐/○ list. See [Todo list](#todo-list) |
+| `todo_write` | — | 8 | Session todo checklist — no input line; collapsed output shows the progress header + first items, expanded renders the full ✓/◐/○ list. See [Todo list](#todo-list) |
 | (unknown) | 1 | 1 | Default renderer picks the first string argument as summary |
 
 ### Status resolution
@@ -771,12 +771,10 @@ The agent is kept aware of an unfinished list across turns: a byte-constant disc
 
 ### Chat rendering
 
-Each `todo_write` call renders as a [tool block](#tool-blocks) with a checklist icon and a localized label (`todo·write`, zh locale `待办·写` — resolved from `title.lang` / your UI locale like the sub-agent labels). The input line is the item count, `(5 items)` (`(5 项)` in zh), and the output is the checklist itself:
+Each `todo_write` call renders as a [tool block](#tool-blocks) with a checklist icon and a localized label (`todo·write`, zh locale `待办·写` — resolved from `title.lang` / your UI locale like the sub-agent labels). The body is the checklist itself:
 
 ```
 ▾ todo·write
-  (5 items)
-
   2/5 completed
   ✓ Fix the failing spec
   ◐ Run the test suite
@@ -792,6 +790,8 @@ Each `todo_write` call renders as a [tool block](#tool-blocks) with a checklist 
 When the [sessions overview](sessions.md#sessions-overview-pisessions) is open in the current tab, the panel stacks in the same column — `todo.panel.position` picks `below` (default) or `above` the sessions window — and the column is split evenly by default: `todo.panel.height < 1` is the panel's fraction of the shared column height (default `0.5`, re-evaluated on every refresh so manual resizes of either window snap back to the configured split), while `todo.panel.height >= 1` pins a fixed line count. Content taller than the panel scrolls. Without the sessions list, the panel opens as its own full-height vertical split sized after `sessions_list.position` / `sessions_list.width`. `q` closes the panel.
 
 With `todo.panel.hide_when_empty` (default), the panel is hidden while the list is empty; an explicitly opened panel shows a `no todos` placeholder instead. With `todo.panel.auto_open`, the panel opens automatically when the session's todo list becomes non-empty (the first write, or a re-added list after a clear).
+
+The mirror is keyed to the tab that owns the session, not to whichever tab has keyboard focus: `todo_write` results update that tab's panel even while you work elsewhere, and other tabs never capture the session's state. Since a split window can only be created in the current tab, an auto-open that fires while the session's tab is in the background is deferred — the panel opens as soon as you enter that tab.
 
 ## Models
 

@@ -1366,25 +1366,11 @@ local renderers = {
 
     -- Todo tool: the result's details carry the full list, so the block body
     -- renders the three-state checklist itself (✓ / ◐ / ○) instead of the
-    -- extension's fixed reply text. The input line is the item count; the
-    -- output is the progress header + item lines (see
-    -- lua/pi/todo/tool_ui.lua).
+    -- extension's fixed reply text (see lua/pi/todo/tool_ui.lua).
     todo_write = {
-        input_visible = 1,
         output_visible = 8,
         display_name = function()
             return TodoToolUi.display_name("todo_write")
-        end,
-        on_start = function(history, args)
-            if type(args) ~= "table" or type(args.todos) ~= "table" then
-                return
-            end
-            local lang = TodoToolUi.resolve_lang()
-            if lang == "zh" then
-                render_body_line(history, ("(%d 项)"):format(#args.todos))
-            else
-                render_body_line(history, ("(%d items)"):format(#args.todos))
-            end
         end,
         on_end = function(history, _, result, is_error, insert_at)
             local details = TodoToolUi.result_details(result)
