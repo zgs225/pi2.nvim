@@ -208,6 +208,18 @@
 ---@field lang? string|nil Language of generated titles (e.g. "zh-CN", "en"). When nil, the title language follows the conversation (default: nil)
 ---@field model? string Model used for title generation as "provider/modelId". When unset the session's own model is used (default: nil); the pinned model is a fall-back to the session model if it cannot be resolved
 
+---@class pi.TodoPanelConfig
+---@field auto_open? boolean Open the todo side panel automatically when a session has unfinished items (default false)
+---@field height? integer Maximum panel height in lines (default 10)
+---@field position? "above"|"below" Stacking position relative to the :PiSessions side panel (default "below")
+---@field hide_when_empty? boolean Hide the panel while the todo list is empty (default true)
+
+---@class pi.TodoConfig
+---@field enabled? boolean Inject the bundled todo extension (todo_write tool + context reminders) into every RPC process (default true)
+---@field remind_after_turns? integer Turns without a todo_write call before the extension reminds the model of an unfinished list; 0 disables the reminder (default 3)
+---@field max_items? integer Maximum number of items per todo list; excess items are rejected so the model keeps the list focused (default 20)
+---@field panel pi.TodoPanelConfig
+
 ---@class pi.SessionsListFloatConfig
 ---@field width? number Width in columns (>=1) or fraction of editor width (<1, default 0.5)
 ---@field height? number Height in lines (>=1) or fraction of editor height (<1, default 0.4)
@@ -328,6 +340,7 @@
 ---@field subagent pi.SubagentConfig
 ---@field vision pi.VisionConfig
 ---@field title pi.TitleConfig
+---@field todo pi.TodoConfig
 ---@field sessions_list pi.SessionsListConfig
 ---@field diff_review pi.DiffReviewConfig
 ---@field zen pi.ZenConfig
@@ -500,6 +513,17 @@ local defaults = {
         lang = nil,
         model = nil,
     },
+    todo = {
+        enabled = true,
+        remind_after_turns = 3,
+        max_items = 20,
+        panel = {
+            auto_open = false,
+            height = 10,
+            position = "below",
+            hide_when_empty = true,
+        },
+    },
     sessions_list = {
         mode = "follow",
         auto_open = false,
@@ -628,6 +652,10 @@ function M.setup(opts)
     -- The bundled auto-title extension re-reads its options from a runtime
     -- file on every turn_end event; same live-reload rationale as vision.
     require("pi.title").publish(M.options.title)
+
+    -- The bundled todo extension re-reads its options from a runtime file on
+    -- every context event; same live-reload rationale as title/vision.
+    require("pi.todo.tool_ui").publish(M.options.todo)
 end
 
 --- Resolve a config value that may be a function, merging the result with

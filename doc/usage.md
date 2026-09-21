@@ -18,6 +18,7 @@ This page walks through how `pi2.nvim` actually works in practice. Each subsecti
 - [Navigation](#navigation)
 - [Quickfix](#quickfix)
 - [Tool blocks](#tool-blocks)
+- [Todo list](#todo-list)
 - [Models](#models)
 - [Thinking](#thinking)
 - [Markdown rendering](#markdown-rendering)
@@ -738,6 +739,7 @@ Built-in thresholds:
 | `poll_subagents` | — | — | Always inline |
 | `wait_subagents` | — | — | Always inline |
 | `stop_subagents` | — | — | Always inline |
+| `todo_write` | 1 | 8 | Session todo checklist — input line is the item count (`(5 items)`); collapsed output shows the progress header + first items, expanded renders the full ✓/◐/○ list. See [Todo list](#todo-list) |
 | (unknown) | 1 | 1 | Default renderer picks the first string argument as summary |
 
 ### Status resolution
@@ -758,6 +760,38 @@ The prefix is stripped from the displayed text before the block is rendered, so 
 
 > [!NOTE]
 > Tool renderers are currently **hard-coded** in `lua/pi/ui/chat/tools.lua`. There's no config surface for registering your own renderer or adjusting built-in thresholds. If you'd like any of these to be configurable, please open an issue.
+
+## Todo list
+
+For multi-step work the agent can maintain a session todo list with the `todo_write` tool. pi2.nvim injects the bundled [`extensions/todo.ts`](extensions.md#bundled-todo-extension-extensionstodots) extension into every RPC process while `todo.enabled` is on (default) — parent and sub-session children alike.
+
+The tool has **full-replacement semantics**: every call submits the complete list, an empty array clears it, and items are identified by their content — there are no ids that can drift out of sync. Validation is strict and self-correcting: at most one item may be `in_progress` at a time, every item needs a non-empty imperative `content` ("Run the test suite") plus an optional present-continuous `activeForm` ("Running the test suite", shown while the item is in progress), and the list is capped at `todo.max_items` items (default 20). A rejected call returns an error stating exactly what to fix, and the previous list stays unchanged.
+
+The agent is kept aware of an unfinished list across turns: a byte-constant discipline note is appended to the system prompt, and before every LLM call — only while the list is non-empty — a compact status line (`[todo] 2/5 completed — in progress: Running the test suite` plus the incomplete items) is injected non-destructively, meaning it never reaches the session file and is re-computed after compaction. After `todo.remind_after_turns` turns (default 3; `0` disables) without a `todo_write` call, the injection gains a stale-list reminder. The list also survives branch switches and compaction (reconstructed from tool results, with a checkpoint fallback).
+
+### Chat rendering
+
+Each `todo_write` call renders as a [tool block](#tool-blocks) with a checklist icon and a localized label (`todo·write`, zh locale `待办·写` — resolved from `title.lang` / your UI locale like the sub-agent labels). The input line is the item count, `(5 items)` (`(5 项)` in zh), and the output is the checklist itself:
+
+```
+▾ todo·write
+  (5 items)
+
+  2/5 completed
+  ✓ Fix the failing spec
+  ◐ Run the test suite
+  ○ Update the changelog
+```
+
+`✓` marks completed items, `◐` the single in-progress item (shown as its `activeForm` when provided, else its content), and `○` pending items; the first line is the progress count (`2/5 completed` / `2/5 已完成`). Collapsed, the block shows the progress header plus the first seven items and `+N lines` for the rest — expand it with `<Tab>` (see [Auto-collapse and `<Tab>`](#auto-collapse-and-tab)). Even expanded, the item list truncates at `todo.max_items` lines with a `… N more` tail. Validation errors and empty-list writes fall back to the extension's fixed reply text (e.g. `Todo list cleared`) instead of the checklist.
+
+### The `:PiTodo` panel
+
+`:PiTodo` toggles a read-only side panel with the session's current list — the same three-state checklist, mirrored live from every `todo_write` result, including replayed history.
+
+When the [sessions overview](sessions.md#sessions-overview-pisessions) is open in the current tab, the panel stacks in the same column — `todo.panel.position` picks `below` (default) or `above` the sessions window — and its height fits the content up to `todo.panel.height` lines. Without the sessions list, the panel opens as its own full-height vertical split sized after `sessions_list.position` / `sessions_list.width`. `q` closes the panel.
+
+With `todo.panel.hide_when_empty` (default), the panel is hidden while the list is empty; an explicitly opened panel shows a `no todos` placeholder instead. With `todo.panel.auto_open`, the panel opens automatically when the session's todo list becomes non-empty (the first write, or a re-added list after a clear).
 
 ## Models
 

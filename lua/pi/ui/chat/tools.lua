@@ -3,6 +3,7 @@
 local Path = require("pi.path")
 local Render = require("pi.ui.render")
 local SubToolUi = require("pi.subsessions.tool_ui")
+local TodoToolUi = require("pi.todo.tool_ui")
 
 local M = {}
 
@@ -38,6 +39,7 @@ local TOOL_ICONS = {
     source_check = nf(0xF0565), -- nf-md-shield-check
     get_search_content = nf(0xF0866), -- nf-md-database-search
     vision = nf(0xF0208), -- nf-md-eye (vision-fallback description block)
+    todo_write = nf(0xF0756), -- nf-md-format-list-checks
     -- Sub-agent family (Material Design outline set)
     list_subagents = nf(0xF0D0B), -- nf-md-account-group-outline
     read_subagent = nf(0xF0229), -- nf-md-file-eye-outline
@@ -1359,6 +1361,50 @@ local renderers = {
                 return ("已停止 %d"):format(n)
             end
             return ("stopped %d"):format(n)
+        end,
+    },
+
+    -- Todo tool: the result's details carry the full list, so the block body
+    -- renders the three-state checklist itself (✓ / ◐ / ○) instead of the
+    -- extension's fixed reply text. The input line is the item count; the
+    -- output is the progress header + item lines (see
+    -- lua/pi/todo/tool_ui.lua).
+    todo_write = {
+        input_visible = 1,
+        output_visible = 8,
+        display_name = function()
+            return TodoToolUi.display_name("todo_write")
+        end,
+        on_start = function(history, args)
+            if type(args) ~= "table" or type(args.todos) ~= "table" then
+                return
+            end
+            local lang = TodoToolUi.resolve_lang()
+            if lang == "zh" then
+                render_body_line(history, ("(%d 项)"):format(#args.todos))
+            else
+                render_body_line(history, ("(%d items)"):format(#args.todos))
+            end
+        end,
+        on_end = function(history, _, result, is_error, insert_at)
+            local details = TodoToolUi.result_details(result)
+            -- Validation rejections return a normal result (never isError) with
+            -- details.error set (see extensions/todo.ts errorDetails); fall back
+            -- to the extension's reply text so the user sees the error.
+            local has_error = type(result) == "table"
+                and type(result.details) == "table"
+                and result.details.error ~= nil
+            if is_error or has_error or not details or (details.total or 0) == 0 then
+                -- Errors and empty lists fall back to the extension's fixed
+                -- reply text (same behavior as default_renderer.on_end).
+                return render_result_output(history, nil, result, nil, insert_at)
+            end
+            local todo_cfg = require("pi.config").options.todo or {}
+            local lines = TodoToolUi.format_lines(details, { max_items = todo_cfg.max_items })
+            for _, line in ipairs(lines) do
+                insert_at = render_body_line(history, line, nil, insert_at)
+            end
+            return insert_at
         end,
     },
 

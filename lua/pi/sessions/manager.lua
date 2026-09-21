@@ -383,6 +383,33 @@ local function track_changed_file(session, args)
     end
 end
 
+--- Mirror a todo tool result into the todo panel state (read-only; the panel
+--- re-renders itself). Lazy requires keep the todo modules out of the hot
+--- path for every other tool and avoid load-order/circular issues. A failing
+--- hook must never break event routing.
+---@param tool_name string?
+---@param result any tool result message (details are read off result.details
+--- or off result itself for replayed toolResult messages, which carry details
+--- at the top level)
+local function update_todo_mirror(tool_name, result)
+    if type(tool_name) ~= "string" then
+        return
+    end
+    local ok, err = pcall(function()
+        local ToolUi = require("pi.todo.tool_ui")
+        if not (type(ToolUi.is_todo_tool) == "function" and ToolUi.is_todo_tool(tool_name)) then
+            return
+        end
+        local details = ToolUi.result_details(result)
+        if details then
+            require("pi.todo").update_from_details(details)
+        end
+    end)
+    if not ok then
+        Notify.warn("todo panel update failed: " .. tostring(err))
+    end
+end
+
 ---@param session pi.Session
 ---@param tool_name string?
 ---@param tool_call_id string?
@@ -696,6 +723,7 @@ function M.handle_event(session, msg)
                 require("pi.quickfix").on_tool_end(msg.toolName, msg.toolCallId, msg.result, msg.isError)
             end)
         end
+        update_todo_mirror(msg.toolName, msg.result)
         if session._pending_file_change_args and not msg.isError then
             local args = session._pending_file_change_args[msg.toolCallId]
             track_changed_file(session, args)
@@ -1472,6 +1500,7 @@ local function replay_messages(session, messages)
             local is_error = msg.isError == true
             -- msg itself has .content, matching what on_tool_end expects as result
             session.chat:on_tool_end(tool_name, tool_call_id, msg, is_error)
+            update_todo_mirror(tool_name, msg)
             -- Track files changed by edit/write tools during replay.
             local tc_args = not is_error and tool_call_args[tool_call_id]
             if tc_args then
@@ -2209,6 +2238,14 @@ end
 ---@param session pi.Session
 function M._register_for_test(session)
     registry[session.id] = session
+end
+
+--- Test-only hook for the todo-panel mirror (tests/todo_panel_e2e.lua): route
+--- a tool result through the same guarded path the event handlers use.
+---@param tool_name string?
+---@param result any
+function M._update_todo_mirror(tool_name, result)
+    update_todo_mirror(tool_name, result)
 end
 
 --- Test-only reset: stop all sessions and clear registry state.
