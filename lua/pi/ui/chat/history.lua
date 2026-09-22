@@ -1283,6 +1283,23 @@ function History:_insert_lines(row, lines_list)
     return row, row + #lines_list
 end
 
+--- Replace a contiguous row range in place. Stale extmarks inside the range
+--- are cleared first; the caller re-applies its own marks on the new text.
+--- Used by tool renderers that rewrite their on_start region when the tool
+--- ends (dispatch_subagents: task tree -> status rows).
+---@param row_start integer 0-indexed first row (inclusive)
+---@param row_finish integer 0-indexed row after the last one (exclusive)
+---@param lines_list string[]
+function History:_replace_lines(row_start, row_finish, lines_list)
+    lines_list = flatten_newlines(lines_list)
+    self:_with_modifiable(function()
+        vim.api.nvim_buf_clear_namespace(self._buf, ns, row_start, row_finish)
+        vim.api.nvim_buf_set_lines(self._buf, row_start, row_finish, false, lines_list)
+    end)
+    self:_update_status_extmark()
+    self:_maybe_scroll()
+end
+
 --- Available display columns for the single-line thinking preview.
 ---@return integer
 function History:_thinking_preview_width(header_text)
@@ -2604,7 +2621,12 @@ function History:on_tool_start(tool_name, tool_call_id, tool_input)
 
         -- Standard multi-line tool block
         local fold = Tools.GLYPHS.FOLD_OPEN
-        local header = fold .. icon .. " " .. display_name
+        -- Tool summary after the name (inline_text): only dispatch defines one
+        -- among block renderers today, so other headers stay byte-identical.
+        local detail = renderer.inline_text and renderer.inline_text(self, tool_input) or nil
+        detail = detail and Tools.flatten_line(detail) or nil
+        local header = fold .. icon .. " " .. display_name .. (detail and ("  " .. detail) or "")
+        local name_end = #fold + #icon + 1 + #display_name
 
         local last_line = vim.api.nvim_buf_line_count(self._buf) - 1
         local cur = vim.api.nvim_buf_get_lines(self._buf, last_line, last_line + 1, false)[1] or ""
@@ -2625,9 +2647,15 @@ function History:on_tool_start(tool_name, tool_call_id, tool_input)
             hl_group = "PiToolHeader",
         })
         vim.api.nvim_buf_set_extmark(self._buf, ns, header_row, icon_start + #icon, {
-            end_col = #header,
+            end_col = name_end,
             hl_group = "PiToolHeader",
         })
+        if detail then
+            vim.api.nvim_buf_set_extmark(self._buf, ns, header_row, name_end + 2, {
+                end_col = #header,
+                hl_group = "PiToolCall",
+            })
+        end
         -- Spinner virtual text on header (removed on tool end)
         local spinner_virt = vim.api.nvim_buf_set_extmark(self._buf, ns, header_row, #header, {
             virt_text = { { "  " .. self._spinner_frames[self._spinner_index], "PiToolRunning" } },
@@ -2805,6 +2833,16 @@ function History:on_tool_end(tool_name, tool_call_id, result, is_error)
                     end_col = #fold + #icon,
                     hl_group = icon_hl,
                 })
+                -- Batch/summary status as header virtual text. Block path only:
+                -- inline tools render the same field in their branch above.
+                local extra = renderer.inline_status and renderer.inline_status(result, is_error) or nil
+                if extra then
+                    local header_line = vim.api.nvim_buf_get_lines(self._buf, pos[1], pos[1] + 1, false)[1] or ""
+                    vim.api.nvim_buf_set_extmark(self._buf, ns, pos[1], #header_line, {
+                        virt_text = { { " " .. extra, "PiToolStatus" } },
+                        virt_text_pos = "inline",
+                    })
+                end
             end
             block.end_extmark = footer_extmark
             block.end_hl_group = footer_hl

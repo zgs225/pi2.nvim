@@ -50,10 +50,11 @@ local ok, err = pcall(function()
     end, 20)
 
     local lines = vim.api.nvim_buf_get_lines(h:buf(), 0, -1, false)
-    local header, tree = false, 0
-    for _, line in ipairs(lines) do
+    local header, tree, header_row = false, 0, nil
+    for i, line in ipairs(lines) do
         if line:find("子·派发", 1, true) then
             header = true
+            header_row = i - 1
         end
         if line:find("├─", 1, true) or line:find("└─", 1, true) then
             tree = tree + 1
@@ -61,6 +62,14 @@ local ok, err = pcall(function()
     end
 
     assert(header, "expected localized dispatch header")
+    assert(header_row, "expected the block header row")
+    -- Gap B regression guard: the block header carries the item-count detail
+    -- (zero counts omitted: spawn×1 · msg×1, never "msg×0").
+    local header_line = vim.api.nvim_buf_get_lines(h:buf(), header_row, header_row + 1, false)[1] or ""
+    assert(
+        header_line:find("2 项 (新建×1 · 续聊×1)", 1, true),
+        "expected the block header to carry the item-count detail, got: " .. header_line
+    )
     assert(tree >= 2, "expected item tree lines, got " .. tree)
 
     local result = {
@@ -71,8 +80,8 @@ local ok, err = pcall(function()
                     status = "completed",
                     summary = { done = 2, total = 2 },
                     items = {
-                        { ref = "spawn", status = "ok", output = "explored" },
-                        { ref = "msg", status = "ok", output = "summarized" },
+                        { ref = "spawn", status = "ok", task = "explore codebase", output = "explored" },
+                        { ref = "msg", status = "ok", target = "child-a", output = "summarized" },
                     },
                 }),
             },
@@ -83,11 +92,15 @@ local ok, err = pcall(function()
     local joined = ""
     vim.wait(1000, function()
         joined = table.concat(vim.api.nvim_buf_get_lines(h:buf(), 0, -1, false), "\n")
-        return joined:find("status:", 1, true) ~= nil and joined:find("✓", 1, true) ~= nil
+        local _, mark_count = joined:gsub("✓", "")
+        return mark_count >= 2
     end, 20)
 
-    assert(joined:find("status:", 1, true), "expected status line on batch end")
     assert(joined:find("✓", 1, true), "expected completion marks")
+    -- The on_start tree is rewritten in place: no separate status: line and no
+    -- per-item result list survive on_tool_end.
+    assert(not joined:find("status:", 1, true), "expected no status: line in the body")
+    assert(not joined:find("explored", 1, true), "expected no ok-output summary")
 
     -- The block must stay fully expanded after on_tool_end: the item tree
     -- lines drawn on_start are still present and no collapse summary markers
@@ -100,6 +113,30 @@ local ok, err = pcall(function()
     end
     assert(tree_after >= 2, "expected item tree lines to survive on_tool_end, got " .. tree_after)
     assert(not joined:match("%+%d+ lines"), 'expected no collapse summary markers ("+N lines") after on_tool_end')
+
+    -- Gap A regression guard: the batch status summary rides the header as
+    -- inline virtual text (the body draws no `status:` line): zh terminal
+    -- form here is "2/2 已完成".
+    local nsn = vim.api.nvim_create_namespace("pi-chat")
+    local status_virt
+    vim.wait(500, function()
+        for _, m in
+            ipairs(
+                vim.api.nvim_buf_get_extmarks(h:buf(), nsn, { header_row, 0 }, { header_row, -1 }, { details = true })
+            )
+        do
+            if type(m[4].virt_text) == "table" then
+                for _, chunk in ipairs(m[4].virt_text) do
+                    if tostring(chunk[1]):find("2/2", 1, true) then
+                        status_virt = chunk[1]
+                        return true
+                    end
+                end
+            end
+        end
+        return false
+    end, 20)
+    assert(status_virt, "expected the batch status virtual text on the block header")
 end)
 
 if old_lang == vim.NIL then
