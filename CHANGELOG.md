@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-09-22
+
+- **FIXED:** Tool output containing consecutive carriage returns (`\r\r` — progress-bar redraw residue from commands like builds and downloads) no longer aborts the tool block's render with `nvim_buf_set_extmark: Invalid 'end_col': out of range`. The buffer-write boundary now flattens embedded CR/LF to spaces one-for-one (byte-length-preserving) instead of collapsing each run to a single space: renderers size their highlight extmarks from the original text, and a buffer line that ended up shorter than the original made the extmark throw inside the scheduled `on_tool_end` callback, leaving the block — and everything queued after it — unrendered (observed when resuming a session whose bash tool had returned `\r-#O#- …\r\r … 0.0%`-style output). The same crash class was latent at seven more sites (tool input fences, diff syntax highlights, error and system-error blocks, compaction summaries, extension custom blocks, and `!` bash block headers); the single boundary fix covers all of them.
+
 ## 2026-09-21
 
 - **CHANGED:** The stacked `:PiTodo` panel now splits the shared column evenly with the `:PiSessions` sidebar instead of sizing to its content: `todo.panel.height` (default now `0.5`, was `10`) takes a fraction of the column height when `< 1` — re-evaluated on every refresh, so manual resizes of either window snap back to the configured split — and an absolute line count when `>= 1`; content taller than the panel scrolls instead of growing it. Open-time sizing derives the fraction from the sessions window's height (it owns the whole column before the split); standalone full-height columns are unchanged.
