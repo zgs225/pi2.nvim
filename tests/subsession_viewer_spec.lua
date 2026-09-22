@@ -1177,7 +1177,11 @@ describe("pi.ui.subsession_viewer", function()
         assert.is_truthy(footer_text:find("claude-3-7-sonnet", 1, true))
         assert.is_truthy(footer_text:find("󰌵 H", 1, true))
         assert.is_truthy(footer_text:find("12k", 1, true))
-        assert.is_truthy(vim.wo[win].statusline:find("claude-3-7-sonnet", 1, true))
+        -- The float window's local 'statusline' must stay untouched: under
+        -- 'laststatus' = 3 it feeds the global statusline and would duplicate
+        -- the footer at the bottom of the screen.
+        assert.is_nil(vim.wo[win].statusline:find("claude-3-7-sonnet", 1, true))
+        assert.is_nil(vim.wo[win].statusline:find("12k", 1, true))
 
         Viewer.close()
         Manifest.load = orig_load
