@@ -629,46 +629,20 @@ function M.update_title(name, status)
     })
 end
 
---- Update the viewer window statusline / footer.
+--- Update the viewer float footer. The float window's local 'statusline' is
+--- deliberately left untouched: under 'laststatus' = 3 (e.g. NvChad) it feeds
+--- the global statusline, which would duplicate the footer at the bottom of
+--- the screen — and a plain text containing "%" is not a valid statusline
+--- expression (E539), so it could even blank the global statusline.
 function M.update_statusline()
     if not viewer_win or not vim.api.nvim_win_is_valid(viewer_win) then
         return
     end
-    if viewer_statusline_enabled == false then
-        pcall(vim.api.nvim_win_set_config, viewer_win, {
-            footer = "",
-            footer_pos = "center",
-        })
-        pcall(function()
-            if viewer_win and vim.api.nvim_win_is_valid(viewer_win) then
-                vim.wo[viewer_win].statusline = ""
-            end
-        end)
-        return
-    end
-
-    local chunks, plain = format_statusline(viewer_status)
-    if chunks and #chunks > 0 then
-        pcall(vim.api.nvim_win_set_config, viewer_win, {
-            footer = chunks,
-            footer_pos = "center",
-        })
-        pcall(function()
-            if viewer_win and vim.api.nvim_win_is_valid(viewer_win) then
-                vim.wo[viewer_win].statusline = plain or ""
-            end
-        end)
-    else
-        pcall(vim.api.nvim_win_set_config, viewer_win, {
-            footer = "",
-            footer_pos = "center",
-        })
-        pcall(function()
-            if viewer_win and vim.api.nvim_win_is_valid(viewer_win) then
-                vim.wo[viewer_win].statusline = ""
-            end
-        end)
-    end
+    local chunks = format_statusline(viewer_status)
+    pcall(vim.api.nvim_win_set_config, viewer_win, {
+        footer = (chunks and #chunks > 0) and chunks or "",
+        footer_pos = "center",
+    })
 end
 
 --- Handle a live session event for the active viewer.
@@ -966,7 +940,7 @@ function M.open(child_id, opts)
     local row = math.max(0, math.floor((editor_h - height) / 2))
     local col = math.floor((editor_w - width) / 2)
     local title = format_title(name, status)
-    local initial_chunks, initial_plain = format_statusline(viewer_status)
+    local initial_chunks = format_statusline(viewer_status)
 
     local win_opts = {
         relative = "editor",
@@ -985,15 +959,6 @@ function M.open(child_id, opts)
     end
 
     local win = vim.api.nvim_open_win(buf, true, win_opts)
-    if viewer_statusline_enabled and initial_plain and initial_plain ~= "" then
-        pcall(function()
-            vim.wo[win].statusline = initial_plain
-        end)
-    else
-        pcall(function()
-            vim.wo[win].statusline = ""
-        end)
-    end
 
     viewer_win = win
     viewer_history = history
