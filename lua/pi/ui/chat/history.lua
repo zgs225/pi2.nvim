@@ -1216,6 +1216,12 @@ end
 --- forwards it verbatim. Flatten newlines at the buffer write boundary so a
 --- malformed upstream string can never take the buffer down. Only newlines are
 --- touched — leading whitespace is meaningful (code blocks, indentation).
+--- INVARIANT: the flatten must be byte-length-preserving (one control char →
+--- one space, never a run → one space). Renderers size their highlight
+--- extmarks from the original text (`end_col = #line`); a buffer line that
+--- ends up shorter than the original makes nvim_buf_set_extmark throw
+--- "Invalid 'end_col': out of range" (real crash: tool output containing
+--- progress-bar residue like "\r\r").
 ---@param lines string[]
 ---@return string[] same table when clean, otherwise a sanitized copy
 local function flatten_newlines(lines)
@@ -1231,7 +1237,7 @@ local function flatten_newlines(lines)
     end
     local out = {}
     for i, line in ipairs(lines) do
-        out[i] = type(line) == "string" and (line:gsub("[\r\n]+", " ")) or line
+        out[i] = type(line) == "string" and (line:gsub("[\r\n]", " ")) or line
     end
     return out
 end

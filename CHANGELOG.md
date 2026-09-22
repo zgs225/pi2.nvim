@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-09-22
+
+- **FIXED:** Tool output containing consecutive carriage returns (`\r\r` — progress-bar redraw residue from commands like builds and downloads) no longer aborts the tool block's render with `nvim_buf_set_extmark: Invalid 'end_col': out of range`. The buffer-write boundary now flattens embedded CR/LF to spaces one-for-one (byte-length-preserving) instead of collapsing each run to a single space: renderers size their highlight extmarks from the original text, and a buffer line that ended up shorter than the original made the extmark throw inside the scheduled `on_tool_end` callback, leaving the block — and everything queued after it — unrendered (observed when resuming a session whose bash tool had returned `\r-#O#- …\r\r … 0.0%`-style output). The same crash class was latent at seven more sites (tool input fences, diff syntax highlights, error and system-error blocks, compaction summaries, extension custom blocks, and `!` bash block headers); the single boundary fix covers all of them.
+
 ## 2026-09-21
 
 - **FIXED:** The `todo_write` chat tool block no longer renders the `(5 items)` input line — the item count duplicates the `2/5 completed` progress header, so the block now renders straight into the ✓/◐/○ checklist.
