@@ -243,6 +243,39 @@ local function render_body_line(history, text, hl_group, insert_at)
     return insert_at
 end
 
+--- Paint border + highlight spans for one dispatch status row: the whole row
+--- in PiToolCall, with the state mark overriding in its own group.
+---@param history pi.ChatHistory
+---@param row integer 0-indexed
+---@param spec pi.DispatchRow
+---@param text string flattened line text
+---@param mark_start integer byte col where the mark starts in `text`
+local function paint_dispatch_row(history, row, spec, text, mark_start)
+    M.set_border(history, row, M.GLYPHS.INDENT)
+    if text == "" then
+        return
+    end
+    local buf = history:buf()
+    local ns_id = history:ns()
+    ---@param from integer byte col (inclusive)
+    ---@param to integer byte col (exclusive)
+    ---@param group string
+    local function span(from, to, group)
+        if to > from then
+            vim.api.nvim_buf_set_extmark(buf, ns_id, row, from, { end_col = to, hl_group = group })
+        end
+    end
+    if spec.mark ~= "" and spec.mark_hl then
+        local mstart = math.min(mark_start, #text)
+        local mend = math.min(mstart + #spec.mark, #text)
+        span(0, mstart, "PiToolCall")
+        span(mstart, mend, spec.mark_hl)
+        span(mend, #text, "PiToolCall")
+    else
+        span(0, #text, "PiToolCall")
+    end
+end
+
 --- Shorten a file path for display: the workspace prefix is stripped so tool
 --- blocks show `apps/web/src/Foo.vue` instead of the model's absolute path.
 --- Lossless (see `pi.path`), so the rendered text still resolves against the
@@ -1239,8 +1272,8 @@ local renderers = {
         inline_status = function(result)
             return SubToolUi.batch_status_text(SubToolUi.result_details(result))
         end,
-        -- No input_visible/output_visible thresholds: the item task tree (on_start)
-        -- and the per-item result list + status line (on_end) are the signal
+        -- No input_visible/output_visible thresholds: the item task tree (on_start,
+        -- rewritten in place to one status row per item on_end) is the signal
         -- content (edit-like), so the block stays fully expanded by default in
         -- every phase (running / completed wait:true / completed wait:false /
         -- replay). The only remaining fold trigger is the generic window-width
@@ -1265,26 +1298,65 @@ local renderers = {
                 return insert_at
             end
             local details = SubToolUi.result_details(result)
-            if not details then
+            local rows = SubToolUi.dispatch_rows(args, details)
+            local n = type(args) == "table" and type(args.items) == "table" and #args.items or 0
+
+            if rows then
+                -- Assemble one line per row. The mark's byte col is taken from
+                -- the flattened prefix: "  ├─ " collapses to " ├─ " here, so
+                -- raw #row.prefix would point one byte past the mark.
+                local texts, mark_starts = {}, {}
+                for i, row in ipairs(rows) do
+                    local line = M.flatten_line(row.prefix)
+                    mark_starts[i] = #line
+                    if row.mark ~= "" then
+                        line = line .. row.mark .. " "
+                    end
+                    line = line .. row.label
+                    if row.excerpt then
+                        line = line .. " — " .. row.excerpt
+                    end
+                    texts[i] = M.flatten_line(line)
+                end
+
+                if insert_at and insert_at >= n and #texts == n then
+                    -- In-place rewrite of the on_start tree: same row count, so
+                    -- insert_at (the tail anchor) stays valid and history draws
+                    -- the generic footer right after the rows.
+                    local row_start = insert_at - n
+                    history:_replace_lines(row_start, insert_at, texts)
+                    for i, row in ipairs(rows) do
+                        paint_dispatch_row(history, row_start + i - 1, row, texts[i], mark_starts[i])
+                    end
+                    return insert_at
+                end
+
+                -- Fallback: no tail anchor to rewrite (block never registered,
+                -- e.g. a tool call id was never supplied) — append instead.
+                for i, row in ipairs(rows) do
+                    local at
+                    if insert_at then
+                        local next_at
+                        at, next_at = history:_insert_lines(insert_at, { texts[i] })
+                        insert_at = next_at
+                    else
+                        at = history:_append_lines({ texts[i] })
+                    end
+                    paint_dispatch_row(history, at, row, texts[i], mark_starts[i])
+                end
                 return insert_at
             end
-            local status = SubToolUi.batch_status_text(details)
-            if status then
-                insert_at = render_body_line(history, "status: " .. status, nil, insert_at)
+
+            -- No rows (details missing, or parseable without an items table):
+            -- keep the on_start tree and surface the tool-level error, if any,
+            -- as a single line after it.
+            local err_text = type(details) == "table" and type(details.error) == "string" and details.error or nil
+            if not err_text or err_text == "" then
+                err_text = extract_result_text(result)
             end
-            if type(details.items) == "table" then
-                for _, item in ipairs(details.items) do
-                    local mark = item.status == "ok" and "✓" or (item.status == "failed" and "✗" or "·")
-                    local label = type(item.ref) == "string" and item.ref ~= "" and item.ref
-                        or SubToolUi.item_label(item)
-                    local line = ("  %s %s"):format(mark, label)
-                    if type(item.output) == "string" and item.output ~= "" then
-                        line = line .. " — " .. M.flatten_line(item.output:sub(1, 80))
-                    elseif type(item.error) == "string" and item.error ~= "" then
-                        line = line .. " — " .. M.flatten_line(item.error:sub(1, 80))
-                    end
-                    insert_at = render_body_line(history, line, nil, insert_at)
-                end
+            if err_text and err_text ~= "" then
+                insert_at =
+                    render_body_line(history, "  ! " .. M.flatten_line(err_text:sub(1, 80)), "PiToolError", insert_at)
             end
             return insert_at
         end,

@@ -1283,6 +1283,23 @@ function History:_insert_lines(row, lines_list)
     return row, row + #lines_list
 end
 
+--- Replace a contiguous row range in place. Stale extmarks inside the range
+--- are cleared first; the caller re-applies its own marks on the new text.
+--- Used by tool renderers that rewrite their on_start region when the tool
+--- ends (dispatch_subagents: task tree -> status rows).
+---@param row_start integer 0-indexed first row (inclusive)
+---@param row_finish integer 0-indexed row after the last one (exclusive)
+---@param lines_list string[]
+function History:_replace_lines(row_start, row_finish, lines_list)
+    lines_list = flatten_newlines(lines_list)
+    self:_with_modifiable(function()
+        vim.api.nvim_buf_clear_namespace(self._buf, ns, row_start, row_finish)
+        vim.api.nvim_buf_set_lines(self._buf, row_start, row_finish, false, lines_list)
+    end)
+    self:_update_status_extmark()
+    self:_maybe_scroll()
+end
+
 --- Available display columns for the single-line thinking preview.
 ---@return integer
 function History:_thinking_preview_width(header_text)

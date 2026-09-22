@@ -71,8 +71,8 @@ local ok, err = pcall(function()
                     status = "completed",
                     summary = { done = 2, total = 2 },
                     items = {
-                        { ref = "spawn", status = "ok", output = "explored" },
-                        { ref = "msg", status = "ok", output = "summarized" },
+                        { ref = "spawn", status = "ok", task = "explore codebase", output = "explored" },
+                        { ref = "msg", status = "ok", target = "child-a", output = "summarized" },
                     },
                 }),
             },
@@ -83,11 +83,15 @@ local ok, err = pcall(function()
     local joined = ""
     vim.wait(1000, function()
         joined = table.concat(vim.api.nvim_buf_get_lines(h:buf(), 0, -1, false), "\n")
-        return joined:find("status:", 1, true) ~= nil and joined:find("✓", 1, true) ~= nil
+        local _, mark_count = joined:gsub("✓", "")
+        return mark_count >= 2
     end, 20)
 
-    assert(joined:find("status:", 1, true), "expected status line on batch end")
     assert(joined:find("✓", 1, true), "expected completion marks")
+    -- The on_start tree is rewritten in place: no separate status: line and no
+    -- per-item result list survive on_tool_end.
+    assert(not joined:find("status:", 1, true), "expected no status: line in the body")
+    assert(not joined:find("explored", 1, true), "expected no ok-output summary")
 
     -- The block must stay fully expanded after on_tool_end: the item tree
     -- lines drawn on_start are still present and no collapse summary markers
