@@ -1,6 +1,10 @@
 -- Headless e2e for the todo panel (lua/pi/todo/init.lua).
 -- Run: nvim --headless -u tests/minimal_init.lua -l tests/todo_panel_e2e.lua
 -- Exercises the real pi.todo.tool_ui + pi.ui.sessions accessor:
+--   0. winfix preconditions (set number + winfix.setup before any pi window
+--      exists) and focus-bounce assertions in 2/3: re-entering the
+--      pi-sessions panel must not reset it to user defaults (the reported
+--      line-number + dropped winfix* bug)
 --   1. manager.update_todo_mirror-equivalent routing through update_from_details
 --   2. standalone column open (winfixwidth, sessions_list width)
 --   3. stacked layout below a fake registered sessions window (winfixheight,
@@ -46,6 +50,81 @@ require("pi.config").options.todo =
     { panel = { auto_open = true, height = 0.5, position = "below", hide_when_empty = true } }
 require("pi.config").options.sessions_list = { position = "left", width = 40 }
 
+-- 0. winfix preconditions ---------------------------------------------------
+-- Reported bug: with a user `set number` config, a pi-sessions panel window
+-- can match winfix's fingerprint (concealcursor="nvic" inherited from a chat
+-- window split, number/relativenumber/cursorline false). The pre-fix
+-- allowlist exempted only pi-chat-*, so the next focus-in ran winfix's reset
+-- and the sidebar showed line numbers while losing winfixbuf/winfixwidth/
+-- winfixheight. winfix.setup() must run before any pi window exists —
+-- section 1 below auto-opens the first panel, so arm everything here.
+vim.cmd("set number")
+check(
+    vim.api.nvim_get_option_value("number", { scope = "global" }) == true,
+    "precondition: user config `set number` (global number=true) is in effect"
+)
+-- Global nvic keeps the fingerprint part of the captured user defaults, so
+-- even a (pre-fix) reset writes "nvic" back and the bounce below always
+-- re-enters a fingerprint-armed panel window.
+vim.o.concealcursor = "nvic"
+check(
+    vim.api.nvim_get_option_value("concealcursor", { scope = "global" }) == "nvic",
+    "precondition: global concealcursor armed to nvic"
+)
+require("pi.ui.winfix").setup()
+
+--- Bounce focus out of a panel window and back, then assert winfix left the
+--- panel untouched (the reported bug: focus-in reset pi-sessions to user
+--- defaults → line numbers + dropped winfix* pins). Prints the observed
+--- options after re-entry so a failure is diagnosable.
+---@param panel integer the panel window to bounce back into
+---@param label string label prefix for the assertion messages
+---@param expect_wfixheight boolean? when set, also assert winfixheight
+local function bounce_focus(panel, label, expect_wfixheight)
+    -- The panel must be fingerprint-armed at bounce time, otherwise the
+    -- assertions below prove nothing about the bug path.
+    check(
+        vim.wo[panel].concealcursor == "nvic"
+            and vim.wo[panel].number == false
+            and vim.wo[panel].relativenumber == false
+            and vim.wo[panel].cursorline == false,
+        label
+            .. ": panel carries the winfix fingerprint before bounce (got "
+            .. vim.inspect({
+                concealcursor = vim.wo[panel].concealcursor,
+                number = vim.wo[panel].number,
+                relativenumber = vim.wo[panel].relativenumber,
+                cursorline = vim.wo[panel].cursorline,
+            })
+            .. ")"
+    )
+    local others = vim.tbl_filter(function(w)
+        return vim.api.nvim_win_is_valid(w) and w ~= panel
+    end, vim.api.nvim_tabpage_list_wins(0))
+    check(#others > 0, label .. ": another window exists to bounce focus to")
+    vim.api.nvim_set_current_win(others[1])
+    vim.api.nvim_set_current_win(panel)
+    local opts = {
+        number = vim.wo[panel].number,
+        relativenumber = vim.wo[panel].relativenumber,
+        concealcursor = vim.wo[panel].concealcursor,
+        cursorline = vim.wo[panel].cursorline,
+        winfixbuf = vim.wo[panel].winfixbuf,
+        winfixwidth = vim.wo[panel].winfixwidth,
+        winfixheight = vim.wo[panel].winfixheight,
+    }
+    print(("INFO %s panel options after focus bounce: %s"):format(label, vim.inspect(opts)))
+    check(opts.number == false, label .. ": no line numbers after focus bounce (number=false)")
+    check(opts.relativenumber == false, label .. ": relativenumber stays false after focus bounce")
+    check(opts.concealcursor == "nvic", label .. ": concealcursor=nvic survives focus bounce")
+    check(opts.cursorline == false, label .. ": cursorline stays false after focus bounce")
+    check(opts.winfixbuf == true, label .. ": winfixbuf survives focus bounce")
+    check(opts.winfixwidth == true, label .. ": winfixwidth survives focus bounce")
+    if expect_wfixheight ~= nil then
+        check(opts.winfixheight == expect_wfixheight, label .. ": winfixheight survives focus bounce")
+    end
+end
+
 -- 1. Tool name routing through the manager hook -----------------------------
 check(ToolUi.is_todo_tool("todo_write") == true, "is_todo_tool(todo_write) is true")
 check(ToolUi.is_todo_tool("read") == false, "is_todo_tool(read) is false")
@@ -75,6 +154,19 @@ eq("auto", Todo._opened_by(), "auto-opened panel is marked auto")
 
 -- 2. Standalone column (close the auto panel, reopen manually) --------------
 Todo.close()
+-- Realistic source for the standalone split: a chat-like window carrying
+-- pi's fingerprint options (mirrors lua/pi/ui/chat/layout.lua set_win_opts),
+-- so the panel inherits concealcursor="nvic" exactly like :PiTodo run while
+-- a chat window is current.
+vim.cmd("split")
+local chatlike = vim.api.nvim_get_current_win()
+vim.wo[chatlike].wrap = false
+vim.wo[chatlike].number = false
+vim.wo[chatlike].relativenumber = false
+vim.wo[chatlike].signcolumn = "no"
+vim.wo[chatlike].concealcursor = "nvic"
+vim.wo[chatlike].cursorline = false
+vim.wo[chatlike].winfixbuf = true
 Todo.open()
 eq("manual", Todo._opened_by(), "explicit open marks the panel manual")
 local win = vim.api.nvim_get_current_win()
@@ -90,6 +182,9 @@ eq(
     lines,
     "standalone panel renders the padded layout"
 )
+-- Focus bounce: re-entering the panel must not reset it to user defaults
+-- (the reported pi-sessions line-number bug).
+bounce_focus(win, "standalone")
 -- auto_open was consumed by the transition above; this open() is explicit.
 Todo.close()
 check(not Todo.is_open(), "close removes the panel")
@@ -97,6 +192,9 @@ check(not Todo.is_open(), "close removes the panel")
 -- 3. Stacked layout --------------------------------------------------------
 -- Register a real sessions-list window through pi.ui.sessions so the panel
 -- stacks in its column. Its side win is a 40-wide left vsplit.
+-- Open it from the chat-like window so the stacked chain (chat-like ->
+-- sessions -> todo split) inherits concealcursor="nvic".
+vim.api.nvim_set_current_win(chatlike)
 SessionList.open()
 local sess_win = SessionList.win(vim.api.nvim_get_current_tabpage())
 check(sess_win ~= nil, "sessions list window registered")
@@ -126,6 +224,9 @@ check(
 )
 check(vim.fn.win_screenpos(sess_win)[1] < vim.fn.win_screenpos(todo_win)[1], "todo panel is below the sessions window")
 check(vim.wo[todo_win].winfixwidth == true, "stacked todo window also fixes the column width")
+-- Focus bounce in the stacked panel: the winfix reset must leave the stacked
+-- window (including winfixheight) untouched.
+bounce_focus(todo_win, "stacked", true)
 
 -- 4. Refresh updates content ----------------------------------------------
 local v2 = {
