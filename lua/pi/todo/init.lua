@@ -593,6 +593,14 @@ function M.current()
     return state_for_tab(current_tab())
 end
 
+--- Return the todo snapshot for a specific session, regardless of which
+--- tab (if any) it is bound to. Detached sessions are included.
+---@param session pi.Session|nil
+---@return pi.TodoDetails|nil
+function M.get(session)
+    return session ~= nil and state[session] or nil
+end
+
 --- Test hook: how the current tab's open panel came to be open.
 ---@return pi.TodoOpenedBy?
 function M._opened_by()

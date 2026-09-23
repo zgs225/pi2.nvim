@@ -232,6 +232,13 @@ require("pi").setup({
             height = 0.75,            -- lines (>=1) or fraction of editor height (<1, default 0.75)
             border = "rounded",       -- float border style (default "rounded")
             statusline = true,        -- show statusline in float footer (context, model, thinking level)
+            todo = {
+                enabled = true,       -- show the todo footer chunk and the `T` panel
+                auto_open = false,    -- auto-open the panel when todos first appear (empty → non-empty)
+                position = "below",   -- panel position inside the viewer: "below" | "above"
+                height = 0.35,        -- panel height as a fraction of the viewer height
+                max_items = 20,       -- max todo items shown in the panel
+            },
         },
     },
 

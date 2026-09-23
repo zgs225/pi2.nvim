@@ -14,6 +14,7 @@ local Sessions = require("pi.sessions.manager")
 local Read = require("pi.subsessions.read")
 local Vision = require("pi.vision")
 local Stats = require("pi.stats")
+local TodoToolUi = require("pi.todo.tool_ui")
 
 ---@class pi.SubsessionViewerOpts
 ---@field on_close? fun()
@@ -63,6 +64,21 @@ local viewer_status = {
     thinking_level = nil,
     context_tokens = nil,
 }
+-- Todo display state (footer chunk + `T` panel)
+---@type pi.TodoDetails?
+local viewer_todo_details = nil
+---@type table[]? decoded JSONL entries (dormant viewers, scanned for todos)
+local viewer_todo_entries = nil
+---@type integer?
+local viewer_todo_panel_win = nil
+---@type integer?
+local viewer_todo_panel_buf = nil
+---@type boolean manual `T` close suppresses auto_open until reopened
+local viewer_todo_panel_suppressed = false
+---@type string|string[]? resolved border of the main float (the panel matches it)
+local viewer_border = nil
+--- Namespace for the todo panel's marker-line highlights.
+local todo_panel_ns = vim.api.nvim_create_namespace("pi-subsession-viewer-todo")
 
 --- Resolve a dimension (columns/lines) from a config value; values < 1 are
 --- fractions of the available space.
@@ -83,6 +99,23 @@ local function component_config(name)
     local components = ((Config.options.statusline or {}).components or {})
     local cfg = components[name]
     return type(cfg) == "table" and cfg or {}
+end
+
+--- Resolve the viewer todo config with the documented defaults applied
+--- defensively (the defaults also live in config.lua; this keeps the viewer
+--- working even if a partial user table reaches setup()).
+---@return pi.SubagentViewerTodoConfig
+local function todo_cfg()
+    local subagent_cfg = Config.options.subagent or {}
+    local viewer_cfg = subagent_cfg.viewer or {}
+    local todo = viewer_cfg.todo or {}
+    return {
+        enabled = todo.enabled ~= false,
+        auto_open = todo.auto_open == true,
+        position = todo.position == "above" and "above" or "below",
+        height = (type(todo.height) == "number" and todo.height > 0) and todo.height or 0.35,
+        max_items = (type(todo.max_items) == "number" and todo.max_items > 0) and todo.max_items or 20,
+    }
 end
 
 ---@param status pi.SubsessionViewerStatus
@@ -206,6 +239,45 @@ local function build_thinking_chunk(status)
     return { display, hl }
 end
 
+--- Whether a todo snapshot describes a non-empty list.
+---@param details pi.TodoDetails?
+---@return boolean
+local function has_todos(details)
+    if type(details) ~= "table" or type(details.todos) ~= "table" then
+        return false
+    end
+    local total = type(details.total) == "number" and details.total or #details.todos
+    return total > 0
+end
+
+--- Footer summary chunk for a todo snapshot: "✓ c/t" once everything is
+--- done, "◐ c/t" while something is in progress, "○ c/t" otherwise. nil when
+--- there is nothing to show (no details, or an empty list — then the footer
+--- stays exactly as it is without the feature).
+---@param details pi.TodoDetails?
+---@return string[]? chunk { text, highlight }
+local function build_todo_chunk(details)
+    -- Explicit nil check doubles as LuaLS's narrowing (has_todos is not a
+    -- type guard).
+    if details == nil or type(details.todos) ~= "table" then
+        return nil
+    end
+    local total = type(details.total) == "number" and details.total or #details.todos
+    if total <= 0 then
+        return nil
+    end
+    local completed = type(details.completed) == "number" and details.completed or 0
+    if completed >= total then
+        return { ("✓ %d/%d"):format(completed, total), "PiTodoDone" }
+    end
+    for _, todo in ipairs(details.todos) do
+        if type(todo) == "table" and todo.status == "in_progress" then
+            return { ("◐ %d/%d"):format(completed, total), "PiTodoInProgress" }
+        end
+    end
+    return { ("○ %d/%d"):format(completed, total), "PiTodoPending" }
+end
+
 --- Build statusline chunks and plain text for subsession viewer footer.
 ---@param status pi.SubsessionViewerStatus
 ---@return string[][]? chunks
@@ -227,6 +299,14 @@ local function format_statusline(status)
     local th = build_thinking_chunk(status)
     if th then
         items[#items + 1] = th
+    end
+    -- Todo summary: fixed slot after the statusline components, gated by
+    -- subagent.viewer.todo.enabled.
+    if todo_cfg().enabled then
+        local t = build_todo_chunk(viewer_todo_details)
+        if t then
+            items[#items + 1] = t
+        end
     end
 
     if #items == 0 then
@@ -458,14 +538,16 @@ local function replay(history, messages)
 end
 
 ---@param path string
----@return table[] messages, string? session_name, table status
+---@return table[] messages, string? session_name, table status, table[] entries
 local function load_messages_from_jsonl(path)
     local file = io.open(path, "r")
     if not file then
-        return {}, nil, {}
+        return {}, nil, {}, {}
     end
     ---@type table[]
     local messages = {}
+    ---@type table[] every decoded entry, kept raw for todo parsing
+    local entries = {}
     ---@type string?
     local session_name = nil
     local status = {}
@@ -473,6 +555,7 @@ local function load_messages_from_jsonl(path)
         if line ~= "" then
             local ok, entry = pcall(vim.json.decode, line)
             if ok and type(entry) == "table" then
+                entries[#entries + 1] = entry
                 local t = entry.type
                 if t == "message" and type(entry.message) == "table" then
                     local msg = entry.message
@@ -527,7 +610,247 @@ local function load_messages_from_jsonl(path)
         end
     end
     file:close()
-    return messages, session_name, status
+    return messages, session_name, status, entries
+end
+
+--- Resolve the current todo snapshot: a live session (RPC running) reads the
+--- per-session mirror maintained by pi.todo (sessions/manager.lua routes
+--- every todo tool result into it); anything else scans the decoded JSONL
+--- entries captured when the viewer opened.
+---@param live_session pi.Session? the viewed session, when it is live
+---@param entries table[]? decoded JSONL entries (dormant viewers)
+---@return pi.TodoDetails?
+local function resolve_todo_details(live_session, entries)
+    if live_session and live_session.rpc and live_session.rpc:is_running() then
+        return require("pi.todo").get(live_session)
+    end
+    if type(entries) ~= "table" then
+        return nil
+    end
+    return TodoToolUi.details_from_entries(entries)
+end
+
+--- Panel content for a todo snapshot: the rendered list, or the one-line
+--- "no todos" placeholder when there is nothing to show.
+---@param details pi.TodoDetails?
+---@param max_items integer
+---@return string[]
+local function todo_panel_lines(details, max_items)
+    local lines = TodoToolUi.format_lines(details, { max_items = max_items })
+    if #lines == 0 then
+        return { "no todos" }
+    end
+    return lines
+end
+
+-- Inner padding of the panel float: blank lines above/below the content
+-- and a blank column on the left (the right side pads itself with empty
+-- cells). Width is capped at this fraction of the viewer width, so very
+-- long items clip instead of covering the message stream.
+local TODO_PANEL_PAD_V = 1
+local TODO_PANEL_PAD_H = 1
+local TODO_PANEL_MAX_WIDTH = 0.6
+
+--- Buffer lines for the panel: the content framed by vertical padding and
+--- indented by the horizontal padding.
+---@param lines string[] content lines
+---@return string[]
+local function pad_todo_panel_lines(lines)
+    local padded = {}
+    for _ = 1, TODO_PANEL_PAD_V do
+        padded[#padded + 1] = ""
+    end
+    for _, line in ipairs(lines) do
+        padded[#padded + 1] = string.rep(" ", TODO_PANEL_PAD_H) .. line
+    end
+    for _ = 1, TODO_PANEL_PAD_V do
+        padded[#padded + 1] = ""
+    end
+    return padded
+end
+
+--- Highlight group for a rendered panel line, keyed by its leading marker
+--- (✓ / ◐ / ○) once the horizontal padding is skipped; header and
+--- truncation lines keep the default color.
+---@param line string
+---@return string? group
+local function todo_line_hl(line)
+    local stripped = line:gsub("^%s+", "")
+    if stripped:find("✓", 1, true) == 1 then
+        return "PiTodoDone"
+    elseif stripped:find("◐", 1, true) == 1 then
+        return "PiTodoInProgress"
+    elseif stripped:find("○", 1, true) == 1 then
+        return "PiTodoPending"
+    end
+    return nil
+end
+
+--- Write panel lines into a scratch buffer and color the marker lines.
+---@param buf integer
+---@param lines string[]
+local function paint_todo_panel_buf(buf, lines)
+    vim.bo[buf].modifiable = true
+    local padded = pad_todo_panel_lines(lines)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, padded)
+    vim.bo[buf].modifiable = false
+    vim.api.nvim_buf_clear_namespace(buf, todo_panel_ns, 0, -1)
+    for i, line in ipairs(padded) do
+        local hl = todo_line_hl(line)
+        if hl then
+            vim.api.nvim_buf_add_highlight(buf, todo_panel_ns, hl, i - 1, 0, -1)
+        end
+    end
+end
+
+--- Float config for the todo panel, laid over the main viewer window:
+--- sized to the padded content (capped at a fraction of the viewer width),
+--- anchored to the viewer's right edge and pinned to its bottom (below) or
+--- top (above) edge. Non-focusable, one zindex above the main float.
+---@param main_cfg table `nvim_win_get_config` of the viewer window
+---@param lines string[] panel content
+---@param cfg pi.SubagentViewerTodoConfig
+---@return table
+local function todo_panel_win_config(main_cfg, lines, cfg)
+    local main_w = main_cfg.width
+    local main_h = main_cfg.height
+    local content_w = 1
+    for _, line in ipairs(lines) do
+        local w = vim.fn.strdisplaywidth(line)
+        if w > content_w then
+            content_w = w
+        end
+    end
+    local width = math.min(content_w + 2 * TODO_PANEL_PAD_H, math.max(1, math.floor(main_w * TODO_PANEL_MAX_WIDTH)))
+    local buf_lines = #lines + 2 * TODO_PANEL_PAD_V
+    local height = math.max(1, math.min(buf_lines, math.floor(main_h * cfg.height)))
+    local row = cfg.position == "above" and main_cfg.row or (main_cfg.row + main_h - height)
+    local col = main_cfg.col + main_w - width
+    return {
+        relative = "editor",
+        row = row,
+        col = col,
+        width = width,
+        height = height,
+        style = "minimal",
+        border = viewer_border or "rounded",
+        focusable = false,
+        zindex = (main_cfg.zindex or 50) + 1,
+    }
+end
+
+--- Whether the todo panel float is currently open and valid.
+---@return boolean
+local function todo_panel_open()
+    return viewer_todo_panel_win ~= nil and vim.api.nvim_win_is_valid(viewer_todo_panel_win)
+end
+
+--- Repaint an open todo panel in place: rewrite its buffer (content) and
+--- re-fit the float (its height follows the list length).
+---@return boolean rendered
+local function render_todo_panel()
+    local win = viewer_todo_panel_win
+    local buf = viewer_todo_panel_buf
+    if not win or not vim.api.nvim_win_is_valid(win) then
+        return false
+    end
+    if not buf or not vim.api.nvim_buf_is_valid(buf) then
+        return false
+    end
+    local cfg = todo_cfg()
+    local lines = todo_panel_lines(viewer_todo_details, cfg.max_items)
+    paint_todo_panel_buf(buf, lines)
+    if viewer_win and vim.api.nvim_win_is_valid(viewer_win) then
+        local main_cfg = vim.api.nvim_win_get_config(viewer_win)
+        pcall(vim.api.nvim_win_set_config, win, todo_panel_win_config(main_cfg, lines, cfg))
+    end
+    return true
+end
+
+--- Open the todo panel float under/over the viewer window. Never takes
+--- focus; opening re-enables auto_open by clearing the manual suppression.
+local function open_todo_panel()
+    if not viewer_win or not vim.api.nvim_win_is_valid(viewer_win) then
+        return
+    end
+    local cfg = todo_cfg()
+    local lines = todo_panel_lines(viewer_todo_details, cfg.max_items)
+    local stale = viewer_todo_panel_buf
+    if stale and vim.api.nvim_buf_is_valid(stale) then
+        pcall(vim.api.nvim_buf_delete, stale, { force = true })
+    end
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.bo[buf].bufhidden = "wipe"
+    paint_todo_panel_buf(buf, lines)
+    local main_cfg = vim.api.nvim_win_get_config(viewer_win)
+    local ok, win = pcall(vim.api.nvim_open_win, buf, false, todo_panel_win_config(main_cfg, lines, cfg))
+    if not ok or not win then
+        pcall(vim.api.nvim_buf_delete, buf, { force = true })
+        Notify.error("Failed to open todo panel: " .. tostring(win))
+        return
+    end
+    viewer_todo_panel_buf = buf
+    viewer_todo_panel_win = win
+    viewer_todo_panel_suppressed = false
+    vim.wo[win].wrap = false
+    vim.wo[win].winhighlight = Highlights.DIALOG_WINHIGHLIGHT
+end
+
+--- Close the todo panel float and buffer, if any. A manual close (from the
+--- `T` toggle) marks the panel suppressed so auto_open stays out of the way
+--- until it is opened again; the viewer's own teardown passes no flag —
+--- after the viewer is gone the suppression carries no meaning.
+---@param suppress? boolean
+local function close_todo_panel(suppress)
+    local win = viewer_todo_panel_win
+    local buf = viewer_todo_panel_buf
+    viewer_todo_panel_win = nil
+    viewer_todo_panel_buf = nil
+    if win and vim.api.nvim_win_is_valid(win) then
+        pcall(vim.api.nvim_win_close, win, true)
+    end
+    if buf and vim.api.nvim_buf_is_valid(buf) then
+        pcall(vim.api.nvim_buf_delete, buf, { force = true })
+    end
+    if suppress then
+        viewer_todo_panel_suppressed = true
+    end
+end
+
+--- Toggle the todo panel float (`T` on the viewer buffer).
+local function toggle_todo_panel()
+    if todo_panel_open() then
+        close_todo_panel(true)
+        return
+    end
+    if not todo_cfg().enabled then
+        Notify.warn("Todo display is disabled (subagent.viewer.todo.enabled = false)")
+        return
+    end
+    open_todo_panel()
+end
+
+--- Recompute the todo snapshot after a todo tool result: refresh the footer
+--- chunk, repaint an open panel in place, and auto-open the panel on the
+--- first nil → non-empty transition when configured (unless the user closed
+--- it manually with `T`). Deferred via vim.schedule: callers may be RPC
+--- callbacks.
+local function refresh_todos()
+    vim.schedule(function()
+        if not M.is_open() then
+            return
+        end
+        local cfg = todo_cfg()
+        local previous = viewer_todo_details
+        viewer_todo_details = resolve_todo_details(viewer_live_session, viewer_todo_entries)
+        M.update_statusline()
+        local appeared = not has_todos(previous) and has_todos(viewer_todo_details)
+        if todo_panel_open() then
+            render_todo_panel()
+        elseif cfg.auto_open and appeared and not viewer_todo_panel_suppressed then
+            open_todo_panel()
+        end
+    end)
 end
 
 --- Close the viewer float and clean up resources.
@@ -539,6 +862,11 @@ function M.close()
     viewer_is_child = false
     viewer_live_session = nil
     viewer_statusline_enabled = true
+    viewer_todo_details = nil
+    viewer_todo_entries = nil
+    viewer_todo_panel_suppressed = false
+    viewer_border = nil
+    close_todo_panel()
     viewer_status = {
         model_id = nil,
         model_provider = nil,
@@ -706,6 +1034,9 @@ local function handle_live_event(session, msg)
         history:on_tool_start(msg.toolName or "tool", msg.toolCallId, args)
     elseif t == "tool_execution_end" then
         history:on_tool_end(msg.toolName or "tool", msg.toolCallId, msg.result, msg.isError)
+        if TodoToolUi.is_todo_tool(msg.toolName) then
+            refresh_todos()
+        end
     elseif t == "tool_execution_update" then
         history:on_tool_update(msg.toolName or "tool", msg.toolCallId, msg)
     elseif t == "bash_execution_update" or msg.type == "bash_execution_update" then
@@ -880,8 +1211,9 @@ function M.open(child_id, opts)
             Notify.warn("Session file not found")
             return
         end
-        local msgs, session_name, jsonl_status = load_messages_from_jsonl(path)
+        local msgs, session_name, jsonl_status, entries = load_messages_from_jsonl(path)
         dormant_messages = msgs
+        viewer_todo_entries = entries
         session_cwd = (jsonl_status and jsonl_status.cwd) or session_cwd
         -- The JSONL fallback only applies while no name is known yet.
         if session_name and session_name ~= "" and not opts_name and not entry_name then
@@ -908,6 +1240,10 @@ function M.open(child_id, opts)
             resolve_context_window(viewer_status.model_id, viewer_status.model_provider)
     end
 
+    -- Todo snapshot for the footer chunk and the `T` panel: the per-session
+    -- mirror for a live session, the decoded JSONL entries otherwise.
+    viewer_todo_details = resolve_todo_details(is_live and session or nil, viewer_todo_entries)
+
     -- 4. Create ChatHistory with fake tab id
     viewer_tab_counter = viewer_tab_counter - 1
     local fake_tab = viewer_tab_counter
@@ -930,6 +1266,7 @@ function M.open(child_id, opts)
     local raw_w = opts.width or viewer_cfg.width or 0.7
     local raw_h = opts.height or viewer_cfg.height or 0.75
     local border = opts.border or viewer_cfg.border or "rounded"
+    viewer_border = border
 
     local editor_w = vim.o.columns
     local editor_h = vim.o.lines - vim.o.cmdheight - 1
@@ -1114,6 +1451,10 @@ function M.open(child_id, opts)
         history:goto_path_at_cursor()
     end, { buffer = buf, nowait = true, desc = "Open file under cursor" })
 
+    vim.keymap.set("n", "T", function()
+        toggle_todo_panel()
+    end, { buffer = buf, nowait = true, desc = "Toggle todo list" })
+
     -- 6. Load messages (RPC or JSONL) and replay into ChatHistory
     if is_live and session and session.rpc then
         local current_child = child_id
@@ -1219,7 +1560,7 @@ function M._replay(history, messages)
 end
 
 ---@param path string
----@return table[] messages, string? session_name, table? status
+---@return table[] messages, string? session_name, table? status, table[]? entries
 function M._load_messages_from_jsonl(path)
     return load_messages_from_jsonl(path)
 end
@@ -1243,6 +1584,52 @@ end
 ---@return string[][]? chunks, string plain
 function M._format_statusline(status)
     return format_statusline(status or viewer_status)
+end
+
+-- Todo test hooks
+---@return pi.TodoDetails?
+function M._todo_details()
+    return viewer_todo_details
+end
+
+--- Test hook: resolve a todo snapshot without touching viewer state.
+---@param live_session pi.Session?
+---@param entries table[]?
+---@return pi.TodoDetails?
+function M._resolve_todo_details(live_session, entries)
+    return resolve_todo_details(live_session, entries)
+end
+
+--- Test hook: the footer summary chunk for a snapshot.
+---@param details pi.TodoDetails?
+---@return string[]? chunk
+function M._todo_chunk(details)
+    return build_todo_chunk(details)
+end
+
+--- Test hook: the panel content lines for a snapshot.
+---@param details pi.TodoDetails?
+---@param max_items? integer
+---@return string[] lines
+function M._todo_panel_lines(details, max_items)
+    return todo_panel_lines(details, max_items or todo_cfg().max_items)
+end
+
+--- Test hook: the highlight group for a rendered panel line.
+---@param line string
+---@return string? group
+function M._todo_line_hl(line)
+    return todo_line_hl(line)
+end
+
+---@return integer?
+function M._todo_panel_win()
+    return viewer_todo_panel_win
+end
+
+---@return boolean
+function M._todo_panel_suppressed()
+    return viewer_todo_panel_suppressed
 end
 
 return M
