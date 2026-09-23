@@ -220,6 +220,51 @@ function M.result_details(result)
     return nil
 end
 
+--- The todo details carried by one decoded session JSONL entry, if any: a
+--- todo_write toolResult message (details first, falling back to the message
+--- content — the result_details parsing) or a pi2-todo custom checkpoint
+--- entry whose data is { todos, completed, total } (both shapes are written
+--- by extensions/todo.ts). Malformed entries yield nil instead of raising.
+---@param entry table
+---@return pi.TodoDetails|nil
+local function entry_details(entry)
+    if entry.type == "message" then
+        local message = entry.message
+        if type(message) == "table" and message.role == "toolResult" and M.is_todo_tool(message.toolName) then
+            return M.result_details(message)
+        end
+    elseif entry.type == "custom" and entry.customType == "pi2-todo" then
+        local data = entry.data
+        if type(data) == "table" and type(data.todos) == "table" then
+            return M._normalize(data)
+        end
+    end
+    return nil
+end
+
+--- Extract the latest todo snapshot from decoded pi session JSONL entries.
+--- Scans in order and keeps the last match: a `message` entry with
+--- role=="toolResult" and toolName=="todo_write" (details from entry.message.details,
+--- falling back to parsing entry.message.content like result_details does),
+--- or a `custom` entry with customType=="pi2-todo" (data = {todos,completed,total}).
+---@param entries table[] decoded JSONL entry tables (type/message/customType/data fields)
+---@return pi.TodoDetails|nil
+function M.details_from_entries(entries)
+    if type(entries) ~= "table" then
+        return nil
+    end
+    local latest = nil
+    for _, entry in ipairs(entries) do
+        if type(entry) == "table" then
+            local details = entry_details(entry)
+            if details ~= nil then
+                latest = details
+            end
+        end
+    end
+    return latest
+end
+
 --- Resolve the completed/total counters from a details table.
 ---@param details? table
 ---@return integer? completed

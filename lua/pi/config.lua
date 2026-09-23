@@ -296,6 +296,14 @@
 ---@field height? number Height in lines (>=1) or fraction of editor height (<1, default 0.75)
 ---@field border? string|string[] Float border style (default "rounded")
 ---@field statusline? boolean Show statusline in viewer footer (default true)
+---@field todo? pi.SubagentViewerTodoConfig Todo footer chunk and `T` list panel inside the viewer
+
+---@class pi.SubagentViewerTodoConfig
+---@field enabled boolean show the todo footer chunk and the `T` panel
+---@field auto_open boolean auto-open the panel when todos first appear
+---@field position "below"|"above" panel position inside the viewer
+---@field height number panel height as a fraction of the viewer height
+---@field max_items integer max todo items shown in the panel
 
 ---@class pi.SubagentConfig
 ---@field enabled? boolean Inject subagent.ts extension (default true)
@@ -504,6 +512,13 @@ local defaults = {
             height = 0.75,
             border = "rounded",
             statusline = true,
+            todo = {
+                enabled = true,
+                auto_open = false,
+                position = "below",
+                height = 0.35,
+                max_items = 20,
+            },
         },
     },
     vision = {},

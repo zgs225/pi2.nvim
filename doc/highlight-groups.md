@@ -162,3 +162,11 @@ The dashboard reuses `PiToolHeader` for its section headers, `Comment` for dimme
 | `PiSessionsListDotDim` | Dim phase of blinking dots |
 | `PiSessionsListCurrent` | Marks the current tab's own session dot in the agent color |
 | `PiSessionsListFloatTitle` | Float title for the sessions list window |
+
+## Sub-session viewer
+
+| Group | Role |
+| --- | --- |
+| `PiTodoDone` | Completed (`✓`) todo row / footer summary chunk in the sub-session viewer's todo display (links to `DiagnosticOk`) |
+| `PiTodoInProgress` | In-progress (`◐`) todo row / footer summary chunk in the sub-session viewer's todo display (links to `DiagnosticWarn`) |
+| `PiTodoPending` | Pending (`○`) todo row / footer summary chunk in the sub-session viewer's todo display (links to `Comment`) |

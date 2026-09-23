@@ -206,6 +206,13 @@ local function set_defaults()
     -- the warn/error thresholds uses PiStatusLineWarning/PiStatusLineError).
     vim.api.nvim_set_hl(0, "PiStatsBar", { default = true, fg = func.fg })
 
+    -- Subsession viewer todo rows / footer summary: the same three-state
+    -- ✓ / ◐ / ○ semantics as the sessions list (done = ok, in-progress =
+    -- busy-amber, pending recedes like a comment).
+    vim.api.nvim_set_hl(0, "PiTodoDone", { default = true, link = "DiagnosticOk" })
+    vim.api.nvim_set_hl(0, "PiTodoInProgress", { default = true, link = "DiagnosticWarn" })
+    vim.api.nvim_set_hl(0, "PiTodoPending", { default = true, link = "Comment" })
+
     vim.api.nvim_set_hl(0, "PiSessionsListIdle", { default = true, fg = comment.fg })
     vim.api.nvim_set_hl(0, "PiSessionsListDotDim", { default = true, fg = comment.fg, bold = false })
     local diag_ok = vim.api.nvim_get_hl(0, { name = "DiagnosticOk", link = false })
