@@ -1,20 +1,23 @@
 --- Background tasks panel (:PiTasks) — a live list of background bash tasks.
 ---
---- One shared scratch buffer lists every task known to pi.tasks (running
+--- One shared scratch buffer lists the tasks known to pi.tasks (running
 --- first, then newest terminal), one row per task: status dot, spinner,
---- command summary and an `id · status · duration` subtitle. The buffer is
---- global: each tab that opens the panel gets its own window on the same
---- buffer, so a single redraw updates every view at once. Window geometry is
---- per-tab.
+--- command summary and an `id · duration` subtitle. By default the
+--- list is scoped to the current tab's session; `A` toggles the all-tasks
+--- view, where rows owned by another session render dimmed with a `#tab`
+--- prefix in the subtitle. The buffer is global: each tab that opens the
+--- panel gets its own window on the same buffer, so a single redraw updates
+--- every view at once. Window geometry is per-tab.
 ---
 --- The panel is a straight adaptation of the sessions overview
 --- (lua/pi/ui/sessions.lua): same shared-buffer model, same blink/spinner
 --- timers (running only while a window is visible), same coalesced
 --- request_refresh(), same help overlay and current-row marker mechanics.
 --- Differences: rows come from pi.tasks instead of the session manager, the
---- current-row marker covers every running task (tasks carry no tab
---- association), and a 1s duration timer keeps running `mm:ss` clocks and
---- the spinner frame ticking.
+--- row set is filtered to the current tab's session (with `A` as the escape
+--- hatch to every task), the current-row marker covers the running tasks of
+--- the current session only, and a 1s duration timer keeps running `mm:ss`
+--- clocks and the spinner frame ticking.
 
 local M = {}
 
@@ -46,9 +49,36 @@ local rows = {}
 ---@type boolean
 local refresh_scheduled = false
 
+--- When true the panel lists every task regardless of owner; false (the
+--- default) limits the list to the tasks of the current tab's session.
+---@type boolean
+local show_all = false
+
+--- Resolver override for specs (see M._set_session_resolver): returns the
+--- current tab's session id, or nil when the tab has no session.
+---@type (fun(): string?)?
+local session_resolver = nil
+
 ---@return pi.TabId
 local function current_tab()
     return vim.api.nvim_get_current_tabpage()
+end
+
+--- Session id of the current tab's session, or nil when the tab has none —
+--- the panel then falls back to showing every task. The session manager is
+--- lazy-required (same pattern as resolve_mode below) to keep the module
+--- graph acyclic; a failing require degrades to "no session".
+---@return string?
+local function current_session_id()
+    if session_resolver then
+        return session_resolver()
+    end
+    local ok, Sessions = pcall(require, "pi.sessions.manager")
+    if not ok then
+        return nil
+    end
+    local session = Sessions.get_for_tab(current_tab())
+    return session and session.id or nil
 end
 
 -- Panel config ----------------------------------------------------------------
@@ -135,23 +165,30 @@ end
 --- the (truncated) command summary, then the `id · duration` subtitle —
 --- the dot already carries the status, so the subtitle stays metadata-only.
 --- Running rows show a live `mm:ss` duration; terminal rows show
---- the age since end_time (`3m ago`). Chunks are byte ranges:
---- { col_start, col_end, hl_group }.
+--- the age since end_time (`3m ago`). A row owned by a different known
+--- session than `current_session_id` is "foreign": its command summary
+--- renders dimmed and the subtitle gains a `#tab` ownership prefix.
+--- Chunks are byte ranges: { col_start, col_end, hl_group }.
 ---@param row pi.TasksRow
 ---@param tick integer
 ---@param width integer? available display width (defaults to 80)
 ---@param now_ms integer? reference time for relative ages (defaults to uv.now())
+---@param current_session_id string? owning session of the panel's tab; nil disables foreign-row rendering
 ---@return string line
 ---@return integer[][] chunks
-function M.format_line(row, tick, width, now_ms)
+function M.format_line(row, tick, width, now_ms, current_session_id)
     width = width or 80
     now_ms = now_ms or uv.now()
     local task = row.task
     local running = task.status == "running"
     local dot = (task.status == "completed" or task.status == "stopped") and "◌" or "●"
     local spinner = running and M.spinner_frame(tick) or nil
+    local foreign = current_session_id ~= nil and task.session_id ~= nil and task.session_id ~= current_session_id
 
     local subtitle = task.id
+    if foreign and task.tab then
+        subtitle = "#" .. task.tab .. " · " .. subtitle
+    end
     if row.duration_ms then
         local time
         if running then
@@ -185,7 +222,7 @@ function M.format_line(row, tick, width, now_ms)
     local text_start = #prefix
     local summary_end = text_start + #summary
     local subtitle_start = summary_end + #sep
-    table.insert(chunks, { text_start, subtitle_start, "Normal" })
+    table.insert(chunks, { text_start, subtitle_start, foreign and "PiTasksListDotDim" or "Normal" })
     table.insert(chunks, { subtitle_start, #line, "PiTasksListDotDim" })
     if spinner then
         table.insert(chunks, 2, { #dot + 1, text_start - 1, "PiTasksListSpinner" })
@@ -304,9 +341,11 @@ end
 local current_matches = {}
 
 --- Window-local marker: a background under the status dot of every running
---- row (tasks carry no tab association, so each window marks the same rows).
---- The buffer is shared across tabs but matches are window-local.
-local function refresh_current_markers()
+--- row of the current session (or of every running row when the tab has no
+--- session — the historical behavior). The buffer is shared across tabs but
+--- matches are window-local.
+---@param session_id string? owning session of the panel's tab (nil = none)
+local function refresh_current_markers(session_id)
     for _, win in pairs(wins) do
         local old_id = current_matches[win]
         if old_id and vim.api.nvim_win_is_valid(win) then
@@ -315,7 +354,7 @@ local function refresh_current_markers()
         current_matches[win] = nil
         if vim.api.nvim_win_is_valid(win) then
             for lnum, row in ipairs(rows) do
-                if row.task.status == "running" then
+                if row.task.status == "running" and (session_id == nil or row.task.session_id == session_id) then
                     local col = row.marker_col or 1
                     local len = row.marker_len or 1
                     local ok, id = pcall(vim.api.nvim_win_call, win, function()
@@ -336,7 +375,14 @@ function M._render()
         return
     end
 
-    rows = Tasks.build_rows()
+    local session_id = current_session_id()
+    ---@type pi.TasksRow[]
+    rows = {}
+    for _, row in ipairs(Tasks.build_rows()) do
+        if show_all or session_id == nil or row.task.session_id == session_id then
+            rows[#rows + 1] = row
+        end
+    end
 
     ---@type string[]
     local lines = {}
@@ -349,7 +395,7 @@ function M._render()
                 width = math.max(width, vim.api.nvim_win_get_width(win))
             end
         end
-        local line, chunks = M.format_line(row, blink_tick + spinner_tick, width)
+        local line, chunks = M.format_line(row, blink_tick + spinner_tick, width, nil, session_id)
         lines[i] = line
         line_chunks[i] = chunks
         row.marker_col = chunks[1][1] + 1
@@ -386,7 +432,7 @@ function M._render()
 
     ensure_blink()
     ensure_spinner()
-    refresh_current_markers()
+    refresh_current_markers(session_id)
 end
 
 --- Coalesced live redraw; no-op unless a list window is visible.
@@ -425,6 +471,7 @@ local HELP_ENTRIES = {
     { "a, i", "Open the output and focus it" },
     { "p", "Preview the output tail in a float" },
     { "x", "Stop the task under the cursor" },
+    { "A", "Toggle between current-session and all tasks" },
     { "R", "Redraw the list" },
     { "q", "Close the list" },
     { "?", "Toggle this help" },
@@ -743,6 +790,10 @@ local function ensure_buf()
     vim.keymap.set("n", "x", function()
         stop_under_cursor()
     end, vim.tbl_extend("force", map_opts, { desc = "Stop the task under the cursor" }))
+    vim.keymap.set("n", "A", function()
+        show_all = not show_all
+        M._render()
+    end, vim.tbl_extend("force", map_opts, { desc = "Toggle between current-session and all tasks" }))
     vim.keymap.set("n", "R", function()
         M._render()
     end, vim.tbl_extend("force", map_opts, { desc = "Redraw task list" }))
@@ -977,6 +1028,19 @@ function M._help_entries()
     return HELP_ENTRIES
 end
 
+--- Test hook: override how the panel resolves the current tab's session id
+--- (nil = the tab has no session). Cleared by M._reset().
+---@param fn (fun(): string?)?
+function M._set_session_resolver(fn)
+    session_resolver = fn
+end
+
+--- Test hook: whether the panel currently shows every task (the `A` view).
+---@return boolean
+function M._show_all()
+    return show_all
+end
+
 --- Test hook: re-arm the pi.tasks refresh subscription after Tasks._reset().
 function M._resubscribe()
     subscribe()
@@ -988,6 +1052,8 @@ function M._reset()
     stop_spinner()
     blink_tick = 0
     spinner_tick = 0
+    show_all = false
+    session_resolver = nil
     for list_win in pairs(help_wins) do
         close_help(list_win)
     end

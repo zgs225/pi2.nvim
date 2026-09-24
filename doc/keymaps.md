@@ -26,6 +26,7 @@ What the plugin does bind on its own:
 | `a` / `i` | Open the output and focus it |
 | `p` | Preview the output tail in a float; press `p` again to close |
 | `x` | Stop the task under the cursor (asks for confirmation first) |
+| `A` | Toggle between the current session's tasks (default) and all sessions' tasks |
 | `R` | Redraw the list |
 | `q` | Close the panel |
 | `?` | Toggle a help overlay listing these keys |

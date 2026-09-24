@@ -197,6 +197,104 @@ describe("pi.tasks handle_event", function()
     end)
 end)
 
+describe("pi.tasks per-session ownership", function()
+    before_each(function()
+        Tasks._reset()
+    end)
+
+    it("stores session_id/tab on a started record", function()
+        assert.is_true(Tasks.handle_event(started_ev("a", 1000), "A", 7))
+        local t = Tasks.get("a")
+        assert.are.equal("A", t.session_id)
+        assert.are.equal(7, t.tab)
+    end)
+
+    it("stores session_id/tab on a synthesized terminal record", function()
+        assert.is_true(Tasks.handle_event(ev("failed", { taskId = "ghost", exitCode = 9 }, 700), "B", 3))
+        local t = Tasks.get("ghost")
+        assert.is_not_nil(t)
+        assert.are.equal("B", t.session_id)
+        assert.are.equal(3, t.tab)
+    end)
+
+    it("started without ownership leaves session_id/tab nil (unknown ownership)", function()
+        Tasks.handle_event(started_ev("a", 1000))
+        assert.is_nil(Tasks.get("a").session_id)
+        assert.is_nil(Tasks.get("a").tab)
+    end)
+
+    it("terminal/stopped events never rewrite an existing task's owner", function()
+        Tasks.handle_event(started_ev("a", 1000), "A", 1)
+        Tasks.handle_event(ev("completed", { taskId = "a" }, 1500), "B", 2)
+        local t = Tasks.get("a")
+        assert.are.equal("completed", t.status)
+        assert.are.equal("A", t.session_id, "completed event must not rewrite the owner")
+        assert.are.equal(1, t.tab)
+
+        Tasks.handle_event(started_ev("b", 2000), "A", 1)
+        Tasks.handle_event(ev("stopped", { taskId = "b" }, 2600), "B", 2)
+        assert.are.equal("stopped", Tasks.get("b").status)
+        assert.are.equal("A", Tasks.get("b").session_id, "stopped event must not rewrite the owner")
+        assert.are.equal(1, Tasks.get("b").tab)
+    end)
+
+    it("list(nil) returns everything; list(session_id) filters by owner", function()
+        Tasks.handle_event(started_ev("a", 100), "A", 1)
+        Tasks.handle_event(started_ev("b", 200), "B", 2)
+        Tasks.handle_event(ev("completed", { taskId = "a" }, 300), "B", 9) -- owner stays A
+        Tasks.handle_event(started_ev("c", 50)) -- unknown ownership
+
+        assert.are.equal(3, #Tasks.list())
+        assert.are.equal(3, #Tasks.list(nil))
+
+        local a_ids = vim.tbl_map(function(t)
+            return t.id
+        end, Tasks.list("A"))
+        assert.are.same({ "a" }, a_ids)
+
+        local b_ids = vim.tbl_map(function(t)
+            return t.id
+        end, Tasks.list("B"))
+        assert.are.same({ "b" }, b_ids)
+
+        assert.are.equal(0, #Tasks.list("missing"))
+    end)
+
+    it("list(session_id) keeps the panel sort order within the filter", function()
+        Tasks.handle_event(started_ev("a", 100), "A", 1)
+        Tasks.handle_event(started_ev("b", 200), "A", 1)
+        Tasks.handle_event(ev("completed", { taskId = "a" }, 300), "A", 1)
+
+        -- running (b) first, then terminal (a) by end_time desc.
+        local ids = vim.tbl_map(function(t)
+            return t.id
+        end, Tasks.list("A"))
+        assert.are.same({ "b", "a" }, ids)
+    end)
+
+    it("remove_session drops the owner's tasks, returns the count, refreshes", function()
+        Tasks.handle_event(started_ev("a", 100), "A", 1)
+        Tasks.handle_event(started_ev("b", 200), "A", 1)
+        Tasks.handle_event(started_ev("c", 300), "B", 2)
+        Tasks.handle_event(started_ev("d", 400)) -- unknown owner survives
+
+        assert.are.equal(2, Tasks.remove_session("A"))
+        assert.is_nil(Tasks.get("a"))
+        assert.is_nil(Tasks.get("b"))
+        assert.is_not_nil(Tasks.get("c"))
+        assert.is_not_nil(Tasks.get("d"))
+        assert.is_true(Tasks.refresh_due())
+    end)
+
+    it("remove_session returns 0 without refreshing for an unknown session", function()
+        Tasks.upsert({ id = "a", command = "", status = "running", start_time = 1, session_id = "A" })
+        assert.is_false(Tasks.refresh_due())
+        assert.are.equal(0, Tasks.remove_session("ghost"))
+        assert.is_false(Tasks.refresh_due(), "no deletions means no refresh")
+        assert.is_not_nil(Tasks.get("a"))
+    end)
+end)
+
 describe("pi.tasks build_rows", function()
     before_each(function()
         Tasks._reset()

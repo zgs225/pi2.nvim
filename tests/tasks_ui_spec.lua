@@ -62,6 +62,43 @@ local function find_help_win()
     return nil, nil
 end
 
+--- Concatenated buffer lines of the panel open in the current tab.
+---@return string
+local function panel_text()
+    local win = Panel.win(vim.api.nvim_get_current_tabpage())
+    local buf = vim.api.nvim_win_get_buf(win)
+    return table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+end
+
+--- Line numbers (1-based) of rows whose text contains `fragment`.
+---@param fragment string
+---@return table<integer, boolean>
+local function marked_lines(fragment)
+    local win = Panel.win(vim.api.nvim_get_current_tabpage())
+    local lines = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(win), 0, -1, false)
+    local hits = {}
+    for lnum, line in ipairs(lines) do
+        if line:find(fragment, 1, true) then
+            hits[lnum] = true
+        end
+    end
+    local matches = vim.api.nvim_win_call(win, function()
+        return vim.fn.getmatches()
+    end)
+    local marked = {}
+    for _, m in ipairs(matches) do
+        if m.group == "PiTasksListCurrent" then
+            -- getmatches() reports each position as a numbered posN field.
+            for _, pos in pairs(m) do
+                if type(pos) == "table" and hits[pos[1]] then
+                    marked[pos[1]] = true
+                end
+            end
+        end
+    end
+    return marked
+end
+
 describe("tasks panel UI", function()
     before_each(function()
         Tasks._reset()
@@ -233,6 +270,102 @@ describe("tasks panel UI", function()
         end)
     end)
 
+    describe("per-session view", function()
+        it("renders only the current session's rows by default", function()
+            seed({ id = "mine", command = "mine cmd", session_id = "sess-1", tab = 1 })
+            seed({ id = "theirs", command = "theirs cmd", session_id = "sess-2", tab = 2 })
+            Panel._set_session_resolver(function()
+                return "sess-1"
+            end)
+
+            Panel.open()
+            local text = panel_text()
+            assert.is_truthy(text:find("mine cmd", 1, true))
+            assert.is_nil(text:find("theirs cmd", 1, true), "foreign session rows hidden by default")
+        end)
+
+        it("A toggles between the current-session and the all-tasks view", function()
+            seed({ id = "mine", command = "mine cmd", session_id = "sess-1", tab = 1 })
+            seed({ id = "theirs", command = "theirs cmd", session_id = "sess-2", tab = 2 })
+            Panel._set_session_resolver(function()
+                return "sess-1"
+            end)
+
+            Panel.open()
+            assert.is_false(Panel._show_all())
+            press("A")
+            assert.is_true(Panel._show_all())
+            local text = panel_text()
+            assert.is_truthy(text:find("mine cmd", 1, true))
+            assert.is_truthy(text:find("theirs cmd", 1, true), "all view lists every task")
+            press("A")
+            assert.is_false(Panel._show_all())
+            text = panel_text()
+            assert.is_truthy(text:find("mine cmd", 1, true))
+            assert.is_nil(text:find("theirs cmd", 1, true), "second A returns to the session view")
+        end)
+
+        it("dims foreign rows and prefixes their subtitle with #tab in the all view", function()
+            seed({ id = "mine", command = "mine cmd", session_id = "sess-1", tab = 1 })
+            seed({ id = "theirs", command = "theirs cmd", session_id = "sess-2", tab = 2 })
+            Panel._set_session_resolver(function()
+                return "sess-1"
+            end)
+
+            Panel.open()
+            press("A")
+            assert.is_truthy(panel_text():find("#2 · theirs", 1, true), "foreign subtitle carries the #tab prefix")
+
+            local mine_row, theirs_row
+            for _, r in ipairs(Panel._rows()) do
+                if r.task.id == "mine" then
+                    mine_row = r
+                elseif r.task.id == "theirs" then
+                    theirs_row = r
+                end
+            end
+            assert.is_not_nil(mine_row)
+            assert.is_not_nil(theirs_row)
+            -- Even tick: the running dot is bright, so the only dim command
+            -- chunk belongs to the foreign row.
+            local _, mine_chunks = Panel.format_line(mine_row, 0, 80, nil, "sess-1")
+            local _, theirs_chunks = Panel.format_line(theirs_row, 0, 80, nil, "sess-1")
+            assert.are.equal("Normal", mine_chunks[3][3])
+            assert.are.equal("PiTasksListDotDim", theirs_chunks[3][3], "foreign command chunk renders dimmed")
+            local theirs_line = Panel.format_line(theirs_row, 0, 80, nil, "sess-1")
+            assert.is_truthy(theirs_line:find("#2 · theirs", 1, true))
+        end)
+
+        it("marks only the current session's running rows", function()
+            seed({ id = "mine", command = "mine cmd", session_id = "sess-1", tab = 1 })
+            seed({ id = "theirs", command = "theirs cmd", session_id = "sess-2", tab = 2 })
+            Panel._set_session_resolver(function()
+                return "sess-1"
+            end)
+
+            Panel.open()
+            press("A")
+            assert.is_truthy(next(marked_lines("mine cmd")), "current-session row marked")
+            local marked = marked_lines("theirs cmd")
+            assert.is_nil(next(marked), "foreign running row left unmarked")
+        end)
+
+        it("falls back to all tasks and marks every running row when the tab has no session", function()
+            seed({ id = "one", command = "one cmd", session_id = "sess-1", tab = 1 })
+            seed({ id = "two", command = "two cmd", session_id = "sess-2", tab = 2 })
+            Panel._set_session_resolver(function()
+                return nil
+            end)
+
+            Panel.open()
+            local text = panel_text()
+            assert.is_truthy(text:find("one cmd", 1, true))
+            assert.is_truthy(text:find("two cmd", 1, true), "no session: every task shown")
+            assert.is_truthy(next(marked_lines("one cmd")), "running row marked")
+            assert.is_truthy(next(marked_lines("two cmd")), "no session: every running row marked")
+        end)
+    end)
+
     describe("open/close/toggle", function()
         it("opens a side window on the shared buffer and reports focus", function()
             Panel.open()
@@ -386,10 +519,10 @@ describe("tasks panel UI", function()
             local win, buf = find_help_win()
             assert.is_not_nil(win)
             local text = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
-            for _, key in ipairs({ "<CR>, o", "a, i", "p", "x", "R", "q", "?" }) do
+            for _, key in ipairs({ "<CR>, o", "a, i", "p", "x", "A", "R", "q", "?" }) do
                 assert.is_truthy(text:find(key, 1, true), "help should list " .. key)
             end
-            assert.are.equal(7, #Panel._help_entries())
+            assert.are.equal(8, #Panel._help_entries())
         end)
 
         it("toggles on a second ?", function()

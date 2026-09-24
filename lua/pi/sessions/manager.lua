@@ -285,10 +285,29 @@ local function bind_chat_to_session(session, chat, tab)
     notify_todo_view_changed(tab)
 end
 
+--- Prune the task registry's per-session records when a session's tab is
+--- torn down (TabClosed cleanup, session close/kill): the backend process
+--- may outlive the tab, but its rows must not linger as zombies. Pcall'd
+--- like prune_todo_state: a failing cleanup is surfaced, never swallowed,
+--- and must not block teardown.
+---@param session_id string?
+local function remove_session_tasks(session_id)
+    if not session_id then
+        return
+    end
+    local ok, err = pcall(function()
+        return Tasks.remove_session(session_id)
+    end)
+    if not ok then
+        Notify.warn("task cleanup failed: " .. tostring(err))
+    end
+end
+
 --- Detach a tab's chat from its session without stopping the backend process.
 ---@param tab pi.TabId
 local function detach_tab(tab)
     local session_id = tab_session_id[tab]
+    remove_session_tasks(session_id)
     if session_id then
         local session = registry[session_id]
         if session and session.attached_tab == tab then
@@ -463,12 +482,15 @@ local function update_todo_mirror(session, tool_name, result)
 end
 
 --- Consume a pi2_bg_task custom message pushed by the bg-tasks extension:
---- forward the lifecycle event to the task registry. Terminal states surface
---- through the panel row and the agent's own triggerTurn report — no extra
---- vim.notify on top. Runs on the RPC callback thread: every user-facing
---- touch (Notify) is vim.schedule'd.
+--- forward the lifecycle event to the task registry, stamped with the owning
+--- session/tab so the registry (and the :PiTasks panel) can scope rows
+--- per session. Terminal states surface through the panel row and the
+--- agent's own triggerTurn report — no extra vim.notify on top. Runs on the
+--- RPC callback thread: every user-facing touch (Notify) is vim.schedule'd.
 ---@param message table custom message object (role="custom", customType="pi2_bg_task")
-local function handle_bg_task_message(message)
+---@param session_id string? owning session id (task ownership routing; nil = unknown)
+---@param tab integer? owning tabpage handle (panel display)
+local function handle_bg_task_message(message, session_id, tab)
     local details = message.details
     if type(details) ~= "table" then
         return
@@ -477,7 +499,7 @@ local function handle_bg_task_message(message)
         type = "pi2_bg_task",
         details = details,
         timestamp = message.timestamp,
-    })
+    }, session_id, tab)
     if not ok then
         Notify.warn("Background task event failed: " .. tostring(consumed))
         return
@@ -991,7 +1013,7 @@ function M.handle_event(session, msg)
             -- registry (and the :PiTasks panel) instead; other customTypes
             -- are dropped, matching the previous de-facto behavior.
             if message.customType == "pi2_bg_task" then
-                handle_bg_task_message(message)
+                handle_bg_task_message(message, session.id, session.attached_tab)
             end
         elseif chat then
             chat:on_message_start(msg)

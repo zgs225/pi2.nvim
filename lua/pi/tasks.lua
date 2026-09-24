@@ -18,6 +18,8 @@ local M = {}
 ---@field exit_code integer|nil
 ---@field output_file string|nil
 ---@field pid integer|nil
+---@field session_id string?  owning session id (passed in at event routing; nil = unknown ownership)
+---@field tab integer?        owning tabpage handle (passed in at event routing; panel display)
 
 ---@class pi.TasksRow
 ---@field task pi.Task
@@ -83,13 +85,17 @@ end
 
 --- All tasks sorted for the panel: running first (start_time ascending),
 --- then everything else by end_time descending (newest first). Terminal
---- tasks without an end_time sort last.
+--- tasks without an end_time sort last. With a session_id, only tasks owned
+--- by that session are returned (nil/omitted = all sessions).
+---@param session_id string?
 ---@return pi.Task[]
-function M.list()
+function M.list(session_id)
     ---@type pi.Task[]
     local tasks = {}
     for _, t in pairs(store) do
-        tasks[#tasks + 1] = t
+        if session_id == nil or t.session_id == session_id then
+            tasks[#tasks + 1] = t
+        end
     end
     table.sort(tasks, function(a, b)
         local a_running = a.status == "running" and 0 or 1
@@ -143,15 +149,20 @@ function M.build_rows(now_ms)
 end
 
 --- Consume a pi2_bg_task event. Recognized events update the registry and
---- return true; anything else returns false with no side effects.
+--- return true; anything else returns false with no side effects. Ownership
+--- (session_id/tab) is stamped onto NEW records only (started, and the
+--- synthesized record for a terminal event on an unknown task); terminal
+--- and stopped events for an existing task never rewrite its owner.
 --- Payload shapes (extension JS contract, in ev.details):
 ---   {kind="started",  taskId, command, pid?, outputFile?}
 ---   {kind="completed", taskId, exitCode?}
 ---   {kind="failed",   taskId, exitCode?}
 ---   {kind="stopped",  taskId, exitCode?}
 ---@param ev table
+---@param session_id string? Owning session id (event routing; nil = unknown ownership)
+---@param tab integer? Owning tabpage handle (panel display)
 ---@return boolean
-function M.handle_event(ev)
+function M.handle_event(ev, session_id, tab)
     if type(ev) ~= "table" or ev.type ~= "pi2_bg_task" then
         return false
     end
@@ -174,6 +185,8 @@ function M.handle_event(ev)
             start_time = ts,
             pid = d.pid,
             output_file = d.outputFile,
+            session_id = session_id,
+            tab = tab,
         }
         store[id] = task
         M.request_refresh()
@@ -191,6 +204,8 @@ function M.handle_event(ev)
                 command = d.command or "",
                 status = "running",
                 start_time = ts,
+                session_id = session_id,
+                tab = tab,
             }
             store[id] = task
         end
@@ -216,6 +231,26 @@ function M.handle_event(ev)
     end
 
     return false
+end
+
+--- Drop every task owned by the given session (tab closed / session
+--- destroyed, so its rows don't linger as zombies). Returns the number of
+--- removed records; schedules a panel refresh only when something was
+--- actually removed. Tasks with unknown ownership (session_id nil) survive.
+---@param session_id string
+---@return integer
+function M.remove_session(session_id)
+    local removed = 0
+    for id, t in pairs(store) do
+        if t.session_id == session_id then
+            store[id] = nil
+            removed = removed + 1
+        end
+    end
+    if removed > 0 then
+        M.request_refresh()
+    end
+    return removed
 end
 
 --- Local stop from the panel (x key): transitions a running task to stopped.
