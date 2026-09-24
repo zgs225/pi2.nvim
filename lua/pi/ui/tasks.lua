@@ -132,8 +132,9 @@ function M.dot_hl(row, tick)
 end
 
 --- Format a row: the status dot at the left edge, a spinner while running,
---- the (truncated) command summary, then the `id · status · duration`
---- subtitle. Running rows show a live `mm:ss` duration; terminal rows show
+--- the (truncated) command summary, then the `id · duration` subtitle —
+--- the dot already carries the status, so the subtitle stays metadata-only.
+--- Running rows show a live `mm:ss` duration; terminal rows show
 --- the age since end_time (`3m ago`). Chunks are byte ranges:
 --- { col_start, col_end, hl_group }.
 ---@param row pi.TasksRow
@@ -150,7 +151,7 @@ function M.format_line(row, tick, width, now_ms)
     local dot = (task.status == "completed" or task.status == "stopped") and "◌" or "●"
     local spinner = running and M.spinner_frame(tick) or nil
 
-    local subtitle = task.id .. " · " .. row.status_label
+    local subtitle = task.id
     if row.duration_ms then
         local time
         if running then

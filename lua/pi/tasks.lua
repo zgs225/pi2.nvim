@@ -43,6 +43,23 @@ local function current_ms()
     return vim.uv.now()
 end
 
+--- Convert an event timestamp to the uv clock. Core stamps custom messages
+--- with Date.now() (Unix epoch ms, ~1.7e12) while uv.now() is the small
+--- event-loop clock; mixing the two makes age math go negative and clamp to
+--- zero (finished rows would show a frozen "0s ago"). Epoch stamps are
+--- rebased onto the uv clock at receipt, preserving the delta from now.
+---@param ts any
+---@return integer
+local function normalize_ts(ts)
+    if type(ts) ~= "number" or ts <= 0 then
+        return current_ms()
+    end
+    if ts > 1e12 then
+        return current_ms() - math.max(0, math.floor(os.time() * 1000 - ts))
+    end
+    return ts
+end
+
 --- Clear all module state. Test-only: also drops registered refresh
 --- listeners so specs cannot leak callbacks into each other.
 function M._reset()
@@ -146,7 +163,7 @@ function M.handle_event(ev)
     if type(id) ~= "string" or id == "" then
         return false
     end
-    local ts = ev.timestamp or current_ms()
+    local ts = normalize_ts(ev.timestamp)
 
     if d.kind == "started" then
         ---@type pi.Task

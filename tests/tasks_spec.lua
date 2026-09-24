@@ -103,6 +103,22 @@ describe("pi.tasks handle_event", function()
         assert.is_true(t.start_time >= before, "start_time must come from vim.uv.now()")
     end)
 
+    it("rebases Unix-epoch timestamps onto the uv clock", function()
+        -- Core stamps custom messages with Date.now(); storing it verbatim
+        -- makes age math (uv.now() - end_time) go negative and clamp to zero.
+        local epoch_ms = os.time() * 1000 - 5000 -- 5s ago
+        Tasks.handle_event(started_ev("a", epoch_ms))
+        local t = Tasks.get("a")
+        local age = vim.uv.now() - t.start_time
+        -- os.time() has 1s resolution, so allow a tolerant window around 5s.
+        assert.is_true(age >= 4000 and age <= 7000, "epoch ts rebased to the uv clock, got age " .. age)
+
+        Tasks.handle_event(ev("completed", { taskId = "a" }, os.time() * 1000 - 2000))
+        local t2 = Tasks.get("a")
+        local end_age = vim.uv.now() - t2.end_time
+        assert.is_true(end_age >= 1000 and end_age <= 4000, "terminal ts rebased too, got " .. end_age)
+    end)
+
     it("completed defaults exit_code to 0 and failed to 1", function()
         Tasks.handle_event(started_ev("a", 1000))
         Tasks.handle_event(ev("completed", { taskId = "a" }, 1500))

@@ -143,7 +143,7 @@ The same background path is available to you through [direct bash mode](#direct-
 
 ### The `:PiTasks` panel
 
-`:PiTasks` (`pi.tasks()`) toggles a live panel listing every background task the current Neovim instance knows about — running tasks first (oldest start first), then finished ones newest-last-end first. Each row is a status dot (`●` blinking while running, steady colors for failed, a dim `◌` for completed/stopped), a braille spinner on running rows, the (truncated) command, and an `id · status · duration` subtitle — a live `mm:ss` clock while running, an age (`3m ago`) once finished. The list buffer is shared across tabs (filetype `pi-tasks`) with one window per tab, and the 1-second animation (running rows' clock/spinner, finished rows' relative age) runs only while a window is visible.
+`:PiTasks` (`pi.tasks()`) toggles a live panel listing every background task the current Neovim instance knows about — running tasks first (oldest start first), then finished ones newest-last-end first. Each row is a status dot (`●` blinking while running, steady colors for failed, a dim `◌` for completed/stopped), a braille spinner on running rows, the (truncated) command, and an `id · duration` subtitle — the dot already carries the status; a live `mm:ss` clock while running, an age (`3m ago`) once finished. The list buffer is shared across tabs (filetype `pi-tasks`) with one window per tab, and the 1-second animation (running rows' clock/spinner, finished rows' relative age) runs only while a window is visible.
 
 From the panel (all buffer-local, only inside the tasks list):
 
