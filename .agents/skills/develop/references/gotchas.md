@@ -36,6 +36,7 @@ Each entry is a real defect or trap encountered while adding features to this pl
 | G24 | No Lua 5.3-only syntax (`&` `\|` `~` `<<` `>>`, `//`, `\u{}`) — stable Neovim's LuaJIT can't parse it; `loop or previous error` is only the secondary symptom |
 | G25 | Validate failure-counting grep patterns against known-failing output first; prefer plenary's literal `Failed :`/`Errors :` summary lines over regexes across colored output |
 | G26 | uv callbacks (`vim.system`, timers) are fast events — `vim.schedule` any editor work; `repeat = 0` is one-shot; hold timer objects or they are GC'd |
+| G31 | `Config.setup()` shares nested tables with the module-local `defaults` (`tbl_deep_extend` keeps references) — never mutate `options.subagent` in place in specs; deepcopy first |
 
 ### G27 — macOS: Screen Recording is a hard gate for screenshots AND window discovery
 - **现象:** On a macOS GUI run, `gui_launch.sh` finds the wezterm-gui pid but **no CGWindowID**; `screencapture` fails with `could not create image`; a direct `CGWindowListCopyWindowInfo` probe returns an empty/`{}` list even though several apps have visible windows.
@@ -218,3 +219,13 @@ Each entry is a real defect or trap encountered while adding features to this pl
 - **现象:** Inside a `vim.system(..., callback)` or `vim.uv.new_timer()` callback, editor calls throw `E5560: nvim_buf_get_lines must not be called in a lua loop callback`. Separately: a periodic flush fires exactly once, or silently stops working after a while.
 - **根因:** Three distinct traps, all from the libuv layer. (1) uv callbacks run in **fast-event context**: most `vim.api`/`vim.fn` calls are forbidden there (pure-Lua state mutation is fine). (2) `timer:start(timeout, repeat, cb)` with `repeat = 0` means *fire once* — a periodic tick needs `repeat > 0`. (3) uv handles are held weakly from Lua: a timer referenced only by a local that goes out of scope is garbage-collected, and its callbacks stop with no error.
 - **修法:** Wrap callback bodies that touch the editor in `vim.schedule(function() ... end)` (or `vim.schedule_wrap`); keep pure-Lua bookkeeping in the fast path if you want to. Store timer objects in module-level locals or class fields for as long as they must run, and `stop()`/`close()` them explicitly on teardown. Pass the interval as the second `start()` argument for repeating timers. These constraints shaped the 30ms coalescing flush in `history.lua` (#32) and the deferred-spawn async refresh in `pi/cache/files.lua` (#34).
+
+### G31 — Mutating `config.options` in specs pollutes the module-local `defaults` for the rest of the run
+- **现象:** A spec sets `Config.options.subagent.reap_after_minutes = 0` to exercise the disabled path; from then on, every later `Config.setup({})` in the same headless run — which should reset options to defaults — still reads `0`, and the leak crosses spec files.
+- **根因:** `M.options = vim.tbl_deep_extend("force", defaults, opts or {})` copies scalars but **keeps references** to nested tables present only in the first source: after `setup()`, `M.options.subagent` *is* `defaults.subagent`. Any in-place write to a nested field lands directly in `defaults`, and the next `setup()` re-derives options from the polluted defaults. Verified headlessly (feat/subagent-reaper): set `reap_after_minutes = 0`, `setup({})`, read back → still `0`.
+- **修法:** Never mutate nested `options` tables in place in specs. Either replace the whole nested table with a deepcopy first —
+  ```lua
+  Config.options.subagent = vim.tbl_deep_extend("force", vim.deepcopy(Config.options.subagent), { reap_after_minutes = 0 })
+  ```
+  — or point `Config.options` at a hand-built table and restore the original afterwards. Top-level scalar writes are safe (`options.foo = 1` copies by value); only nested tables alias.
+- **元教训:** "setup resets state" is only true when setup's source of truth was never mutated. After changing global config in a test, ask: did I just write through into the defaults?

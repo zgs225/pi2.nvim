@@ -214,12 +214,14 @@ require("pi").setup({
     -- Children run as detached background processes with their own session files.
     subagent = {
         enabled = true,
-        max_children = 5,           -- concurrent active children per parent lineage
+        max_children = 5,           -- max live child processes per parent lineage (any status; dead don't count)
         report_mode = "last_message", -- completion report uses child's last assistant output
         default_config = "inherit",   -- "inherit" parent model/thinking, or "default"
         max_batch_size = 5,           -- max items per dispatch_subagents batch
         batch_timeout_ms = 300000,    -- default wait_subagents timeout (5 min)
         batch_ttl_hours = 24,         -- retain completed batch records (hours)
+        reap_after_minutes = 30,     -- minutes a settled child process idles before it is auto-closed (0 disables event-driven reaping)
+        reap_sweep_minutes = 10,      -- minutes between periodic idle sweeps of settled children (0 disables the sweep)
         show_full_ids = false,        -- show full UUIDs in sub-agent tool rows (default: truncated …suffix)
         sessions_list = {
             collapse_children = false, -- collapse sub-sessions by default (alias: collapsed, sessions_list.collapse_subsessions)
@@ -232,6 +234,13 @@ require("pi").setup({
             height = 0.75,            -- lines (>=1) or fraction of editor height (<1, default 0.75)
             border = "rounded",       -- float border style (default "rounded")
             statusline = true,        -- show statusline in float footer (context, model, thinking level)
+            todo = {
+                enabled = true,       -- show the todo footer chunk and the `T` panel
+                auto_open = false,    -- auto-open the panel when todos first appear (empty → non-empty)
+                position = "below",   -- panel position inside the viewer: "below" | "above"
+                height = 0.35,        -- panel height as a fraction of the viewer height
+                max_items = 20,       -- max todo items shown in the panel
+            },
         },
     },
 

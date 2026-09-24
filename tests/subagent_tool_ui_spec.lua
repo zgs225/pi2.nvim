@@ -128,8 +128,8 @@ describe("subagent tool_ui", function()
                         status = "completed",
                         summary = { done = 2, total = 2 },
                         items = {
-                            { ref = "a", status = "ok", output = "result a" },
-                            { ref = "b", status = "ok", output = "result b" },
+                            { ref = "a", status = "ok", task = "first task", output = "result a" },
+                            { ref = "b", status = "ok", task = "second task", output = "result b" },
                         },
                     }),
                 },
@@ -139,10 +139,23 @@ describe("subagent tool_ui", function()
             h:on_tool_end("dispatch_subagents", "d-end", result, false)
         end)
         vim.wait(100)
-        local text = table.concat(vim.api.nvim_buf_get_lines(h:buf(), 0, -1, false), "\n")
-        assert.matches("status:", text)
+        local lines = vim.api.nvim_buf_get_lines(h:buf(), 0, -1, false)
+        local text = table.concat(lines, "\n")
+        -- The N tree rows are rewritten in place: no separate status line, no
+        -- result list, no ok-output summary; body stays exactly N rows + footer.
+        assert.is_nil(text:find("status:", 1, true), "no status: line in the body")
         assert.matches("✓", text)
-        assert.matches("result a", text)
+        assert.is_nil(text:find("result a", 1, true), "ok rows must not print output summaries")
+        assert.matches("first task", text)
+        local tree_rows = 0
+        for _, line in ipairs(lines) do
+            if line:find("├─", 1, true) or line:find("└─", 1, true) then
+                tree_rows = tree_rows + 1
+            end
+        end
+        assert.are.equal(2, tree_rows, "body must hold exactly one row per item")
+        -- header + 2 rows + blank footer line
+        assert.are.equal(4, #lines)
     end)
 
     it("renders dispatch block on_end with multiline output without error", function()
@@ -175,8 +188,10 @@ describe("subagent tool_ui", function()
         end)
         vim.wait(100)
         local text = table.concat(vim.api.nvim_buf_get_lines(h:buf(), 0, -1, false), "\n")
-        assert.matches("line1 line2", text)
-        assert.matches("boom stack", text)
+        -- ok rows carry no output summary; the failed row keeps a flattened,
+        -- 80-char-capped excerpt of its error.
+        assert.is_nil(text:find("line1 line2", 1, true), "ok rows must not print output summaries")
+        assert.matches("boom stack trace", text, nil, true)
     end)
 
     it("renderer uses dynamic inline for dispatch", function()

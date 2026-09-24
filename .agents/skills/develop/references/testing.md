@@ -22,6 +22,8 @@ The repo ships `tests/minimal_init.lua` and a `Makefile` with `test` (hermetic p
 
 **How it runs:** `nvim --headless -u ~/.config/nvim/init.lua -l script.lua`. The script drives `require("pi").show{layout="side"}`, `vim.wait(...)` for buffers, mutates buffers, calls chat methods, and exits `cq 0`/`cq 1`. `make smoke` is the minimal version of this, committed at `scripts/smoke.lua` (open the chat, assert the history/prompt buffers exist and the session's RPC backend process started). **Worktree caveat:** this boots the user's real config, so lazy loads pi from the **main checkout** (`~/.local/share/nvim/lazy/pi2.nvim`), not a feature worktree. To exercise worktree code headless, run the script under `-u tests/minimal_init.lua` instead (path-relative, worktree-safe); see G23.
 
+**Real-binary e2e:** `scripts/e2e/reaper.lua` runs the subagent idle-reaper + `max_children` scenarios against a real `pi --mode rpc` process, real uv timers and real provider/LLM settle events — run it with `make e2e-reaper` from the repo root; it needs the pi binary + a configured provider, so it stays out of CI and `make test`.
+
 **Stub the backend** at the top of any script that submits: `chat._agent.send = function(_) end` (get `chat` via `require("pi.sessions.manager").get().chat`). This prevents real model calls *and*, because the stub returns before the RPC send, prevents the pi backend from writing a session transcript — so sessions stay clean.
 
 **Pitfalls unique to headless:**

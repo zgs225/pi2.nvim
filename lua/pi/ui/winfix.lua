@@ -4,13 +4,12 @@
 --- window-local options (nonumber, signcolumn=no, etc.).
 ---
 --- Solution: capture the user's window option defaults at setup time, before
---- any pi windows exist. On BufEnter, detect windows that inherited pi's
---- options via a multi-option fingerprint and reset them to the captured
---- defaults.
+--- any pi windows exist. On BufEnter, detect windows whose buffer is a USER
+--- buffer that inherited pi's options via a multi-option fingerprint, and
+--- reset them to the captured defaults. Windows showing any pi buffer
+--- (filetype "pi-*") are exempt: the pi panels configure their own options.
 
 local M = {}
-
-local Ft = require("pi.filetypes")
 
 --- Options that pi sets on its windows.
 ---@type string[]
@@ -34,12 +33,17 @@ local OPTION_NAMES = {
     "virtualedit",
 }
 
---- Pi filetypes whose windows should keep pi options.
-local PI_FILETYPES = {
-    [Ft.history] = true,
-    [Ft.prompt] = true,
-    [Ft.attachments] = true,
-}
+--- Whether a filetype belongs to a pi buffer. Every filetype in
+--- pi.filetypes starts with the "pi-" prefix (pi-chat-history, pi-chat-prompt,
+--- pi-chat-attachments, pi-dialog, pi-sessions, pi-diff-review), so the rule is
+--- self-maintaining for current and future panels. Windows showing a pi
+--- buffer keep pi's options (the panels set them explicitly at creation);
+--- only user buffers that inherited pi's window options are reset.
+---@param ft string filetype of the buffer being entered
+---@return boolean true when the filetype is a pi buffer filetype
+local function is_pi_filetype(ft)
+    return ft:sub(1, 3) == "pi-"
+end
 
 --- User defaults captured at setup time.
 ---@type table<string, any>
@@ -65,7 +69,7 @@ function M.setup()
 
     vim.api.nvim_create_autocmd("BufEnter", {
         callback = function(ev)
-            if PI_FILETYPES[vim.bo[ev.buf].filetype] then
+            if is_pi_filetype(vim.bo[ev.buf].filetype) then
                 return
             end
             local win = vim.api.nvim_get_current_win()

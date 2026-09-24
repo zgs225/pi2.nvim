@@ -9,6 +9,7 @@ What the plugin does bind on its own:
 - `<C-p>` / `<C-n>` / `<Up>` / `<Down>` prompt-history recall (see [Usage → Prompt history](usage.md#prompt-history)).
 - `<Tab>` block expand/collapse and `gf` open-file-under-cursor in the history buffer.
 - `gp` return to parent session when viewing a sub-session (see [Sessions → Sub-sessions](sessions.md#sub-sessions)).
+- `T` inside the sub-session viewer float toggles the viewed session's todo list panel (see [Usage → In the sub-session viewer](usage.md#in-the-sub-session-viewer)).
 - `dd` / `x` to remove an entry in the attachments buffer.
 - The [diff review](diff-review.md) keys inside the diff tab.
 - The `:PiDiff` session diff review: in the panel's file list, moving the cursor previews the file's diff, `<CR>`/`o` jumps to its first changed line, `<C-f>`/`<C-b>`/`<C-d>`/`<C-u>` scroll the diff on the right; in the diff area, `<CR>`/`o` jumps to the line under the cursor; `q` closes the whole review (see [Session diff review](diff-review.md#session-diff-review-pidiff)).
