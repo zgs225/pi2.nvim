@@ -9,6 +9,7 @@ local Manifest = require("pi.subsessions.manifest")
 local Read = require("pi.subsessions.read")
 local Batch = require("pi.subsessions.batch")
 local Sessions = require("pi.sessions.manager")
+local Reaper = require("pi.subsessions.reaper")
 
 --- Abort epochs per lineage: interactive spawns capture the epoch at start and
 --- bail out when it changes mid-flight (see M.spawn).
@@ -332,6 +333,23 @@ function M.on_parent_resumed(session, session_path)
     require("pi.ui.sessions").request_refresh()
 end
 
+--- Liveness test behind the `subagent.max_children` limit: a child occupies a
+--- slot while its RPC process is still running in this Neovim instance,
+--- whatever the manifest says — a completed (or interrupted) child whose
+--- process lingers must not let the lineage spawn past the cap, while a dead
+--- process (failed/dormant, or no registry row at all) frees its slot.
+--- Lives here, not in manifest.lua, so the manifest never requires the
+--- sessions manager (dependency direction).
+---@param child_id string
+---@return boolean
+local function child_process_alive(child_id)
+    local session = Sessions.get_by_id(child_id)
+    if not session or not session.rpc then
+        return false
+    end
+    return session.rpc:is_running() == true
+end
+
 --- Spawn a background sub-session for `parent`.
 ---@param parent pi.Session
 ---@param opts pi.SubsessionSpawnOpts
@@ -374,7 +392,7 @@ function M.spawn(parent, opts, callback)
         local epoch = M.abort_epoch(lineage_id)
 
         local max = subcfg.max_children or 5
-        if not Manifest.try_reserve_spawn(lineage_id, max) then
+        if not Manifest.try_reserve_spawn(lineage_id, max, child_process_alive) then
             callback(nil, ("max %d concurrent sub-sessions"):format(max))
             return
         end
@@ -672,6 +690,9 @@ function M.on_child_settled(child)
         if parent then
             SessionList.acknowledge_reported_children_for_current_tab(parent)
         end
+        -- Manifest is settled: arm the idle reaper (fire-time re-checks all
+        -- conditions; a failure here must never break settle handling).
+        pcall(Reaper.schedule, child.id)
     end
 
     local manifest = Manifest.load()
@@ -764,6 +785,8 @@ function M.on_child_settled(child)
             end
             SessionList.request_refresh()
             SessionList.acknowledge_reported_children_for_current_tab(parent)
+            -- Prompt-injection path patched the manifest last: arm the reaper here too.
+            pcall(Reaper.schedule, child.id)
         end)
     end)
 end
@@ -775,6 +798,8 @@ end
 --- potentially large file on every startup (write amplification + mtime
 --- churn for backup tools).
 function M.rebuild_statuses()
+    -- Setup entry (invoked once from pi.setup): start the periodic idle sweep.
+    pcall(Reaper.start)
     local manifest = Manifest.load()
     if Manifest.decode_failed() then
         -- The on-disk manifest did not decode: the in-memory table is not

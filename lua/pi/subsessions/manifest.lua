@@ -319,28 +319,59 @@ function M.count_active_children(parent_id)
     return n
 end
 
+---@alias pi.SubsessionChildAlivePred fun(child_id: string): boolean
+
+--- Children of a lineage whose process is still alive, whatever their
+--- manifest status. This is the counting behind `subagent.max_children` when
+--- the caller supplies a liveness predicate (the Sessions registry check lives
+--- in the caller — manifest must not require the sessions manager).
+---@param lineage_id string
+---@param is_alive pi.SubsessionChildAlivePred
+---@return integer
+function M.count_alive_children(lineage_id, is_alive)
+    local manifest = M.load()
+    local n = 0
+    for id, entry in pairs(manifest) do
+        if is_child_entry_key(id) and type(entry) == "table" and entry.parent_id == lineage_id and is_alive(id) then
+            n = n + 1
+        end
+    end
+    return n
+end
+
 ---@param lineage_id string
 ---@return integer
 function M.pending_spawns(lineage_id)
     return occupy[lineage_id] or 0
 end
 
---- Active children plus in-flight spawns for a lineage.
+--- Occupancy for a lineage: in-flight spawns plus, when `is_alive` is given,
+--- every child whose process is still running (any status — a
+--- completed-but-alive child keeps holding a slot); otherwise only manifest
+--- rows with status "active" (legacy counting, default for callers that do not
+--- pass a predicate).
 ---@param lineage_id string
+---@param is_alive? pi.SubsessionChildAlivePred
 ---@return integer
-function M.spawn_occupancy(lineage_id)
+function M.spawn_occupancy(lineage_id, is_alive)
+    if is_alive then
+        return M.count_alive_children(lineage_id, is_alive) + M.pending_spawns(lineage_id)
+    end
     return M.count_active_children(lineage_id) + M.pending_spawns(lineage_id)
 end
 
 --- Reserve one spawn slot. Call `release_spawn` after upsert or on failure.
 ---@param lineage_id string
 ---@param max_children integer
+---@param is_alive? pi.SubsessionChildAlivePred Optional liveness predicate: when given, occupancy counts
+--- children of this lineage whose process is still running (any manifest status) instead of only
+--- status=="active" rows, so completed-but-alive processes keep occupying slots. Omit for legacy counting.
 ---@return boolean
-function M.try_reserve_spawn(lineage_id, max_children)
+function M.try_reserve_spawn(lineage_id, max_children, is_alive)
     if type(lineage_id) ~= "string" or lineage_id == "" then
         return false
     end
-    if M.spawn_occupancy(lineage_id) >= max_children then
+    if M.spawn_occupancy(lineage_id, is_alive) >= max_children then
         return false
     end
     occupy[lineage_id] = (occupy[lineage_id] or 0) + 1

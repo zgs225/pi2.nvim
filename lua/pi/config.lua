@@ -307,13 +307,15 @@
 
 ---@class pi.SubagentConfig
 ---@field enabled? boolean Inject subagent.ts extension (default true)
----@field max_children? integer Max concurrent sub-sessions per parent lineage (default 5)
+---@field max_children? integer Max live child processes per parent lineage (default 5; completed-but-alive count, dead don't)
 ---@field report_mode? "last_message" Report mode when sub-session completes (default "last_message")
 ---@field default_config? "inherit"|"default" Sub-session model/thinking default (default "inherit")
 ---@field max_batch_size? integer Max items per dispatch_subagents batch (default 5)
 ---@field batch_timeout_ms? integer Default wait_subagents timeout (default 300000)
 ---@field batch_ttl_hours? integer Hours to retain completed batch records (default 24)
 ---@field show_full_ids? boolean Show full UUIDs in sub-agent tool rows (default false; truncated)
+---@field reap_after_minutes? number Minutes a settled child process idles before auto-close (default 30; 0 disables event-driven reaping)
+---@field reap_sweep_minutes? number Minutes between periodic idle sweeps (default 10; 0 disables the sweep)
 ---@field sessions_list? pi.SubagentSessionsListConfig
 ---@field viewer? pi.SubagentViewerConfig Float window sizing for the sub-session viewer
 
@@ -501,6 +503,8 @@ local defaults = {
         batch_timeout_ms = 300000,
         batch_ttl_hours = 24,
         show_full_ids = false,
+        reap_after_minutes = 30,
+        reap_sweep_minutes = 10,
         sessions_list = {
             collapse_children = false,
             show_dormant = false,
