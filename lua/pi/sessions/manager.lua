@@ -463,9 +463,10 @@ local function update_todo_mirror(session, tool_name, result)
 end
 
 --- Consume a pi2_bg_task custom message pushed by the bg-tasks extension:
---- forward the lifecycle event to the task registry and surface a user
---- notification when a task reaches a terminal state. Runs on the RPC
---- callback thread: every user-facing touch (Notify) is vim.schedule'd.
+--- forward the lifecycle event to the task registry. Terminal states surface
+--- through the panel row and the agent's own triggerTurn report — no extra
+--- vim.notify on top. Runs on the RPC callback thread: every user-facing
+--- touch (Notify) is vim.schedule'd.
 ---@param message table custom message object (role="custom", customType="pi2_bg_task")
 local function handle_bg_task_message(message)
     local details = message.details
@@ -484,28 +485,6 @@ local function handle_bg_task_message(message)
     if not consumed then
         return
     end
-    local kind = details.kind
-    if kind ~= "completed" and kind ~= "failed" and kind ~= "stopped" then
-        return
-    end
-    local task = Tasks.get(details.taskId)
-    local command = task and task.command or ""
-    command = command:gsub("%s+", " ")
-    if #command > 60 then
-        command = command:sub(1, 60) .. "…"
-    end
-    local exit_code = (task and task.exit_code) or details.exitCode
-    local exit_txt = exit_code and (" (exit " .. tostring(exit_code) .. ")") or ""
-    local suffix = command ~= "" and (": " .. command) or ""
-    vim.schedule(function()
-        if kind == "failed" then
-            Notify.warn("Task " .. details.taskId .. " failed" .. exit_txt .. suffix)
-        elseif kind == "completed" then
-            Notify.info("Task " .. details.taskId .. " finished" .. exit_txt .. suffix)
-        else
-            Notify.info("Task " .. details.taskId .. " stopped" .. exit_txt .. suffix)
-        end
-    end)
 end
 
 ---@param session pi.Session

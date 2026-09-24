@@ -270,10 +270,12 @@ local function stop_spinner()
     spinner_timer = nil
 end
 
---- Run the 1s duration timer only while a running row is on screen: it keeps
---- `mm:ss` clocks and the spinner frame advancing.
+--- Run the 1s duration timer while the panel is visible and any row exists:
+--- it keeps the `mm:ss` clocks and spinner frames of running rows advancing,
+--- and ticks the relative age (`3m ago`) of finished ones so it never
+--- freezes at the moment the task ended.
 local function ensure_spinner()
-    if not any_win_visible() or not has_running_row() then
+    if not any_win_visible() or #rows == 0 then
         stop_spinner()
         return
     end
@@ -285,7 +287,7 @@ local function ensure_spinner()
         1000,
         1000,
         vim.schedule_wrap(function()
-            if not any_win_visible() or not has_running_row() then
+            if not any_win_visible() or #rows == 0 then
                 vim.schedule(stop_spinner)
                 return
             end

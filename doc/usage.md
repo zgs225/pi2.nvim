@@ -139,11 +139,11 @@ The same background path is available to you through [direct bash mode](#direct-
 !& npm run dev
 ```
 
-— and the command starts in the background instead of streaming into the chat. You get an immediate confirmation with the task id; completion still arrives as a notification (see below). A bare `&` with nothing after it is rejected with an error.
+— and the command starts in the background instead of streaming into the chat. You get an immediate confirmation with the task id; completion is still reported to you (see below). A bare `&` with nothing after it is rejected with an error.
 
 ### The `:PiTasks` panel
 
-`:PiTasks` (`pi.tasks()`) toggles a live panel listing every background task the current Neovim instance knows about — running tasks first (oldest start first), then finished ones newest-last-end first. Each row is a status dot (`●` blinking while running, steady colors for failed, a dim `◌` for completed/stopped), a braille spinner on running rows, the (truncated) command, and an `id · status · duration` subtitle — a live `mm:ss` clock while running, an age (`3m ago`) once finished. The list buffer is shared across tabs (filetype `pi-tasks`) with one window per tab, and running clocks/spinner animate only while a window is visible.
+`:PiTasks` (`pi.tasks()`) toggles a live panel listing every background task the current Neovim instance knows about — running tasks first (oldest start first), then finished ones newest-last-end first. Each row is a status dot (`●` blinking while running, steady colors for failed, a dim `◌` for completed/stopped), a braille spinner on running rows, the (truncated) command, and an `id · status · duration` subtitle — a live `mm:ss` clock while running, an age (`3m ago`) once finished. The list buffer is shared across tabs (filetype `pi-tasks`) with one window per tab, and the 1-second animation (running rows' clock/spinner, finished rows' relative age) runs only while a window is visible.
 
 From the panel (all buffer-local, only inside the tasks list):
 
@@ -159,7 +159,7 @@ From the panel (all buffer-local, only inside the tasks list):
 
 Output views are read-only (`pi-task-output` filetype, `q` closes) and tail-read large outputs: files over 256 KB are read from the end, capped at 10000 lines. Stopping a task sends SIGTERM to the recorded pid; the authoritative `stopped` state arrives from the backend's own event, so the row updates even if you stop it elsewhere. Task state lives in memory only — it is not persisted, so tasks from past sessions don't survive a Neovim restart.
 
-Whenever a task reaches a terminal state — completed, failed, or stopped — π also surfaces a notification (`Task b3f2a1 finished (exit 0): npm run dev`, failed tasks warn), regardless of whether the panel is open. Panel placement and sizing are configured under [`tasks_panel`](configuration.md); the colors are the [`PiTasksList*`](highlight-groups.md#background-tasks-panel) highlight groups.
+Whenever a task reaches a terminal state — completed, failed, or stopped — the extension wakes the agent, which reports the outcome in the chat; the panel row updates in place at the same moment. Panel placement and sizing are configured under [`tasks_panel`](configuration.md); the colors are the [`PiTasksList*`](highlight-groups.md#background-tasks-panel) highlight groups.
 
 ## Prompt history
 
