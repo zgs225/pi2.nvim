@@ -14,6 +14,23 @@ What the plugin does bind on its own:
 - The [diff review](diff-review.md) keys inside the diff tab.
 - The `:PiDiff` session diff review: in the panel's file list, moving the cursor previews the file's diff, `<CR>`/`o` jumps to its first changed line, `<C-f>`/`<C-b>`/`<C-d>`/`<C-u>` scroll the diff on the right; in the diff area, `<CR>`/`o` jumps to the line under the cursor; `q` closes the whole review (see [Session diff review](diff-review.md#session-diff-review-pidiff)).
 - The [sessions overview](sessions.md#sessions-overview-pisessions) keys inside the list.
+- The [background tasks](#background-tasks-panel-pitasks) panel keys inside the list.
+
+## Background tasks panel (`:PiTasks`)
+
+`:PiTasks` lists the background bash tasks reported by the bg-tasks extension (see [Usage → Background tasks](usage.md#background-tasks)). All of these are **buffer-local** mappings on the shared tasks list buffer (filetype `pi-tasks`) — they only fire inside the tasks panel, never in your own buffers:
+
+| Key | Action |
+| --- | --- |
+| `<CR>` / `o` | Open this task's output in a vsplit (cursor stays in the list) |
+| `a` / `i` | Open the output and focus it |
+| `p` | Preview the output tail in a float; press `p` again to close |
+| `x` | Stop the task under the cursor (asks for confirmation first) |
+| `R` | Redraw the list |
+| `q` | Close the panel |
+| `?` | Toggle a help overlay listing these keys |
+
+The output and preview buffers are read-only (`pi-task-output` filetype) and carry a buffer-local `q` that closes their window.
 
 ## Key specs
 
@@ -46,6 +63,7 @@ Every π buffer gets a stable filetype, so you can target them from your own `Fi
 | `pi-chat-attachments` | Attachments panel |
 | `pi-dialog` | Input and info dialog floats (completion plugins can be disabled here without affecting the prompt) |
 | `pi-sessions` | The [sessions overview](sessions.md#sessions-overview-pisessions) list |
+| `pi-tasks` | The [background tasks](#background-tasks-panel-pitasks) panel (`:PiTasks`) |
 | `pi-diff-review` | The `:PiDiff` session diff review file list (left area of the panel) |
 
 ## Example setup

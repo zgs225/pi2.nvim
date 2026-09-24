@@ -298,6 +298,57 @@ M.check = function()
         end
     end
 
+    -- ── Bundled background bash tasks extension ───────────────────────
+    local bg_path = Cli.bg_tasks_extension_path()
+    if vim.uv.fs_stat(bg_path) then
+        vim.health.ok("bundled background bash tasks extension found")
+    else
+        vim.health.warn("bundled background bash tasks extension not found at " .. bg_path, {
+            "Reinstall pi2.nvim",
+            "Without it `run_in_background` / `&`-prefix are unavailable and :PiTasks stays empty",
+        })
+    end
+
+    -- Version floor: bg-tasks overrides the built-in bash tool via
+    -- pi.registerTool() and re-exports createBashToolDefinition() /
+    -- getShellConfig() from the package root, all verified on pi 0.85.1
+    -- (exact introduction version unknown — floor set to validated version).
+    -- Below the floor the extension fails to load and pi logs the error —
+    -- sessions keep stock bash, no crash, :PiTasks stays empty.
+    local bg_min = Compat.bg_tasks_min_supported
+    if not pi_version then
+        vim.health.warn(
+            "Could not verify pi version against the background bash tasks requirement (pi >= " .. bg_min .. ")"
+        )
+    else
+        local cmp_bg = Compat.compare_versions(pi_version, bg_min)
+        if cmp_bg == nil then
+            vim.health.warn(
+                "Could not compare pi version `"
+                    .. pi_version
+                    .. "` against the background bash tasks minimum `"
+                    .. bg_min
+                    .. "`"
+            )
+        elseif cmp_bg < 0 then
+            vim.health.warn(
+                "pi version `" .. pi_version .. "` is older than the background bash tasks minimum `" .. bg_min .. "`",
+                {
+                    "Upgrade pi to " .. bg_min .. "+ so `run_in_background` and the `&` prefix work",
+                    "With an older pi the extension fails to load and bash stays stock — no crash",
+                }
+            )
+        else
+            vim.health.ok(
+                "pi version `"
+                    .. pi_version
+                    .. "` satisfies the background bash tasks requirement (pi >= "
+                    .. bg_min
+                    .. ")"
+            )
+        end
+    end
+
     -- ── Image compression tools ────────────────────────────────────────
     local compress_cfg = Config.options.prompt and Config.options.prompt.image_compress or {}
     if compress_cfg.enable ~= false then

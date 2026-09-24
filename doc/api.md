@@ -26,6 +26,10 @@ pi.fork()                     -- new session from a past user message; picks for
                               -- messages, then prefills the prompt for re-asking (:PiFork)
 pi.clone()                    -- duplicate the current branch into a new session (:PiClone)
 pi.sessions()                 -- toggle the live sessions overview (:PiSessions)
+pi.tasks()                    -- toggle the background tasks panel (:PiTasks): the
+                              -- background bash tasks reported by the bg-tasks
+                              -- extension, with status and durations (see
+                              -- doc/usage.md#background-tasks)
 pi.session_stats(session?)  -- show the stats dashboard for a session: identity, tokens, cost, cache
                               -- waste, context: current tab's session by default; `s` in :PiSessions
                               -- shows the stats of the session under the cursor (:PiSessionStats)

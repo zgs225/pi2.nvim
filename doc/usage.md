@@ -6,6 +6,7 @@ This page walks through how `pi2.nvim` actually works in practice. Each subsecti
 - [Prompt](#prompt)
 - [Aborting with double `<Esc>`](#aborting-with-double-esc)
 - [Direct bash mode (`!`)](#direct-bash-mode-)
+- [Background tasks](#background-tasks)
 - [Prompt history](#prompt-history)
 - [Draft persistence](#draft-persistence)
 - [Mentions](#mentions)
@@ -112,6 +113,53 @@ A few details that match the TUI:
 - Only one direct bash command can run at a time. Submitting another while one is running is rejected with a warning (press `<Esc>` to cancel the running one first, same as the TUI).
 - A single `<Esc>` (in either insert or normal mode on the prompt) cancels a running `!` command — the same as `:PiAbortBash` / `pi.abort_bash()`. This is separate from the double-`<Esc>` agent abort above: `<Esc>` cancels a bash command when one is running, and arms the double-`<Esc>` agent abort when the agent is streaming.
 - `!` commands are recorded in the prompt history, so `<C-p>` / `<Up>` recalls them like normal prompts.
+
+## Background tasks
+
+Long-running shell commands — dev servers, watchers, long builds, slow test suites — don't have to block the conversation. With the bundled [`bg-tasks` extension](extensions.md#bundled-background-tasks-extension-extensionsbg-tasksts) loaded, both the agent and you can start bash commands that run in the background while everything else keeps moving.
+
+> [!NOTE]
+> `bg-tasks.ts` is injected into the RPC process automatically (like the other bundled extensions). It requires pi **0.85.1+** — on older versions the extension fails to load, pi logs the error, and bash falls back to stock behavior with the `:PiTasks` panel staying empty (`:checkhealth pi` reports the version floor). To opt out entirely, pass `--no-extensions` via `cli.args`.
+
+### From the agent
+
+The extension overrides the built-in `bash` tool with one extra optional parameter, `run_in_background`. When the agent passes `run_in_background: true` (the intended use: dev servers, file watchers, long builds, test suites that take minutes), the command spawns detached instead of blocking the turn:
+
+- The tool returns immediately with a task id and the output file path.
+- stdout/stderr stream into a log file in the system temp directory: `pi-bash-<taskId>.log` (the same naming convention pi uses for its truncated-output spill files).
+- The model is told **not** to poll the output file — when the task finishes (or fails, or is stopped), the extension wakes the agent with a completion report (task id, command, exit code or signal, output path) injected into its context.
+
+The `timeout` parameter does not apply to background tasks, and the model is instructed not to append `&` itself. Foreground `bash` calls are byte-for-byte the built-in behavior — streaming, truncation, timeout kill, and abort handling are unchanged.
+
+### From the prompt
+
+The same background path is available to you through [direct bash mode](#direct-bash-mode-): prefix the `!` command with `&` —
+
+```
+!& npm run dev
+```
+
+— and the command starts in the background instead of streaming into the chat. You get an immediate confirmation with the task id; completion still arrives as a notification (see below). A bare `&` with nothing after it is rejected with an error.
+
+### The `:PiTasks` panel
+
+`:PiTasks` (`pi.tasks()`) toggles a live panel listing every background task the current Neovim instance knows about — running tasks first (oldest start first), then finished ones newest-last-end first. Each row is a status dot (`●` blinking while running, steady colors for failed, a dim `◌` for completed/stopped), a braille spinner on running rows, the (truncated) command, and an `id · status · duration` subtitle — a live `mm:ss` clock while running, an age (`3m ago`) once finished. The list buffer is shared across tabs (filetype `pi-tasks`) with one window per tab, and running clocks/spinner animate only while a window is visible.
+
+From the panel (all buffer-local, only inside the tasks list):
+
+| Key | Action |
+| --- | --- |
+| `<CR>` / `o` | Open this task's output in a vsplit (cursor stays in the list) |
+| `a` / `i` | Open the output and focus it |
+| `p` | Preview the output tail (200 lines) in a float; `p` again closes it |
+| `x` | Stop the task under the cursor (confirms, then SIGTERM) |
+| `R` | Redraw the list |
+| `q` | Close the panel |
+| `?` | Toggle a help overlay listing these keys |
+
+Output views are read-only (`pi-task-output` filetype, `q` closes) and tail-read large outputs: files over 256 KB are read from the end, capped at 10000 lines. Stopping a task sends SIGTERM to the recorded pid; the authoritative `stopped` state arrives from the backend's own event, so the row updates even if you stop it elsewhere. Task state lives in memory only — it is not persisted, so tasks from past sessions don't survive a Neovim restart.
+
+Whenever a task reaches a terminal state — completed, failed, or stopped — π also surfaces a notification (`Task b3f2a1 finished (exit 0): npm run dev`, failed tasks warn), regardless of whether the panel is open. Panel placement and sizing are configured under [`tasks_panel`](configuration.md); the colors are the [`PiTasksList*`](highlight-groups.md#background-tasks-panel) highlight groups.
 
 ## Prompt history
 

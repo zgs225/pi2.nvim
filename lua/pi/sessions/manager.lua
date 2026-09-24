@@ -63,6 +63,7 @@ local Attention = require("pi.attention")
 local Dialog = require("pi.ui.dialog")
 local Extension = require("pi.ui.extension")
 local CommandsCache = require("pi.cache.commands")
+local Tasks = require("pi.tasks")
 
 ---@class pi.StartupSection
 ---@field header string
@@ -459,6 +460,52 @@ local function update_todo_mirror(session, tool_name, result)
     if not ok then
         Notify.warn("todo panel update failed: " .. tostring(err))
     end
+end
+
+--- Consume a pi2_bg_task custom message pushed by the bg-tasks extension:
+--- forward the lifecycle event to the task registry and surface a user
+--- notification when a task reaches a terminal state. Runs on the RPC
+--- callback thread: every user-facing touch (Notify) is vim.schedule'd.
+---@param message table custom message object (role="custom", customType="pi2_bg_task")
+local function handle_bg_task_message(message)
+    local details = message.details
+    if type(details) ~= "table" then
+        return
+    end
+    local ok, consumed = pcall(Tasks.handle_event, {
+        type = "pi2_bg_task",
+        details = details,
+        timestamp = message.timestamp,
+    })
+    if not ok then
+        Notify.warn("Background task event failed: " .. tostring(consumed))
+        return
+    end
+    if not consumed then
+        return
+    end
+    local kind = details.kind
+    if kind ~= "completed" and kind ~= "failed" and kind ~= "stopped" then
+        return
+    end
+    local task = Tasks.get(details.taskId)
+    local command = task and task.command or ""
+    command = command:gsub("%s+", " ")
+    if #command > 60 then
+        command = command:sub(1, 60) .. "…"
+    end
+    local exit_code = (task and task.exit_code) or details.exitCode
+    local exit_txt = exit_code and (" (exit " .. tostring(exit_code) .. ")") or ""
+    local suffix = command ~= "" and (": " .. command) or ""
+    vim.schedule(function()
+        if kind == "failed" then
+            Notify.warn("Task " .. details.taskId .. " failed" .. exit_txt .. suffix)
+        elseif kind == "completed" then
+            Notify.info("Task " .. details.taskId .. " finished" .. exit_txt .. suffix)
+        else
+            Notify.info("Task " .. details.taskId .. " stopped" .. exit_txt .. suffix)
+        end
+    end)
 end
 
 ---@param session pi.Session
@@ -958,7 +1005,16 @@ function M.handle_event(session, msg)
         end
         return false
     elseif t == "message_start" then
-        if chat then
+        local message = msg.message
+        if type(message) == "table" and message.role == "custom" then
+            -- Custom extension messages never render in chat history. The
+            -- bg-tasks extension's pi2_bg_task lifecycle feeds the task
+            -- registry (and the :PiTasks panel) instead; other customTypes
+            -- are dropped, matching the previous de-facto behavior.
+            if message.customType == "pi2_bg_task" then
+                handle_bg_task_message(message)
+            end
+        elseif chat then
             chat:on_message_start(msg)
         end
     elseif t == "message_end" then
@@ -977,7 +1033,7 @@ function M.handle_event(session, msg)
                 session._pending_file_change_args[tool_call_id] = nil
             end
         end
-        if chat then
+        if chat and not (type(message) == "table" and message.role == "custom") then
             chat:on_message_end(msg)
         end
     elseif t == "tool_execution_update" then

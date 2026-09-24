@@ -110,7 +110,7 @@
 ---@field reason? string compaction summarization reason: "manual" | "threshold" | "overflow"
 ---@field id? string
 ---@field method? string
----@field message? string|{ stopReason?: string, errorMessage?: string, [string]: any }
+---@field message? string|{ role?: string, customType?: string, details?: table, timestamp?: integer, stopReason?: string, errorMessage?: string, [string]: any }
 ---@field messages? table[]
 ---@field notifyType? "info"|"warning"|"error"
 ---@field options? string[]

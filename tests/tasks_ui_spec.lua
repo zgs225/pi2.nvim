@@ -1,0 +1,438 @@
+-- Background tasks panel (:PiTasks) UI — lua/pi/ui/tasks.lua.
+--
+-- Hermetic: seeds fake tasks through pi.tasks.upsert (no RPC, no spawned
+-- processes) and exercises row formatting, ordering, cursor lookup, the
+-- stop keymap path (with vim.fn.confirm mocked), open/close/toggle, output
+-- windows, the preview float, and the help overlay against real headless
+-- windows.
+
+local Tasks = require("pi.tasks")
+local Panel = require("pi.ui.tasks")
+
+---@return integer
+local function now_ms()
+    return vim.uv.now()
+end
+
+--- Seed a fake task.
+---@param fields table
+---@return table
+local function seed(fields)
+    local task = vim.tbl_extend("force", {
+        id = "t1",
+        command = "echo hi",
+        status = "running",
+        start_time = now_ms() - 60_000,
+    }, fields)
+    Tasks.upsert(task)
+    return task
+end
+
+--- Press a key in the current window through the real key path.
+---@param key string
+local function press(key)
+    vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(key, true, false, true), "x", false)
+end
+
+--- Find a window displaying a buffer whose name contains `fragment`.
+---@param fragment string
+---@return integer?
+local function find_win_by_name(fragment)
+    for _, win in ipairs(vim.api.nvim_list_wins()) do
+        local name = vim.api.nvim_buf_get_name(vim.api.nvim_win_get_buf(win))
+        if name:find(fragment, 1, true) then
+            return win
+        end
+    end
+    return nil
+end
+
+--- Find the help float: a pi-dialog buffer showing the panel shortcuts.
+---@return integer?, integer?
+local function find_help_win()
+    for _, win in ipairs(vim.api.nvim_list_wins()) do
+        local buf = vim.api.nvim_win_get_buf(win)
+        if vim.bo[buf].filetype == "pi-dialog" then
+            local text = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+            if text:find("Toggle this help", 1, true) then
+                return win, buf
+            end
+        end
+    end
+    return nil, nil
+end
+
+describe("tasks panel UI", function()
+    before_each(function()
+        Tasks._reset()
+        Panel._reset()
+        Panel._resubscribe()
+    end)
+
+    after_each(function()
+        -- Close anything the test left open besides the panel itself.
+        for _, win in ipairs(vim.api.nvim_list_wins()) do
+            if vim.api.nvim_win_is_valid(win) then
+                local buf = vim.api.nvim_win_get_buf(win)
+                local name = vim.api.nvim_buf_get_name(buf)
+                if name:find("pi://task", 1, true) or name:find("pi://tasks", 1, true) then
+                    pcall(vim.api.nvim_win_close, win, true)
+                end
+            end
+        end
+        Panel._reset()
+        Tasks._reset()
+    end)
+
+    describe("format_line", function()
+        it("formats a running row with dot, spinner, summary and mm:ss subtitle", function()
+            local task = seed({ id = "run1", command = "make test" })
+            local row = Tasks.build_rows(task.start_time + 65_000)[1]
+            local line, chunks = Panel.format_line(row, 0, 80)
+
+            assert.is_truthy(line:find("●", 1, true), "running dot")
+            assert.is_truthy(line:find(Panel.spinner_frame(0), 1, true), "spinner frame")
+            assert.is_truthy(line:find("make test", 1, true), "command summary")
+            assert.is_truthy(line:find("run1 · running · 01:05", 1, true), "subtitle with live duration")
+
+            assert.are.equal("PiTasksListRunning", chunks[1][3])
+            assert.are.equal("PiTasksListSpinner", chunks[2][3])
+            -- The subtitle chunk is dimmed metadata.
+            local subtitle_hl = chunks[#chunks][3]
+            assert.are.equal("PiTasksListDotDim", subtitle_hl)
+            -- The dot sits at the left edge.
+            assert.are.equal(0, chunks[1][1])
+        end)
+
+        it("blinks the running dot on odd ticks", function()
+            local task = seed({ id = "run1" })
+            local row = Tasks.build_rows(task.start_time + 1000)[1]
+            local _, even = Panel.format_line(row, 2, 80)
+            local _, odd = Panel.format_line(row, 3, 80)
+            assert.are.equal("PiTasksListRunning", even[1][3])
+            assert.are.equal("PiTasksListDotDim", odd[1][3])
+        end)
+
+        it("renders terminal rows with a dim glyph and relative end time", function()
+            local base = now_ms()
+            seed({ id = "done1", status = "completed", start_time = base - 300_000, end_time = base - 180_000 })
+            local rows = Tasks.build_rows(base)
+            local row
+            for _, r in ipairs(rows) do
+                if r.task.id == "done1" then
+                    row = r
+                end
+            end
+            assert.is_not_nil(row)
+            local line, chunks = Panel.format_line(row, 0, 80, base)
+            assert.is_truthy(line:find("◌", 1, true), "completed uses the dim glyph")
+            assert.is_truthy(line:find("done1 · done · 3m ago", 1, true), "relative end time")
+            assert.are.equal("PiTasksListSuccess", chunks[1][3])
+        end)
+
+        it("maps failed and stopped statuses to their highlight groups", function()
+            local base = now_ms()
+            seed({ id = "f1", status = "failed", start_time = base - 10_000, end_time = base - 5000, exit_code = 1 })
+            seed({ id = "s1", status = "stopped", start_time = base - 20_000, end_time = base - 15_000 })
+            local by_id = {}
+            for _, r in ipairs(Tasks.build_rows(base)) do
+                by_id[r.task.id] = r
+            end
+            local _, failed_chunks = Panel.format_line(by_id.f1, 0, 80)
+            local _, stopped_chunks = Panel.format_line(by_id.s1, 0, 80)
+            assert.are.equal("PiTasksListFailure", failed_chunks[1][3])
+            assert.are.equal("PiTasksListStopped", stopped_chunks[1][3])
+        end)
+
+        it("truncates the command summary to the available width", function()
+            local task = seed({ id = "run1", command = string.rep("x", 200) })
+            local row = Tasks.build_rows(task.start_time + 1000)[1]
+            local line, _ = Panel.format_line(row, 0, 40)
+            assert.is_true(vim.fn.strdisplaywidth(line) <= 40)
+            assert.is_truthy(line:find("…", 1, true), "truncated with ellipsis")
+        end)
+    end)
+
+    describe("render and lookup", function()
+        it("renders running tasks first, then newest terminal tasks", function()
+            local base = now_ms()
+            seed({ id = "old_done", status = "completed", start_time = base - 500_000, end_time = base - 400_000 })
+            seed({ id = "new_done", status = "completed", start_time = base - 300_000, end_time = base - 200_000 })
+            seed({ id = "run_a", command = "aaa", start_time = base - 50_000 })
+            seed({ id = "run_b", command = "bbb", start_time = base - 10_000 })
+
+            Panel.open()
+            local rendered = table.concat(
+                vim.api.nvim_buf_get_lines(
+                    vim.api.nvim_win_get_buf(Panel.win(vim.api.nvim_get_current_tabpage())),
+                    0,
+                    -1,
+                    false
+                ),
+                "\n"
+            )
+            local i_run_a = rendered:find("run_a", 1, true)
+            local i_run_b = rendered:find("run_b", 1, true)
+            local i_new = rendered:find("new_done", 1, true)
+            local i_old = rendered:find("old_done", 1, true)
+            assert.is_not_nil(i_run_a)
+            assert.is_not_nil(i_run_b)
+            assert.is_not_nil(i_new)
+            assert.is_not_nil(i_old)
+            assert.is_true(i_run_a < i_run_b, "running sorted by start_time ascending")
+            assert.is_true(i_run_b < i_new, "running before terminal")
+            assert.is_true(i_new < i_old, "terminal sorted by end_time descending")
+        end)
+
+        it("marks row highlights with the contract highlight group names", function()
+            local base = now_ms()
+            seed({ id = "run1", command = "make" })
+            seed({ id = "f1", status = "failed", start_time = base - 10_000, end_time = base - 5000, exit_code = 1 })
+            Panel.open()
+
+            local buf = vim.api.nvim_win_get_buf(Panel.win(vim.api.nvim_get_current_tabpage()))
+            local groups = {}
+            for _, mark in
+                ipairs(
+                    vim.api.nvim_buf_get_extmarks(
+                        buf,
+                        vim.api.nvim_create_namespace("pi-tasks-list"),
+                        0,
+                        -1,
+                        { details = true }
+                    )
+                )
+            do
+                groups[mark[4].hl_group] = true
+            end
+            assert.is_truthy(groups.PiTasksListRunning, "running dot group")
+            assert.is_truthy(groups.PiTasksListSpinner, "running spinner group")
+            assert.is_truthy(groups.PiTasksListFailure, "failed dot group")
+            assert.is_truthy(groups.PiTasksListDotDim, "subtitle dim group")
+        end)
+
+        it("resolves the row under the cursor by line number", function()
+            local base = now_ms()
+            seed({ id = "first", command = "one", start_time = base - 30_000 })
+            seed({ id = "second", command = "two", start_time = base - 20_000 })
+            Panel.open()
+            local win = Panel.win(vim.api.nvim_get_current_tabpage())
+            vim.api.nvim_set_current_win(win)
+            vim.api.nvim_win_set_cursor(win, { 2, 0 })
+            local row, task = Panel._row_task_under_cursor()
+            assert.is_not_nil(row)
+            assert.are.equal("second", task.id)
+        end)
+
+        it("shows an empty-state line when there are no tasks", function()
+            Panel.open()
+            local buf = vim.api.nvim_win_get_buf(Panel.win(vim.api.nvim_get_current_tabpage()))
+            local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+            assert.are.equal(1, #lines)
+            assert.is_truthy(lines[1]:find("no background tasks", 1, true))
+        end)
+    end)
+
+    describe("open/close/toggle", function()
+        it("opens a side window on the shared buffer and reports focus", function()
+            Panel.open()
+            local win = Panel.win(vim.api.nvim_get_current_tabpage())
+            assert.is_not_nil(win)
+            assert.is_true(vim.api.nvim_win_is_valid(win))
+            local buf = vim.api.nvim_win_get_buf(win)
+            assert.are.equal("pi-tasks", vim.bo[buf].filetype)
+            local name = vim.api.nvim_buf_get_name(buf)
+            assert.is_truthy(name:find("pi://tasks", 1, true))
+            assert.is_true(Panel.has_focus())
+            assert.is_true(vim.wo[win].cursorline)
+            assert.is_false(vim.wo[win].number)
+        end)
+
+        it("toggle closes an open panel and reopens a closed one", function()
+            Panel.toggle()
+            assert.is_not_nil(Panel.win(vim.api.nvim_get_current_tabpage()))
+
+            Panel.toggle()
+            assert.is_nil(Panel.win(vim.api.nvim_get_current_tabpage()))
+
+            Panel.toggle()
+            assert.is_not_nil(Panel.win(vim.api.nvim_get_current_tabpage()))
+        end)
+
+        it("focuses an already-open panel window instead of stacking", function()
+            Panel.open()
+            local first = Panel.win(vim.api.nvim_get_current_tabpage())
+            vim.cmd("wincmd p")
+            Panel.open()
+            assert.are.equal(first, Panel.win(vim.api.nvim_get_current_tabpage()))
+            assert.are.equal(first, vim.api.nvim_get_current_win())
+        end)
+    end)
+
+    describe("stop key (x)", function()
+        it("confirms, marks the task stopped, and signals the pid", function()
+            seed({ id = "run1", pid = 987_654_321 })
+            Panel.open()
+            vim.api.nvim_set_current_win(Panel.win(vim.api.nvim_get_current_tabpage()))
+
+            local orig_confirm = vim.fn.confirm
+            vim.fn.confirm = function()
+                return 1 -- &Yes
+            end
+            press("x")
+            vim.fn.confirm = orig_confirm
+
+            local stopped = Tasks.get("run1")
+            assert.are.equal("stopped", stopped.status)
+            assert.is_not_nil(stopped.end_time)
+        end)
+
+        it("keeps the task running when the confirmation is declined", function()
+            seed({ id = "run1", pid = 987_654_321 })
+            Panel.open()
+            vim.api.nvim_set_current_win(Panel.win(vim.api.nvim_get_current_tabpage()))
+
+            local orig_confirm = vim.fn.confirm
+            vim.fn.confirm = function()
+                return 2 -- &No
+            end
+            press("x")
+            vim.fn.confirm = orig_confirm
+
+            assert.are.equal("running", Tasks.get("run1").status)
+        end)
+
+        it("binds x to the stop action with a description", function()
+            Panel.open()
+            local map = vim.fn.maparg("x", "n", false, true)
+            assert.are.equal(1, map.buffer)
+            assert.are.equal("Stop the task under the cursor", map.desc)
+        end)
+
+        it("does not bind a delete key", function()
+            Panel.open()
+            local map = vim.fn.maparg("d", "n", false, true)
+            assert.are_not.equal(1, map.buffer)
+        end)
+    end)
+
+    describe("task output", function()
+        it("<CR> opens the output in a vsplit without focusing it; a focuses it", function()
+            local path = vim.fn.tempname()
+            local fifty = {}
+            for i = 1, 50 do
+                fifty[i] = tostring(i)
+            end
+            vim.fn.writefile(fifty, path)
+            seed({ id = "run1", output_file = path })
+            Panel.open()
+            vim.api.nvim_set_current_win(Panel.win(vim.api.nvim_get_current_tabpage()))
+            local list_win = vim.api.nvim_get_current_win()
+
+            press("<CR>")
+            local out_win = find_win_by_name("pi://task-output/run1")
+            assert.is_not_nil(out_win)
+            assert.are.equal(list_win, vim.api.nvim_get_current_win(), "o/<CR> keeps focus on the list")
+            local lines = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(out_win), 0, -1, false)
+            assert.are.equal(50, #lines)
+            -- Each open creates a fresh output window: close the first so the
+            -- focus assertion below sees exactly one.
+            vim.api.nvim_win_close(out_win, true)
+
+            press("a")
+            out_win = find_win_by_name("pi://task-output/run1")
+            assert.is_not_nil(out_win)
+            assert.are.equal(out_win, vim.api.nvim_get_current_win(), "a focuses the output window")
+
+            vim.fn.delete(path)
+        end)
+
+        it("p toggles a focusable centered preview float with the output tail", function()
+            local path = vim.fn.tempname()
+            local lines = {}
+            for i = 1, 300 do
+                lines[i] = "line " .. i
+            end
+            vim.fn.writefile(lines, path)
+            seed({ id = "run1", output_file = path })
+            Panel.open()
+            vim.api.nvim_set_current_win(Panel.win(vim.api.nvim_get_current_tabpage()))
+
+            press("p")
+            local preview = find_win_by_name("pi://task-preview/run1")
+            assert.is_not_nil(preview)
+            local cfg = vim.api.nvim_win_get_config(preview)
+            assert.is_true(cfg.focusable, "preview is focusable so it can be scrolled")
+            assert.is_not_nil(cfg.border, "preview has a border")
+            local title = type(cfg.title) == "table" and cfg.title[1][1] or tostring(cfg.title)
+            assert.is_truthy(title:find("run1", 1, true))
+            local buf_lines = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(preview), 0, -1, false)
+            assert.are.equal(200, #buf_lines, "preview shows only the tail")
+            assert.are.equal("line 300", buf_lines[#buf_lines])
+
+            -- Preview float is per list window: toggle the same key to close.
+            vim.api.nvim_set_current_win(Panel.win(vim.api.nvim_get_current_tabpage()))
+            press("p")
+            assert.is_nil(find_win_by_name("pi://task-preview/run1"))
+
+            vim.fn.delete(path)
+        end)
+    end)
+
+    describe("help overlay", function()
+        it("lists every bound key", function()
+            Panel.open()
+            press("?")
+            local win, buf = find_help_win()
+            assert.is_not_nil(win)
+            local text = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+            for _, key in ipairs({ "<CR>, o", "a, i", "p", "x", "R", "q", "?" }) do
+                assert.is_truthy(text:find(key, 1, true), "help should list " .. key)
+            end
+            assert.are.equal(7, #Panel._help_entries())
+        end)
+
+        it("toggles on a second ?", function()
+            Panel.open()
+            press("?")
+            assert.is_not_nil(find_help_win())
+            press("?")
+            assert.is_nil(find_help_win())
+        end)
+    end)
+
+    describe("refresh wiring", function()
+        it("redraws from a tasks refresh notification while visible", function()
+            Panel.open()
+            seed({ id = "late", command = "arrived late" })
+            Tasks.request_refresh()
+            vim.wait(100, function()
+                local win = Panel.win(vim.api.nvim_get_current_tabpage())
+                if not win then
+                    return false
+                end
+                local text = table.concat(vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(win), 0, -1, false), "\n")
+                return text:find("arrived late", 1, true) ~= nil
+            end)
+            local win = Panel.win(vim.api.nvim_get_current_tabpage())
+            local text = table.concat(vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(win), 0, -1, false), "\n")
+            assert.is_truthy(text:find("arrived late", 1, true))
+        end)
+
+        it("request_refresh coalesces multiple notifications into one render", function()
+            Panel.open()
+            local renders = 0
+            local orig = Panel._render
+            Panel._render = function()
+                renders = renders + 1
+                return orig()
+            end
+            Tasks.request_refresh()
+            Tasks.request_refresh()
+            Tasks.request_refresh()
+            vim.wait(100)
+            Panel._render = orig
+            assert.are.equal(1, renders)
+        end)
+    end)
+end)

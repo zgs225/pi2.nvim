@@ -1446,6 +1446,13 @@ function Chat:on_message_start(msg)
         return
     end
 
+    -- Custom extension messages (role="custom", e.g. the bg-tasks
+    -- extension's pi2_bg_task pushes) never render: no block, no state.
+    -- They are consumed upstream by the session pipeline.
+    if message.role == "custom" then
+        return
+    end
+
     if message.role == "user" then
         -- Extract text and attachments from the user message content
         local text = ""
@@ -1527,7 +1534,10 @@ end
 ---@param msg pi.RpcEvent
 function Chat:on_message_end(msg)
     local message = msg.message
-    if not message or message.role ~= "assistant" then
+    if not message or message.role == "custom" then
+        return
+    end
+    if message.role ~= "assistant" then
         return
     end
 
