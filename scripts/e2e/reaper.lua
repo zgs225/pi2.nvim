@@ -245,29 +245,29 @@ local function scenario_s1(parent, report)
     step("S1 close the revived child")
     local revived_id = revived.id
     local reg_present = Sessions.get_by_id(id) ~= nil
+    -- First-try close must stop the revived process: M.close resolves the
+    -- revive id-migration window itself (session-file fallback), so the old
+    -- heal-and-retry tolerance is gone — a failure here is a FAIL. The wait
+    -- below is diagnostic only (kept for its information value): the revived
+    -- session's pre-switch get_state response can transiently re-key the
+    -- registry (capture_session_id -> migrate_session_id), with the
+    -- post-switch get_state healing it one round-trip later.
     local stopped = Subsessions.close(id)
-    if not stopped then
-        -- Diagnostic: the revived session's pre-switch get_state response can
-        -- transiently re-key the registry (capture_session_id -> migrate),
-        -- with the post-switch get_state healing it one round-trip later.
-        local healed = vim.wait(2000, function()
-            return Sessions.get_by_id(id) ~= nil
-        end, 50)
-        print(
-            ("[S1] close=false revived_id=%s reg_present=%s healed_2s=%s running=%s npid_alive=%s status=%s"):format(
-                tostring(revived_id),
-                tostring(reg_present),
-                tostring(healed),
-                tostring(nrpc:is_running()),
-                tostring(os_alive(npid)),
-                tostring(manifest_status(id))
-            )
+    local healed = vim.wait(2000, function()
+        return Sessions.get_by_id(id) ~= nil
+    end, 50)
+    print(
+        ("[S1] close=%s revived_id=%s reg_present=%s healed_2s=%s running=%s npid_alive=%s status=%s"):format(
+            tostring(stopped),
+            tostring(revived_id),
+            tostring(reg_present),
+            tostring(healed),
+            tostring(nrpc:is_running()),
+            tostring(os_alive(npid)),
+            tostring(manifest_status(id))
         )
-        if healed then
-            stopped = Subsessions.close(id)
-        end
-    end
-    check(stopped, "S1: close did not stop the revived process", {
+    )
+    check(stopped, "S1: first-try close did not stop the revived process", {
         revived_id = revived_id,
         registry_present = reg_present,
         running = nrpc:is_running(),

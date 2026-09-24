@@ -597,13 +597,50 @@ function M.switch_to_parent(callback, opts)
     reattach_or_load(parent, path, callback)
 end
 
+--- Resolve the registry session behind a child id, tolerating the revive
+--- id-migration window.
+---
+--- `M.revive` pins the registry key to the manifest id via
+--- `Sessions.ensure_id(child, child_id)`, but the pre-switch `get_state`
+--- response of the freshly spawned process carries the new process's
+--- self-generated sessionId, and `capture_session_id` →
+--- `migrate_session_id` (sessions/manager.lua) migrates the key away; the
+--- post-switch `get_state` migrates it back one round-trip later. Inside that
+--- window `Sessions.get_by_id(child_id)` returns nil while the process is
+--- still alive. Fall back to matching the revive-loaded session file
+--- (`Read.find_path(child_id)` — the manifest id's JSONL on disk, still
+--- reported as `session_file` by the child in that window) among registered
+--- *child* sessions (`parent_id ~= nil`), so a close during the window still
+--- stops the process instead of stranding a live process under a dormant
+--- manifest row (which the reaper would skip forever).
+---
+--- Only `M.close` consults this fallback; other lookups keep the strict id match.
+---@param child_id string Manifest child session id.
+---@return pi.Session? session Registry session to close, or nil when none resolves.
+local function resolve_child(child_id)
+    local session = Sessions.get_by_id(child_id)
+    if session then
+        return session
+    end
+    local path = Read.find_path(child_id)
+    if not path or path == "" then
+        return nil
+    end
+    for _, s in ipairs(Sessions.list_all()) do
+        if s.parent_id ~= nil and type(s.session_file) == "string" and same_resolved_path(s.session_file, path) then
+            return s
+        end
+    end
+    return nil
+end
+
 --- Close sub-session process (file retained).
 ---@param child_id string
 ---@param callback? fun(ok: boolean)
 ---@return boolean stopped True when a running RPC process was stopped.
 function M.close(child_id, callback)
     local stopped = false
-    local child = Sessions.get_by_id(child_id)
+    local child = resolve_child(child_id)
     if child and child.rpc:is_running() then
         Sessions.close_session(child)
         stopped = true
