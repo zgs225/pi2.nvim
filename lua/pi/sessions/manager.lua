@@ -507,11 +507,28 @@ local function handle_bg_task_message(message, session_id, tab)
     if not consumed then
         return
     end
+    local tasks_cfg = Config.options.tasks_panel or {}
+    -- Auto-close: when the session's last background task reaches a terminal
+    -- state, close its tab's panel (opt-in via tasks_panel.auto_close).
+    -- Skipped while the panel has focus — never yank it from under a user
+    -- reading it. pi.ui.tasks is lazy-required as in the auto-open path.
+    if
+        (details.kind == "completed" or details.kind == "failed" or details.kind == "stopped")
+        and tasks_cfg.auto_close
+        and tab ~= nil
+        and not Tasks.has_running(session_id)
+    then
+        local ok_close, TasksPanel = pcall(require, "pi.ui.tasks")
+        if ok_close and TasksPanel.win(tab) ~= nil and not TasksPanel.has_focus() then
+            vim.schedule(function()
+                TasksPanel.close_tab(tab)
+            end)
+        end
+    end
     -- Auto-open: when a background task starts in the tab the user is
     -- currently looking at, surface its panel (opt-in via
     -- tasks_panel.auto_open). pi.ui.tasks is lazy-required to keep the
     -- module graph acyclic (ui/tasks lazy-requires this manager).
-    local tasks_cfg = Config.options.tasks_panel or {}
     if details.kind ~= "started" or not tasks_cfg.auto_open then
         return
     end

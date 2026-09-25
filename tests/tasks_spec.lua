@@ -34,6 +34,32 @@ local function pump(ms)
     vim.wait(ms or 50)
 end
 
+describe("pi.tasks has_running", function()
+    before_each(function()
+        Tasks._reset()
+    end)
+
+    it("tracks running state per session", function()
+        Tasks.handle_event(started_ev("a", 1000), "sess-A")
+        Tasks.handle_event(started_ev("b", 2000), "sess-B")
+        assert.is_true(Tasks.has_running("sess-A"))
+        assert.is_true(Tasks.has_running("sess-B"))
+
+        Tasks.handle_event(ev("completed", { taskId = "a" }, 3000), "sess-A")
+        assert.is_false(Tasks.has_running("sess-A"))
+        assert.is_true(Tasks.has_running("sess-B"))
+
+        Tasks.handle_event(ev("failed", { taskId = "b" }, 4000), "sess-B")
+        assert.is_false(Tasks.has_running("sess-B"))
+    end)
+
+    it("scopes strictly by session id", function()
+        Tasks.handle_event(started_ev("a", 1000), "sess-A")
+        assert.is_false(Tasks.has_running("sess-C"))
+        assert.is_false(Tasks.has_running(nil))
+    end)
+end)
+
 describe("pi.tasks registry", function()
     before_each(function()
         Tasks._reset()

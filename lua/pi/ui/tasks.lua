@@ -964,12 +964,12 @@ function M.open()
     M._render()
 end
 
---- Close the tasks panel window in the current tab (no-op when absent).
---- Every close path (the `q` keymap, toggle) funnels through here: close
---- the window first, then release the sidebar claim so the remaining edge
---- panels expand. Release is idempotent, and float windows never claimed.
-function M.close()
-    local tab = current_tab()
+--- Close the tasks panel window in `tab` (no-op when absent). Safe to call
+--- for a tab the user is not looking at: closing a window never touches the
+--- current tabpage or focus. Close the window first, then release the
+--- sidebar claim so the remaining edge panels expand.
+---@param tab integer
+function M.close_tab(tab)
     local win = win_for(tab)
     if not win then
         return
@@ -979,6 +979,12 @@ function M.close()
         pcall(vim.api.nvim_win_close, win, false)
     end
     Sidebar.release(tab, "tasks")
+end
+
+--- Close the tasks panel window in the current tab (no-op when absent).
+--- Every close path (the `q` keymap, toggle) funnels through here.
+function M.close()
+    M.close_tab(current_tab())
 end
 
 --- True when the current window is a `:PiTasks` panel.

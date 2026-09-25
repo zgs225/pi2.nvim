@@ -240,6 +240,7 @@
 ---@field width integer Window width for left/right placement in the side layout (default 40)
 ---@field height integer Window height for top/bottom placement in the side layout (default 12)
 ---@field auto_open? boolean Open the tasks panel when a background task starts in the current tab (default false)
+---@field auto_close? boolean Close the panel when the session's background tasks have all finished (default false)
 
 ---@class pi.DiffReviewListConfig
 ---@field position? "left"|"right" Side window placement (default "left")
@@ -566,6 +567,7 @@ local defaults = {
         width = 40,
         height = 12,
         auto_open = false,
+        auto_close = false,
     },
     diff_review = {
         width = 0.8,

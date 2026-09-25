@@ -158,6 +158,7 @@ describe("tasks panel UI", function()
         end
         fake_wins = {}
         Config.options.tasks_panel.auto_open = false
+        Config.options.tasks_panel.auto_close = false
     end)
 
     describe("format_line", function()
@@ -438,6 +439,103 @@ describe("tasks panel UI", function()
             Panel.open()
             assert.are.equal(first, Panel.win(vim.api.nvim_get_current_tabpage()))
             assert.are.equal(first, vim.api.nvim_get_current_win())
+        end)
+    end)
+
+    describe("auto_close", function()
+        --- Feed a bg-task lifecycle event through the session manager's real
+        --- event path for a fake session attached to `tab`.
+        ---@param tab pi.TabId
+        ---@param kind string
+        ---@param task_id string
+        local function feed(tab, kind, task_id)
+            Manager.handle_event({ id = "sess-auto", attached_tab = tab }, {
+                type = "message_start",
+                message = {
+                    role = "custom",
+                    customType = "pi2_bg_task",
+                    details = { kind = kind, taskId = task_id, command = "sleep 1", pid = 4242 },
+                },
+            })
+        end
+
+        local function wait_closed(tab)
+            vim.wait(500, function()
+                return Panel.win(tab) == nil
+            end, 10)
+        end
+
+        it("defaults to false in the config", function()
+            assert.is_false(Config.options.tasks_panel.auto_close)
+        end)
+
+        it("closes the panel when the session's last running task finishes", function()
+            Config.options.tasks_panel.auto_close = true
+            local tab = vim.api.nvim_get_current_tabpage()
+            feed(tab, "started", "ac1")
+            Panel.open()
+            assert.is_not_nil(Panel.win(tab))
+            feed(tab, "completed", "ac1")
+            wait_closed(tab)
+            assert.is_nil(Panel.win(tab), "panel auto-closed after the last task finished")
+        end)
+
+        it("waits for every running task before closing", function()
+            Config.options.tasks_panel.auto_close = true
+            local tab = vim.api.nvim_get_current_tabpage()
+            feed(tab, "started", "ac1")
+            feed(tab, "started", "ac2")
+            Panel.open()
+            feed(tab, "completed", "ac1")
+            vim.wait(100)
+            assert.is_not_nil(Panel.win(tab), "one task still running keeps the panel open")
+            feed(tab, "failed", "ac2")
+            wait_closed(tab)
+            assert.is_nil(Panel.win(tab), "panel closes once all tasks finished")
+        end)
+
+        it("stays open while disabled", function()
+            Config.options.tasks_panel.auto_close = false
+            local tab = vim.api.nvim_get_current_tabpage()
+            feed(tab, "started", "ac1")
+            Panel.open()
+            feed(tab, "completed", "ac1")
+            vim.wait(100)
+            assert.is_not_nil(Panel.win(tab), "disabled auto_close never closes the panel")
+        end)
+
+        it("never yanks a focused panel", function()
+            Config.options.tasks_panel.auto_close = true
+            local tab = vim.api.nvim_get_current_tabpage()
+            feed(tab, "started", "ac1")
+            Panel.open()
+            vim.api.nvim_set_current_win(Panel.win(tab))
+            feed(tab, "completed", "ac1")
+            vim.wait(100)
+            assert.is_not_nil(Panel.win(tab), "focused panel stays open")
+        end)
+    end)
+
+    describe("close_tab", function()
+        it("closes another tab's panel without stealing focus", function()
+            Panel.open()
+            local tab = vim.api.nvim_get_current_tabpage()
+            local panel_win = Panel.win(tab)
+            assert.is_not_nil(panel_win)
+            vim.cmd("tabnew")
+            local other = vim.api.nvim_get_current_tabpage()
+
+            Panel.close_tab(tab)
+
+            assert.is_nil(Panel.win(tab))
+            assert.is_false(vim.api.nvim_win_is_valid(panel_win))
+            assert.are.equal(other, vim.api.nvim_get_current_tabpage(), "current tabpage untouched")
+            assert.are.equal(0, #Sidebar.panels(tab, "left"), "sidebar claim released")
+            vim.cmd("tabclose!")
+        end)
+
+        it("is a no-op for a tab without a panel", function()
+            Panel.close_tab(424242)
         end)
     end)
 

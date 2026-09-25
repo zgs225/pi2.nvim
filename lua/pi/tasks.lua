@@ -83,6 +83,20 @@ function M.get(id)
     return store[id]
 end
 
+--- True while any task owned by `session_id` is still running. Drives the
+--- panel auto-close: the moment the last running task of a session reaches
+--- a terminal state the session is idle.
+---@param session_id string?
+---@return boolean
+function M.has_running(session_id)
+    for _, t in pairs(store) do
+        if t.status == "running" and t.session_id == session_id then
+            return true
+        end
+    end
+    return false
+end
+
 --- All tasks sorted for the panel: running first (start_time ascending),
 --- then everything else by end_time descending (newest first). Terminal
 --- tasks without an end_time sort last. With a session_id, only tasks owned
