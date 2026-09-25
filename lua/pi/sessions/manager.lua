@@ -507,6 +507,27 @@ local function handle_bg_task_message(message, session_id, tab)
     if not consumed then
         return
     end
+    -- Auto-open: when a background task starts in the tab the user is
+    -- currently looking at, surface its panel (opt-in via
+    -- tasks_panel.auto_open). pi.ui.tasks is lazy-required to keep the
+    -- module graph acyclic (ui/tasks lazy-requires this manager).
+    local tasks_cfg = Config.options.tasks_panel or {}
+    if details.kind ~= "started" or not tasks_cfg.auto_open then
+        return
+    end
+    if tab == nil then
+        return
+    end
+    if tab ~= vim.api.nvim_get_current_tabpage() then
+        return
+    end
+    local ok_panel, Panel = pcall(require, "pi.ui.tasks")
+    if not ok_panel or Panel.win(tab) then
+        return
+    end
+    vim.schedule(function()
+        Panel.open()
+    end)
 end
 
 ---@param session pi.Session

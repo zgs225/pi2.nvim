@@ -8,6 +8,35 @@
 
 local Tasks = require("pi.tasks")
 local Panel = require("pi.ui.tasks")
+local Sidebar = require("pi.ui.sidebar")
+local Config = require("pi.config")
+local Manager = require("pi.sessions.manager")
+
+--- Windows created by a test to stand in for another panel's window;
+--- closed in after_each so a failed assertion can't leak a stray split.
+---@type integer[]
+local fake_wins = {}
+
+--- Create a fake "sessions" window claimed on the current tab's left edge,
+--- mimicking the sessions list before the tasks panel opens.
+---@return integer
+local function claim_fake_sessions()
+    vim.cmd("topleft 30vsplit")
+    local win = vim.api.nvim_get_current_win()
+    fake_wins[#fake_wins + 1] = win
+    Sidebar.claim(vim.api.nvim_get_current_tabpage(), "left", "sessions", win)
+    return win
+end
+
+--- Panel keys currently registered at the current tab's left edge.
+---@return table<string, integer>
+local function left_edge_keys()
+    local keys = {}
+    for _, panel in ipairs(Sidebar.panels(vim.api.nvim_get_current_tabpage(), "left")) do
+        keys[panel.key] = panel.win
+    end
+    return keys
+end
 
 ---@return integer
 local function now_ms()
@@ -104,6 +133,8 @@ describe("tasks panel UI", function()
         Tasks._reset()
         Panel._reset()
         Panel._resubscribe()
+        Sidebar._reset()
+        fake_wins = {}
     end)
 
     after_each(function()
@@ -119,6 +150,14 @@ describe("tasks panel UI", function()
         end
         Panel._reset()
         Tasks._reset()
+        Sidebar._reset()
+        for _, win in ipairs(fake_wins) do
+            if vim.api.nvim_win_is_valid(win) then
+                pcall(vim.api.nvim_win_close, win, true)
+            end
+        end
+        fake_wins = {}
+        Config.options.tasks_panel.auto_open = false
     end)
 
     describe("format_line", function()
@@ -399,6 +438,130 @@ describe("tasks panel UI", function()
             Panel.open()
             assert.are.equal(first, Panel.win(vim.api.nvim_get_current_tabpage()))
             assert.are.equal(first, vim.api.nvim_get_current_win())
+        end)
+    end)
+
+    describe("sidebar stacking", function()
+        it("claims the left edge while open and releases it on close and toggle", function()
+            Panel.open()
+            local tasks_win = Panel.win(vim.api.nvim_get_current_tabpage())
+            assert.is_not_nil(tasks_win)
+            assert.are.equal(tasks_win, left_edge_keys().tasks, "open panel registered on the left edge")
+
+            Panel.close()
+            assert.is_nil(left_edge_keys().tasks, "close releases the claim")
+
+            Panel.open()
+            assert.is_not_nil(left_edge_keys().tasks)
+            Panel.toggle()
+            assert.is_nil(Panel.win(vim.api.nvim_get_current_tabpage()))
+            assert.is_nil(left_edge_keys().tasks, "toggle close releases the claim too")
+        end)
+
+        it("splits into an existing sessions column instead of opening a new one", function()
+            local sess_win = claim_fake_sessions()
+
+            Panel.open()
+            local tasks_win = Panel.win(vim.api.nvim_get_current_tabpage())
+            assert.is_not_nil(tasks_win)
+            assert.are_not.equal(sess_win, tasks_win)
+
+            -- Same column: identical left position and width (the split
+            -- stacks the new window above the sessions window, so row
+            -- starts differ by construction).
+            local sess_pos = vim.api.nvim_win_get_position(sess_win)
+            local tasks_pos = vim.api.nvim_win_get_position(tasks_win)
+            assert.are.equal(sess_pos[2], tasks_pos[2], "same column: no second sidebar column")
+            assert.are.equal(
+                vim.api.nvim_win_get_width(sess_win),
+                vim.api.nvim_win_get_width(tasks_win),
+                "in-column split inherits the column width"
+            )
+
+            -- Both panels are claimed and restack divides the column height.
+            local keys = left_edge_keys()
+            assert.are.equal(sess_win, keys.sessions)
+            assert.are.equal(tasks_win, keys.tasks)
+            local budget = vim.o.lines - vim.o.cmdheight - 2
+            assert.are.equal(
+                budget,
+                vim.api.nvim_win_get_height(sess_win) + vim.api.nvim_win_get_height(tasks_win),
+                "restack splits the column height between the two panels"
+            )
+            assert.is_true(vim.wo[sess_win].winfixheight)
+            assert.is_true(vim.wo[tasks_win].winfixheight)
+
+            -- Closing tasks leaves the sessions panel registered and expands it.
+            Panel.close()
+            keys = left_edge_keys()
+            assert.is_nil(keys.tasks)
+            assert.are.equal(sess_win, keys.sessions)
+            assert.are.equal(vim.o.lines - vim.o.cmdheight - 1, vim.api.nvim_win_get_height(sess_win))
+        end)
+    end)
+
+    describe("auto_open", function()
+        --- Feed a bg-task "started" custom message through the session
+        --- manager's real event path for a fake session attached to `tab`.
+        ---@param tab pi.TabId
+        ---@param kind string
+        local function feed_bg_event(tab, kind)
+            Manager.handle_event({ id = "sess-auto", attached_tab = tab }, {
+                type = "message_start",
+                message = {
+                    role = "custom",
+                    customType = "pi2_bg_task",
+                    details = { kind = kind, taskId = "auto1", command = "sleep 1", pid = 4242 },
+                },
+            })
+        end
+
+        it("defaults to false in the config", function()
+            assert.is_false(Config.options.tasks_panel.auto_open)
+        end)
+
+        it("opens the panel when a task starts in the current tab", function()
+            Config.options.tasks_panel.auto_open = true
+            local tab = vim.api.nvim_get_current_tabpage()
+            feed_bg_event(tab, "started")
+            vim.wait(500, function()
+                return Panel.win(tab) ~= nil
+            end, 10)
+            assert.is_not_nil(Panel.win(tab), "panel auto-opened for a started task")
+            Panel.close()
+        end)
+
+        it("stays closed while auto_open is disabled", function()
+            Config.options.tasks_panel.auto_open = false
+            local tab = vim.api.nvim_get_current_tabpage()
+            feed_bg_event(tab, "started")
+            vim.wait(100)
+            assert.is_nil(Panel.win(tab), "disabled auto_open never opens the panel")
+        end)
+
+        it("ignores a task started for another tab", function()
+            Config.options.tasks_panel.auto_open = true
+            local cur = vim.api.nvim_get_current_tabpage()
+            vim.cmd("tabnew")
+            local other = vim.api.nvim_get_current_tabpage()
+            vim.cmd("tabprevious")
+            assert.are_not.equal(cur, other)
+
+            feed_bg_event(other, "started")
+            vim.wait(100)
+            assert.is_nil(Panel.win(cur), "no auto-open in the current tab")
+            assert.is_nil(Panel.win(other), "no auto-open for the foreign tab either")
+
+            vim.api.nvim_set_current_tabpage(other)
+            vim.cmd("tabclose!")
+        end)
+
+        it("ignores non-started bg-task events", function()
+            Config.options.tasks_panel.auto_open = true
+            local tab = vim.api.nvim_get_current_tabpage()
+            feed_bg_event(tab, "completed")
+            vim.wait(100)
+            assert.is_nil(Panel.win(tab), "terminal events do not auto-open")
         end)
     end)
 

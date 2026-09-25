@@ -81,6 +81,7 @@ stub_tool_ui()
 local Todo = require("pi.todo")
 local Manager = require("pi.sessions.manager")
 local Config = require("pi.config")
+local Sidebar = require("pi.ui.sidebar")
 
 --- Monotonic counter so every fake session object is unique.
 local next_fake_id = 0
@@ -182,6 +183,7 @@ describe("todo panel session switching", function()
 
     after_each(function()
         Todo._reset()
+        Sidebar._reset()
         Manager._reset()
         while vim.fn.tabpagenr("$") > 1 do
             vim.cmd("tablast")

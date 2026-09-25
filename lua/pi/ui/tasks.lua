@@ -24,6 +24,7 @@ local M = {}
 local Config = require("pi.config")
 local Ft = require("pi.filetypes")
 local Highlights = require("pi.ui.highlights")
+local Sidebar = require("pi.ui.sidebar")
 local Tasks = require("pi.tasks")
 
 local ns = vim.api.nvim_create_namespace("pi-tasks-list")
@@ -821,23 +822,45 @@ local function set_list_win_opts(win)
     vim.wo[win].winfixbuf = true
 end
 
+--- Open the side window at the configured edge. When the edge already has
+--- a registered panel (e.g. the sessions list), the window is created by
+--- splitting that panel's window *in place* so both share the same
+--- column/row; otherwise the original topleft/botright split opens a fresh
+--- one. Afterwards the window is claimed at the sidebar stacking registry
+--- (which also divides the perpendicular dimension among the edge's
+--- panels). Focus semantics match the historical behavior: the new panel
+--- window keeps focus.
 ---@param b integer
 ---@return integer
 local function open_side_win(b)
     local cfg = panel_cfg()
     local position = cfg.position or "left"
-    local cmd
-    if position == "right" then
-        cmd = "botright " .. cfg.width .. "vsplit"
-    elseif position == "top" then
-        cmd = "topleft " .. cfg.height .. "split"
-    elseif position == "bottom" then
-        cmd = "botright " .. cfg.height .. "split"
+    local tab = current_tab()
+    local edge = Sidebar.effective_edge(tab, position)
+    local vertical = edge == "left" or edge == "right"
+    local panels = Sidebar.panels(tab, edge)
+    local win
+    if #panels > 0 then
+        -- Stack into the existing column/row instead of opening a new one:
+        -- split the last panel's window so the new window inherits its
+        -- width (vertical edge) or height (horizontal edge).
+        vim.api.nvim_set_current_win(panels[#panels].win)
+        vim.cmd(vertical and "split" or "vsplit")
+        win = vim.api.nvim_get_current_win()
     else
-        cmd = "topleft " .. cfg.width .. "vsplit"
+        local cmd
+        if position == "right" then
+            cmd = "botright " .. cfg.width .. "vsplit"
+        elseif position == "top" then
+            cmd = "topleft " .. cfg.height .. "split"
+        elseif position == "bottom" then
+            cmd = "botright " .. cfg.height .. "split"
+        else
+            cmd = "topleft " .. cfg.width .. "vsplit"
+        end
+        vim.cmd(cmd)
+        win = vim.api.nvim_get_current_win()
     end
-    vim.cmd(cmd)
-    local win = vim.api.nvim_get_current_win()
     vim.api.nvim_win_set_buf(win, b)
     set_list_win_opts(win)
     if position == "top" or position == "bottom" then
@@ -845,6 +868,10 @@ local function open_side_win(b)
     else
         vim.wo[win].winfixwidth = true
     end
+    -- Column/row size along the edge stays owned by the opener (above);
+    -- the claim pins the perpendicular dimension via restack. Float
+    -- windows never reach this function, so they never claim.
+    Sidebar.claim(tab, edge, "tasks", win, { weight = 1 })
     return win
 end
 
@@ -909,8 +936,8 @@ local function win_for(tab)
 end
 
 --- Public accessor: the tasks-panel window open in `tab` (nil when none).
---- Used by other panels (e.g. the todo panel) to stack in the same sidebar
---- column, mirroring the sessions-list usage.
+--- Used by the session pipeline (tasks_panel.auto_open check) to tell
+--- whether the panel is already open in a tab.
 ---@param tab pi.TabId
 ---@return integer?
 function M.win(tab)
@@ -938,6 +965,9 @@ function M.open()
 end
 
 --- Close the tasks panel window in the current tab (no-op when absent).
+--- Every close path (the `q` keymap, toggle) funnels through here: close
+--- the window first, then release the sidebar claim so the remaining edge
+--- panels expand. Release is idempotent, and float windows never claimed.
 function M.close()
     local tab = current_tab()
     local win = win_for(tab)
@@ -948,6 +978,7 @@ function M.close()
     if vim.api.nvim_win_is_valid(win) then
         pcall(vim.api.nvim_win_close, win, false)
     end
+    Sidebar.release(tab, "tasks")
 end
 
 --- True when the current window is a `:PiTasks` panel.

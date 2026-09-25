@@ -3,6 +3,7 @@
 -- per-tab-window like the list itself.
 
 local SessionList = require("pi.ui.sessions")
+local Sidebar = require("pi.ui.sidebar")
 
 --- Find the help float: a pi-dialog buffer showing the session list shortcuts.
 ---@return integer?, integer?
@@ -49,6 +50,7 @@ describe("session list help overlay", function()
     after_each(function()
         pcall(SessionList.close)
         SessionList._reset()
+        Sidebar._reset()
     end)
 
     it("binds ? in the list buffer", function()

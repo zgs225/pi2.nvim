@@ -1,6 +1,7 @@
 -- Unit tests for pi.todo (:PiTodo panel): the details state mirror, panel
--- line building, height computation, hide_when_empty behavior, and the
--- open/close/is_open bookkeeping (exercised against real headless windows).
+-- line building, the pi.ui.sidebar claim (weight/order mapping and stacked
+-- geometry), hide_when_empty behavior, and the open/close/is_open
+-- bookkeeping (exercised against real headless windows).
 --
 -- pi.todo.tool_ui is owned by another change, so the spec injects a stub via
 -- package.preload before the first require and restores it afterwards.
@@ -75,6 +76,7 @@ stub_tool_ui()
 local Todo = require("pi.todo")
 local Config = require("pi.config")
 local Manager = require("pi.sessions.manager")
+local Sidebar = require("pi.ui.sidebar")
 
 --- Chat-less fake sessions bound to tabs, so the todo panel's per-session
 --- state has a routing session and its viewed-session resolution
@@ -144,6 +146,7 @@ describe("todo panel", function()
     after_each(function()
         pcall(Todo.close)
         Todo._reset()
+        Sidebar._reset()
         Manager._reset()
         bound_sessions = {}
         Config.options = saved_options
@@ -191,31 +194,54 @@ describe("todo panel", function()
         end)
     end)
 
-    describe("height computation", function()
-        it("fraction 0.5 of the column", function()
-            local cfg = { auto_open = false, height = 0.5, position = "below", hide_when_empty = true }
-            assert.are.equal(10, Todo._height_for(cfg, 20))
+    describe("sidebar claim", function()
+        --- Registered panels of the current tab's left edge (the default
+        --- sessions_list.position, so the edge the panel claims).
+        ---@return table[]
+        local function panels()
+            return Sidebar.panels(vim.api.nvim_get_current_tabpage(), "left")
+        end
+
+        it("standalone open claims the edge with the default weight and order", function()
+            Todo.open()
+            local ps = panels()
+            assert.are.equal(1, #ps)
+            assert.are.equal("todo", ps[1].key)
+            assert.are.equal(Todo.win(vim.api.nvim_get_current_tabpage()), ps[1].win)
+            -- height 0.5 (default) maps to weight 1 (f/(1-f), the even
+            -- split); position "below" falls through to the ORDER map
+            -- entry (todo = 2).
+            assert.are.equal(1, ps[1].weight)
+            assert.are.equal(2, ps[1].order)
         end)
 
-        it("fraction 0.25 of the column (floored)", function()
-            local cfg = { auto_open = false, height = 0.25, position = "below", hide_when_empty = true }
-            assert.are.equal(5, Todo._height_for(cfg, 20))
-            assert.are.equal(2, Todo._height_for(cfg, 10))
+        it("fractional height maps to weight f/(1-f)", function()
+            Config.options.todo =
+                { panel = { auto_open = false, height = 0.25, position = "below", hide_when_empty = true } }
+            Todo.open()
+            assert.are.equal(0.25 / 0.75, panels()[1].weight)
         end)
 
-        it("absolute height is kept as lines", function()
-            local cfg = { auto_open = false, height = 6, position = "below", hide_when_empty = true }
-            assert.are.equal(6, Todo._height_for(cfg, 20))
+        it("absolute height maps to a weight normalized against the column budget", function()
+            Config.options.todo =
+                { panel = { auto_open = false, height = 6, position = "below", hide_when_empty = true } }
+            Todo.open()
+            local budget = vim.o.lines - vim.o.cmdheight - 2
+            assert.are.equal(6 / (budget - 6), panels()[1].weight)
         end)
 
-        it("absolute height is bounded by the column (neighbor keeps one line)", function()
-            local cfg = { auto_open = false, height = 6, position = "below", hide_when_empty = true }
-            assert.are.equal(3, Todo._height_for(cfg, 4))
+        it("position=above claims order 0.5 (stacked before sessions)", function()
+            Config.options.todo =
+                { panel = { auto_open = false, height = 0.5, position = "above", hide_when_empty = true } }
+            Todo.open()
+            assert.are.equal(0.5, panels()[1].order)
         end)
 
-        it("fraction never goes below one line", function()
-            local cfg = { auto_open = false, height = 0.5, position = "below", hide_when_empty = true }
-            assert.are.equal(1, Todo._height_for(cfg, 1))
+        it("closing releases the claim", function()
+            Todo.open()
+            assert.is_true(#panels() > 0)
+            Todo.close()
+            assert.are.equal(0, #panels())
         end)
     end)
 
@@ -303,9 +329,23 @@ describe("todo panel", function()
         ---@type integer?
         local fake_sess_win
 
-        ---@type table? saved package.loaded['pi.ui.sessions']
-        local saved_sessions_mod
+        --- Column budget shared by the stacked windows (pi.ui.sidebar restack
+        --- counts one statusline row per stacked window).
+        ---@param n integer
+        ---@return integer
+        local function budget(n)
+            return vim.o.lines - vim.o.cmdheight - n
+        end
 
+        ---@return table[] registered panels of the current tab's left edge
+        local function panels()
+            return Sidebar.panels(vim.api.nvim_get_current_tabpage(), "left")
+        end
+
+        --- Open a fake sessions column and register it with the sidebar the
+        --- way the real sessions list claims it (key "sessions", weight 1):
+        --- the todo panel finds its stacking neighbour through the registry,
+        --- not through pi.ui.sessions.
         ---@return integer sessions-like window (full-height side column)
         local function open_fake_sessions()
             -- Mimic the real :PiSessions geometry: a full-height side column
@@ -319,20 +359,13 @@ describe("todo panel", function()
             -- Move the rest of the editor into its own column.
             vim.cmd("wincmd j")
             vim.cmd("vsplit")
-            -- Point pi.ui.sessions at a fake exposing the same M.win(tab)
-            -- accessor the panel uses to find the sidebar column.
             fake_sess_win = sess
-            package.loaded["pi.ui.sessions"] = {
-                win = function()
-                    return fake_sess_win
-                end,
-            }
+            Sidebar.claim(vim.api.nvim_get_current_tabpage(), "left", "sessions", sess, { weight = 1 })
             return sess
         end
 
         before_each(function()
             fake_sess_win = nil
-            saved_sessions_mod = package.loaded["pi.ui.sessions"]
         end)
 
         after_each(function()
@@ -340,52 +373,70 @@ describe("todo panel", function()
             if fake_sess_win and vim.api.nvim_win_is_valid(fake_sess_win) then
                 pcall(vim.api.nvim_win_close, fake_sess_win, true)
             end
-            package.loaded["pi.ui.sessions"] = saved_sessions_mod
         end)
 
-        it("stacks below the sessions window with winfixheight", function()
+        it("stacks below the sessions window and claims the sidebar registry", function()
             local sess = open_fake_sessions()
-            local col = vim.fn.winheight(sess)
             update(details({ { content = "a", status = "pending" } }))
             Todo.open()
             local todo_win = vim.api.nvim_get_current_win()
             assert.are_not.equal(sess, todo_win)
             assert.is_true(vim.wo[todo_win].winfixheight)
-            -- RIGHT AFTER open the panel must be at the default 50/50 split of
-            -- the column it was opened from. Catches the 'equalalways'
-            -- collapse and any content-sized shrink-to-fit regression.
-            assert.are.equal(math.floor(col * 0.5), vim.fn.winheight(todo_win))
+            -- Registry: sessions (order 1) first, todo (order 2, default
+            -- weight 0.5) after it.
+            local ps = panels()
+            assert.are.equal(2, #ps)
+            assert.are.equal("sessions", ps[1].key)
+            assert.are.equal("todo", ps[2].key)
+            assert.are.equal(0.5, ps[2].weight)
+            -- Geometry: restack divides the column budget by weight (1 : 0.5).
+            local total = budget(2)
+            local h_sess = vim.fn.winheight(sess)
+            local h_todo = vim.fn.winheight(todo_win)
+            assert.are.equal(total, h_sess + h_todo)
+            assert.is_true(h_sess > h_todo, "sessions keeps the larger share")
+            assert.is_true(math.abs(h_todo - total / 3) <= 2, "todo gets its ~0.5 weight share, got " .. h_todo)
             -- The todo panel sits below the sessions window.
             assert.is_true(vim.fn.win_screenpos(sess)[1] < vim.fn.win_screenpos(todo_win)[1])
         end)
 
-        it("ratio override 0.25 sizes the panel from the column height", function()
+        it("ratio override 0.25 maps to a 0.25 claim weight", function()
             Config.options.todo =
                 { panel = { auto_open = false, height = 0.25, position = "below", hide_when_empty = true } }
             local sess = open_fake_sessions()
-            local col = vim.fn.winheight(sess)
             update(details({ { content = "a", status = "pending" } }))
             Todo.open()
             local todo_win = vim.api.nvim_get_current_win()
-            assert.are.equal(math.floor(col * 0.25), vim.fn.winheight(todo_win))
-            -- The sessions window keeps the (larger) rest of the column.
-            assert.is_true(vim.fn.winheight(sess) > vim.fn.winheight(todo_win))
+            assert.are.equal(0.25, panels()[2].weight)
+            -- Weight split 1 : 0.25 — the sessions window keeps the rest.
+            local total = budget(2)
+            local h_sess = vim.fn.winheight(sess)
+            local h_todo = vim.fn.winheight(todo_win)
+            assert.are.equal(total, h_sess + h_todo)
+            assert.is_true(h_sess > h_todo, "sessions keeps the larger share")
+            assert.is_true(math.abs(h_todo - total / 5) <= 2, "todo gets its 0.25 weight share, got " .. h_todo)
         end)
 
-        it("absolute height 6 is honored in lines", function()
+        it("absolute height 6 maps to a normalized claim weight", function()
             Config.options.todo =
                 { panel = { auto_open = false, height = 6, position = "below", hide_when_empty = true } }
             local sess = open_fake_sessions()
             update(details({ { content = "a", status = "pending" } }))
             Todo.open()
             local todo_win = vim.api.nvim_get_current_win()
-            assert.are.equal(6, vim.fn.winheight(todo_win))
-            assert.is_true(vim.fn.winheight(sess) > 0)
+            local total = budget(2)
+            -- weight = L / budget against the sessions weight of 1: restack
+            -- approximates the pinned line count (within rounding).
+            assert.are.equal(6 / total, panels()[2].weight)
+            local h_sess = vim.fn.winheight(sess)
+            local h_todo = vim.fn.winheight(todo_win)
+            local expect = 6 * total / (total + 6)
+            assert.are.equal(total, h_sess + h_todo)
+            assert.is_true(math.abs(h_todo - expect) <= 2, "todo approximates 6 lines, got " .. h_todo)
         end)
 
         it("content taller than the panel does not grow it (scrolls instead)", function()
             local sess = open_fake_sessions()
-            local col = vim.fn.winheight(sess)
             update(details({
                 { content = "a", status = "pending" },
                 { content = "b", status = "pending" },
@@ -397,52 +448,67 @@ describe("todo panel", function()
             }))
             Todo.open()
             local todo_win = vim.api.nvim_get_current_win()
-            -- 3 header lines + 7 items = 10 rendered lines, but the default
-            -- 50/50 split of the column caps the window at half its height.
-            assert.are.equal(math.floor(col * 0.5), vim.fn.winheight(todo_win))
+            -- 3 header lines + 7 items = 10 rendered lines, but the window is
+            -- sized by its claim weight (~a third of the column at the default
+            -- 0.5), not by the content — the excess scrolls.
+            local total = budget(2)
+            local h_todo = vim.fn.winheight(todo_win)
+            assert.is_true(math.abs(h_todo - total / 3) <= 2, "sized by claim weight, got " .. h_todo)
+            assert.is_true(h_todo < 10, "window stays below the rendered line count, got " .. h_todo)
+            assert.are.equal(total, vim.fn.winheight(sess) + h_todo)
         end)
 
-        it("stacks above the sessions window with position=above", function()
+        it("stacks above the sessions window with position=above (order 0.5)", function()
             Config.options.todo =
                 { panel = { auto_open = false, height = 0.5, position = "above", hide_when_empty = true } }
             local sess = open_fake_sessions()
             update(details({ { content = "a", status = "pending" } }))
             Todo.open()
             local todo_win = vim.api.nvim_get_current_win()
+            -- Registry order puts todo before sessions; the split lands the
+            -- window above the anchor.
+            local ps = panels()
+            assert.are.equal("todo", ps[1].key)
+            assert.are.equal(0.5, ps[1].order)
             assert.is_true(vim.fn.win_screenpos(todo_win)[1] < vim.fn.win_screenpos(sess)[1])
         end)
 
-        it("refresh re-asserts the stacked height after it is disturbed", function()
+        it("sidebar restack re-asserts the weight split after layout churn", function()
             local sess = open_fake_sessions()
-            local col = vim.fn.winheight(sess)
             update(details({ { content = "a", status = "pending" } }))
             Todo.open()
             local todo_win = vim.api.nvim_get_current_win()
-            assert.are.equal(math.floor(col * 0.5), vim.fn.winheight(todo_win))
             -- Simulate layout churn: grow the panel beyond its target.
             pcall(vim.api.nvim_win_set_height, todo_win, 12)
-            Todo.refresh()
-            -- The refresh recomputes the ratio from the column total as it
-            -- stands after the churn, so the drift is corrected back to the
-            -- configured 50/50 split; the sessions window keeps the rest.
-            local col2 = vim.fn.winheight(sess) + vim.fn.winheight(todo_win)
-            assert.are.equal(math.floor(col2 * 0.5), vim.fn.winheight(todo_win))
-            assert.are.equal(col2 - math.floor(col2 * 0.5), vim.fn.winheight(sess))
+            Sidebar.restack(vim.api.nvim_get_current_tabpage(), "left")
+            local total = budget(2)
+            local h_sess = vim.fn.winheight(sess)
+            local h_todo = vim.fn.winheight(todo_win)
+            assert.are.equal(total, h_sess + h_todo)
+            assert.is_true(h_sess > h_todo, "sessions keeps the larger share")
+            assert.is_true(
+                math.abs(h_todo - total / 3) <= 2,
+                "drift corrected back to the weight split, got " .. h_todo
+            )
         end)
 
-        it("refresh re-asserts the ratio after the sessions window is resized", function()
+        it("sidebar restack re-asserts the split after the sessions window is resized", function()
             local sess = open_fake_sessions()
             update(details({ { content = "a", status = "pending" } }))
             Todo.open()
             local todo_win = vim.api.nvim_get_current_win()
             -- Manual resize of the sessions window redistributes the column.
             pcall(vim.api.nvim_win_set_height, sess, 12)
-            Todo.refresh()
-            -- Column total as it stands after the resize; the ratio is
-            -- re-derived from it on every refresh.
-            local col = vim.fn.winheight(sess) + vim.fn.winheight(todo_win)
-            assert.are.equal(math.floor(col * 0.5), vim.fn.winheight(todo_win))
-            assert.are.equal(col - math.floor(col * 0.5), vim.fn.winheight(sess))
+            Sidebar.restack(vim.api.nvim_get_current_tabpage(), "left")
+            local total = budget(2)
+            local h_sess = vim.fn.winheight(sess)
+            local h_todo = vim.fn.winheight(todo_win)
+            assert.are.equal(total, h_sess + h_todo)
+            assert.is_true(h_sess > h_todo, "sessions keeps the larger share")
+            assert.is_true(
+                math.abs(h_todo - total / 3) <= 2,
+                "drift corrected back to the weight split, got " .. h_todo
+            )
         end)
     end)
 

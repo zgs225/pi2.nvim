@@ -7,10 +7,11 @@
 --      line-number + dropped winfix* bug)
 --   1. manager.update_todo_mirror-equivalent routing through update_from_details
 --   2. standalone column open (winfixwidth, sessions_list width)
---   3. stacked layout below a fake registered sessions window (winfixheight,
---      default even 50/50 split, ratio 0.25 override, absolute 6)
---   4. refresh renders new content + re-asserts the configured ratio after a
---      manual resize
+--   3. stacked layout below the real sessions window via the sidebar registry
+--      (winfixheight, default even 50/50 split, ratio 0.25 override,
+--      absolute 6)
+--   4. refresh renders new content; a manual resize persists (restack runs
+--      on claim/release, not on refresh)
 --   6. hide_when_empty: cleared list -> manual panel keeps "no todos" placeholder
 --   7. replay-style toolResult + non-todo tool gating
 --   8. per-tab buffers: two tabs with open panels each show their own list
@@ -198,9 +199,9 @@ vim.api.nvim_set_current_win(chatlike)
 SessionList.open()
 local sess_win = SessionList.win(vim.api.nvim_get_current_tabpage())
 check(sess_win ~= nil, "sessions list window registered")
--- The real sessions left/right column fixes width only; the todo split's
--- height must survive without a fixed-height neighbor.
-check(vim.wo[sess_win].winfixheight == false, "sessions column has no winfixheight (mimics real layout)")
+-- Sole panel on the edge: the sidebar leaves it unpinned (height-flexible).
+-- The pin appears once the todo panel joins the stack (checked in section 3).
+check(vim.wo[sess_win].winfixheight == false, "sessions column alone is not winfixheight")
 Manager._update_todo_mirror("todo_write", live_result)
 pump()
 -- auto_open fired on the mirror transition? The state was already non-empty,
@@ -212,14 +213,17 @@ Todo.open()
 local todo_win = vim.api.nvim_get_current_win()
 check(todo_win ~= sess_win, "todo window differs from sessions window")
 check(vim.wo[todo_win].winfixheight == true, "stacked todo window is winfixheight")
--- RIGHT AFTER open: default height 0.5 = even 50/50 split of the column.
--- Catches both the 'equalalways' collapse and a content-sized shrink-to-fit.
+-- RIGHT AFTER open: sidebar restack divides the column by claim weight;
+-- the default 0.5 fraction maps to weight 1 (even split), each stacked
+-- window costing one statusline row.
+local column2 = vim.fn.winheight(sess_win) + vim.fn.winheight(todo_win)
 check(
-    vim.fn.winheight(todo_win) == math.floor(sess_h * 0.5),
-    "stacked todo window is the default 50/50 split (got "
+    column2 == vim.o.lines - vim.o.cmdheight - 2
+        and math.abs(vim.fn.winheight(sess_win) - vim.fn.winheight(todo_win)) <= 1,
+    "stacked todo window splits the column evenly (got "
+        .. vim.fn.winheight(sess_win)
+        .. "/"
         .. vim.fn.winheight(todo_win)
-        .. ", want "
-        .. math.floor(sess_h * 0.5)
         .. ")"
 )
 check(vim.fn.win_screenpos(sess_win)[1] < vim.fn.win_screenpos(todo_win)[1], "todo panel is below the sessions window")
@@ -245,18 +249,13 @@ pump()
 local buf2 = vim.api.nvim_win_get_buf(todo_win)
 local lines2 = vim.api.nvim_buf_get_lines(buf2, 0, -1, false)
 eq("  Todo · 2/3 completed", lines2[2], "refresh renders the new progress header")
--- refresh re-asserts the configured ratio even after layout churn: it is
--- re-derived from the current column total (sessions + todo).
+-- A manual resize persists across refresh: sidebar restacks on
+-- claim/release only, no longer on every refresh.
 vim.api.nvim_win_set_height(todo_win, 14)
-local column = vim.fn.winheight(sess_win) + vim.fn.winheight(todo_win)
 Todo.refresh()
 check(
-    vim.fn.winheight(todo_win) == math.floor(column * 0.5),
-    "refresh re-asserts the stacked ratio after a manual resize (got "
-        .. vim.fn.winheight(todo_win)
-        .. ", want "
-        .. math.floor(column * 0.5)
-        .. ")"
+    vim.fn.winheight(todo_win) == 14,
+    "manual resize persists across refresh (got " .. vim.fn.winheight(todo_win) .. ")"
 )
 
 -- 4b. Ratio and absolute overrides (close + reopen so open-time sizing runs) -

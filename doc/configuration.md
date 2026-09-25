@@ -342,6 +342,9 @@ require("pi").setup({
         width = 40,
         -- Window height for top/bottom placement (side layout).
         height = 12,
+        -- Open the panel automatically when a background task starts in the
+        -- current tab (default false).
+        auto_open = false,
         -- Note: the float layout is fixed (editor-centered at 0.5 x 0.4 with a
         -- rounded border); width/height/position apply to the side layout only.
     },

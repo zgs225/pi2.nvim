@@ -2,6 +2,7 @@
 
 local Attention = require("pi.attention")
 local SessionList = require("pi.ui.sessions")
+local Sidebar = require("pi.ui.sidebar")
 
 ---@param opts { replaying?: boolean, chat_focus?: boolean }
 ---@return pi.Chat
@@ -22,6 +23,7 @@ describe("attention.should_notify_on_completion", function()
     after_each(function()
         pcall(SessionList.close)
         SessionList._reset()
+        Sidebar._reset()
     end)
 
     it("allows a live turn when the user is elsewhere", function()

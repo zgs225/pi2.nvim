@@ -16,6 +16,7 @@ local Config = require("pi.config")
 local Ft = require("pi.filetypes")
 local Highlights = require("pi.ui.highlights")
 local ChildFilter = require("pi.subsessions.sessions_list")
+local Sidebar = require("pi.ui.sidebar")
 
 local ns = vim.api.nvim_create_namespace("pi-sessions-list")
 
@@ -1698,6 +1699,10 @@ local function open_side_win(b)
     else
         vim.wo[win].winfixwidth = true
     end
+    -- Register with the sidebar stacking coordinator so shared edges are
+    -- divided between panels instead of competing (restack runs on claim).
+    local tab = current_tab()
+    Sidebar.claim(tab, Sidebar.effective_edge(tab, position), "sessions", win, { weight = 1 })
     return win
 end
 
@@ -1754,12 +1759,16 @@ local function win_for(tab)
     if win and vim.api.nvim_win_is_valid(win) then
         return win
     end
+    if win then
+        -- The list window died without M.close (external :q / Ctrl-W c, tab
+        -- closed): the window is already gone, so drop its stacking claim.
+        Sidebar.release(tab, "sessions")
+    end
     wins[tab] = nil
     return nil
 end
 
 --- Public accessor: the sessions-list window open in `tab` (nil when none).
---- Used by the todo panel to stack in the same sidebar column.
 ---@param tab pi.TabId
 ---@return integer?
 function M.win(tab)
@@ -1799,6 +1808,8 @@ function M.close()
     if vim.api.nvim_win_is_valid(win) then
         pcall(vim.api.nvim_win_close, win, false)
     end
+    -- Window first, then release (release is idempotent).
+    Sidebar.release(tab, "sessions")
 end
 
 --- True when the current window is a `:PiSessions` list.

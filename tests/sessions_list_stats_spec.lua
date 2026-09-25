@@ -4,6 +4,7 @@
 -- the dialog content, and the dead-process guard.
 
 local SessionList = require("pi.ui.sessions")
+local Sidebar = require("pi.ui.sidebar")
 
 --- Canned get_session_stats payload for the fake RPC.
 local STATS_DATA = {
@@ -123,6 +124,7 @@ describe("session list stats key", function()
             end
         end
         SessionList._reset()
+        Sidebar._reset()
     end)
 
     it("binds s to the stats action in the list buffer", function()

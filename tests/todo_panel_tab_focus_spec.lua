@@ -81,6 +81,7 @@ stub_tool_ui()
 local Todo = require("pi.todo")
 local Manager = require("pi.sessions.manager")
 local Config = require("pi.config")
+local Sidebar = require("pi.ui.sidebar")
 
 --- Build a details payload as the todo_write tool would produce.
 ---@param items { content: string, status: string }[]
@@ -113,6 +114,7 @@ describe("todo panel per-session state", function()
 
     after_each(function()
         Todo._reset()
+        Sidebar._reset()
         Manager._reset()
         -- Drop any extra tab created by the tests (close from the last tab so
         -- the first tab survives).

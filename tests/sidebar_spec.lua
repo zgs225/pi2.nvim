@@ -37,11 +37,13 @@ describe("pi.ui.sidebar", function()
     before_each(cleanup)
     after_each(cleanup)
 
-    it("gives a single panel the full column height and pins it", function()
+    it("gives a single panel the full column height without pinning it", function()
         local win = new_left_win()
         Sidebar.claim(1, "left", "sessions", win)
         assert.are.equal(height_budget(1), vim.api.nvim_win_get_height(win))
-        assert.is_true(vim.wo[win].winfixheight)
+        -- A sole panel keeps its natural size: no winfix pin until it
+        -- actually shares the edge with another panel.
+        assert.is_false(vim.wo[win].winfixheight)
     end)
 
     it("splits the column evenly between two panels", function()
@@ -113,6 +115,8 @@ describe("pi.ui.sidebar", function()
         vim.api.nvim_win_close(w2, true)
         Sidebar.release(1, "tasks")
         assert.are.equal(height_budget(1), vim.api.nvim_win_get_height(w1))
+        -- Left alone again, the panel is unpinned (standalone semantics).
+        assert.is_false(vim.wo[w1].winfixheight)
         assert.are.equal(1, #Sidebar.panels(1, "left"))
         assert.are.equal("sessions", Sidebar.panels(1, "left")[1].key)
     end)

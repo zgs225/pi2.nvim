@@ -170,17 +170,22 @@ function M.restack(tab, edge)
     total = math.max(n, total)
 
     local sizes = distribute(total, weights)
+    -- Pin the perpendicular dimension only while actually sharing the edge:
+    -- a sole panel keeps its natural size without a winfix pin, so a
+    -- standalone column window stays height-flexible (and a panel left
+    -- alone after a sibling closes is unpinned again).
+    local pin = n >= 2
     for i, p in ipairs(panels) do
         if vim.api.nvim_win_is_valid(p.win) then
             if vertical then
                 pcall(vim.api.nvim_win_set_height, p.win, sizes[i])
                 pcall(function()
-                    vim.wo[p.win].winfixheight = true
+                    vim.wo[p.win].winfixheight = pin
                 end)
             else
                 pcall(vim.api.nvim_win_set_width, p.win, sizes[i])
                 pcall(function()
-                    vim.wo[p.win].winfixwidth = true
+                    vim.wo[p.win].winfixwidth = pin
                 end)
             end
         end

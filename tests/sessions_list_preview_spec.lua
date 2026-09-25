@@ -6,6 +6,7 @@
 -- on the viewer's own generalization landing first.
 
 local SessionList = require("pi.ui.sessions")
+local Sidebar = require("pi.ui.sidebar")
 
 --- Fake session with just enough surface for the list render and the preview
 --- key. Answers the get_state name fetch like the real backend (scheduled), so
@@ -182,6 +183,7 @@ describe("sessions list preview key", function()
     after_each(function()
         pcall(SessionList.close)
         SessionList._reset()
+        Sidebar._reset()
     end)
 
     it("binds p to the read-only preview in the list buffer", function()
