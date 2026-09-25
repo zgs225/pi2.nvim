@@ -158,7 +158,6 @@ describe("tasks panel UI", function()
         end
         fake_wins = {}
         Config.options.tasks_panel.auto_open = false
-        Config.options.tasks_panel.auto_close = false
     end)
 
     describe("format_line", function()
@@ -465,12 +464,7 @@ describe("tasks panel UI", function()
             end, 10)
         end
 
-        it("defaults to false in the config", function()
-            assert.is_false(Config.options.tasks_panel.auto_close)
-        end)
-
         it("closes the panel when the session's last running task finishes", function()
-            Config.options.tasks_panel.auto_close = true
             local tab = vim.api.nvim_get_current_tabpage()
             feed(tab, "started", "ac1")
             Panel.open()
@@ -481,7 +475,6 @@ describe("tasks panel UI", function()
         end)
 
         it("waits for every running task before closing", function()
-            Config.options.tasks_panel.auto_close = true
             local tab = vim.api.nvim_get_current_tabpage()
             feed(tab, "started", "ac1")
             feed(tab, "started", "ac2")
@@ -494,18 +487,7 @@ describe("tasks panel UI", function()
             assert.is_nil(Panel.win(tab), "panel closes once all tasks finished")
         end)
 
-        it("stays open while disabled", function()
-            Config.options.tasks_panel.auto_close = false
-            local tab = vim.api.nvim_get_current_tabpage()
-            feed(tab, "started", "ac1")
-            Panel.open()
-            feed(tab, "completed", "ac1")
-            vim.wait(100)
-            assert.is_not_nil(Panel.win(tab), "disabled auto_close never closes the panel")
-        end)
-
         it("never yanks a focused panel", function()
-            Config.options.tasks_panel.auto_close = true
             local tab = vim.api.nvim_get_current_tabpage()
             feed(tab, "started", "ac1")
             Panel.open()

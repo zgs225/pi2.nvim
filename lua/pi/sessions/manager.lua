@@ -509,12 +509,11 @@ local function handle_bg_task_message(message, session_id, tab)
     end
     local tasks_cfg = Config.options.tasks_panel or {}
     -- Auto-close: when the session's last background task reaches a terminal
-    -- state, close its tab's panel (opt-in via tasks_panel.auto_close).
-    -- Skipped while the panel has focus — never yank it from under a user
-    -- reading it. pi.ui.tasks is lazy-required as in the auto-open path.
+    -- state, close its tab's panel. Skipped while the panel has focus —
+    -- never yank it from under a user reading it. pi.ui.tasks is
+    -- lazy-required as in the auto-open path.
     if
         (details.kind == "completed" or details.kind == "failed" or details.kind == "stopped")
-        and tasks_cfg.auto_close
         and tab ~= nil
         and not Tasks.has_running(session_id)
     then

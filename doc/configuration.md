@@ -345,9 +345,6 @@ require("pi").setup({
         -- Open the panel automatically when a background task starts in the
         -- current tab (default false).
         auto_open = false,
-        -- Close the panel automatically once the session's background
-        -- tasks have all finished (skipped while the panel has focus).
-        auto_close = false,
         -- Note: the float layout is fixed (editor-centered at 0.5 x 0.4 with a
         -- rounded border); width/height/position apply to the side layout only.
     },
