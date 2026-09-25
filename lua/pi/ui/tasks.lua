@@ -275,6 +275,30 @@ local function stop_blink()
 end
 
 --- Run the dot blink timer only while a running row is on screen.
+--- Tabs whose auto-close fired while the panel had focus: the close is
+--- deferred until focus leaves, so a panel the user is reading is never
+--- yanked away.
+---@type table<integer, boolean>
+local pending_auto_close = {}
+
+--- Flush deferred auto-closes: close every pending panel once the user is
+--- no longer looking at any panel window. Module-table lookups only, so
+--- this is safe to define before the window helpers.
+local function flush_pending_auto_close()
+    if not next(pending_auto_close) then
+        return
+    end
+    -- has_focus() is about the current window, so one check covers all
+    -- pending tabs.
+    if M.has_focus() then
+        return
+    end
+    for tab, _ in pairs(pending_auto_close) do
+        pending_auto_close[tab] = nil
+        M.close_tab(tab)
+    end
+end
+
 local function ensure_blink()
     if not any_win_visible() or not has_running_row() then
         stop_blink()
@@ -332,6 +356,7 @@ local function ensure_spinner()
             end
             spinner_tick = spinner_tick + 1
             M._render()
+            flush_pending_auto_close()
         end)
     )
 end
@@ -987,7 +1012,30 @@ function M.close()
     M.close_tab(current_tab())
 end
 
---- True when the current window is a `:PiTasks` panel.
+--- Auto-close entry point from the session pipeline: close the panel in
+--- `tab`. Defers while the panel (or one of its output views) has focus;
+--- the deferred close flushes on WinLeave/WinClosed and on the panel tick.
+---@param tab integer
+function M.request_auto_close(tab)
+    if not win_for(tab) then
+        return
+    end
+    if M.has_focus() then
+        pending_auto_close[tab] = true
+        return
+    end
+    M.close_tab(tab)
+end
+
+vim.api.nvim_create_autocmd({ "WinLeave", "WinClosed" }, {
+    group = vim.api.nvim_create_augroup("PiTasksAutoClose", { clear = true }),
+    callback = function()
+        vim.schedule(flush_pending_auto_close)
+    end,
+})
+
+--- True when the current window is a `:PiTasks` panel or one of its task
+--- output views (reading an output counts as looking at the panel).
 ---@return boolean
 function M.has_focus()
     local win = vim.api.nvim_get_current_win()
@@ -1003,7 +1051,8 @@ function M.has_focus()
     if buf and vim.api.nvim_buf_is_valid(buf) and b == buf then
         return true
     end
-    return vim.bo[b].filetype == "pi-tasks"
+    local ft = vim.bo[b].filetype
+    return ft == "pi-tasks" or ft == "pi-task-output"
 end
 
 --- Toggle the tasks panel in the current tab.
@@ -1091,6 +1140,9 @@ function M._reset()
     spinner_tick = 0
     show_all = false
     session_resolver = nil
+    for tab in pairs(pending_auto_close) do
+        pending_auto_close[tab] = nil
+    end
     for list_win in pairs(help_wins) do
         close_help(list_win)
     end

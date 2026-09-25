@@ -383,19 +383,22 @@ describe("todo panel", function()
             assert.are_not.equal(sess, todo_win)
             assert.is_true(vim.wo[todo_win].winfixheight)
             -- Registry: sessions (order 1) first, todo (order 2, default
-            -- weight 0.5) after it.
+            -- weight 1 — the 0.5 fraction maps to f/(1-f)) after it.
             local ps = panels()
             assert.are.equal(2, #ps)
             assert.are.equal("sessions", ps[1].key)
             assert.are.equal("todo", ps[2].key)
-            assert.are.equal(0.5, ps[2].weight)
-            -- Geometry: restack divides the column budget by weight (1 : 0.5).
+            assert.are.equal(1, ps[2].weight)
+            -- Geometry: restack divides the column budget evenly (1 : 1).
             local total = budget(2)
             local h_sess = vim.fn.winheight(sess)
             local h_todo = vim.fn.winheight(todo_win)
             assert.are.equal(total, h_sess + h_todo)
             assert.is_true(h_sess > h_todo, "sessions keeps the larger share")
-            assert.is_true(math.abs(h_todo - total / 3) <= 2, "todo gets its ~0.5 weight share, got " .. h_todo)
+            assert.is_true(
+                math.abs(h_todo - total / 2) <= 2,
+                "todo gets its 0.5-fraction (weight 1) share, got " .. h_todo
+            )
             -- The todo panel sits below the sessions window.
             assert.is_true(vim.fn.win_screenpos(sess)[1] < vim.fn.win_screenpos(todo_win)[1])
         end)
@@ -407,8 +410,9 @@ describe("todo panel", function()
             update(details({ { content = "a", status = "pending" } }))
             Todo.open()
             local todo_win = vim.api.nvim_get_current_win()
-            assert.are.equal(0.25, panels()[2].weight)
-            -- Weight split 1 : 0.25 — the sessions window keeps the rest.
+            -- The 0.25 fraction maps to weight 0.25/0.75 = 1/3.
+            assert.are.equal(0.25 / 0.75, panels()[2].weight)
+            -- Weight split 1 : 1/3 — the sessions window keeps the rest.
             local total = budget(2)
             local h_sess = vim.fn.winheight(sess)
             local h_todo = vim.fn.winheight(todo_win)
@@ -425,9 +429,9 @@ describe("todo panel", function()
             Todo.open()
             local todo_win = vim.api.nvim_get_current_win()
             local total = budget(2)
-            -- weight = L / budget against the sessions weight of 1: restack
+            -- weight = L/(budget-L) against the sessions weight of 1: restack
             -- approximates the pinned line count (within rounding).
-            assert.are.equal(6 / total, panels()[2].weight)
+            assert.are.equal(6 / (total - 6), panels()[2].weight)
             local h_sess = vim.fn.winheight(sess)
             local h_todo = vim.fn.winheight(todo_win)
             local expect = 6 * total / (total + 6)
@@ -449,12 +453,13 @@ describe("todo panel", function()
             Todo.open()
             local todo_win = vim.api.nvim_get_current_win()
             -- 3 header lines + 7 items = 10 rendered lines, but the window is
-            -- sized by its claim weight (~a third of the column at the default
-            -- 0.5), not by the content — the excess scrolls.
+            -- sized by its claim weight (half the column at the default 0.5,
+            -- which maps to weight 1), not by the content — the excess
+            -- scrolls.
             local total = budget(2)
             local h_todo = vim.fn.winheight(todo_win)
-            assert.is_true(math.abs(h_todo - total / 3) <= 2, "sized by claim weight, got " .. h_todo)
-            assert.is_true(h_todo < 10, "window stays below the rendered line count, got " .. h_todo)
+            assert.is_true(math.abs(h_todo - total / 2) <= 2, "sized by claim weight, got " .. h_todo)
+            assert.is_true(h_todo <= 10, "window stays at or below the rendered line count, got " .. h_todo)
             assert.are.equal(total, vim.fn.winheight(sess) + h_todo)
         end)
 
@@ -487,7 +492,7 @@ describe("todo panel", function()
             assert.are.equal(total, h_sess + h_todo)
             assert.is_true(h_sess > h_todo, "sessions keeps the larger share")
             assert.is_true(
-                math.abs(h_todo - total / 3) <= 2,
+                math.abs(h_todo - total / 2) <= 2,
                 "drift corrected back to the weight split, got " .. h_todo
             )
         end)
@@ -506,7 +511,7 @@ describe("todo panel", function()
             assert.are.equal(total, h_sess + h_todo)
             assert.is_true(h_sess > h_todo, "sessions keeps the larger share")
             assert.is_true(
-                math.abs(h_todo - total / 3) <= 2,
+                math.abs(h_todo - total / 2) <= 2,
                 "drift corrected back to the weight split, got " .. h_todo
             )
         end)

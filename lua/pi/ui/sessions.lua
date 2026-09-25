@@ -1171,17 +1171,22 @@ local function row_session_under_cursor()
     return row, nil
 end
 
+--- Jump to the tab of the session under the cursor and focus its chat.
+--- Returns false without side effects when the row is stale (no session,
+--- no tab, or a tabpage that no longer exists) so callers can no-op.
+---@param at_end boolean?
+---@return boolean jumped
 local function jump_under_cursor(at_end)
     local row, session = row_session_under_cursor()
     if not row then
-        return
+        return false
     end
     local Subsessions = require("pi.subsessions")
     local Sessions = require("pi.sessions.manager")
     local target_tab = row.tab or vim.api.nvim_get_current_tabpage()
 
     if row.is_tree_parent and row.session then
-        if vim.api.nvim_get_current_tabpage() ~= target_tab then
+        if vim.api.nvim_get_current_tabpage() ~= target_tab and vim.api.nvim_tabpage_is_valid(target_tab) then
             vim.api.nvim_set_current_tabpage(target_tab)
         end
         Subsessions.switch_to_parent(function(ok, err)
@@ -1198,7 +1203,7 @@ local function jump_under_cursor(at_end)
                 require("pi.notify").error(err)
             end
         end)
-        return
+        return true
     end
 
     if row.depth and row.depth > 0 and row.child_id then
@@ -1216,10 +1221,13 @@ local function jump_under_cursor(at_end)
                 require("pi.notify").error(err)
             end
         end, { tab = target_tab })
-        return
+        return true
     end
     if not row.tab or not session then
-        return
+        return false
+    end
+    if not vim.api.nvim_tabpage_is_valid(row.tab) then
+        return false
     end
     vim.api.nvim_set_current_tabpage(row.tab)
     if at_end then
@@ -1227,6 +1235,7 @@ local function jump_under_cursor(at_end)
     else
         session.chat:ensure_shown_and_focus_prompt()
     end
+    return true
 end
 
 --- Rename the session under the cursor: prompt for a display name and send it
@@ -1321,7 +1330,9 @@ local function fork_under_cursor()
     if not session then
         return
     end
-    jump_under_cursor()
+    if not jump_under_cursor() then
+        return
+    end
     require("pi").fork()
 end
 
@@ -1330,7 +1341,9 @@ local function clone_under_cursor()
     if not session then
         return
     end
-    jump_under_cursor()
+    if not jump_under_cursor() then
+        return
+    end
     require("pi").clone()
 end
 
@@ -1339,7 +1352,9 @@ local function tree_under_cursor()
     if not session then
         return
     end
-    jump_under_cursor()
+    if not jump_under_cursor() then
+        return
+    end
     require("pi").tree()
 end
 

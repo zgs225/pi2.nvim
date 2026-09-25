@@ -509,8 +509,9 @@ local function handle_bg_task_message(message, session_id, tab)
     end
     local tasks_cfg = Config.options.tasks_panel or {}
     -- Auto-close: when the session's last background task reaches a terminal
-    -- state, close its tab's panel. Skipped while the panel has focus —
-    -- never yank it from under a user reading it. pi.ui.tasks is
+    -- state, request the owning tab's panel to close. The panel defers while
+    -- it (or one of its output views) has focus and flushes the close once
+    -- focus leaves — never yank a panel the user is reading. pi.ui.tasks is
     -- lazy-required as in the auto-open path.
     if
         (details.kind == "completed" or details.kind == "failed" or details.kind == "stopped")
@@ -518,9 +519,9 @@ local function handle_bg_task_message(message, session_id, tab)
         and not Tasks.has_running(session_id)
     then
         local ok_close, TasksPanel = pcall(require, "pi.ui.tasks")
-        if ok_close and TasksPanel.win(tab) ~= nil and not TasksPanel.has_focus() then
+        if ok_close then
             vim.schedule(function()
-                TasksPanel.close_tab(tab)
+                TasksPanel.request_auto_close(tab)
             end)
         end
     end
@@ -542,7 +543,14 @@ local function handle_bg_task_message(message, session_id, tab)
         return
     end
     vim.schedule(function()
+        -- Auto-open must not steal focus from whatever the user is doing
+        -- (usually typing in the chat prompt): restore the window that was
+        -- current when the event fired.
+        local cur = vim.api.nvim_get_current_win()
         Panel.open()
+        if vim.api.nvim_win_is_valid(cur) then
+            pcall(vim.api.nvim_set_current_win, cur)
+        end
     end)
 end
 
