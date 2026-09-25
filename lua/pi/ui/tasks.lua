@@ -2,7 +2,11 @@
 ---
 --- One shared scratch buffer lists the tasks known to pi.tasks (running
 --- first, then newest terminal), one row per task: status dot, spinner,
---- command summary and an `id · duration` subtitle. By default the
+--- command summary and an `id · duration` subtitle. The buffer opens with a
+--- blank spacer, a dimmed `  Tasks · <n> running · <m> finished` title and a
+--- blank spacer, and every row renders with a 2-space indent — the todo
+--- panel's layout (lua/pi/todo/init.lua `panel_lines`); an empty list shows
+--- a dim `  no tasks` placeholder instead of the rows. By default the
 --- list is scoped to the current tab's session; `A` toggles the all-tasks
 --- view, where rows owned by another session render dimmed with a `#tab`
 --- prefix in the subtitle. The buffer is global: each tab that opens the
@@ -44,7 +48,13 @@ local buf = nil
 ---@type table<pi.TabId, integer> list window per tab
 local wins = {}
 
----@type pi.TasksRow[] rows of the last render (index == buffer line)
+--- Buffer lines rendered above the task rows: blank spacer, title, blank
+--- spacer (the todo panel's spacer/header/spacer shape). Task row `i` lives
+--- at buffer line `i + HEADER_LINES`; the header lines never enter `rows`.
+local HEADER_LINES = 3
+
+---@type pi.TasksRow[] rows of the last render (index == row order; the
+--- buffer line of row i is i + HEADER_LINES)
 local rows = {}
 
 ---@type boolean
@@ -169,10 +179,13 @@ end
 --- the age since end_time (`3m ago`). A row owned by a different known
 --- session than `current_session_id` is "foreign": its command summary
 --- renders dimmed and the subtitle gains a `#tab` ownership prefix.
---- Chunks are byte ranges: { col_start, col_end, hl_group }.
+--- Chunks are byte ranges: { col_start, col_end, hl_group }, relative to
+--- the un-indented line — the renderer prefixes the 2-space indent and
+--- shifts every chunk (see _render).
 ---@param row pi.TasksRow
 ---@param tick integer
----@param width integer? available display width (defaults to 80)
+---@param width integer? window display width (defaults to 80); the summary
+--- budget is width - 2, leaving room for the row's 2-space indent
 ---@param now_ms integer? reference time for relative ages (defaults to uv.now())
 ---@param current_session_id string? owning session of the panel's tab; nil disables foreign-row rendering
 ---@return string line
@@ -204,7 +217,10 @@ function M.format_line(row, tick, width, now_ms, current_session_id)
 
     local prefix = dot .. " " .. (spinner and spinner .. " " or "")
     local sep = " · "
+    -- Rows render with a 2-space indent, so the available width for the
+    -- content is the window width minus the indent.
     local budget = width
+        - 2
         - vim.fn.strdisplaywidth(prefix)
         - vim.fn.strdisplaywidth(sep)
         - vim.fn.strdisplaywidth(subtitle)
@@ -379,8 +395,9 @@ local function refresh_current_markers(session_id)
         end
         current_matches[win] = nil
         if vim.api.nvim_win_is_valid(win) then
-            for lnum, row in ipairs(rows) do
+            for i, row in ipairs(rows) do
                 if row.task.status == "running" and (session_id == nil or row.task.session_id == session_id) then
+                    local lnum = i + HEADER_LINES
                     local col = row.marker_col or 1
                     local len = row.marker_len or 1
                     local ok, id = pcall(vim.api.nvim_win_call, win, function()
@@ -410,10 +427,30 @@ function M._render()
         end
     end
 
+    -- Title counts cover the filtered rows; terminal = completed/failed/stopped.
+    local running, finished = 0, 0
+    for _, row in ipairs(rows) do
+        local status = row.task.status
+        if status == "running" then
+            running = running + 1
+        elseif status == "completed" or status == "failed" or status == "stopped" then
+            finished = finished + 1
+        end
+    end
+    local title = "  Tasks"
+    if #rows > 0 then
+        title = title .. (" · %d running · %d finished"):format(running, finished)
+    end
+
     ---@type string[]
-    local lines = {}
-    ---@type table<integer, integer[][]>
-    local line_chunks = {}
+    local lines = { "", title, "" }
+    -- Loosely typed: each entry is a { col_start, col_end, hl_group } triple,
+    -- whose string hl_group the `integer[][]` shape of format_line() does not
+    -- express (assigning literals to it trips the type checker).
+    ---@type table<integer, any[]>
+    local line_chunks = {
+        [2] = { { 0, #title, "PiTasksListDotDim" } },
+    }
     for i, row in ipairs(rows) do
         local width = 80
         for _, win in pairs(wins) do
@@ -422,19 +459,25 @@ function M._render()
             end
         end
         local line, chunks = M.format_line(row, blink_tick + spinner_tick, width, nil, session_id)
-        lines[i] = line
-        line_chunks[i] = chunks
-        row.marker_col = chunks[1][1] + 1
-        row.marker_len = chunks[1][2] - chunks[1][1]
+        -- 2-space indent: shift every byte column right by the indent width.
+        local indented = {}
+        for _, chunk in ipairs(chunks) do
+            indented[#indented + 1] = { chunk[1] + 2, chunk[2] + 2, chunk[3] }
+        end
+        lines[#lines + 1] = "  " .. line
+        line_chunks[#lines] = indented
+        row.marker_col = indented[1][1] + 1
+        row.marker_len = indented[1][2] - indented[1][1]
     end
-    if #lines == 0 then
-        lines = { "  (no background tasks)" }
+    if #rows == 0 then
+        lines[#lines + 1] = "  no tasks"
+        line_chunks[#lines] = { { 0, #"  no tasks", "PiTasksListDotDim" } }
     end
 
     vim.bo[buf].modifiable = true
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
     vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
-    for lnum, chunks in ipairs(line_chunks) do
+    for lnum, chunks in pairs(line_chunks) do
         for _, chunk in ipairs(chunks) do
             pcall(vim.api.nvim_buf_set_extmark, buf, ns, lnum - 1, chunk[1], {
                 end_col = chunk[2],
@@ -481,7 +524,7 @@ end
 ---@return pi.TasksRow?, pi.Task?
 local function row_task_under_cursor()
     local lnum = vim.api.nvim_win_get_cursor(0)[1]
-    local row = rows[lnum]
+    local row = rows[lnum - HEADER_LINES]
     if not row then
         return nil, nil
     end
@@ -987,6 +1030,15 @@ function M.open()
     end
     wins[tab] = win
     M._render()
+    -- The header block owns the top lines: land the cursor on the first task
+    -- row so row keys (<CR>, x, p, …) act on it right after open, matching
+    -- the behavior before the header existed.
+    if #rows > 0 and vim.api.nvim_win_is_valid(win) then
+        local cursor = vim.api.nvim_win_get_cursor(win)
+        if cursor[1] <= HEADER_LINES then
+            pcall(vim.api.nvim_win_set_cursor, win, { HEADER_LINES + 1, 0 })
+        end
+    end
 end
 
 --- Close the tasks panel window in `tab` (no-op when absent). Safe to call
@@ -1102,7 +1154,7 @@ function M._row_task_under_cursor()
     return row_task_under_cursor()
 end
 
---- Test hook: the rows of the last render (index == buffer line).
+--- Test hook: the rows of the last render (buffer line = index + HEADER_LINES).
 ---@return pi.TasksRow[]
 function M._rows()
     return rows

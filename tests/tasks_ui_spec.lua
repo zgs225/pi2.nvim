@@ -99,6 +99,53 @@ local function panel_text()
     return table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
 end
 
+--- Buffer lines of the panel open in the current tab.
+---@return string[]
+local function panel_lines()
+    local win = Panel.win(vim.api.nvim_get_current_tabpage())
+    return vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(win), 0, -1, false)
+end
+
+--- Highlight groups carried by the panel namespace's extmarks on a 1-based
+--- buffer line, as a set.
+---@param lnum integer
+---@return table<string, boolean>
+local function hl_on_line(lnum)
+    local win = Panel.win(vim.api.nvim_get_current_tabpage())
+    local b = vim.api.nvim_win_get_buf(win)
+    local groups = {}
+    local marks =
+        vim.api.nvim_buf_get_extmarks(b, vim.api.nvim_create_namespace("pi-tasks-list"), 0, -1, { details = true })
+    for _, mark in ipairs(marks) do
+        if mark[2] == lnum - 1 then
+            groups[mark[4].hl_group] = true
+        end
+    end
+    return groups
+end
+
+--- Position {lnum, col, len} of the running-row marker whose row contains
+--- `fragment` (nil when that row is unmarked).
+---@param fragment string
+---@return integer[]?
+local function marker_pos(fragment)
+    local win = Panel.win(vim.api.nvim_get_current_tabpage())
+    local lines = panel_lines()
+    local matches = vim.api.nvim_win_call(win, function()
+        return vim.fn.getmatches()
+    end)
+    for _, m in ipairs(matches) do
+        if m.group == "PiTasksListCurrent" then
+            for _, pos in pairs(m) do
+                if type(pos) == "table" and lines[pos[1]] and lines[pos[1]]:find(fragment, 1, true) then
+                    return pos
+                end
+            end
+        end
+    end
+    return nil
+end
+
 --- Line numbers (1-based) of rows whose text contains `fragment`.
 ---@param fragment string
 ---@return table<integer, boolean>
@@ -220,11 +267,13 @@ describe("tasks panel UI", function()
             assert.are.equal("PiTasksListStopped", stopped_chunks[1][3])
         end)
 
-        it("truncates the command summary to the available width", function()
+        it("truncates the command summary to the indent-adjusted budget", function()
             local task = seed({ id = "run1", command = string.rep("x", 200) })
             local row = Tasks.build_rows(task.start_time + 1000)[1]
             local line, _ = Panel.format_line(row, 0, 40)
-            assert.is_true(vim.fn.strdisplaywidth(line) <= 40)
+            -- Budget = window width - the 2-space row indent.
+            assert.is_true(vim.fn.strdisplaywidth(line) <= 38, "content fits width - 2")
+            assert.is_true(vim.fn.strdisplaywidth("  " .. line) <= 40, "indented row fits the window width")
             assert.is_truthy(line:find("…", 1, true), "truncated with ellipsis")
         end)
     end)
@@ -287,25 +336,104 @@ describe("tasks panel UI", function()
             assert.is_truthy(groups.PiTasksListDotDim, "subtitle dim group")
         end)
 
-        it("resolves the row under the cursor by line number", function()
+        it("renders a blank/title/blank header with running and finished counts", function()
+            local base = now_ms()
+            seed({ id = "run1", command = "make test", start_time = base - 50_000 })
+            seed({ id = "run2", command = "make lint", start_time = base - 40_000 })
+            seed({ id = "done1", status = "completed", start_time = base - 300_000, end_time = base - 200_000 })
+            seed({ id = "fail1", status = "failed", start_time = base - 10_000, end_time = base - 5000, exit_code = 1 })
+
+            Panel.open()
+            local lines = panel_lines()
+            assert.are.equal("", lines[1], "leading blank spacer")
+            assert.are.equal("  Tasks · 2 running · 2 finished", lines[2])
+            assert.is_truthy(hl_on_line(2).PiTasksListDotDim, "title renders dimmed")
+            assert.are.equal("", lines[3], "blank spacer between title and rows")
+            -- Rows start after the 3-line header and carry the 2-space indent.
+            assert.are.equal("  ", lines[4]:sub(1, 2), "first row indented by 2")
+            assert.is_truthy(lines[4]:find("run1", 1, true), "first running row at line 4")
+        end)
+
+        it("writes zero running counts when every task has finished", function()
+            local base = now_ms()
+            seed({ id = "done1", status = "completed", start_time = base - 300_000, end_time = base - 200_000 })
+            seed({ id = "stop1", status = "stopped", start_time = base - 20_000, end_time = base - 15_000 })
+
+            Panel.open()
+            assert.are.equal("  Tasks · 0 running · 2 finished", panel_lines()[2])
+        end)
+
+        it("resolves the row under the cursor past the title header", function()
             local base = now_ms()
             seed({ id = "first", command = "one", start_time = base - 30_000 })
             seed({ id = "second", command = "two", start_time = base - 20_000 })
             Panel.open()
             local win = Panel.win(vim.api.nvim_get_current_tabpage())
             vim.api.nvim_set_current_win(win)
-            vim.api.nvim_win_set_cursor(win, { 2, 0 })
+            -- The header block occupies lines 1-3, so rows start at line 4.
+            vim.api.nvim_win_set_cursor(win, { 4, 0 })
             local row, task = Panel._row_task_under_cursor()
             assert.is_not_nil(row)
+            assert.are.equal("first", task.id)
+            vim.api.nvim_win_set_cursor(win, { 5, 0 })
+            row, task = Panel._row_task_under_cursor()
+            assert.is_not_nil(row)
             assert.are.equal("second", task.id)
+            -- Blank spacer and title line map to no row.
+            vim.api.nvim_win_set_cursor(win, { 1, 0 })
+            row, task = Panel._row_task_under_cursor()
+            assert.is_nil(row)
+            assert.is_nil(task)
+            vim.api.nvim_win_set_cursor(win, { 2, 0 })
+            row, task = Panel._row_task_under_cursor()
+            assert.is_nil(row)
+            assert.is_nil(task)
         end)
 
-        it("shows an empty-state line when there are no tasks", function()
+        it("indents rows and shifts their chunks and marker right by 2", function()
+            seed({ id = "run1", command = "make test" })
             Panel.open()
-            local buf = vim.api.nvim_win_get_buf(Panel.win(vim.api.nvim_get_current_tabpage()))
-            local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-            assert.are.equal(1, #lines)
-            assert.is_truthy(lines[1]:find("no background tasks", 1, true))
+            local lines = panel_lines()
+            assert.are.equal(4, #lines)
+            assert.are.equal("  ", lines[4]:sub(1, 2), "row indented by 2")
+
+            -- Dot extmark: buffer line 4 → 0-based row 3, dot at byte 2.
+            local win = Panel.win(vim.api.nvim_get_current_tabpage())
+            local dot_mark
+            for _, mark in
+                ipairs(
+                    vim.api.nvim_buf_get_extmarks(
+                        vim.api.nvim_win_get_buf(win),
+                        vim.api.nvim_create_namespace("pi-tasks-list"),
+                        0,
+                        -1,
+                        { details = true }
+                    )
+                )
+            do
+                if mark[2] == 3 and mark[3] == 2 then
+                    dot_mark = mark
+                end
+            end
+            assert.is_not_nil(dot_mark, "dot extmark rendered after the indent")
+
+            -- Window marker follows the same offset: line 4, 1-based col 3.
+            local pos = marker_pos("make test")
+            assert.is_not_nil(pos, "running row marked")
+            assert.are.equal(4, pos[1], "marker on the first row line")
+            assert.are.equal(3, pos[2], "marker on the indented dot")
+        end)
+
+        it("shows a dimmed no-tasks placeholder under a count-free title", function()
+            Panel.open()
+            local lines = panel_lines()
+            assert.are.equal(4, #lines)
+            assert.are.equal("", lines[1])
+            assert.are.equal("  Tasks", lines[2], "title carries no counts without tasks")
+            assert.is_nil(lines[2]:find("·", 1, true), "no counts appended")
+            assert.are.equal("", lines[3])
+            assert.are.equal("  no tasks", lines[4])
+            assert.is_truthy(hl_on_line(4).PiTasksListDotDim, "placeholder renders dimmed")
         end)
     end)
 
