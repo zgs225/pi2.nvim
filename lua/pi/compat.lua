@@ -4,6 +4,7 @@
 ---@field vision_min_supported string minimum pi version for the bundled vision fallback extension (extensions/vision.ts)
 ---@field title_min_supported string minimum pi version for the bundled auto-title extension (extensions/title.ts)
 ---@field scoped_models_min_supported string minimum pi version for the bundled model-scope bridge extension (extensions/scoped-models.ts)
+---@field bg_tasks_min_supported string minimum pi version for the bundled background bash tasks extension (extensions/bg-tasks.ts)
 local M = {
     -- Keep these in sync with release validation notes.
     min_supported = "0.65.2",
@@ -25,6 +26,15 @@ local M = {
     -- bridge stays silent: :PiSelectModel falls back to config.models or the
     -- full model list — degraded scope mirroring, no crash.
     scoped_models_min_supported = "0.83.0",
+    -- The bg-tasks extension overrides the built-in bash tool via
+    -- pi.registerTool() and reports completions via pi.sendMessage(), and
+    -- delegates the foreground path to createBashToolDefinition()/getShellConfig()
+    -- re-exported from the package root. Those root re-exports are verified on
+    -- pi 0.85.1; the exact introduction version is unknown (NOTE(verify)), so
+    -- the floor is set to the validated version. Below the floor the extension
+    -- fails to load and pi logs the error — sessions keep stock bash, no crash,
+    -- and :PiTasks simply stays empty.
+    bg_tasks_min_supported = "0.85.1",
 }
 
 ---@param version string

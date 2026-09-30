@@ -96,6 +96,10 @@ function M.setup()
         Pi.sessions()
     end, { desc = "Toggle π sessions overview list" })
 
+    vim.api.nvim_create_user_command("PiTasks", function()
+        Pi.tasks()
+    end, { desc = "Toggle π background tasks panel" })
+
     vim.api.nvim_create_user_command("PiSessionStats", function()
         Pi.session_stats()
     end, { desc = "Show π session stats dashboard (tokens, cost, context)" })

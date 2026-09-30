@@ -4,6 +4,7 @@
 
 local Ft = require("pi.filetypes")
 local SessionList = require("pi.ui.sessions")
+local Sidebar = require("pi.ui.sidebar")
 
 --- Build a fake pi.Session with just enough surface for the list.
 ---@param opts? { running?: boolean, streaming?: boolean, compacting?: boolean, verb?: string, tab?: integer, title_status?: string }
@@ -76,6 +77,7 @@ describe("sessions overview", function()
         -- Close any list window we opened, then drop module state.
         pcall(SessionList.close)
         SessionList._reset()
+        Sidebar._reset()
     end)
 
     describe("status_of", function()
@@ -1424,6 +1426,36 @@ describe("sessions overview", function()
 
             Config.options.sessions_list.mode = saved_mode
             Config.options.layout.default = saved_default
+        end)
+
+        it("claims the left sidebar while open and releases it on close", function()
+            local Config = require("pi.config")
+            local saved_mode = Config.options.sessions_list.mode
+            local saved_position = Config.options.sessions_list.position
+            Config.options.sessions_list.mode = "side"
+            Config.options.sessions_list.position = "left"
+            local tab = vim.api.nvim_get_current_tabpage()
+
+            local function panel_keys()
+                local keys = {}
+                for _, p in ipairs(Sidebar.panels(tab, "left")) do
+                    keys[#keys + 1] = p.key
+                end
+                return keys
+            end
+
+            SessionList.open()
+            local open_keys = panel_keys()
+            SessionList.close()
+            local closed_keys = panel_keys()
+
+            -- Restore before asserting so a failure cannot leak config into
+            -- the following tests.
+            Config.options.sessions_list.mode = saved_mode
+            Config.options.sessions_list.position = saved_position
+
+            assert.is_true(vim.tbl_contains(open_keys, "sessions"), "open list must claim the left sidebar edge")
+            assert.is_false(vim.tbl_contains(closed_keys, "sessions"), "closed list must release the edge")
         end)
     end)
 end)

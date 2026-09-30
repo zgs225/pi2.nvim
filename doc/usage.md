@@ -6,6 +6,7 @@ This page walks through how `pi2.nvim` actually works in practice. Each subsecti
 - [Prompt](#prompt)
 - [Aborting with double `<Esc>`](#aborting-with-double-esc)
 - [Direct bash mode (`!`)](#direct-bash-mode-)
+- [Background tasks](#background-tasks)
 - [Prompt history](#prompt-history)
 - [Draft persistence](#draft-persistence)
 - [Mentions](#mentions)
@@ -112,6 +113,53 @@ A few details that match the TUI:
 - Only one direct bash command can run at a time. Submitting another while one is running is rejected with a warning (press `<Esc>` to cancel the running one first, same as the TUI).
 - A single `<Esc>` (in either insert or normal mode on the prompt) cancels a running `!` command — the same as `:PiAbortBash` / `pi.abort_bash()`. This is separate from the double-`<Esc>` agent abort above: `<Esc>` cancels a bash command when one is running, and arms the double-`<Esc>` agent abort when the agent is streaming.
 - `!` commands are recorded in the prompt history, so `<C-p>` / `<Up>` recalls them like normal prompts.
+
+## Background tasks
+
+Long-running shell commands — dev servers, watchers, long builds, slow test suites — don't have to block the conversation. With the bundled [`bg-tasks` extension](extensions.md#bundled-background-tasks-extension-extensionsbg-tasksts) loaded, both the agent and you can start bash commands that run in the background while everything else keeps moving.
+
+> [!NOTE]
+> `bg-tasks.ts` is injected into the RPC process automatically (like the other bundled extensions). It requires pi **0.85.1+** — on older versions the extension fails to load, pi logs the error, and bash falls back to stock behavior with the `:PiTasks` panel staying empty (`:checkhealth pi` reports the version floor). To opt out entirely, pass `--no-extensions` via `cli.args`.
+
+### From the agent
+
+The extension overrides the built-in `bash` tool with one extra optional parameter, `run_in_background`. When the agent passes `run_in_background: true` (the intended use: dev servers, file watchers, long builds, test suites that take minutes), the command spawns detached instead of blocking the turn:
+
+- The tool returns immediately with a task id and the output file path.
+- stdout/stderr stream into a log file in the system temp directory: `pi-bash-<taskId>.log` (the same naming convention pi uses for its truncated-output spill files).
+- The model is told **not** to poll the output file — when the task finishes (or fails, or is stopped), the extension wakes the agent with a completion report (task id, command, exit code or signal, output path) injected into its context.
+
+The `timeout` parameter does not apply to background tasks, and the model is instructed not to append `&` itself. Foreground `bash` calls are byte-for-byte the built-in behavior — streaming, truncation, timeout kill, and abort handling are unchanged.
+
+### From the prompt
+
+The same background path is available to you through [direct bash mode](#direct-bash-mode-): prefix the `!` command with `&` —
+
+```
+!& npm run dev
+```
+
+— and the command starts in the background instead of streaming into the chat. You get an immediate confirmation with the task id; completion is still reported to you (see below). A bare `&` with nothing after it is rejected with an error.
+
+### The `:PiTasks` panel
+
+`:PiTasks` (`pi.tasks()`) toggles a live panel listing the background tasks of the current tab's session — press `A` to toggle between the current-session view (the default) and every session's tasks (rows from other sessions are dimmed and prefixed with their tab number, e.g. `#2 ·`; a tab without a session shows everything). Tasks belong to the session that started them: closing the owning tab kills its background processes and removes its rows. Within the view, running tasks come first (oldest start first), then finished ones newest-last-end first. The panel mirrors the todo panel's container: a dimmed title line (`Tasks`, with `· N running · M finished` counts when tasks exist) between blank spacer lines, and every content row carries a 2-space inner padding. Each row is a status dot (`●` blinking while running, steady colors for failed, a dim `◌` for completed/stopped), a braille spinner on running rows, the (truncated) command, and an `id · duration` subtitle — the dot already carries the status; a live `mm:ss` clock while running, an age (`3m ago`) once finished. An empty registry shows a dim `no tasks` placeholder. The list buffer is shared across tabs (filetype `pi-tasks`) with one window per tab, and the 1-second animation (running rows' clock/spinner, finished rows' relative age) runs only while a window is visible. Side panels share an edge: with the sessions list or the todo panel already open at the same `position`, the tasks panel splits inside the same column rather than opening its own (the sidebar coordinator divides the space; stacking order sessions → todo → tasks). Set `tasks_panel.auto_open = true` to open the panel automatically when a background task starts in the current tab (default false). The panel also closes itself: once the session's background tasks have all finished, the owning tab's panel closes automatically — it waits for every running task and never closes while you're looking at it.
+
+From the panel (all buffer-local, only inside the tasks list):
+
+| Key | Action |
+| --- | --- |
+| `<CR>` / `o` | Open this task's output in a vsplit (cursor stays in the list) |
+| `a` / `i` | Open the output and focus it |
+| `p` | Preview the output tail (200 lines) in a float; `p` again closes it |
+| `x` | Stop the task under the cursor (confirms, then SIGTERM) |
+| `R` | Redraw the list |
+| `q` | Close the panel |
+| `?` | Toggle a help overlay listing these keys |
+
+Output views are read-only (`pi-task-output` filetype, `q` closes) and tail-read large outputs: files over 256 KB are read from the end, capped at 10000 lines. Stopping a task sends SIGTERM to the recorded pid; the authoritative `stopped` state arrives from the backend's own event, so the row updates even if you stop it elsewhere. Task state lives in memory only — it is not persisted, so tasks from past sessions don't survive a Neovim restart.
+
+Whenever a task reaches a terminal state — completed, failed, or stopped — the extension wakes the agent, which reports the outcome in the chat; the panel row updates in place at the same moment. Panel placement and sizing are configured under [`tasks_panel`](configuration.md); the colors are the [`PiTasksList*`](highlight-groups.md#background-tasks-panel) highlight groups.
 
 ## Prompt history
 
@@ -787,7 +835,7 @@ Each `todo_write` call renders as a [tool block](#tool-blocks) with a checklist 
 
 `:PiTodo` toggles a read-only side panel with the viewed session's current list — the same three-state checklist, mirrored live from every `todo_write` result, including replayed history.
 
-When the [sessions overview](sessions.md#sessions-overview-pisessions) is open in the current tab, the panel stacks in the same column — `todo.panel.position` picks `below` (default) or `above` the sessions window — and the column is split evenly by default: `todo.panel.height < 1` is the panel's fraction of the shared column height (default `0.5`, re-evaluated on every refresh so manual resizes of either window snap back to the configured split), while `todo.panel.height >= 1` pins a fixed line count. Content taller than the panel scrolls. Without the sessions list, the panel opens as its own full-height vertical split sized after `sessions_list.position` / `sessions_list.width`. `q` closes the panel.
+Pi's side panels share an edge instead of competing for it: when several are open at the same `position`, they stack in one column (stacking order sessions → todo → tasks) and the sidebar coordinator divides the space by each panel's configured share. For this panel, `todo.panel.position` picks `below` (default) or `above` the sessions list in the stack, and `todo.panel.height < 1` is the panel's fraction of the shared column height (default `0.5` — an even split), while `todo.panel.height >= 1` pins a fixed line count. Shares are (re)applied whenever a panel opens or closes; a manual resize persists until the next open/close. Content taller than the panel scrolls. Without any other panel at the edge, the panel opens as its own full-height vertical split sized after `sessions_list.position` / `sessions_list.width`. `q` closes the panel.
 
 With `todo.panel.hide_when_empty` (default), the panel is hidden while the list is empty; an explicitly opened panel shows a `no todos` placeholder instead. With `todo.panel.auto_open`, the panel opens automatically when the session's todo list becomes non-empty (the first write, or a re-added list after a clear).
 

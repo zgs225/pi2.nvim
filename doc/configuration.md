@@ -330,6 +330,27 @@ require("pi").setup({
         },
     },
 
+    -- Background tasks panel (:PiTasks): a live list of the background bash
+    -- tasks reported by the bg-tasks extension (running first, then newest
+    -- terminal), with status dots, spinners, and durations. See
+    -- doc/usage.md#background-tasks.
+    tasks_panel = {
+        -- How the window opens: "side" | "float" explicitly, or "follow" the
+        -- current tab's chat layout (default).
+        mode = "follow",
+        -- Window placement in the side layout: "left" | "right" | "top" | "bottom".
+        position = "left",
+        -- Window width for left/right placement (side layout).
+        width = 40,
+        -- Window height for top/bottom placement (side layout).
+        height = 12,
+        -- Open the panel automatically when a background task starts in the
+        -- current tab (default false).
+        auto_open = false,
+        -- Note: the float layout is fixed (editor-centered at 0.5 x 0.4 with a
+        -- rounded border); width/height/position apply to the side layout only.
+    },
+
     -- Session diff review (:PiDiff): one floating panel — an outer border
     -- framing the file list and the diff of the selected file — showing
     -- the `git diff` of every file the current session changed. See

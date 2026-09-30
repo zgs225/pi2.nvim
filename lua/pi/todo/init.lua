@@ -27,21 +27,25 @@
 --- Unlike the sessions list (whose rows are global, so one shared buffer
 --- serves every window), todo state is per-tab: each tab gets its own scratch
 --- buffer in `bufs[tab]`, and a refresh writes only that tab's buffer.
---- When the sessions sidebar (pi.ui.sessions) is open in the tab, the todo
---- panel stacks in the same column (focus the sessions window, then `split`
---- below/above it); otherwise it opens as its own vertical-split column sized
---- after the sessions-list config. Stacked height follows the sessions-list
---- dimension convention (values < 1 are fractions): todo.panel.height < 1 is
---- the panel's fraction of the shared sessions+todo column (default 0.5, an
---- even split), >= 1 is absolute lines; the ratio is re-evaluated on every
---- refresh, so manual resizes of the column are corrected back to the
---- configured split. Stacked windows are winfixheight; standalone columns are
---- winfixwidth, so the column width survives layout churn.
+--- Edge sharing is delegated to pi.ui.sidebar (the stacking coordinator):
+--- opening claims the tab's sidebar edge with key "todo" and a weight/order
+--- derived from todo.panel.height / todo.panel.position; every close path
+--- closes the window first, then releases the claim (release is idempotent).
+--- When other panels already hold the edge, the panel splits the last
+--- registered window, landing in the shared column/row ("above" tops the
+--- stack and claims registry order 0.5; "below" appends after the sessions
+--- panel); otherwise it opens as its own vertical-split column sized after
+--- the sessions-list config. Geometry is owned by sidebar.restack on every
+--- claim/release: todo.panel.height < 1 is the claim weight itself (default
+--- 0.5), >= 1 (absolute lines) is normalized against the column budget
+--- (lines - cmdheight - 2). Standalone columns are winfixwidth, so the
+--- column width survives layout churn.
 
 local M = {}
 
 local Config = require("pi.config")
 local Ft = require("pi.filetypes")
+local Sidebar = require("pi.ui.sidebar")
 
 ---@class pi.TodoItem
 ---@field content string
@@ -156,8 +160,8 @@ end
 ---   line 4+: one line per todo, consistently 2-space indented
 ---
 --- The empty-list placeholder follows the same shape (spacer + indented
---- "no todos"). The returned list is the FINAL render: every height
---- computation consumes its length, so padding is never clipped.
+--- "no todos"). The returned list is the FINAL render; the panel window
+--- never sizes itself to content, so padding is never clipped.
 --- Returns nil when the panel should render nothing. An empty list renders
 --- the placeholder only for manually-opened panels (or when hide_when_empty
 --- is false); auto-opened panels are closed by refresh() instead.
@@ -208,22 +212,6 @@ local function panel_lines(tab)
     return out
 end
 
---- Height of the stacked panel window inside the shared sessions+todo column.
---- `cfg.height < 1` is a fraction of `column_height` (the column total, which
---- is the sessions window's height at open time and sessions+todo on refresh
---- — re-evaluating on every refresh also corrects manual :resize drift back
---- to the configured ratio); `>= 1` is absolute lines. The result is bounded
---- so the neighboring window keeps at least one line. Content taller than the
---- panel just scrolls — the height is never shrink-to-content.
---- Exported for tests.
----@param cfg pi.TodoPanelResolvedConfig
----@param column_height integer total height of the shared sessions+todo column
----@return integer
-function M._height_for(cfg, column_height)
-    local target = cfg.height < 1 and math.floor(column_height * cfg.height) or math.floor(cfg.height)
-    return math.max(1, math.min(target, math.max(1, column_height - 1)))
-end
-
 --- Rebuild `tab`'s panel buffer contents from `tab`'s viewed session's state
 --- (no-op when there is nothing to show).
 ---@param tab pi.TabId
@@ -241,21 +229,6 @@ local function render_buf(tab)
     vim.api.nvim_buf_set_lines(b, 0, -1, false, lines)
     vim.bo[b].modifiable = false
     return true
-end
-
---- The sessions sidebar window in `tab`, when valid (nil otherwise).
----@param tab pi.TabId
----@return integer?
-local function sessions_win(tab)
-    local ok, Sessions = pcall(require, "pi.ui.sessions")
-    if not ok or not Sessions or type(Sessions.win) ~= "function" then
-        return nil
-    end
-    local win = Sessions.win(tab)
-    if win and vim.api.nvim_win_is_valid(win) then
-        return win
-    end
-    return nil
 end
 
 --- Buffer-local options for the tab's scratch panel buffer.
@@ -311,38 +284,64 @@ local function set_win_opts(win, stacked)
     end
 end
 
---- Open the panel stacked in the sessions sidebar column (same width): focus
---- the sessions window and split below/above it according to panel.position.
---- The sessions window keeps the rest of the column; the new todo window is
---- winfixheight. The height is a fraction of the column (sessions owns the
---- whole column before the split) or absolute lines, never content-sized.
+--- The sidebar edge the panel opens at. The todo panel has no position
+--- config of its own and follows `sessions_list.position` (effective_edge
+--- validates it and falls back to "left").
 ---@param tab pi.TabId
+---@return pi.SidebarEdge
+local function panel_edge(tab)
+    local sl = Config.options.sessions_list or {}
+    return Sidebar.effective_edge(tab, sl.position)
+end
+
+--- Claim options for pi.ui.sidebar derived from the panel config.
+--- Weight: the configured share is mapped against the neighbouring panels'
+--- weight 1 — `height < 1` (column-share fraction f) becomes weight
+--- f/(1-f) (f = 0.5 → weight 1, the even split); `height >= 1` (absolute
+--- lines L) becomes weight L/(budget-L) with the column budget
+--- (lines - cmdheight - 2), so restack approximates the pinned share.
+--- Order: "above" tops the stack (before the sessions panel); otherwise
+--- the default ORDER map entry applies (after sessions, before tasks).
+---@param cfg pi.TodoPanelResolvedConfig
+---@return { weight: number, order?: number }
+local function claim_opts(cfg)
+    local weight
+    if cfg.height < 1 then
+        weight = cfg.height / math.max(0.01, 1 - cfg.height)
+    else
+        local budget = math.max(1, vim.o.lines - vim.o.cmdheight - 2)
+        weight = cfg.height / math.max(1, budget - cfg.height)
+    end
+    local opts = { weight = weight }
+    if cfg.position == "above" then
+        opts.order = 0.5
+    end
+    return opts
+end
+
+--- Open the panel stacked with the panels already registered on `edge`:
+--- focus the last of them and split it (horizontal split for left/right
+--- edges, vertical for top/bottom), so the new window shares that
+--- column/row. `panel.position` picks the side of the anchor the window
+--- lands on. Geometry is sidebar's: the claim that follows restacks the
+--- edge to the configured weights, so no height is computed here.
+---@param edge pi.SidebarEdge
+---@param anchor integer window of the last panel registered on `edge`
 ---@param b integer
 ---@return integer?
-local function open_stacked(tab, b)
-    local cfg = panel_config()
-    local sess = sessions_win(tab)
-    if not sess then
-        return nil
-    end
-    local ok, err = pcall(vim.api.nvim_set_current_win, sess)
+local function open_stacked(edge, anchor, b)
+    local ok, err = pcall(vim.api.nvim_set_current_win, anchor)
     if not ok then
         require("pi.notify").warn("Cannot open todo panel: " .. tostring(err))
         return nil
     end
-    -- Sessions owns the whole column before the split, so its height IS the
-    -- column height the fraction is taken from.
-    local height = M._height_for(cfg, vim.api.nvim_win_get_height(sess))
-    local cmd = (cfg.position == "above" and "leftabove " or "rightbelow ") .. height .. "split"
+    local cfg = panel_config()
+    local vertical = edge == "left" or edge == "right"
+    local cmd = (cfg.position == "above" and "leftabove " or "rightbelow ") .. (vertical and "split" or "vsplit")
     vim.cmd(cmd)
     local win = vim.api.nvim_get_current_win()
     pcall(vim.api.nvim_win_set_buf, win, b)
     set_win_opts(win, true)
-    -- The :split count is not sticky: 'equalalways' (on by default) equalizes
-    -- the column whenever the layout is (re)processed before winfixheight is
-    -- consulted, collapsing the column to 50/50. After pinning winfixheight,
-    -- re-assert the target height explicitly.
-    pcall(vim.api.nvim_win_set_height, win, height)
     return win
 end
 
@@ -382,10 +381,13 @@ function M.win(tab)
     return nil
 end
 
---- Open the todo panel in the current tab. When the sessions sidebar is open
---- in this tab, the panel stacks in its column; otherwise it opens as its own
---- sidebar column. The panel shows a "no todos" placeholder even when the
---- list is empty (manually-opened windows ignore hide_when_empty).
+--- Open the todo panel in the current tab. When other panels already hold
+--- the tab's sidebar edge, the panel splits the last of them and stacks in
+--- the shared column/row; otherwise it opens as its own sidebar column. The
+--- window claims the edge in pi.ui.sidebar with a weight/order derived from
+--- todo.panel.height / todo.panel.position. The panel shows a "no todos"
+--- placeholder even when the list is empty (manually-opened windows ignore
+--- hide_when_empty).
 --- `how` records how the panel came to be open ("auto" for the auto_open
 --- transition, default "manual" for :PiTodo); see pi.TodoOpenedBy.
 ---@param how? pi.TodoOpenedBy
@@ -406,25 +408,41 @@ function M.open(how)
         opened_by[tab] = nil
         return
     end
-    local sess = sessions_win(tab)
-    local win = (sess and open_stacked(tab, b)) or open_standalone(tab, b)
+    local cfg = panel_config()
+    local edge = panel_edge(tab)
+    local panels = Sidebar.panels(tab, edge)
+    local win
+    if #panels > 0 then
+        win = open_stacked(edge, panels[#panels].win, b)
+    end
+    if not win then
+        win = open_standalone(tab, b)
+        -- The standalone split is always a vertical column (topleft/botright
+        -- vsplit), so the claim edge is the side it opened on even when the
+        -- configured position named a horizontal edge.
+        edge = (Config.options.sessions_list or {}).position == "right" and "right" or "left"
+    end
     if win then
         wins[tab] = win
+        -- Claim after the buffer is set: restack pins the window geometry.
+        Sidebar.claim(tab, edge, "todo", win, claim_opts(cfg))
     end
 end
 
---- Close `tab`'s panel window, if any, and drop its opened_by marker.
+--- Close `tab`'s panel window, if any, drop its opened_by marker, and
+--- release the tab's sidebar claim. Window first, then release; release is
+--- idempotent and also sweeps a claim whose window died behind our back.
 ---@param tab pi.TabId
 local function close_for_tab(tab)
     local win = M.win(tab)
-    if not win then
-        return
+    if win then
+        wins[tab] = nil
+        opened_by[tab] = nil
+        if vim.api.nvim_win_is_valid(win) then
+            pcall(vim.api.nvim_win_close, win, false)
+        end
     end
-    wins[tab] = nil
-    opened_by[tab] = nil
-    if vim.api.nvim_win_is_valid(win) then
-        pcall(vim.api.nvim_win_close, win, false)
-    end
+    Sidebar.release(tab, "todo")
 end
 
 --- Close the panel window in the current tab (no-op when absent).
@@ -444,17 +462,10 @@ end
 --- Re-render one open panel window under its tab's VIEWED session's state.
 --- Auto-opened panels whose viewed session has no todos (and
 --- hide_when_empty is on) close instead of showing an empty list;
---- manually-opened panels keep showing the placeholder. Stacked windows:
---- re-assert the pinned height after every render, computed from the column
---- total (sessions + todo as they stand now). The :split count is not sticky
---- ('equalalways' can re-equalize the column; a neighbor resize can
---- redistribute it), and re-deriving the ratio from the current column height
---- also corrects manual :resize drift back to the configured split (absolute
---- heights stay absolute). Standalone columns stay full-height — no height is
---- forced there.
+--- manually-opened panels keep showing the placeholder. Window geometry is
+--- not touched here: pi.ui.sidebar restacks the edge on every claim/release.
 ---@param tab pi.TabId
----@param win integer
-local function refresh_tab(tab, win)
+local function refresh_tab(tab)
     local cfg = panel_config()
     local cleared = not has_todos(state_for_tab(tab))
     if cleared and cfg.hide_when_empty and opened_by[tab] ~= "manual" then
@@ -462,11 +473,6 @@ local function refresh_tab(tab, win)
         return
     end
     render_buf(tab)
-    local sess = sessions_win(tab)
-    if sess then
-        local column = vim.api.nvim_win_get_height(sess) + vim.api.nvim_win_get_height(win)
-        pcall(vim.api.nvim_win_set_height, win, M._height_for(cfg, column))
-    end
 end
 
 --- Coalesced re-render of all open panel windows; each window renders the
@@ -478,7 +484,7 @@ end
 function M.refresh()
     for tab, win in pairs(wins) do
         if vim.api.nvim_win_is_valid(win) then
-            refresh_tab(tab, win)
+            refresh_tab(tab)
         end
     end
 end
@@ -492,9 +498,8 @@ end
 ---@param tab pi.TabId
 function M.on_viewed_session_changed(tab)
     vim.schedule(function()
-        local win = M.win(tab)
-        if win then
-            refresh_tab(tab, win)
+        if M.win(tab) then
+            refresh_tab(tab)
         end
     end)
 end
@@ -607,12 +612,14 @@ function M._opened_by()
     return opened_by[current_tab()]
 end
 
---- Test hook: drop all module state and close every panel window.
+--- Test hook: drop all module state, close every panel window, and release
+--- its sidebar claims.
 function M._reset()
-    for _, win in pairs(wins) do
+    for tab, win in pairs(wins) do
         if vim.api.nvim_win_is_valid(win) then
             pcall(vim.api.nvim_win_close, win, false)
         end
+        Sidebar.release(tab, "todo")
     end
     for _, b in pairs(bufs) do
         if vim.api.nvim_buf_is_valid(b) then

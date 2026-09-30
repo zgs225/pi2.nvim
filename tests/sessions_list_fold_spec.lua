@@ -1,5 +1,6 @@
 local Config = require("pi.config")
 local SessionList = require("pi.ui.sessions")
+local Sidebar = require("pi.ui.sidebar")
 
 local function fake_session(opts)
     opts = opts or {}
@@ -57,6 +58,7 @@ describe("sub-session fold/unfold in :PiSessions", function()
     after_each(function()
         pcall(SessionList.close)
         SessionList._reset()
+        Sidebar._reset()
         Manifest.children_of = orig_children
     end)
 

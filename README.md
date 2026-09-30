@@ -259,6 +259,7 @@ require("pi").setup({
 | `:PiFork` | Start a new session from a past user message (rewind and re-ask) |
 | `:PiClone` | Duplicate the current session branch into a new session file |
 | `:PiSessions` | Toggle the live sessions overview (all active sessions: name + busy/idle/attention) |
+| `:PiTasks` | Toggle the background tasks panel: background bash tasks (dev servers, long builds) with status, output viewer, and stop — requires the `bg-tasks` extension loaded (see [doc/usage.md](doc/usage.md#background-tasks)) |
 | `:PiSessionStats` | Show the session stats dashboard: messages, tokens (with cache split), per-model cost breakdown, cache re-billed waste, context usage — plus the vision extension's own usage (`Extensions` section) |
 | `:PiSubNew` | Spawn a background sub-session with a task prompt (inherits model/thinking by default) |
 | `:PiSubSwitch` | Pick a child sub-session (including dormant) and switch the current tab's chat to it |
@@ -290,11 +291,11 @@ Detailed guides live in [`doc/`](doc/):
 
 | Doc | What's inside |
 | --- | --- |
-| [doc/usage.md](doc/usage.md) | Chat & layouts, prompt (submit/queue/abort), direct bash mode (`!`), prompt history & drafts, `@mentions`, slash commands, completion, attachments, zen mode, statusline, navigation, quickfix, tool blocks, todo list, models, thinking, markdown rendering, buffer reload, startup block |
+| [doc/usage.md](doc/usage.md) | Chat & layouts, prompt (submit/queue/abort), direct bash mode (`!`), background tasks (`:PiTasks`), prompt history & drafts, `@mentions`, slash commands, completion, attachments, zen mode, statusline, navigation, quickfix, tool blocks, todo list, models, thinking, markdown rendering, buffer reload, startup block |
 | [doc/sessions.md](doc/sessions.md) | One session per tab, storage & cwd scoping, continue/resume, sub-sessions (`:PiSub*`), session tree (`:PiTree`), fork/clone (`:PiFork`/`:PiClone`), sessions overview (`:PiSessions`), compaction |
 | [doc/diff-review.md](doc/diff-review.md) | Two-way diff review of agent edits, review notes, permission-extension protocol reference, session diff review (`:PiDiff`) |
 | [doc/attention.md](doc/attention.md) | Attention queue, dialogs, notifications, queue inspection API |
-| [doc/extensions.md](doc/extensions.md) | Extension UI routing, startup announcements, `on_widget` custom blocks, adapting non-upstream RPC backends |
+| [doc/extensions.md](doc/extensions.md) | Extension UI routing, startup announcements, `on_widget` custom blocks, adapting non-upstream RPC backends, bundled extensions (sub-agent, todo, background tasks) |
 | [doc/configuration.md](doc/configuration.md) | Full annotated defaults + project trust |
 | [doc/keymaps.md](doc/keymaps.md) | Key specs, stable filetypes, example setup |
 | [doc/api.md](doc/api.md) | Lua API reference |
@@ -326,6 +327,7 @@ Everything below is present in `pi2.nvim` and **not** in upstream `alex35mil/pi.
 
 - [Double-`<Esc>` abort](doc/usage.md#aborting-with-double-esc) — a second `<Esc>` within a timeout aborts the running turn — and, since the same gesture stays live during an auto-retry, cancels a "Retrying…" backoff too — with a persistent statusline hint.
 - [Session todo list (`todo_write` + `:PiTodo`)](doc/usage.md#todo-list) — for multi-step work the agent maintains a session todo list with a full-replacement todo tool (exactly one item in progress, stale-list reminders, list survives compaction and branch switches); tool blocks render the ✓/◐/○ checklist and `:PiTodo` toggles a live side panel (stacked in the `:PiSessions` column, with auto-open / hide-when-empty knobs); the read-only sub-session viewer surfaces a child's todos too — footer summary chunk plus a `T`-toggled list panel.
+- [Background bash tasks (`run_in_background` + `:PiTasks`)](doc/usage.md#background-tasks) — with the bundled `bg-tasks` extension loaded, the agent's `bash` tool gains `run_in_background` (dev servers, watchers, long builds) and a `&` prefix backgrounds your own `!` commands; output streams to a temp-dir log, completion wakes the agent with the exit status, and `:PiTasks` toggles a live panel with output viewer / preview / stop.
 
 **UI & rendering**
 

@@ -234,6 +234,13 @@
 ---@field height? integer Window height for top/bottom placement in the side layout (default 12)
 ---@field float pi.SessionsListFloatConfig Float window sizing when the current tab uses the float layout
 
+---@class pi.TasksPanelConfig
+---@field mode "follow"|"side"|"float" How the panel opens: "side" or "float" explicitly, or "follow" the current tab's chat layout (default "follow")
+---@field position "left"|"right"|"top"|"bottom" Window placement in the side layout (default "left")
+---@field width integer Window width for left/right placement in the side layout (default 40)
+---@field height integer Window height for top/bottom placement in the side layout (default 12)
+---@field auto_open? boolean Open the tasks panel when a background task starts in the current tab (default false)
+
 ---@class pi.DiffReviewListConfig
 ---@field position? "left"|"right" Side window placement (default "left")
 ---@field width? integer Side window width in columns (default 30)
@@ -352,6 +359,7 @@
 ---@field title pi.TitleConfig
 ---@field todo pi.TodoConfig
 ---@field sessions_list pi.SessionsListConfig
+---@field tasks_panel pi.TasksPanelConfig
 ---@field diff_review pi.DiffReviewConfig
 ---@field zen pi.ZenConfig
 ---@field prompt pi.PromptConfig
@@ -555,6 +563,13 @@ local defaults = {
             height = 0.4,
             border = "rounded",
         },
+    },
+    tasks_panel = {
+        mode = "follow",
+        position = "left",
+        width = 40,
+        height = 12,
+        auto_open = false,
     },
     diff_review = {
         width = 0.8,

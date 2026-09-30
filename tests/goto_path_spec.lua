@@ -10,6 +10,7 @@ local Config = require("pi.config")
 local Ft = require("pi.filetypes")
 local History = require("pi.ui.chat.history")
 local SessionList = require("pi.ui.sessions")
+local Sidebar = require("pi.ui.sidebar")
 
 --- Windows that existed before the test started; restored in after_each.
 local base_wins = {}
@@ -80,6 +81,7 @@ describe("goto_path_at_cursor window selection (issue #62)", function()
         if #base_wins > 0 and vim.api.nvim_win_is_valid(base_wins[1]) then
             vim.api.nvim_set_current_win(base_wins[1])
         end
+        Sidebar._reset()
     end)
 
     it("skips the sessions list window and opens a new split (no E1513)", function()

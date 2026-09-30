@@ -5,6 +5,7 @@
 -- registration, the jump-then-trigger wiring, and the stale-row no-op.
 
 local SessionList = require("pi.ui.sessions")
+local Sidebar = require("pi.ui.sidebar")
 
 --- Fake session living in `tab`, with chat focus recorders and a scripted
 --- rpc:send for the list's name fetch.
@@ -118,6 +119,7 @@ describe("session list fork/clone/tree keys", function()
         if tab_b and vim.api.nvim_tabpage_is_valid(tab_b) then
             pcall(vim.api.nvim_tabpage_delete, tab_b, true)
         end
+        Sidebar._reset()
     end)
 
     it("binds f, C and t to the action keys in the list buffer", function()

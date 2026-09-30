@@ -8,6 +8,7 @@ M.CHAT_PROMPT_ATTENTION_WINHIGHLIGHT =
 M.CHAT_PROMPT_BASH_WINHIGHLIGHT = "NormalFloat:PiFloat,FloatBorder:PiFloatBorder,FloatTitle:PiChatPromptFloatBashTitle"
 M.CHAT_ATTACHMENTS_WINHIGHLIGHT = "NormalFloat:PiFloat,FloatBorder:PiFloatBorder,FloatTitle:PiChatAttachmentsFloatTitle"
 M.SESSIONS_LIST_WINHIGHLIGHT = "NormalFloat:PiFloat,FloatBorder:PiFloatBorder,FloatTitle:PiSessionsListFloatTitle"
+M.TASKS_LIST_WINHIGHLIGHT = "NormalFloat:PiFloat,FloatBorder:PiFloatBorder,FloatTitle:PiTasksListFloatTitle"
 M.DIFF_REVIEW_WINHIGHLIGHT = "NormalFloat:PiFloat,FloatBorder:PiFloatBorder,FloatTitle:PiDiffReviewFloatTitle"
 M.DIFF_WINHIGHLIGHT = "WinBar:PiDiffWinbar,WinBarNC:PiDiffWinbar"
 
@@ -229,6 +230,22 @@ local function set_defaults()
     vim.api.nvim_set_hl(0, "PiSessionsListPending", { default = true, fg = comment.fg, italic = true })
     vim.api.nvim_set_hl(0, "PiSessionsListSpinner", { default = true, fg = special.fg })
     vim.api.nvim_set_hl(0, "PiSessionsListFloatTitle", { default = true, fg = title.fg, bold = true })
+
+    -- Background tasks panel (:PiTasks): running spins in the info hue,
+    -- terminal states map to ok/error/warn, and the current-row marker uses
+    -- the cursorline background so the active row reads at a glance.
+    vim.api.nvim_set_hl(0, "PiTasksListRunning", { default = true, link = "DiagnosticInfo" })
+    vim.api.nvim_set_hl(0, "PiTasksListSpinner", { default = true, link = "PiTasksListRunning" })
+    vim.api.nvim_set_hl(0, "PiTasksListSuccess", { default = true, link = "DiagnosticOk" })
+    vim.api.nvim_set_hl(0, "PiTasksListFailure", { default = true, link = "DiagnosticError" })
+    vim.api.nvim_set_hl(0, "PiTasksListStopped", { default = true, link = "DiagnosticWarn" })
+    if cursorline.bg then
+        vim.api.nvim_set_hl(0, "PiTasksListCurrent", { default = true, bg = cursorline.bg, bold = true })
+    else
+        vim.api.nvim_set_hl(0, "PiTasksListCurrent", { default = true, bold = true })
+    end
+    vim.api.nvim_set_hl(0, "PiTasksListDotDim", { default = true, link = "Comment" })
+    vim.api.nvim_set_hl(0, "PiTasksListFloatTitle", { default = true, fg = title.fg, bold = true })
     vim.api.nvim_set_hl(0, "PiDiffReviewFile", { default = true, fg = title.fg, bold = true })
     vim.api.nvim_set_hl(0, "PiDiffReviewHint", { default = true, fg = comment.fg, italic = true })
     vim.api.nvim_set_hl(0, "PiDiffReviewWorktree", { default = true, fg = title.fg, bold = true, italic = true })

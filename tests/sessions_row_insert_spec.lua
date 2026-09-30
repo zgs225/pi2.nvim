@@ -4,6 +4,7 @@
 -- jump semantics.
 
 local SessionList = require("pi.ui.sessions")
+local Sidebar = require("pi.ui.sidebar")
 local Chat = require("pi.ui.chat")
 
 --- Build a session whose chat counts calls to the two focus variants, with
@@ -166,6 +167,7 @@ describe("sessions list rows: a / i append-focus keys (#94)", function()
     after_each(function()
         pcall(SessionList.close)
         SessionList._reset()
+        Sidebar._reset()
     end)
 
     it("a routes to the append-at-end focus variant", function()
@@ -209,6 +211,7 @@ describe("sessions list a/i end state with a real chat (#94)", function()
         chat = nil
         pcall(SessionList.close)
         SessionList._reset()
+        Sidebar._reset()
     end)
 
     it("a lands the prompt cursor past the last character of a multi-line draft", function()

@@ -16,6 +16,7 @@ local Config = require("pi.config")
 local Ft = require("pi.filetypes")
 local Highlights = require("pi.ui.highlights")
 local ChildFilter = require("pi.subsessions.sessions_list")
+local Sidebar = require("pi.ui.sidebar")
 
 local ns = vim.api.nvim_create_namespace("pi-sessions-list")
 
@@ -1170,17 +1171,22 @@ local function row_session_under_cursor()
     return row, nil
 end
 
+--- Jump to the tab of the session under the cursor and focus its chat.
+--- Returns false without side effects when the row is stale (no session,
+--- no tab, or a tabpage that no longer exists) so callers can no-op.
+---@param at_end boolean?
+---@return boolean jumped
 local function jump_under_cursor(at_end)
     local row, session = row_session_under_cursor()
     if not row then
-        return
+        return false
     end
     local Subsessions = require("pi.subsessions")
     local Sessions = require("pi.sessions.manager")
     local target_tab = row.tab or vim.api.nvim_get_current_tabpage()
 
     if row.is_tree_parent and row.session then
-        if vim.api.nvim_get_current_tabpage() ~= target_tab then
+        if vim.api.nvim_get_current_tabpage() ~= target_tab and vim.api.nvim_tabpage_is_valid(target_tab) then
             vim.api.nvim_set_current_tabpage(target_tab)
         end
         Subsessions.switch_to_parent(function(ok, err)
@@ -1197,7 +1203,7 @@ local function jump_under_cursor(at_end)
                 require("pi.notify").error(err)
             end
         end)
-        return
+        return true
     end
 
     if row.depth and row.depth > 0 and row.child_id then
@@ -1215,10 +1221,13 @@ local function jump_under_cursor(at_end)
                 require("pi.notify").error(err)
             end
         end, { tab = target_tab })
-        return
+        return true
     end
     if not row.tab or not session then
-        return
+        return false
+    end
+    if not vim.api.nvim_tabpage_is_valid(row.tab) then
+        return false
     end
     vim.api.nvim_set_current_tabpage(row.tab)
     if at_end then
@@ -1226,6 +1235,7 @@ local function jump_under_cursor(at_end)
     else
         session.chat:ensure_shown_and_focus_prompt()
     end
+    return true
 end
 
 --- Rename the session under the cursor: prompt for a display name and send it
@@ -1320,7 +1330,9 @@ local function fork_under_cursor()
     if not session then
         return
     end
-    jump_under_cursor()
+    if not jump_under_cursor() then
+        return
+    end
     require("pi").fork()
 end
 
@@ -1329,7 +1341,9 @@ local function clone_under_cursor()
     if not session then
         return
     end
-    jump_under_cursor()
+    if not jump_under_cursor() then
+        return
+    end
     require("pi").clone()
 end
 
@@ -1338,7 +1352,9 @@ local function tree_under_cursor()
     if not session then
         return
     end
-    jump_under_cursor()
+    if not jump_under_cursor() then
+        return
+    end
     require("pi").tree()
 end
 
@@ -1698,6 +1714,10 @@ local function open_side_win(b)
     else
         vim.wo[win].winfixwidth = true
     end
+    -- Register with the sidebar stacking coordinator so shared edges are
+    -- divided between panels instead of competing (restack runs on claim).
+    local tab = current_tab()
+    Sidebar.claim(tab, Sidebar.effective_edge(tab, position), "sessions", win, { weight = 1 })
     return win
 end
 
@@ -1754,12 +1774,16 @@ local function win_for(tab)
     if win and vim.api.nvim_win_is_valid(win) then
         return win
     end
+    if win then
+        -- The list window died without M.close (external :q / Ctrl-W c, tab
+        -- closed): the window is already gone, so drop its stacking claim.
+        Sidebar.release(tab, "sessions")
+    end
     wins[tab] = nil
     return nil
 end
 
 --- Public accessor: the sessions-list window open in `tab` (nil when none).
---- Used by the todo panel to stack in the same sidebar column.
 ---@param tab pi.TabId
 ---@return integer?
 function M.win(tab)
@@ -1799,6 +1823,8 @@ function M.close()
     if vim.api.nvim_win_is_valid(win) then
         pcall(vim.api.nvim_win_close, win, false)
     end
+    -- Window first, then release (release is idempotent).
+    Sidebar.release(tab, "sessions")
 end
 
 --- True when the current window is a `:PiSessions` list.

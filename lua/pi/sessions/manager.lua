@@ -63,6 +63,7 @@ local Attention = require("pi.attention")
 local Dialog = require("pi.ui.dialog")
 local Extension = require("pi.ui.extension")
 local CommandsCache = require("pi.cache.commands")
+local Tasks = require("pi.tasks")
 
 ---@class pi.StartupSection
 ---@field header string
@@ -284,10 +285,29 @@ local function bind_chat_to_session(session, chat, tab)
     notify_todo_view_changed(tab)
 end
 
+--- Prune the task registry's per-session records when a session's tab is
+--- torn down (TabClosed cleanup, session close/kill): the backend process
+--- may outlive the tab, but its rows must not linger as zombies. Pcall'd
+--- like prune_todo_state: a failing cleanup is surfaced, never swallowed,
+--- and must not block teardown.
+---@param session_id string?
+local function remove_session_tasks(session_id)
+    if not session_id then
+        return
+    end
+    local ok, err = pcall(function()
+        return Tasks.remove_session(session_id)
+    end)
+    if not ok then
+        Notify.warn("task cleanup failed: " .. tostring(err))
+    end
+end
+
 --- Detach a tab's chat from its session without stopping the backend process.
 ---@param tab pi.TabId
 local function detach_tab(tab)
     local session_id = tab_session_id[tab]
+    remove_session_tasks(session_id)
     if session_id then
         local session = registry[session_id]
         if session and session.attached_tab == tab then
@@ -459,6 +479,79 @@ local function update_todo_mirror(session, tool_name, result)
     if not ok then
         Notify.warn("todo panel update failed: " .. tostring(err))
     end
+end
+
+--- Consume a pi2_bg_task custom message pushed by the bg-tasks extension:
+--- forward the lifecycle event to the task registry, stamped with the owning
+--- session/tab so the registry (and the :PiTasks panel) can scope rows
+--- per session. Terminal states surface through the panel row and the
+--- agent's own triggerTurn report — no extra vim.notify on top. Runs on the
+--- RPC callback thread: every user-facing touch (Notify) is vim.schedule'd.
+---@param message table custom message object (role="custom", customType="pi2_bg_task")
+---@param session_id string? owning session id (task ownership routing; nil = unknown)
+---@param tab integer? owning tabpage handle (panel display)
+local function handle_bg_task_message(message, session_id, tab)
+    local details = message.details
+    if type(details) ~= "table" then
+        return
+    end
+    local ok, consumed = pcall(Tasks.handle_event, {
+        type = "pi2_bg_task",
+        details = details,
+        timestamp = message.timestamp,
+    }, session_id, tab)
+    if not ok then
+        Notify.warn("Background task event failed: " .. tostring(consumed))
+        return
+    end
+    if not consumed then
+        return
+    end
+    local tasks_cfg = Config.options.tasks_panel or {}
+    -- Auto-close: when the session's last background task reaches a terminal
+    -- state, request the owning tab's panel to close. The panel defers while
+    -- it (or one of its output views) has focus and flushes the close once
+    -- focus leaves — never yank a panel the user is reading. pi.ui.tasks is
+    -- lazy-required as in the auto-open path.
+    if
+        (details.kind == "completed" or details.kind == "failed" or details.kind == "stopped")
+        and tab ~= nil
+        and not Tasks.has_running(session_id)
+    then
+        local ok_close, TasksPanel = pcall(require, "pi.ui.tasks")
+        if ok_close then
+            vim.schedule(function()
+                TasksPanel.request_auto_close(tab)
+            end)
+        end
+    end
+    -- Auto-open: when a background task starts in the tab the user is
+    -- currently looking at, surface its panel (opt-in via
+    -- tasks_panel.auto_open). pi.ui.tasks is lazy-required to keep the
+    -- module graph acyclic (ui/tasks lazy-requires this manager).
+    if details.kind ~= "started" or not tasks_cfg.auto_open then
+        return
+    end
+    if tab == nil then
+        return
+    end
+    if tab ~= vim.api.nvim_get_current_tabpage() then
+        return
+    end
+    local ok_panel, Panel = pcall(require, "pi.ui.tasks")
+    if not ok_panel or Panel.win(tab) then
+        return
+    end
+    vim.schedule(function()
+        -- Auto-open must not steal focus from whatever the user is doing
+        -- (usually typing in the chat prompt): restore the window that was
+        -- current when the event fired.
+        local cur = vim.api.nvim_get_current_win()
+        Panel.open()
+        if vim.api.nvim_win_is_valid(cur) then
+            pcall(vim.api.nvim_set_current_win, cur)
+        end
+    end)
 end
 
 ---@param session pi.Session
@@ -958,7 +1051,16 @@ function M.handle_event(session, msg)
         end
         return false
     elseif t == "message_start" then
-        if chat then
+        local message = msg.message
+        if type(message) == "table" and message.role == "custom" then
+            -- Custom extension messages never render in chat history. The
+            -- bg-tasks extension's pi2_bg_task lifecycle feeds the task
+            -- registry (and the :PiTasks panel) instead; other customTypes
+            -- are dropped, matching the previous de-facto behavior.
+            if message.customType == "pi2_bg_task" then
+                handle_bg_task_message(message, session.id, session.attached_tab)
+            end
+        elseif chat then
             chat:on_message_start(msg)
         end
     elseif t == "message_end" then
@@ -977,7 +1079,7 @@ function M.handle_event(session, msg)
                 session._pending_file_change_args[tool_call_id] = nil
             end
         end
-        if chat then
+        if chat and not (type(message) == "table" and message.role == "custom") then
             chat:on_message_end(msg)
         end
     elseif t == "tool_execution_update" then

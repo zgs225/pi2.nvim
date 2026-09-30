@@ -372,6 +372,13 @@ function M.sessions()
     require("pi.ui.sessions").toggle()
 end
 
+--- Toggle the background tasks panel (:PiTasks): a live list of the
+--- background bash tasks reported by the bg-tasks extension, with status
+--- (running/done/failed/stopped) and durations. One panel per tab.
+function M.tasks()
+    require("pi.ui.tasks").toggle()
+end
+
 --- Review every file changed by a session (:PiDiff): a floating
 --- window with the combined `git diff` of the session's changed files.
 --- Untracked files render as full-file additions; <CR>/o jumps to the file

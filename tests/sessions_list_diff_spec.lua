@@ -5,6 +5,7 @@
 -- files warnings.
 
 local SessionList = require("pi.ui.sessions")
+local Sidebar = require("pi.ui.sidebar")
 local DiffReview = require("pi.ui.diff_review")
 
 ---@type string[]
@@ -130,6 +131,7 @@ describe("session list diff key", function()
             pcall(vim.fn.delete, dir, "rf")
         end
         cleanup_dirs = {}
+        Sidebar._reset()
     end)
 
     it("binds d to the diff action in the list buffer", function()

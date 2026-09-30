@@ -130,6 +130,13 @@ function M.scoped_models_extension_path()
     return plugin_root() .. "/extensions/scoped-models.ts"
 end
 
+--- Absolute path to the bundled background bash tasks extension
+--- (bash tool `run_in_background` override + `&`-prefix user bash).
+---@return string
+function M.bg_tasks_extension_path()
+    return plugin_root() .. "/extensions/bg-tasks.ts"
+end
+
 --- Absolute path to the bundled sub-agent extension (parent sessions only).
 ---@return string
 function M.subagent_extension_path()
@@ -205,6 +212,18 @@ function M.command(opts)
             cmd[#cmd + 1] = "--extension"
             cmd[#cmd + 1] = todo_ext
         end
+    end
+    -- Inject the background bash tasks extension unconditionally (like
+    -- title.ts): the foreground bash path delegates byte-for-byte to the
+    -- built-in definition, so the override is inert until the model passes
+    -- run_in_background or the user prefixes an interactive `!` command with
+    -- `&`. Below pi 0.85.1 the extension may fail to load (exports used are
+    -- verified on 0.85.1) — pi logs the load error and the session continues
+    -- with stock bash; see :checkhealth pi.
+    local bg_ext = M.bg_tasks_extension_path()
+    if vim.fn.filereadable(bg_ext) == 1 then
+        cmd[#cmd + 1] = "--extension"
+        cmd[#cmd + 1] = bg_ext
     end
     -- Sub-agent extensions, mutually exclusive per process role: parents
     -- get subagent.ts (orchestration tools + system-prompt note), children

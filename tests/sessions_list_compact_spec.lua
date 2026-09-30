@@ -5,6 +5,7 @@
 -- streaming / already-compacting / dead-process guards.
 
 local SessionList = require("pi.ui.sessions")
+local Sidebar = require("pi.ui.sidebar")
 
 --- Fake session with a scripted rpc:send: answers get_state through
 --- vim.schedule like a real backend would, and records every request in
@@ -119,6 +120,7 @@ describe("session list compact key", function()
     after_each(function()
         pcall(SessionList.close)
         SessionList._reset()
+        Sidebar._reset()
     end)
 
     it("binds c to the compact action in the list buffer", function()
