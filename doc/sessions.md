@@ -84,6 +84,10 @@ While viewing a child, `:PiNewSession` / `pi.new_session()` or a bare `/new` in 
 
 When a user-spawned child finishes, its last assistant message is injected into the parent as `[子会话「name」已完成] …` or `[Sub-session "name" completed] …` (language follows `title.lang` / UI locale). A child interrupted by a user abort is recorded as `interrupted` in the manifest instead and injects no completion report. Agent-spawned children skip this injection — they receive a synchronous tool result instead. Configure via `subagent.*` in [Configuration](configuration.md).
 
+### Idle process reaping
+
+A settled child's RPC process does **not** exit on its own — it stays alive so `dispatch_subagents` can reuse it without a respawn. To keep long sessions from accumulating dozens of idle `pi` processes, pi2.nvim closes them automatically once they have been idle for `subagent.reap_after_minutes` (default 30): the manifest row turns `dormant`, the child's session JSONL is kept on disk, and the child stays fully revivable via `:PiSubSwitch` or `dispatch_subagents({ target, message })`. A periodic sweep every `subagent.reap_sweep_minutes` (default 10) is the backstop: it also catches children settled before the last restart or whose manifest row went missing, and it skips anything still `active` (revived / running a new task), any process that is already gone, and any child that is the current session of an open tab. Set both options to `0` to disable reaping entirely (`reap_after_minutes = 0` alone disables the event-driven close; `reap_sweep_minutes = 0` alone disables only the periodic sweep).
+
 ### Sub-session names
 
 A child's label — its row in `:PiSessions`, the entries of the `:PiSubSwitch` / `:PiSubView` pickers, the `dispatch_subagents` block header, and the completion notice above — resolves in this order:

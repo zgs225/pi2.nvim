@@ -9,6 +9,7 @@ local Manifest = require("pi.subsessions.manifest")
 local Read = require("pi.subsessions.read")
 local Batch = require("pi.subsessions.batch")
 local Sessions = require("pi.sessions.manager")
+local Reaper = require("pi.subsessions.reaper")
 
 --- Abort epochs per lineage: interactive spawns capture the epoch at start and
 --- bail out when it changes mid-flight (see M.spawn).
@@ -332,6 +333,23 @@ function M.on_parent_resumed(session, session_path)
     require("pi.ui.sessions").request_refresh()
 end
 
+--- Liveness test behind the `subagent.max_children` limit: a child occupies a
+--- slot while its RPC process is still running in this Neovim instance,
+--- whatever the manifest says — a completed (or interrupted) child whose
+--- process lingers must not let the lineage spawn past the cap, while a dead
+--- process (failed/dormant, or no registry row at all) frees its slot.
+--- Lives here, not in manifest.lua, so the manifest never requires the
+--- sessions manager (dependency direction).
+---@param child_id string
+---@return boolean
+local function child_process_alive(child_id)
+    local session = Sessions.get_by_id(child_id)
+    if not session or not session.rpc then
+        return false
+    end
+    return session.rpc:is_running() == true
+end
+
 --- Spawn a background sub-session for `parent`.
 ---@param parent pi.Session
 ---@param opts pi.SubsessionSpawnOpts
@@ -374,7 +392,7 @@ function M.spawn(parent, opts, callback)
         local epoch = M.abort_epoch(lineage_id)
 
         local max = subcfg.max_children or 5
-        if not Manifest.try_reserve_spawn(lineage_id, max) then
+        if not Manifest.try_reserve_spawn(lineage_id, max, child_process_alive) then
             callback(nil, ("max %d concurrent sub-sessions"):format(max))
             return
         end
@@ -579,13 +597,50 @@ function M.switch_to_parent(callback, opts)
     reattach_or_load(parent, path, callback)
 end
 
+--- Resolve the registry session behind a child id, tolerating the revive
+--- id-migration window.
+---
+--- `M.revive` pins the registry key to the manifest id via
+--- `Sessions.ensure_id(child, child_id)`, but the pre-switch `get_state`
+--- response of the freshly spawned process carries the new process's
+--- self-generated sessionId, and `capture_session_id` →
+--- `migrate_session_id` (sessions/manager.lua) migrates the key away; the
+--- post-switch `get_state` migrates it back one round-trip later. Inside that
+--- window `Sessions.get_by_id(child_id)` returns nil while the process is
+--- still alive. Fall back to matching the revive-loaded session file
+--- (`Read.find_path(child_id)` — the manifest id's JSONL on disk, still
+--- reported as `session_file` by the child in that window) among registered
+--- *child* sessions (`parent_id ~= nil`), so a close during the window still
+--- stops the process instead of stranding a live process under a dormant
+--- manifest row (which the reaper would skip forever).
+---
+--- Only `M.close` consults this fallback; other lookups keep the strict id match.
+---@param child_id string Manifest child session id.
+---@return pi.Session? session Registry session to close, or nil when none resolves.
+local function resolve_child(child_id)
+    local session = Sessions.get_by_id(child_id)
+    if session then
+        return session
+    end
+    local path = Read.find_path(child_id)
+    if not path or path == "" then
+        return nil
+    end
+    for _, s in ipairs(Sessions.list_all()) do
+        if s.parent_id ~= nil and type(s.session_file) == "string" and same_resolved_path(s.session_file, path) then
+            return s
+        end
+    end
+    return nil
+end
+
 --- Close sub-session process (file retained).
 ---@param child_id string
 ---@param callback? fun(ok: boolean)
 ---@return boolean stopped True when a running RPC process was stopped.
 function M.close(child_id, callback)
     local stopped = false
-    local child = Sessions.get_by_id(child_id)
+    local child = resolve_child(child_id)
     if child and child.rpc:is_running() then
         Sessions.close_session(child)
         stopped = true
@@ -672,6 +727,9 @@ function M.on_child_settled(child)
         if parent then
             SessionList.acknowledge_reported_children_for_current_tab(parent)
         end
+        -- Manifest is settled: arm the idle reaper (fire-time re-checks all
+        -- conditions; a failure here must never break settle handling).
+        pcall(Reaper.schedule, child.id)
     end
 
     local manifest = Manifest.load()
@@ -764,6 +822,8 @@ function M.on_child_settled(child)
             end
             SessionList.request_refresh()
             SessionList.acknowledge_reported_children_for_current_tab(parent)
+            -- Prompt-injection path patched the manifest last: arm the reaper here too.
+            pcall(Reaper.schedule, child.id)
         end)
     end)
 end
@@ -775,6 +835,8 @@ end
 --- potentially large file on every startup (write amplification + mtime
 --- churn for backup tools).
 function M.rebuild_statuses()
+    -- Setup entry (invoked once from pi.setup): start the periodic idle sweep.
+    pcall(Reaper.start)
     local manifest = Manifest.load()
     if Manifest.decode_failed() then
         -- The on-disk manifest did not decode: the in-memory table is not
