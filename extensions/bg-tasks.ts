@@ -17,18 +17,26 @@
  * Background path (`run_in_background: true`):
  *  - Spawns `getShellConfig().shell -c <command>` detached + unref'd, with
  *    stdout/stderr streamed to `join(tmpdir(), "pi-bash-<taskId>.log")` — the
- *    same naming convention core uses for truncated-output spill files.
- *  - Returns immediately; the model is told the task id and output file and
- *    explicitly instructed NOT to poll.
- *  - The process is reaped via the "close" event; completion is reported by a
- *    custom message (customType "pi2_bg_task", display:false) sent with
- *    `{ triggerTurn: true, deliverAs: "followUp" }`. Core's convertToLlm maps
- *    custom messages to user-role context, so the report text reaches the LLM
- *    AND wakes the agent after the current turn. A `context` handler
- *    registered at load time is the fallback injector for completions that
- *    could not be delivered (e.g. stale extension ctx after reload); it reads
- *    the module-level task table and marks deliveries so nothing is injected
- *    twice.
+ *    same naming convention core uses for truncated-output spill files. The
+ *    model is told the task id and output file and explicitly instructed NOT
+ *    to poll.
+ *  - The process is reaped via the "close" event. Completion is reported with
+ *    TWO display:false custom messages (customType "pi2_bg_task"):
+ *    1. an immediate status notification sent WITHOUT options — the same
+ *       append path as the "started" push, so the frontend task panel leaves
+ *       its spinner state as soon as the process exits. Core appends this
+ *       message instantly when idle and only defers it to the next turn end
+ *       while streaming. Delivering this via `followUp` instead would strand
+ *       the panel on "running" for the whole remainder of a streaming run
+ *       (followUp is drained only at run end, and not at all when a run
+ *       exits via abort/error).
+ *    2. the wake report with `{ triggerTurn: true, deliverAs: "followUp" }` —
+ *       core's convertToLlm maps custom messages to user-role context, so
+ *       the report text reaches the LLM and wakes the agent after the
+ *       current run. A `context` handler registered at load time is the
+ *       fallback injector for wake reports that could not be delivered
+ *       (e.g. stale extension ctx after reload); it reads the module-level
+ *       task table and marks deliveries so nothing is injected twice.
  *  - A process.on("exit") hook SIGKILLs every tracked background process group
  *    best-effort, mirroring core's killTrackedDetachedChildren (that helper is
  *    not exported from the package root, so we track pids ourselves).
@@ -323,11 +331,24 @@ export default function bgTasks(pi: ExtensionAPI) {
 	}
 
 	/**
-	 * Report a finished task to the session stream: display:false custom
-	 * message + triggerTurn followUp, so pi.nvim's RPC channel sees the event
-	 * and the agent is woken with the report in its context (convertToLlm maps
-	 * custom messages to user role). On success the task is marked delivered;
-	 * the context handler above back-fills any delivery that threw here.
+	 * Report a finished task to the session stream with TWO display:false
+	 * custom messages:
+	 *
+	 * 1. Immediate status notification, sent WITHOUT options. Core appends a
+	 *    no-options custom message instantly when the agent is idle
+	 *    (`_appendCustomMessage`) and only queues it until the next `turn_end`
+	 *    while streaming (`_pendingCustomMessages`, also flushed when a run
+	 *    ends or aborts) — so the frontend task panel always hears about the
+	 *    exit within at most one turn, and instantly when idle. Reusing the
+	 *    followUp path here would strand the panel on "running" for the whole
+	 *    remainder of a streaming run, and a run exiting via abort/error never
+	 *    drains the followUp queue at all.
+	 *
+	 * 2. Wake report with `{ triggerTurn: true, deliverAs: "followUp" }`: maps
+	 *    to user-role context (convertToLlm) and starts a new turn once the
+	 *    current run finishes. `task.delivered` tracks THIS message only (it
+	 *    reflects "the agent has been notified with the full report"); the
+	 *    context handler above back-fills any wake that threw instead.
 	 */
 	function reportCompletion(task: BgTaskState): void {
 		if (task.delivered) {
@@ -340,21 +361,38 @@ export default function bgTasks(pi: ExtensionAPI) {
 				: task.exitCode === 0
 					? "completed"
 					: "failed";
+		const details = {
+			kind,
+			taskId: task.taskId,
+			command: task.command,
+			pid: task.pid,
+			outputFile: task.outputFile,
+			exitCode: task.exitCode,
+			signal: task.signal,
+		} satisfies BgTaskDetails;
+		// 1. Immediate frontend notification — panel status update. Content
+		// stays terse so the agent context (custom messages map to user role)
+		// receives a compact status line; the full report follows via the wake
+		// message.
+		try {
+			pi.sendMessage({
+				customType: CUSTOM_TYPE,
+				content: `[Background task ${task.taskId} ${kind}]`,
+				display: false,
+				details,
+			});
+		} catch {
+			// Stale ctx after reload: the panel keeps its last known state; the
+			// wake path below still refreshes it when deliverable.
+		}
+		// 2. Wake the agent with the full report once the current run finishes.
 		try {
 			pi.sendMessage(
 				{
 					customType: CUSTOM_TYPE,
 					content: buildFinishNote(task),
 					display: false,
-					details: {
-						kind,
-						taskId: task.taskId,
-						command: task.command,
-						pid: task.pid,
-						outputFile: task.outputFile,
-						exitCode: task.exitCode,
-						signal: task.signal,
-					} satisfies BgTaskDetails,
+					details,
 				},
 				{ triggerTurn: true, deliverAs: "followUp" },
 			);
