@@ -109,7 +109,7 @@ While the prompt text starts with `!` (leading whitespace is ignored), the promp
 A few details that match the TUI:
 
 - `!!command` runs the command but **excludes** its output from the LLM context — handy for noisy or private output you don't want the model to see. The block renders dimmer to mark it as excluded.
-- Output streams live into a collapsible block (`▾ $ <command>` header, indented output, fold with `<Tab>` like any other block). Multi-line commands show each line under the header. Non-zero exit codes render as `(exit N)`, cancellations as `(cancelled)`, and truncated output notes the full-output temp path.
+- Output streams live into a collapsible block (`▾ $ <command>` header, indented output, fold with `<Tab>` like any other block). Multi-line commands show each line under the header. Non-zero exit codes render as `(exit N)`, cancellations as `(cancelled)`, and truncated output notes the full-output temp path — put the cursor on that notice and press `gf` (or call [`pi.goto_file_under_cursor()`](#open-file-under-cursor)) to open the full output.
 - Only one direct bash command can run at a time. Submitting another while one is running is rejected with a warning (press `<Esc>` to cancel the running one first, same as the TUI).
 - A single `<Esc>` (in either insert or normal mode on the prompt) cancels a running `!` command — the same as `:PiAbortBash` / `pi.abort_bash()`. This is separate from the double-`<Esc>` agent abort above: `<Esc>` cancels a bash command when one is running, and arms the double-`<Esc>` agent abort when the agent is streaming.
 - `!` commands are recorded in the prompt history, so `<C-p>` / `<Up>` recalls them like normal prompts.
@@ -702,7 +702,7 @@ Tool blocks print the paths they touch, and agent prose often references files. 
 pi.goto_file_under_cursor() -- returns true when a file was opened
 ```
 
-It recognizes a bare path (the tool body lines contain the path — shortened as described in [Path display](#path-display)), an `@path` mention with an optional `#L<line>`, and a `path:line` suffix, and jumps to the indicated line when present. Inside a tool block the real path comes from the tool call's own arguments, so it resolves even when the rendered line shows only a file name; relative paths are resolved against the session cwd first and then against Neovim's cwd. Lines that don't resolve to a real file are ignored. Windows pinned with `winfixbuf` are skipped; when no regular window is usable, π falls back to a fresh split.
+It recognizes a bare path (the tool body lines contain the path — shortened as described in [Path display](#path-display)), an `@path` mention with an optional `#L<line>`, a `path:line` suffix, and the full-output temp path in a bash truncation notice (`Output truncated. Full output: /tmp/…`), and jumps to the indicated line when present. Inside a tool block the real path comes from the tool call's own arguments, so it resolves even when the rendered line shows only a file name; relative paths are resolved against the session cwd first and then against Neovim's cwd. Lines that don't resolve to a real file are ignored. Windows pinned with `winfixbuf` are skipped; when no regular window is usable, π falls back to a fresh split.
 
 `gf` is bound to this on the history buffer by default, so once you move into the history (e.g. `<C-g>h`) you can just `gf` on a path to jump to it.
 
@@ -734,7 +734,7 @@ When the agent invokes a tool, pi2.nvim renders the call inline in the chat hist
   lua/pi/init.lua:42: foo = 1
 ```
 
-Successful tool calls end silently (a blank breathing line); only errors print a status footer. The labels come from `labels.tool`, `labels.tool_failure` in your config. A spinner animates on the header row while the tool is running.
+Successful tool calls end silently (a blank breathing line); only errors print a status footer. The labels come from `labels.tool`, `labels.tool_failure` in your config. A spinner animates on the header row while the tool is running. On pi 1.1.0 and newer, a completed tool also shows how long it ran next to its status — `Took 1.2s`, or `Took 234ms` below one second; older pi versions (and legacy session records) carry no duration field and render exactly as before.
 
 ### Inline vs full blocks
 

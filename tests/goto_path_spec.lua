@@ -169,4 +169,18 @@ describe("goto_path_at_cursor window selection (issue #62)", function()
         -- Pinned window untouched.
         assert.equals(pinned_buf, vim.api.nvim_win_get_buf(pinned_win))
     end)
+
+    it("opens the full-output path from a bash truncation notice", function()
+        -- issue #116: the bash truncation line is prose, not a bare path, so
+        -- the whole-line fallback used to feed "Output truncated. Full
+        -- output: <path>" to _resolve_file and fail. extract_path now captures
+        -- the path after the `Full output:` marker.
+        local h = make_history("Output truncated. Full output: " .. target)
+        local hist_win = open_history_win(h)
+
+        local ok, opened = goto_first_line(h, hist_win)
+        assert.is_true(ok, "goto_path_at_cursor must not raise on the notice line")
+        assert.is_true(opened, "the full-output path must resolve")
+        assert.equals(target, vim.api.nvim_buf_get_name(vim.api.nvim_get_current_buf()))
+    end)
 end)

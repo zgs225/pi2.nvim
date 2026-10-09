@@ -92,6 +92,7 @@ History._stream_flush_ms = 30
 ---@field tool_input? table
 ---@field inline? boolean
 ---@field finished? boolean
+---@field duration_ms? number pi 1.1.0+ monotonic tool execution time in ms (absent on older pi / legacy records)
 ---@field expanded? boolean
 ---@field expanded_inner_lines? string[]
 ---@field expanded_inner_extmarks? table[]
@@ -2685,6 +2686,18 @@ function History:on_tool_start(tool_name, tool_call_id, tool_input)
     end)
 end
 
+--- Format a tool execution duration for the status line. pi reports integer
+--- milliseconds from a monotonic clock: sub-second runs read `Took 234ms`,
+--- longer ones `Took 1.2s`.
+---@param ms number
+---@return string
+local function format_duration_ms(ms)
+    if ms >= 1000 then
+        return string.format("Took %.1fs", ms / 1000)
+    end
+    return string.format("Took %dms", ms)
+end
+
 ---@param tool_name string
 ---@param tool_call_id string
 ---@param result? table
@@ -2705,7 +2718,16 @@ function History:on_tool_end(tool_name, tool_call_id, result, is_error)
         if block and block.finished then
             return
         end
+        -- pi 1.1.0+ reports the tool's monotonic execution time (ms) on the
+        -- `tool_execution_end` event and on replayed ToolResultMessages.
+        -- Absent on pi < 1.1.0 and in legacy session records: nil-safe, no
+        -- duration text is rendered then.
+        local duration_ms
+        if type(result) == "table" and type(result.durationMs) == "number" then
+            duration_ms = result.durationMs
+        end
         if block then
+            block.duration_ms = duration_ms
             block.finished = true
             self:_delete_tool_live_update(block)
             -- Remove spinner virtual text from header
@@ -2759,6 +2781,9 @@ function History:on_tool_end(tool_name, tool_call_id, result, is_error)
             local virt = {}
             if extra then
                 virt[#virt + 1] = { " " .. extra, "PiToolStatus" }
+            end
+            if duration_ms then
+                virt[#virt + 1] = { "  " .. format_duration_ms(duration_ms), "PiToolStatus" }
             end
             if not is_success then
                 virt[#virt + 1] = { "  " .. status_icon, status_hl }
@@ -2836,10 +2861,17 @@ function History:on_tool_end(tool_name, tool_call_id, result, is_error)
                 -- Batch/summary status as header virtual text. Block path only:
                 -- inline tools render the same field in their branch above.
                 local extra = renderer.inline_status and renderer.inline_status(result, is_error) or nil
+                local virt = {}
                 if extra then
+                    virt[#virt + 1] = { " " .. extra, "PiToolStatus" }
+                end
+                if duration_ms then
+                    virt[#virt + 1] = { "  " .. format_duration_ms(duration_ms), "PiToolStatus" }
+                end
+                if #virt > 0 then
                     local header_line = vim.api.nvim_buf_get_lines(self._buf, pos[1], pos[1] + 1, false)[1] or ""
                     vim.api.nvim_buf_set_extmark(self._buf, ns, pos[1], #header_line, {
-                        virt_text = { { " " .. extra, "PiToolStatus" } },
+                        virt_text = virt,
                         virt_text_pos = "inline",
                     })
                 end
@@ -4337,6 +4369,12 @@ local function extract_path(line)
     local p, ln = trimmed:match("^(%S+):(%d+)$")
     if p then
         return p, tonumber(ln)
+    end
+
+    -- bash truncation notice: `Output truncated. Full output: /tmp/…`
+    local full = trimmed:match("Full output:%s*(%S+)")
+    if full and full ~= "" then
+        return full, nil
     end
 
     -- whole line as a path
