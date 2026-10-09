@@ -632,6 +632,12 @@ function M.dispatch(parent, opts, callback)
             return
         end
 
+        Manifest.bind_session_lineage(parent, parent_id)
+        local lineage_id = Manifest.lineage_for_session(parent)
+        if lineage_id == "" then
+            lineage_id = parent_id
+        end
+
         ---@type pi.SubsessionBatchItem[]
         local items = {}
         local seen_refs = {}
@@ -659,25 +665,52 @@ function M.dispatch(parent, opts, callback)
             items[#items + 1] = item
         end
 
-        local new_spawns = 0
-        for _, item in ipairs(items) do
-            if item.task then
-                new_spawns = new_spawns + 1
+        for i, item in ipairs(items) do
+            if item.target then
+                local entry = Manifest.load()[item.target]
+                if type(entry) ~= "table" then
+                    callback({ error = ("item %d: unknown sub-agent target %q"):format(i, item.target) })
+                    return
+                end
+                if entry.parent_id ~= lineage_id then
+                    callback({
+                        error = ("item %d: target %q is not a sub-agent of this session"):format(i, item.target),
+                    })
+                    return
+                end
             end
-        end
-        Manifest.bind_session_lineage(parent, parent_id)
-        local lineage_id = Manifest.lineage_for_session(parent)
-        if lineage_id == "" then
-            lineage_id = parent_id
         end
 
         -- Spawn pre-check shares the alive-process occupancy check with M.spawn.
         local Subsessions = require("pi.subsessions")
+        local new_spawns = 0
+        local counted_targets = {}
+        for _, item in ipairs(items) do
+            if item.task then
+                new_spawns = new_spawns + 1
+            elseif item.target and not counted_targets[item.target] then
+                counted_targets[item.target] = true
+                if not Subsessions.is_child_process_alive(item.target) then
+                    new_spawns = new_spawns + 1
+                end
+            end
+        end
+
+        local reuse_exclude = {}
+        for _, item in ipairs(items) do
+            if item.target then
+                reuse_exclude[item.target] = true
+            end
+        end
+
         local max_children = subcfg.max_children or 5
         local occupancy = Manifest.spawn_occupancy(lineage_id, Subsessions.is_child_process_alive)
         if occupancy + new_spawns > max_children then
             local deficit = occupancy + new_spawns - max_children
-            Reaper.reap_oldest_settled(lineage_id, deficit)
+            -- Auto-reap settled children to make room, but never reap targets this
+            -- batch is about to reuse (otherwise run_batch would have to revive them,
+            -- defeating the reap and risking over-quota spawn).
+            Reaper.reap_oldest_settled(lineage_id, deficit, reuse_exclude)
             occupancy = Manifest.spawn_occupancy(lineage_id, Subsessions.is_child_process_alive)
         end
         if occupancy + new_spawns > max_children then

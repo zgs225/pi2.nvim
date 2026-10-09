@@ -661,6 +661,8 @@ function M.close(child_id, callback)
 end
 
 --- Revive a dormant sub-session (spawn process + switch_session).
+--- Subject to `subagent.max_children` quota and auto-reaps the oldest settled
+--- child of the same lineage to make room when slots are saturated.
 ---@param child_id string
 ---@param callback fun(session: pi.Session?, err: string?)
 function M.revive(child_id, callback)
@@ -669,19 +671,52 @@ function M.revive(child_id, callback)
         callback(nil, "session file not found")
         return
     end
+    local entry = Manifest.load()[child_id]
+    local lineage_id = entry and entry.parent_id or nil
+    if not lineage_id or lineage_id == "" then
+        callback(nil, "sub-session parent lineage not found")
+        return
+    end
+    local subcfg = Config.options.subagent or {}
+    if subcfg.enabled == false then
+        callback(nil, "subagent disabled")
+        return
+    end
+    local max = subcfg.max_children or 5
+    if not Manifest.try_reserve_spawn(lineage_id, max, M.is_child_process_alive) then
+        -- Slot pressure: auto-reap the oldest settled child to make room.
+        if
+            Reaper.reap_oldest_settled(lineage_id, 1) == 0
+            or not Manifest.try_reserve_spawn(lineage_id, max, M.is_child_process_alive)
+        then
+            callback(nil, ("max %d concurrent sub-sessions"):format(max))
+            return
+        end
+    end
+    local held = true
+    local function unreserve()
+        if held then
+            held = false
+            Manifest.release_spawn(lineage_id)
+        end
+    end
+
     local tab = vim.api.nvim_get_current_tabpage()
     local child = Sessions.create_detached(tab, { subagent = false })
     if not child then
+        unreserve()
         callback(nil, "failed to start process")
         return
     end
     Sessions.ensure_id(child, child_id)
+    unreserve()
     child.parent_id = (Manifest.load()[child_id] or {}).parent_id
     Sessions.load_session_path(child, path, function(ok)
         if ok then
             Manifest.patch(child_id, { status = "active", last_active_at = Manifest.iso_now() })
             callback(child, nil)
         else
+            unreserve()
             Sessions.close_session(child)
             callback(nil, "failed to switch session")
         end

@@ -816,8 +816,19 @@ describe("subsession batch", function()
         end)
 
         it("treats JSON null fields as absent on a reuse item", function()
+            Manifest.upsert("child-uuid", {
+                parent_id = "parent-1",
+                name = "worker",
+                task_prompt = "t",
+                config = {},
+                status = "dormant",
+                reported = false,
+                created_at = Manifest.iso_now(),
+                last_active_at = Manifest.iso_now(),
+            })
             Subsessions.revive = function(_parent, _id, callback)
-                callback({
+                local cb = callback or _id
+                cb({
                     id = "child-uuid",
                     rpc = {
                         is_running = function()
@@ -840,6 +851,30 @@ describe("subsession batch", function()
             local res = dispatch({ item })
             assert.is_nil(res.batch_id)
             assert.is_truthy(res.error and res.error:find("`model`", 1, true))
+        end)
+
+        it("rejects an unknown sub-agent target", function()
+            local res = dispatch({ { target = "nonexistent-target", message = "go" } })
+            assert.is_nil(res.batch_id)
+            assert.is_truthy(res.error and res.error:find('unknown sub-agent target "nonexistent-target"', 1, true))
+        end)
+
+        it("rejects a sub-agent target belonging to a different session lineage", function()
+            Manifest.upsert("foreign-child", {
+                parent_id = "other-lineage",
+                name = "foreign",
+                task_prompt = "t",
+                config = {},
+                status = "dormant",
+                reported = false,
+                created_at = Manifest.iso_now(),
+                last_active_at = Manifest.iso_now(),
+            })
+            local res = dispatch({ { target = "foreign-child", message = "go" } })
+            assert.is_nil(res.batch_id)
+            assert.is_truthy(
+                res.error and res.error:find('target "foreign-child" is not a sub-agent of this session', 1, true)
+            )
         end)
     end)
 
@@ -957,5 +992,280 @@ describe("subsession batch", function()
             assert.equals("active", Manifest.load()["child-active"].status)
             assert.is_truthy(Sessions.get_by_id("child-active"))
         end)
+
+        it("counts dormant reuse toward quota and rejects when limit would be exceeded", function()
+            Manifest.upsert("child-active", {
+                parent_id = "parent-limit-test",
+                parent_epoch = 0,
+                name = "worker-active",
+                task_prompt = "first task",
+                config = {},
+                status = "active",
+                reported = false,
+                created_at = Manifest.iso_now(),
+                last_active_at = Manifest.iso_now(),
+                agent_spawned = true,
+                run_generation = 1,
+            })
+            local child_sess = {
+                id = "child-active",
+                rpc = {
+                    is_running = function()
+                        return true
+                    end,
+                    stop = function() end,
+                },
+            }
+            Sessions._register_for_test(child_sess)
+
+            Manifest.upsert("child-dormant", {
+                parent_id = "parent-limit-test",
+                parent_epoch = 0,
+                name = "worker-dormant",
+                task_prompt = "first task",
+                config = {},
+                status = "dormant",
+                reported = false,
+                created_at = Manifest.iso_now(),
+                last_active_at = Manifest.iso_now(),
+                agent_spawned = true,
+                run_generation = 1,
+            })
+
+            local res
+            Batch.dispatch(parent, {
+                items = {
+                    { ref = "reuse-item", target = "child-dormant", message = "continue work" },
+                },
+            }, function(r)
+                res = r
+            end)
+
+            assert.is_not_nil(res)
+            assert.is_nil(res.batch_id)
+            assert.is_truthy(res.error and res.error:find("would exceed max 1 concurrent sub-sessions", 1, true))
+
+            assert.equals("active", Manifest.load()["child-active"].status)
+            assert.is_truthy(Sessions.get_by_id("child-active"))
+        end)
+
+        it("auto-reaps a completed-but-alive child to admit a dormant reuse", function()
+            Manifest.upsert("child-completed", {
+                parent_id = "parent-limit-test",
+                parent_epoch = 0,
+                name = "worker-completed",
+                task_prompt = "first task",
+                config = {},
+                status = "completed",
+                reported = false,
+                created_at = Manifest.iso_now(),
+                last_active_at = Manifest.iso_now(),
+                agent_spawned = true,
+                run_generation = 1,
+            })
+            local child_sess = {
+                id = "child-completed",
+                rpc = {
+                    is_running = function()
+                        return true
+                    end,
+                    stop = function() end,
+                },
+            }
+            Sessions._register_for_test(child_sess)
+
+            Manifest.upsert("child-dormant", {
+                parent_id = "parent-limit-test",
+                parent_epoch = 0,
+                name = "worker-dormant",
+                task_prompt = "first task",
+                config = {},
+                status = "dormant",
+                reported = false,
+                created_at = Manifest.iso_now(),
+                last_active_at = Manifest.iso_now(),
+                agent_spawned = true,
+                run_generation = 1,
+            })
+
+            local res
+            Batch.dispatch(parent, {
+                items = {
+                    { ref = "reuse-item", target = "child-dormant", message = "continue work" },
+                },
+            }, function(r)
+                res = r
+            end)
+
+            assert.is_not_nil(res)
+            assert.is_nil(res.error)
+            assert.is_string(res.batch_id)
+            assert.equals("running", res.status)
+
+            assert.equals("dormant", Manifest.load()["child-completed"].status)
+            assert.is_nil(Sessions.get_by_id("child-completed"))
+
+            Batch.cancel(res.batch_id)
+        end)
+
+        it("does not count alive reuse as a new spawn and does not reap the reuse target during auto-reap", function()
+            Config.options.subagent.max_children = 2
+
+            -- C1 is settled-but-alive, and older than C2. C1 is the reuse target.
+            Manifest.upsert("child-C1", {
+                parent_id = "parent-limit-test",
+                parent_epoch = 0,
+                name = "worker-C1",
+                task_prompt = "c1 task",
+                config = {},
+                status = "completed",
+                reported = false,
+                created_at = "2024-01-01T00:00:00Z",
+                last_active_at = "2024-01-01T00:00:00Z",
+                agent_spawned = true,
+                run_generation = 1,
+            })
+            local sess_c1 = {
+                id = "child-C1",
+                rpc = {
+                    is_running = function()
+                        return true
+                    end,
+                    stop = function() end,
+                    send = function(_, _, cb)
+                        if cb then
+                            cb({ success = true })
+                        end
+                        return true
+                    end,
+                },
+            }
+            Sessions._register_for_test(sess_c1)
+
+            -- C2 is settled-but-alive, and newer than C1. It should be reaped instead of C1.
+            Manifest.upsert("child-C2", {
+                parent_id = "parent-limit-test",
+                parent_epoch = 0,
+                name = "worker-C2",
+                task_prompt = "c2 task",
+                config = {},
+                status = "completed",
+                reported = false,
+                created_at = "2024-01-02T00:00:00Z",
+                last_active_at = "2024-01-02T00:00:00Z",
+                agent_spawned = true,
+                run_generation = 1,
+            })
+            local sess_c2 = {
+                id = "child-C2",
+                rpc = {
+                    is_running = function()
+                        return true
+                    end,
+                    stop = function() end,
+                },
+            }
+            Sessions._register_for_test(sess_c2)
+
+            local res
+            Batch.dispatch(parent, {
+                items = {
+                    { ref = "task-item", task = "new work", name = "new-child" },
+                    { ref = "reuse-item", target = "child-C1", message = "continue work" },
+                },
+            }, function(r)
+                res = r
+            end)
+
+            assert.is_not_nil(res)
+            assert.is_nil(res.error)
+            assert.is_string(res.batch_id)
+            assert.equals("running", res.status)
+
+            -- C1 was preserved (not reaped) because it was excluded as a reuse target
+            assert.is_truthy(Sessions.get_by_id("child-C1"))
+            assert.equals("completed", Manifest.load()["child-C1"].status)
+
+            -- C2 was reaped instead to make room for the new spawn item
+            assert.is_nil(Sessions.get_by_id("child-C2"))
+            assert.equals("dormant", Manifest.load()["child-C2"].status)
+
+            Batch.cancel(res.batch_id)
+        end)
+
+        it(
+            "rejects dispatch when active + alive reuse saturates quota and auto-reap cannot reap reuse target",
+            function()
+                Config.options.subagent.max_children = 2
+
+                Manifest.upsert("child-A", {
+                    parent_id = "parent-limit-test",
+                    parent_epoch = 0,
+                    name = "worker-A",
+                    task_prompt = "task a",
+                    config = {},
+                    status = "active",
+                    reported = false,
+                    created_at = Manifest.iso_now(),
+                    last_active_at = Manifest.iso_now(),
+                    agent_spawned = true,
+                    run_generation = 1,
+                })
+                local sess_a = {
+                    id = "child-A",
+                    rpc = {
+                        is_running = function()
+                            return true
+                        end,
+                        stop = function() end,
+                    },
+                }
+                Sessions._register_for_test(sess_a)
+
+                Manifest.upsert("child-C1", {
+                    parent_id = "parent-limit-test",
+                    parent_epoch = 0,
+                    name = "worker-C1",
+                    task_prompt = "c1 task",
+                    config = {},
+                    status = "completed",
+                    reported = false,
+                    created_at = Manifest.iso_now(),
+                    last_active_at = Manifest.iso_now(),
+                    agent_spawned = true,
+                    run_generation = 1,
+                })
+                local sess_c1 = {
+                    id = "child-C1",
+                    rpc = {
+                        is_running = function()
+                            return true
+                        end,
+                        stop = function() end,
+                    },
+                }
+                Sessions._register_for_test(sess_c1)
+
+                local res
+                Batch.dispatch(parent, {
+                    items = {
+                        { ref = "task-item", task = "new work", name = "new-child" },
+                        { ref = "reuse-item", target = "child-C1", message = "continue work" },
+                    },
+                }, function(r)
+                    res = r
+                end)
+
+                assert.is_not_nil(res)
+                assert.is_nil(res.batch_id)
+                assert.is_truthy(res.error and res.error:find("would exceed max 2 concurrent sub-sessions", 1, true))
+
+                -- C1 was not reaped
+                assert.is_truthy(Sessions.get_by_id("child-C1"))
+                assert.equals("completed", Manifest.load()["child-C1"].status)
+                -- A is still running
+                assert.is_truthy(Sessions.get_by_id("child-A"))
+            end
+        )
     end)
 end)

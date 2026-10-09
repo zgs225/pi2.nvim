@@ -118,6 +118,11 @@ describe("sub-session abort propagation and lineage resolution", function()
             status = "active",
             name = "parent",
         })
+        Manifest.upsert(child.id, {
+            parent_id = parent.id,
+            status = "active",
+            name = "child",
+        })
 
         local batch_id
         Batch.dispatch(parent, {
@@ -179,6 +184,11 @@ describe("sub-session abort propagation and lineage resolution", function()
             parent_id = parent.id,
             status = "active",
             name = "parent",
+        })
+        Manifest.upsert(child.id, {
+            parent_id = parent.id,
+            status = "interrupted",
+            name = "child",
         })
 
         local batch_id
@@ -334,6 +344,11 @@ describe("sub-session abort propagation and lineage resolution", function()
             parent_id = parent.id,
             status = "active",
             name = "parent",
+        })
+        Manifest.upsert("child-target-1", {
+            parent_id = parent.id,
+            status = "dormant",
+            name = "child",
         })
 
         local batch_id

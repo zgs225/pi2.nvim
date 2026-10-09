@@ -115,8 +115,9 @@ end
 --- manifest status, and not the current session of any tabpage.
 ---@param lineage_id string
 ---@param needed integer
+---@param exclude? table<string, boolean> Child ids never to reap (e.g. reuse targets of the batch being admitted).
 ---@return integer reaped
-function M.reap_oldest_settled(lineage_id, needed)
+function M.reap_oldest_settled(lineage_id, needed, exclude)
     if type(needed) ~= "number" or needed <= 0 or type(lineage_id) ~= "string" or lineage_id == "" then
         return 0
     end
@@ -129,6 +130,7 @@ function M.reap_oldest_settled(lineage_id, needed)
             and type(entry) == "table"
             and entry.parent_id == lineage_id
             and settled_status[entry.status]
+            and not (exclude and exclude[id])
         then
             candidates[#candidates + 1] = {
                 id = id,

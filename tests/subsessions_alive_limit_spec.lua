@@ -4,6 +4,7 @@
 
 local Config = require("pi.config")
 local Manifest = require("pi.subsessions.manifest")
+local Read = require("pi.subsessions.read")
 local Reaper = require("pi.subsessions.reaper")
 local Subsessions = require("pi.subsessions")
 local Sessions = require("pi.sessions.manager")
@@ -108,6 +109,7 @@ describe("spawn enforces max_children over live children", function()
     local manifest_tmp
     local real_create
     local real_path
+    local real_find_path
     local created = 0
 
     before_each(function()
@@ -115,6 +117,10 @@ describe("spawn enforces max_children over live children", function()
         created = 0
         manifest_tmp = vim.fn.tempname() .. "-alive-spawn-manifest.json"
         real_path = Manifest.path
+        real_find_path = Read.find_path
+        Read.find_path = function(id)
+            return "/tmp/" .. id .. ".jsonl"
+        end
         Manifest._reset()
         Reaper._reset()
         Manifest.path = function()
@@ -124,7 +130,8 @@ describe("spawn enforces max_children over live children", function()
         Sessions.create_detached = function()
             created = created + 1
             local n = created
-            local session = {
+            local session
+            session = {
                 id = "tmp-spawn-" .. n,
                 rpc = {
                     is_running = function()
@@ -134,11 +141,20 @@ describe("spawn enforces max_children over live children", function()
                     send = function(_, cmd, cb)
                         if cmd.type == "get_state" and cb then
                             vim.schedule(function()
-                                cb({ success = true, data = { sessionId = "child-" .. n } })
+                                -- Spawn: the fresh process reports its real id.
+                                -- Revive: ensure_id already pinned the manifest
+                                -- id, so report it back unchanged (mirrors the
+                                -- backend keeping the switched session's id).
+                                local id = session.id:match("^tmp%-spawn%-") and ("child-" .. n) or session.id
+                                cb({ success = true, data = { sessionId = id } })
                             end)
                         elseif cmd.type == "prompt" and cb then
                             vim.schedule(function()
                                 cb({ success = true })
+                            end)
+                        elseif cmd.type == "switch_session" and cb then
+                            vim.schedule(function()
+                                cb({ success = true, data = {} })
                             end)
                         end
                         return true
@@ -152,6 +168,7 @@ describe("spawn enforces max_children over live children", function()
 
     after_each(function()
         Sessions.create_detached = real_create
+        Read.find_path = real_find_path
         Manifest.path = real_path
         Manifest._reset()
         Reaper._reset()
@@ -188,6 +205,92 @@ describe("spawn enforces max_children over live children", function()
         )
         return child, err
     end
+
+    ---@param id string
+    ---@return pi.Session?, string?
+    local function revive_sync(id)
+        local child, err
+        Subsessions.revive(id, function(c, e)
+            child = c
+            err = e
+        end)
+        assert.is_true(
+            vim.wait(3000, function()
+                return child ~= nil or err ~= nil
+            end, 10),
+            "revive should settle"
+        )
+        return child, err
+    end
+
+    it("blocks revive while an active child process is still running", function()
+        local child, err = spawn_sync("one")
+        assert.is_nil(err)
+        assert.is_truthy(child)
+        assert.is_true(
+            vim.wait(3000, function()
+                return Manifest.load()["child-1"] ~= nil
+            end, 10),
+            "first child should register"
+        )
+        assert.equals("active", Manifest.load()["child-1"].status)
+        assert.is_truthy(Sessions.get_by_id("child-1"))
+
+        Manifest.upsert("dormant-1", {
+            parent_id = "parent-1",
+            name = "dormant",
+            task_prompt = "old",
+            config = {},
+            status = "dormant",
+            reported = false,
+            created_at = Manifest.iso_now(),
+            last_active_at = Manifest.iso_now(),
+        })
+
+        local before_created = created
+        local revived, revive_err = revive_sync("dormant-1")
+        assert.is_nil(revived)
+        assert.is_truthy(revive_err, "revive must fail when limit reached")
+        assert.is_truthy(revive_err:find("max", 1, true))
+        assert.equals(before_created, created, "no new process should be created")
+    end)
+
+    it("auto-reaps a completed-but-alive child to admit revive", function()
+        local child, err = spawn_sync("one")
+        assert.is_nil(err)
+        assert.is_truthy(child)
+        assert.is_true(
+            vim.wait(3000, function()
+                return Manifest.load()["child-1"] ~= nil
+            end, 10),
+            "first child should register"
+        )
+
+        -- Simulate on_child_settled: task done, status completed, process still running.
+        Manifest.patch("child-1", { status = "completed", last_active_at = Manifest.iso_now() })
+        assert.is_truthy(Sessions.get_by_id("child-1"))
+
+        Manifest.upsert("dormant-1", {
+            parent_id = "parent-1",
+            name = "dormant",
+            task_prompt = "old",
+            config = {},
+            status = "dormant",
+            reported = false,
+            created_at = Manifest.iso_now(),
+            last_active_at = Manifest.iso_now(),
+        })
+
+        local before_created = created
+        local revived, revive_err = revive_sync("dormant-1")
+        assert.is_nil(revive_err)
+        assert.is_truthy(revived, "revive should succeed after auto-reaping settled child")
+        assert.equals("dormant-1", revived.id)
+        assert.equals(before_created + 1, created, "new process should be created for revived child")
+        assert.equals("dormant", Manifest.load()["child-1"].status)
+        assert.is_nil(Sessions.get_by_id("child-1"))
+        assert.equals("active", Manifest.load()["dormant-1"].status)
+    end)
 
     it("auto-reaps a completed-but-alive child to admit a new spawn", function()
         local child, err = spawn_sync("one")

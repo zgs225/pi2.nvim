@@ -117,6 +117,11 @@ describe("regression: PiAbort during sub-wait", function()
             status = "active",
             name = "parent",
         })
+        Manifest.upsert(child.id, {
+            parent_id = parent.id,
+            status = "active",
+            name = "child",
+        })
 
         -- Parent dispatches a batch
         local batch_id
