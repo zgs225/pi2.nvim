@@ -175,6 +175,7 @@ The dashboard reuses `PiToolHeader` for its section headers, `Comment` for dimme
 | `PiTasksListCurrent` | Window-local background marker under the status dot of every running row (cursorline background + bold) |
 | `PiTasksListDotDim` | Dim phase of the running dot's blink, and the `id · status · duration` subtitle (links to `Comment`) |
 | `PiTasksListFloatTitle` | Float title for the tasks panel window |
+| `PiTasksPreviewMeta` | Dimmed metadata header of the preview float (command line stays Normal; the id/status/duration/output-path lines; links to `Comment`) |
 
 ## Sub-session viewer
 

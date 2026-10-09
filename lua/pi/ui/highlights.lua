@@ -246,6 +246,9 @@ local function set_defaults()
     end
     vim.api.nvim_set_hl(0, "PiTasksListDotDim", { default = true, link = "Comment" })
     vim.api.nvim_set_hl(0, "PiTasksListFloatTitle", { default = true, fg = title.fg, bold = true })
+    -- Preview float: the command/metadata header lines stay dim so the output
+    -- tail below them reads as the content.
+    vim.api.nvim_set_hl(0, "PiTasksPreviewMeta", { default = true, link = "Comment" })
     vim.api.nvim_set_hl(0, "PiDiffReviewFile", { default = true, fg = title.fg, bold = true })
     vim.api.nvim_set_hl(0, "PiDiffReviewHint", { default = true, fg = comment.fg, italic = true })
     vim.api.nvim_set_hl(0, "PiDiffReviewWorktree", { default = true, fg = title.fg, bold = true, italic = true })

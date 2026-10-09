@@ -538,7 +538,7 @@ end
 local HELP_ENTRIES = {
     { "<CR>, o", "Open this task's output (vsplit)" },
     { "a, i", "Open the output and focus it" },
-    { "p", "Preview the output tail in a float" },
+    { "p", "Preview output live in a float (command + metadata header)" },
     { "x", "Stop the task under the cursor" },
     { "A", "Toggle between current-session and all tasks" },
     { "R", "Redraw the list" },
@@ -709,14 +709,181 @@ local function open_output_under_cursor(focus)
     end
 end
 
---- Preview floats per list window: `p` opens the output tail (200 lines) in a
---- centered, focusable float so it can be scrolled; pressing `p` again
---- closes it.
+--- Preview floats per list window: `p` opens a live, focusable float whose
+--- header shows the command, status, duration and output path above the
+--- output tail. A running task's tail is re-read every PREVIEW_POLL_MS so
+--- it follows the process; the poll stops once the task settles. Pressing
+--- `p` again closes it.
 ---@type table<integer, integer>
 local preview_wins = {}
 
+--- Live-tail bookkeeping per list window: the poll timer plus the id/path/
+--- last tail needed to re-render. Cleared together with preview_wins.
+---@class pi.TasksPreviewState
+---@field timer uv.uv_timer_t?
+---@field task_id string
+---@field path string
+---@field tail string[]?
+
+---@type table<integer, pi.TasksPreviewState>
+local preview_state = {}
+
+--- Extmark namespace of the preview buffer's dimmed metadata header.
+---@type integer
+local preview_ns = vim.api.nvim_create_namespace("pi-tasks-preview")
+
+--- Maximum output lines a preview renders (the metadata header sits above).
+local PREVIEW_TAIL_LINES = 1000
+
+--- Live-tail poll interval in ms (same cadence as the panel's 500ms blink).
+local PREVIEW_POLL_MS = 500
+
+--- Augroup owning the preview's WinClosed watchers, so the per-list-window
+--- watcher can be deduplicated (repeated `p` toggles must not stack).
+---@type integer
+local preview_augroup = vim.api.nvim_create_augroup("PiTasksPreview", { clear = true })
+
+--- Status label of a preview's header line (exit code/signal when terminal).
+---@param task pi.Task
+---@return string
+local function preview_status(task)
+    if task.status == "running" then
+        return "running"
+    end
+    if task.status == "completed" then
+        return "done (exit " .. (task.exit_code or 0) .. ")"
+    end
+    if task.status == "failed" then
+        return task.exit_code and ("failed (exit " .. task.exit_code .. ")") or "failed"
+    end
+    if task.signal then
+        return "stopped (signal " .. task.signal .. ")"
+    end
+    return "stopped"
+end
+
+--- Duration header line: `running for mm:ss` while live, `ran for mm:ss ·
+--- ended <ago>` once terminal. nil when start_time is unknown.
+---@param task pi.Task
+---@param now_ms integer
+---@return string?
+local function preview_duration(task, now_ms)
+    if not task.start_time then
+        return nil
+    end
+    if task.status == "running" then
+        return "running for " .. format_duration(now_ms - task.start_time)
+    end
+    local stop = task.end_time or now_ms
+    local text = "ran for " .. format_duration(math.max(0, stop - task.start_time))
+    if task.end_time then
+        text = text .. " · ended " .. format_ago(now_ms - task.end_time)
+    end
+    return text
+end
+
+--- Compose the preview buffer: `$ command`, a blank, the id/status/pid line
+--- plus the optional duration and output path, then a blank and the tail. A
+--- `#<tab> · ` prefix marks only a task owned by another tab, matching the
+--- list rows.
+---@param task pi.Task
+---@param tail string[]?
+---@return string[] lines
+---@return integer[] meta 1-based line numbers rendered in PiTasksPreviewMeta
+local function preview_content(task, tail)
+    local lines = { "$ " .. (task.command or ""), "" }
+    local foreign = task.tab ~= nil and task.tab ~= current_tab()
+    local head = (foreign and ("#" .. task.tab .. " · ") or "") .. task.id
+    head = head .. " · " .. preview_status(task)
+    if task.pid then
+        head = head .. " · pid " .. task.pid
+    end
+    lines[#lines + 1] = head
+    local duration = preview_duration(task, uv.now())
+    if duration then
+        lines[#lines + 1] = duration
+    end
+    if task.output_file and task.output_file ~= "" then
+        lines[#lines + 1] = task.output_file
+    end
+    local meta = {}
+    for i = 3, #lines do
+        meta[#meta + 1] = i
+    end
+    if tail and #tail > 0 then
+        lines[#lines + 1] = ""
+        for _, line in ipairs(tail) do
+            lines[#lines + 1] = line
+        end
+    end
+    return lines, meta
+end
+
+--- Stop and close a preview's poll timer (no-op when none is armed).
+---@param list_win integer
+local function stop_preview_timer(list_win)
+    local state = preview_state[list_win]
+    if not state or not state.timer then
+        return
+    end
+    pcall(state.timer.stop, state.timer)
+    if not state.timer:is_closing() then
+        state.timer:close()
+    end
+    state.timer = nil
+end
+
+--- Rewrite the preview buffer from the latest task state and output tail.
+--- Keeps the window pinned to the bottom (tail -f style) while the old
+--- cursor sat on the last line or the float is unfocused.
+---@param list_win integer
+local function preview_render(list_win)
+    local state = preview_state[list_win]
+    local win = preview_wins[list_win]
+    if not state or not (win and vim.api.nvim_win_is_valid(win)) then
+        return
+    end
+    local task = Tasks.get(state.task_id)
+    if not task then
+        return
+    end
+    -- A nil read (file gone/unreadable) keeps the previous tail but still
+    -- refreshes the header.
+    local fresh = read_output_lines(state.path, PREVIEW_TAIL_LINES)
+    if fresh then
+        state.tail = fresh
+    end
+    local lines, meta = preview_content(task, state.tail)
+    local b = vim.api.nvim_win_get_buf(win)
+    local old_last = vim.api.nvim_buf_line_count(b)
+    local ok, cursor = pcall(vim.api.nvim_win_get_cursor, win)
+    local old_cursor = ok and cursor[1] or old_last
+    local had_focus = vim.api.nvim_get_current_win() == win
+    vim.bo[b].modifiable = true
+    vim.api.nvim_buf_set_lines(b, 0, -1, false, lines)
+    vim.bo[b].modifiable = false
+    vim.api.nvim_buf_clear_namespace(b, preview_ns, 0, -1)
+    for _, lnum in ipairs(meta) do
+        if lines[lnum] then
+            pcall(vim.api.nvim_buf_set_extmark, b, preview_ns, lnum - 1, 0, {
+                end_col = #lines[lnum],
+                hl_group = "PiTasksPreviewMeta",
+            })
+        end
+    end
+    if not had_focus or old_cursor >= old_last then
+        pcall(vim.api.nvim_win_set_cursor, win, { math.max(1, #lines), 0 })
+    else
+        -- The user scrolled away: keep their position but never past the end
+        -- when the rewrite shrank the buffer.
+        pcall(vim.api.nvim_win_set_cursor, win, { math.min(old_cursor, #lines), 0 })
+    end
+end
+
 ---@param list_win integer
 local function close_preview(list_win)
+    stop_preview_timer(list_win)
+    preview_state[list_win] = nil
     local preview = preview_wins[list_win]
     if preview and vim.api.nvim_win_is_valid(preview) then
         vim.api.nvim_win_close(preview, true)
@@ -724,7 +891,68 @@ local function close_preview(list_win)
     preview_wins[list_win] = nil
 end
 
---- Toggle the read-only output-tail preview float for the task under cursor.
+--- Watch a list window so its preview closes with it, registering the
+--- autocmd only once per window: repeated `p` opens used to stack a `once`
+--- watcher on the same list window each time.
+---@param list_win integer
+local function watch_list_win(list_win)
+    if
+        #vim.api.nvim_get_autocmds({ group = preview_augroup, event = "WinClosed", pattern = tostring(list_win) }) > 0
+    then
+        return
+    end
+    vim.api.nvim_create_autocmd("WinClosed", {
+        group = preview_augroup,
+        pattern = tostring(list_win),
+        once = true,
+        callback = function()
+            close_preview(list_win)
+        end,
+    })
+end
+
+--- One live-tail poll. Stops the timer when the float is gone or the task
+--- settles (after a final render); a vanished task keeps the old content.
+---@param list_win integer
+local function preview_tick(list_win)
+    local state = preview_state[list_win]
+    if not state then
+        return
+    end
+    local win = preview_wins[list_win]
+    if not (win and vim.api.nvim_win_is_valid(win)) then
+        close_preview(list_win)
+        return
+    end
+    local task = Tasks.get(state.task_id)
+    if not task then
+        stop_preview_timer(list_win)
+        return
+    end
+    preview_render(list_win)
+    if task.status ~= "running" then
+        stop_preview_timer(list_win)
+    end
+end
+
+--- Arm the 500ms live-tail poll (same shape as ensure_blink/ensure_spinner).
+---@param list_win integer
+local function start_preview_timer(list_win)
+    local state = preview_state[list_win]
+    if not state or state.timer then
+        return
+    end
+    state.timer = assert(uv.new_timer())
+    state.timer:start(
+        PREVIEW_POLL_MS,
+        PREVIEW_POLL_MS,
+        vim.schedule_wrap(function()
+            preview_tick(list_win)
+        end)
+    )
+end
+
+--- Toggle the read-only live preview float for the task under cursor.
 ---@param list_win integer
 local function toggle_preview(list_win)
     if not vim.api.nvim_win_is_valid(list_win) then
@@ -744,14 +972,13 @@ local function toggle_preview(list_win)
         Notify.warn("Task " .. task.id .. " has no output file")
         return
     end
-    local lines = read_output_lines(task.output_file, 200)
-    if not lines then
+    local tail = read_output_lines(task.output_file, PREVIEW_TAIL_LINES)
+    if not tail then
         Notify.warn("Cannot read output for task " .. task.id .. ": " .. task.output_file)
         return
     end
 
     local b = vim.api.nvim_create_buf(false, true)
-    vim.api.nvim_buf_set_lines(b, 0, -1, false, lines)
     pcall(vim.api.nvim_buf_set_name, b, "pi://task-preview/" .. task.id)
     vim.bo[b].buftype = "nofile"
     vim.bo[b].bufhidden = "wipe"
@@ -780,23 +1007,27 @@ local function toggle_preview(list_win)
     })
     vim.wo[win].winhighlight = list_winhighlight()
     vim.wo[win].wrap = false
-    pcall(vim.api.nvim_win_set_cursor, win, { math.max(1, #lines), 0 })
     preview_wins[list_win] = win
+    preview_state[list_win] = {
+        timer = nil,
+        task_id = task.id,
+        path = task.output_file,
+        tail = tail,
+    }
+    preview_render(list_win)
+    if task.status == "running" then
+        start_preview_timer(list_win)
+    end
 
     vim.api.nvim_create_autocmd("WinClosed", {
+        group = preview_augroup,
         pattern = tostring(win),
-        once = true,
-        callback = function()
-            preview_wins[list_win] = nil
-        end,
-    })
-    vim.api.nvim_create_autocmd("WinClosed", {
-        pattern = tostring(list_win),
         once = true,
         callback = function()
             close_preview(list_win)
         end,
     })
+    watch_list_win(list_win)
 end
 
 -- Stop (x) --------------------------------------------------------------------
@@ -855,7 +1086,7 @@ local function ensure_buf()
     end, vim.tbl_extend("force", map_opts, { desc = "Open the output and focus it" }))
     vim.keymap.set("n", "p", function()
         toggle_preview(vim.api.nvim_get_current_win())
-    end, vim.tbl_extend("force", map_opts, { desc = "Preview the output tail in a float" }))
+    end, vim.tbl_extend("force", map_opts, { desc = "Preview output live in a float (command + metadata header)" }))
     vim.keymap.set("n", "x", function()
         stop_under_cursor()
     end, vim.tbl_extend("force", map_opts, { desc = "Stop the task under the cursor" }))
@@ -1200,6 +1431,10 @@ function M._reset()
     end
     for list_win in pairs(preview_wins) do
         close_preview(list_win)
+    end
+    for list_win in pairs(preview_state) do
+        stop_preview_timer(list_win)
+        preview_state[list_win] = nil
     end
     if buf and vim.api.nvim_buf_is_valid(buf) then
         pcall(vim.api.nvim_buf_delete, buf, { force = true })

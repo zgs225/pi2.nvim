@@ -151,13 +151,13 @@ From the panel (all buffer-local, only inside the tasks list):
 | --- | --- |
 | `<CR>` / `o` | Open this task's output in a vsplit (cursor stays in the list) |
 | `a` / `i` | Open the output and focus it |
-| `p` | Preview the output tail (200 lines) in a float; `p` again closes it |
+| `p` | Preview the output live in a float; `p` again closes it |
 | `x` | Stop the task under the cursor (confirms, then SIGTERM) |
 | `R` | Redraw the list |
 | `q` | Close the panel |
 | `?` | Toggle a help overlay listing these keys |
 
-Output views are read-only (`pi-task-output` filetype, `q` closes) and tail-read large outputs: files over 256 KB are read from the end, capped at 10000 lines. Stopping a task sends SIGTERM to the recorded pid; the authoritative `stopped` state arrives from the backend's own event, so the row updates even if you stop it elsewhere. Task state lives in memory only — it is not persisted, so tasks from past sessions don't survive a Neovim restart.
+Output views are read-only (`pi-task-output` filetype, `q` closes) and tail-read large outputs: files over 256 KB are read from the end, capped at 10000 lines. The `p` preview opens a live float for the task under the cursor: a header shows the full command (`$ …`) over a dimmed metadata block — id, status (with exit code/signal once terminal), pid, a `running for mm:ss` clock that becomes `ran for mm:ss · ended … ago`, and the output path — followed by the output tail (up to 1000 lines). While the task runs the tail is re-read every 500 ms and the view follows the newest line (the cursor sticks to the bottom only when it was already there, or the float is unfocused); a terminal status updates the header one last time and then the preview freezes. Stopping a task sends SIGTERM to the recorded pid; the authoritative `stopped` state arrives from the backend's own event, so the row updates even if you stop it elsewhere. Task state lives in memory only — it is not persisted, so tasks from past sessions don't survive a Neovim restart.
 
 Whenever a task reaches a terminal state — completed, failed, or stopped — the extension wakes the agent, which reports the outcome in the chat; the panel row updates in place at the same moment. Panel placement and sizing are configured under [`tasks_panel`](configuration.md); the colors are the [`PiTasksList*`](highlight-groups.md#background-tasks-panel) highlight groups.
 
