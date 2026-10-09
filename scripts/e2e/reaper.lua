@@ -9,6 +9,8 @@
 --   S2  reaping disabled, max_children=1: settled child stays resident; a second
 --       spawn auto-reaps it (dormant/closed) and succeeds.
 --   S2b active (unsettled) child blocks a new spawn under max_children=1.
+--   S2c max_children=1: revive dormant child auto-reaps completed-but-alive child.
+--   S2d max_children=1: active child blocks revive of a dormant child.
 --
 -- Needs the pi binary + a configured provider, so it is NOT part of `make test`
 -- or CI. Run from the repo root:
@@ -390,6 +392,150 @@ local function scenario_s2b(parent, report)
     step("S2b child-1 closed")
 end
 
+--- S2c: max_children=1 — reviving a dormant child auto-reaps a completed-but-alive child.
+---@param parent table
+---@param report table
+local function scenario_s2c(parent, report)
+    apply_subagent_cfg({ reap_after_minutes = 0, max_children = 1 })
+    step("S2c config reap_after_minutes=0 max_children=1")
+
+    -- 1. Create a dormant child (c_dormant): spawn -> settle -> close
+    local c_dormant, e_dormant = spawn_child(parent)
+    check(c_dormant ~= nil, "S2c: dormant child spawn failed: " .. tostring(e_dormant))
+    local pid_d = record_child(report, c_dormant)
+    check(pid_d ~= nil, "S2c: could not read dormant child pid")
+    wait_settled(c_dormant.id, 180)
+    check(manifest_status(c_dormant.id) == "completed", "S2c: dormant candidate not completed", {
+        status = manifest_status(c_dormant.id),
+    })
+    local dormant_id = c_dormant.id
+    local closed_ok = Subsessions.close(dormant_id)
+    check(closed_ok, "S2c: close did not stop dormant candidate")
+    wait_os_dead(pid_d, 15000)
+    check(manifest_status(dormant_id) == "dormant", "S2c: candidate not dormant after close", {
+        status = manifest_status(dormant_id),
+    })
+    step("S2c dormant child prepared (dormant + dead)")
+
+    -- 2. Create a completed-but-alive child (c_completed): spawn -> settle (reaping disabled so it stays resident)
+    local c_completed, e_completed = spawn_child(parent)
+    check(c_completed ~= nil, "S2c: completed child spawn failed: " .. tostring(e_completed))
+    local pid_c = record_child(report, c_completed)
+    check(pid_c ~= nil, "S2c: could not read completed child pid")
+    wait_settled(c_completed.id, 180)
+    check(manifest_status(c_completed.id) == "completed", "S2c: completed child not completed after settle", {
+        status = manifest_status(c_completed.id),
+    })
+    check(c_completed.rpc:is_running() == true and os_alive(pid_c), "S2c: completed child not resident after settle")
+    step("S2c completed child prepared (completed + alive)")
+
+    -- 3. Revive dormant_id: max_children=1 must auto-reap c_completed to free the slot
+    local revived, rerr
+    Subsessions.revive(dormant_id, function(s, e)
+        revived, rerr = s, e
+    end)
+    local got = vim.wait(30000, function()
+        return revived ~= nil or rerr ~= nil
+    end, 50)
+    check(got and revived ~= nil, "S2c: revive failed to auto-reap completed child: " .. tostring(rerr or "timeout"))
+    check(manifest_status(c_completed.id) == "dormant", "S2c: completed child not dormant after auto-reap", {
+        status = manifest_status(c_completed.id),
+    })
+    local dead_c = wait_os_dead(pid_c, 15000)
+    check(dead_c and not os_alive(pid_c), "S2c: completed child OS process survived auto-reap", { pid = pid_c })
+    check(c_completed.rpc:is_running() == false, "S2c: completed child rpc still running after auto-reap")
+    check(Sessions.get_by_id(c_completed.id) == nil, "S2c: completed child still registered after auto-reap")
+
+    local nrpc = revived.rpc
+    check(nrpc:is_running() == true, "S2c: revived process not running")
+    local npid = rpc_pid(nrpc)
+    check(npid ~= nil and npid ~= pid_d, "S2c: revived pid invalid or reused", { old = pid_d, new = npid })
+    report.pids[#report.pids + 1] = npid
+    check(os_alive(npid), "S2c: revived process not alive at OS level", { pid = npid })
+    check(manifest_status(dormant_id) == "active", "S2c: manifest not active after revive", {
+        status = manifest_status(dormant_id),
+    })
+    step("S2c revive succeeded; completed child auto-reaped (dormant + dead)")
+
+    local stopped = Subsessions.close(dormant_id)
+    check(stopped, "S2c: close did not stop revived child")
+    wait_os_dead(npid, 15000)
+    step("S2c revived child closed")
+end
+
+--- S2d: max_children=1 — reviving a dormant child is rejected when an active child is running.
+---@param parent table
+---@param report table
+local function scenario_s2d(parent, report)
+    apply_subagent_cfg({ reap_after_minutes = 0, max_children = 1 })
+    step("S2d config reap_after_minutes=0 max_children=1")
+
+    -- 1. Create a dormant child (c_dormant): spawn -> settle -> close
+    local c_dormant, e_dormant = spawn_child(parent)
+    check(c_dormant ~= nil, "S2d: dormant child spawn failed: " .. tostring(e_dormant))
+    local pid_d = record_child(report, c_dormant)
+    check(pid_d ~= nil, "S2d: could not read dormant child pid")
+    wait_settled(c_dormant.id, 180)
+    check(manifest_status(c_dormant.id) == "completed", "S2d: dormant candidate not completed", {
+        status = manifest_status(c_dormant.id),
+    })
+    local dormant_id = c_dormant.id
+    local closed_ok = Subsessions.close(dormant_id)
+    check(closed_ok, "S2d: close did not stop dormant candidate")
+    wait_os_dead(pid_d, 15000)
+    check(manifest_status(dormant_id) == "dormant", "S2d: candidate not dormant after close", {
+        status = manifest_status(dormant_id),
+    })
+    step("S2d dormant child prepared (dormant + dead)")
+
+    -- 2. Spawn an active child (c_active): task in flight
+    local c_active, e_active = spawn_child(parent)
+    check(c_active ~= nil, "S2d: active child spawn failed: " .. tostring(e_active))
+    local pid_a = record_child(report, c_active)
+    check(pid_a ~= nil, "S2d: could not read active child pid")
+    check(manifest_status(c_active.id) == "active", "S2d: active child not active after spawn", {
+        status = manifest_status(c_active.id),
+    })
+    step("S2d active child running (task in flight)")
+
+    -- 3. Attempt to revive dormant_id while c_active is running: must be rejected
+    local before = #Sessions.list_all()
+    local revived, rerr
+    Subsessions.revive(dormant_id, function(s, e)
+        revived, rerr = s, e
+    end)
+    local got = vim.wait(5000, function()
+        return revived ~= nil or rerr ~= nil
+    end, 50)
+    check(got, "S2d: revive callback never fired")
+    check(revived == nil, "S2d: revive while child is active unexpectedly succeeded", {
+        id = revived ~= nil and revived.id or nil,
+    })
+    check(type(rerr) == "string" and rerr:find("max 1", 1, true) ~= nil, "S2d: error lacks 'max 1'", { err = rerr })
+    check(rerr:find("concurrent sub-sessions", 1, true) ~= nil, "S2d: error lacks 'concurrent sub-sessions'", {
+        err = rerr,
+    })
+    check(#Sessions.list_all() == before, "S2d: capped revive leaked a registry session", {
+        before = before,
+        after = #Sessions.list_all(),
+    })
+    check(c_active.rpc:is_running() == true and os_alive(pid_a), "S2d: active child died when capped revive failed")
+    check(manifest_status(dormant_id) == "dormant", "S2d: dormant child status changed despite revive failure")
+    print(("[S2d] capped revive rejected while active: %s"):format(rerr))
+    step("S2d max_children=1 enforced on revive (active child holds the slot)")
+
+    wait_settled(c_active.id, 180)
+    check(manifest_status(c_active.id) == "completed", "S2d: active child not completed after settle", {
+        status = manifest_status(c_active.id),
+    })
+    step("S2d active child settled")
+
+    local stopped = Subsessions.close(c_active.id)
+    check(stopped, "S2d: close did not stop active child")
+    wait_os_dead(pid_a, 15000)
+    step("S2d active child closed")
+end
+
 --- Always-run teardown: kill every spawned process, remove our session files,
 --- restore the manifest to its pre-run snapshot, stop timers/singletons.
 ---@param report table
@@ -512,6 +658,8 @@ local ok, failure = pcall(function()
     scenario_s1(parent, report)
     scenario_s2(parent, report)
     scenario_s2b(parent, report)
+    scenario_s2c(parent, report)
+    scenario_s2d(parent, report)
 end)
 
 local notes = cleanup(report, manifest_path, manifest_snapshot)
@@ -527,7 +675,7 @@ if not ok then
 end
 
 print(
-    ("PASS: reaper e2e OK — S1 spawn/settle/reap/revive/close, S2 auto-reap on max_children, S2b active blocks spawn (in %.2fs)"):format(
+    ("PASS: reaper e2e OK — S1 spawn/settle/reap/revive/close, S2 auto-reap on max_children, S2b active blocks spawn, S2c revive auto-reap, S2d active blocks revive (in %.2fs)"):format(
         total
     )
 )

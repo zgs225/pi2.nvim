@@ -2,6 +2,7 @@
 -- that session file (pi aborts the agent on every switch_session).
 
 local Config = require("pi.config")
+local Manifest = require("pi.subsessions.manifest")
 local Sessions = require("pi.sessions.manager")
 local Subsessions = require("pi.subsessions")
 local Read = require("pi.subsessions.read")
@@ -168,6 +169,8 @@ describe("subsession view-switch without abort", function()
     local find_paths
     local tab
     local chat
+    local manifest_tmp
+    local real_manifest_path
 
     before_each(function()
         Config.setup({})
@@ -181,6 +184,12 @@ describe("subsession view-switch without abort", function()
         end
         tab = vim.api.nvim_get_current_tabpage()
         chat = stub_chat()
+        manifest_tmp = vim.fn.tempname() .. "-manifest.json"
+        real_manifest_path = Manifest.path
+        Manifest.path = function()
+            return manifest_tmp
+        end
+        Manifest._reset()
     end)
 
     after_each(function()
@@ -189,6 +198,9 @@ describe("subsession view-switch without abort", function()
         Sessions.load_session_path = real_load
         Subsessions.on_parent_resumed = real_resumed
         Sessions._reset()
+        Manifest.path = real_manifest_path
+        Manifest._reset()
+        os.remove(manifest_tmp)
         Config.setup({})
     end)
 
@@ -432,6 +444,16 @@ describe("subsession view-switch without abort", function()
             return revived
         end
         find_paths["dormant-id"] = "/tmp/dormant.jsonl"
+        Manifest.upsert("dormant-id", {
+            parent_id = "parent-id",
+            name = "worker",
+            task_prompt = "t",
+            config = {},
+            status = "dormant",
+            reported = false,
+            created_at = Manifest.iso_now(),
+            last_active_at = Manifest.iso_now(),
+        })
 
         local result
         Subsessions.revive("dormant-id", function(session)
