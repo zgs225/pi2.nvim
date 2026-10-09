@@ -30,13 +30,17 @@
  *       the panel on "running" for the whole remainder of a streaming run
  *       (followUp is drained only at run end, and not at all when a run
  *       exits via abort/error).
- *    2. the wake report with `{ triggerTurn: true, deliverAs: "followUp" }` —
- *       core's convertToLlm maps custom messages to user-role context, so
- *       the report text reaches the LLM and wakes the agent after the
- *       current run. A `context` handler registered at load time is the
- *       fallback injector for wake reports that could not be delivered
- *       (e.g. stale extension ctx after reload); it reads the module-level
- *       task table and marks deliveries so nothing is injected twice.
+ *    2. the wake report with `{ triggerTurn: true }` — without `deliverAs`,
+ *       core steers active runs so the report is delivered mid-run at the
+ *       next turn boundary rather than queued until settle time (idle agents
+ *       wake immediately). Steered custom messages map to user context and
+ *       persist in the session transcript. The load-time `context` handler
+ *       remains the fallback injector for reports whose send threw; it reads
+ *       the module-level task table and marks deliveries so nothing is
+ *       injected twice. (An abort that discards the steering queue before it
+ *       drains loses the report — the same exposure the previous followUp
+ *       design had; `delivered` is set at send time, so the context handler
+ *       cannot back-fill that case.)
  *  - A process.on("exit") hook SIGKILLs every tracked background process group
  *    best-effort, mirroring core's killTrackedDetachedChildren (that helper is
  *    not exported from the package root, so we track pids ourselves).
@@ -344,11 +348,16 @@ export default function bgTasks(pi: ExtensionAPI) {
 	 *    remainder of a streaming run, and a run exiting via abort/error never
 	 *    drains the followUp queue at all.
 	 *
-	 * 2. Wake report with `{ triggerTurn: true, deliverAs: "followUp" }`: maps
-	 *    to user-role context (convertToLlm) and starts a new turn once the
-	 *    current run finishes. `task.delivered` tracks THIS message only (it
-	 *    reflects "the agent has been notified with the full report"); the
-	 *    context handler above back-fills any wake that threw instead.
+	 * 2. Wake report with `{ triggerTurn: true }`: dropping `deliverAs` steers
+	 *    the active run so the report delivers mid-run at the next turn
+	 *    boundary instead of waiting for the entire run to settle (followUp
+	 *    was the old behavior that caused end-of-run notification bursts).
+	 *    Idle agents wake immediately. Steered messages persist in the
+	 *    transcript. `task.delivered` tracks THIS message only; the `context`
+	 *    handler above back-fills any report whose send threw. (A report
+	 *    already queued when an abort discards the steering queue is lost —
+	 *    same as the previous followUp design — because `delivered` is set at
+	 *    send time.)
 	 */
 	function reportCompletion(task: BgTaskState): void {
 		if (task.delivered) {
@@ -385,7 +394,8 @@ export default function bgTasks(pi: ExtensionAPI) {
 			// Stale ctx after reload: the panel keeps its last known state; the
 			// wake path below still refreshes it when deliverable.
 		}
-		// 2. Wake the agent with the full report once the current run finishes.
+		// 2. Wake the agent with the full report (steered mid-run at turn boundary,
+		// or starting a new turn immediately if idle).
 		try {
 			pi.sendMessage(
 				{
@@ -394,7 +404,7 @@ export default function bgTasks(pi: ExtensionAPI) {
 					display: false,
 					details,
 				},
-				{ triggerTurn: true, deliverAs: "followUp" },
+				{ triggerTurn: true },
 			);
 			task.delivered = true;
 		} catch {
