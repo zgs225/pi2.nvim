@@ -24,7 +24,7 @@ What the plugin does bind on its own:
 | --- | --- |
 | `<CR>` / `o` | Open this task's output in a vsplit (cursor stays in the list) |
 | `a` / `i` | Open the output and focus it |
-| `p` | Preview the output tail in a float; press `p` again to close |
+| `p` | Preview the output live in a float (command + metadata header); press `p` again to close |
 | `x` | Stop the task under the cursor (asks for confirmation first) |
 | `A` | Toggle between the current session's tasks (default) and all sessions' tasks |
 | `R` | Redraw the list |

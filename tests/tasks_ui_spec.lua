@@ -643,6 +643,67 @@ describe("tasks panel UI", function()
         end)
     end)
 
+    describe("registry merge", function()
+        --- Feed a bg-task lifecycle event through the session manager's real
+        --- event path for a fake session attached to the current tab.
+        ---@param details table
+        local function feed(details)
+            Manager.handle_event({ id = "sess-merge", attached_tab = vim.api.nvim_get_current_tabpage() }, {
+                type = "message_start",
+                message = {
+                    role = "custom",
+                    customType = "pi2_bg_task",
+                    timestamp = 1_700_000_000_000,
+                    details = details,
+                },
+            })
+        end
+
+        it("merges the full completion payload into a synthesized task", function()
+            feed({
+                kind = "completed",
+                taskId = "m1",
+                command = "make build",
+                pid = 777,
+                outputFile = "/tmp/m1.log",
+                exitCode = 0,
+                signal = "SIGTERM",
+            })
+            local task = Tasks.get("m1")
+            assert.is_not_nil(task)
+            assert.are.equal("completed", task.status)
+            assert.are.equal("make build", task.command)
+            assert.are.equal(777, task.pid)
+            assert.are.equal("/tmp/m1.log", task.output_file)
+            assert.are.equal(0, task.exit_code)
+            assert.are.equal("SIGTERM", task.signal)
+        end)
+
+        it("falls back to exit 1 when a failed event carries a JSON-null exitCode", function()
+            feed({ kind = "failed", taskId = "m2", exitCode = vim.NIL, signal = nil })
+            assert.are.equal(1, Tasks.get("m2").exit_code)
+        end)
+
+        it("still merges a stopped payload after a local mark_stopped", function()
+            feed({ kind = "started", taskId = "m3", command = "sleep 1" })
+            local local_end = now_ms() - 1_000
+            assert.is_true(Tasks.mark_stopped("m3", local_end))
+            feed({
+                kind = "stopped",
+                taskId = "m3",
+                pid = 5,
+                signal = "SIGTERM",
+                exitCode = vim.NIL,
+            })
+            local task = Tasks.get("m3")
+            assert.are.equal("stopped", task.status)
+            assert.are.equal("SIGTERM", task.signal)
+            assert.is_nil(task.exit_code)
+            assert.are.equal(5, task.pid)
+            assert.are.equal(local_end, task.end_time, "local mark_stopped end_time is preserved")
+        end)
+    end)
+
     describe("close_tab", function()
         it("closes another tab's panel without stealing focus", function()
             Panel.open()
@@ -868,14 +929,14 @@ describe("tasks panel UI", function()
             vim.fn.delete(path)
         end)
 
-        it("p toggles a focusable centered preview float with the output tail", function()
+        it("p toggles a focusable centered preview float with a header and output tail", function()
             local path = vim.fn.tempname()
             local lines = {}
             for i = 1, 300 do
                 lines[i] = "line " .. i
             end
             vim.fn.writefile(lines, path)
-            seed({ id = "run1", output_file = path })
+            seed({ id = "run1", command = "make test", output_file = path })
             Panel.open()
             vim.api.nvim_set_current_win(Panel.win(vim.api.nvim_get_current_tabpage()))
 
@@ -888,13 +949,208 @@ describe("tasks panel UI", function()
             local title = type(cfg.title) == "table" and cfg.title[1][1] or tostring(cfg.title)
             assert.is_truthy(title:find("run1", 1, true))
             local buf_lines = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(preview), 0, -1, false)
-            assert.are.equal(200, #buf_lines, "preview shows only the tail")
+            -- Header: `$ command`, blank, id/status line, duration, output path,
+            -- blank; the 300-line file fits under the 1000-line cap in full.
+            assert.are.equal("$ make test", buf_lines[1])
+            assert.is_truthy(buf_lines[3]:find("run1", 1, true), "metadata line carries the id")
+            assert.is_truthy(buf_lines[3]:find("running", 1, true), "metadata line carries the status")
+            assert.are.equal(6 + 300, #buf_lines, "header plus the full output tail")
             assert.are.equal("line 300", buf_lines[#buf_lines])
 
             -- Preview float is per list window: toggle the same key to close.
             vim.api.nvim_set_current_win(Panel.win(vim.api.nvim_get_current_tabpage()))
             press("p")
             assert.is_nil(find_win_by_name("pi://task-preview/run1"))
+
+            vim.fn.delete(path)
+        end)
+
+        it("p renders a metadata header for a finished task and never polls", function()
+            local path = vim.fn.tempname()
+            vim.fn.writefile({ "hello", "world" }, path)
+            local start = now_ms() - 12_000
+            seed({
+                id = "done1",
+                command = "make build",
+                status = "completed",
+                exit_code = 0,
+                pid = 4321,
+                start_time = start,
+                end_time = start + 12_000,
+                output_file = path,
+            })
+            Panel.open()
+            vim.api.nvim_set_current_win(Panel.win(vim.api.nvim_get_current_tabpage()))
+
+            press("p")
+            local preview = find_win_by_name("pi://task-preview/done1")
+            assert.is_not_nil(preview)
+            local b = vim.api.nvim_win_get_buf(preview)
+            local lines = vim.api.nvim_buf_get_lines(b, 0, -1, false)
+            assert.are.equal("$ make build", lines[1])
+            assert.is_truthy(lines[3]:find("done1", 1, true), "meta line carries the id")
+            assert.is_truthy(lines[3]:find("done (exit 0)", 1, true), "meta line carries the exit status")
+            assert.is_truthy(lines[3]:find("pid 4321", 1, true), "meta line carries the pid")
+            local text = table.concat(lines, "\n")
+            assert.is_truthy(text:find(path, 1, true), "meta header shows the output path")
+            assert.are.equal("world", lines[#lines], "tail rendered under the header")
+
+            -- A terminal task never arms the poll: even appending to the file
+            -- leaves the buffer byte-for-byte unchanged.
+            local frozen = table.concat(lines, "\n")
+            local f = io.open(path, "a")
+            assert.is_not_nil(f)
+            f:write("late line\n")
+            f:close()
+            vim.wait(1500, function()
+                return false
+            end, 50)
+            local after = table.concat(vim.api.nvim_buf_get_lines(b, 0, -1, false), "\n")
+            assert.are.equal(frozen, after, "finished preview is static")
+
+            vim.fn.delete(path)
+        end)
+
+        it("renders a stopped task's signal in the preview header", function()
+            local path = vim.fn.tempname()
+            vim.fn.writefile({ "bye" }, path)
+            seed({
+                id = "stop1",
+                command = "sleep 100",
+                status = "stopped",
+                pid = 9,
+                signal = "SIGTERM",
+                start_time = now_ms() - 3_000,
+                end_time = now_ms() - 1_000,
+                output_file = path,
+            })
+            Panel.open()
+            vim.api.nvim_set_current_win(Panel.win(vim.api.nvim_get_current_tabpage()))
+
+            press("p")
+            local preview = find_win_by_name("pi://task-preview/stop1")
+            assert.is_not_nil(preview)
+            local lines = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(preview), 0, -1, false)
+            assert.is_truthy(lines[3]:find("stopped (signal SIGTERM)", 1, true), "header shows the stop signal")
+
+            vim.fn.delete(path)
+        end)
+
+        it("p follows a running task's output live and freezes once it settles", function()
+            local path = vim.fn.tempname()
+            vim.fn.writefile({ "first" }, path)
+            local start = now_ms() - 5_000
+            seed({
+                id = "live1",
+                command = "tail -f log",
+                status = "running",
+                start_time = start,
+                output_file = path,
+            })
+            Panel.open()
+            vim.api.nvim_set_current_win(Panel.win(vim.api.nvim_get_current_tabpage()))
+
+            press("p")
+            local preview = find_win_by_name("pi://task-preview/live1")
+            assert.is_not_nil(preview)
+
+            -- Append a line; the 500ms poll should pick it up.
+            local f = io.open(path, "a")
+            assert.is_not_nil(f)
+            f:write("appended live\n")
+            f:close()
+
+            local followed = vim.wait(2000, function()
+                if not vim.api.nvim_win_is_valid(preview) then
+                    return true
+                end
+                local ls = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(preview), 0, -1, false)
+                return ls[#ls] == "appended live"
+            end, 50)
+            assert.is_true(followed, "poll picked up the appended output")
+            local followed_lines = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(preview), 0, -1, false)
+            assert.are.equal(#followed_lines, vim.api.nvim_win_get_cursor(preview)[1], "cursor follows the tail")
+
+            -- Settle the task: the header flips to done, then the poll stops.
+            Tasks.upsert({
+                id = "live1",
+                command = "tail -f log",
+                status = "completed",
+                start_time = start,
+                end_time = now_ms(),
+                exit_code = 0,
+                output_file = path,
+            })
+            local updated = vim.wait(2000, function()
+                local ls = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(preview), 0, -1, false)
+                return ls[3] ~= nil and ls[3]:find("done (exit 0)", 1, true) ~= nil
+            end, 50)
+            assert.is_true(updated, "terminal render shows the exit status")
+
+            -- With the poll stopped the buffer no longer changes.
+            local frozen =
+                table.concat(vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(preview), 0, -1, false), "\n")
+            vim.fn.writefile({ "first", "appended live", "after settle" }, path)
+            vim.wait(1500, function()
+                return false
+            end, 50)
+            local after =
+                table.concat(vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(preview), 0, -1, false), "\n")
+            assert.are.equal(frozen, after, "content frozen once the task settles")
+
+            vim.fn.delete(path)
+        end)
+
+        it("keeps a scrolled cursor in place on live updates", function()
+            local path = vim.fn.tempname()
+            vim.fn.writefile({ "first", "second", "third" }, path)
+            local start = now_ms() - 5_000
+            seed({
+                id = "scroll1",
+                command = "tail -f log",
+                status = "running",
+                start_time = start,
+                output_file = path,
+            })
+            Panel.open()
+            vim.api.nvim_set_current_win(Panel.win(vim.api.nvim_get_current_tabpage()))
+
+            press("p")
+            local preview = find_win_by_name("pi://task-preview/scroll1")
+            assert.is_not_nil(preview)
+
+            -- Park the cursor on line 1: the live tail must still refresh
+            -- without yanking it back to the bottom.
+            vim.api.nvim_win_set_cursor(preview, { 1, 0 })
+            local f = io.open(path, "a")
+            assert.is_not_nil(f)
+            f:write("appended scrolled\n")
+            f:close()
+
+            local updated = vim.wait(2000, function()
+                local ls = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(preview), 0, -1, false)
+                for _, line in ipairs(ls) do
+                    if line == "appended scrolled" then
+                        return true
+                    end
+                end
+                return false
+            end, 50)
+            assert.is_true(updated, "live tail still picked up the new line")
+            assert.are.equal(1, vim.api.nvim_win_get_cursor(preview)[1], "scrolled cursor is not pulled to the bottom")
+
+            -- Settle the task so the poll stops before the spec ends.
+            Tasks.upsert({
+                id = "scroll1",
+                command = "tail -f log",
+                status = "stopped",
+                start_time = start,
+                end_time = now_ms(),
+                output_file = path,
+            })
+            vim.wait(1000, function()
+                return false
+            end, 50)
 
             vim.fn.delete(path)
         end)

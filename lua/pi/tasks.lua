@@ -16,6 +16,7 @@ local M = {}
 ---@field start_time integer   ms timestamp (from the event payload)
 ---@field end_time integer|nil ms timestamp
 ---@field exit_code integer|nil
+---@field signal string|nil
 ---@field output_file string|nil
 ---@field pid integer|nil
 ---@field session_id string?  owning session id (passed in at event routing; nil = unknown ownership)
@@ -162,16 +163,73 @@ function M.build_rows(now_ms)
     return rows
 end
 
+--- Drop a JSON null (`vim.NIL`, which is truthy in Lua) down to nil so an
+--- `x or fallback` / `if x == nil` test behaves as intended; other values
+--- pass through untouched.
+---@param value any
+---@return any
+local function non_null(value)
+    if value == vim.NIL then
+        return nil
+    end
+    return value
+end
+
+--- Adopt the payload's output path when the record has none yet. A JSON
+--- null decodes to the truthy vim.NIL, which must not be stored as a path.
+---@param current string|nil
+---@param value any
+---@return string|nil
+local function merge_output_file(current, value)
+    if current ~= nil then
+        return current
+    end
+    if value == nil or value == vim.NIL then
+        return nil
+    end
+    return value
+end
+
+--- Idempotently fill the fields a terminal payload carries onto an existing
+--- record: only nil fields are adopted, so an earlier event (or a local stop
+--- via mark_stopped) is never clobbered. JSON nulls are normalized away.
+---@param task pi.Task
+---@param d table
+---@return boolean changed whether any field was newly adopted
+local function merge_terminal_fields(task, d)
+    local changed = false
+    local output_file = merge_output_file(task.output_file, d.outputFile)
+    if output_file ~= task.output_file then
+        task.output_file = output_file
+        changed = true
+    end
+    if task.pid == nil then
+        local pid = non_null(d.pid)
+        if pid ~= nil then
+            task.pid = pid
+            changed = true
+        end
+    end
+    if task.signal == nil then
+        local signal = non_null(d.signal)
+        if signal ~= nil then
+            task.signal = signal
+            changed = true
+        end
+    end
+    return changed
+end
+
 --- Consume a pi2_bg_task event. Recognized events update the registry and
 --- return true; anything else returns false with no side effects. Ownership
 --- (session_id/tab) is stamped onto NEW records only (started, and the
 --- synthesized record for a terminal event on an unknown task); terminal
 --- and stopped events for an existing task never rewrite its owner.
 --- Payload shapes (extension JS contract, in ev.details):
----   {kind="started",  taskId, command, pid?, outputFile?}
----   {kind="completed", taskId, exitCode?}
----   {kind="failed",   taskId, exitCode?}
----   {kind="stopped",  taskId, exitCode?}
+---   {kind="started",   taskId, command, pid?, outputFile?}
+---   {kind="completed", taskId, command?, pid?, outputFile?, exitCode?, signal?}
+---   {kind="failed",    taskId, command?, pid?, outputFile?, exitCode?, signal?}
+---   {kind="stopped",   taskId, command?, pid?, outputFile?, exitCode?, signal?}
 ---@param ev table
 ---@param session_id string? Owning session id (event routing; nil = unknown ownership)
 ---@param tab integer? Owning tabpage handle (panel display)
@@ -194,11 +252,11 @@ function M.handle_event(ev, session_id, tab)
         ---@type pi.Task
         local task = {
             id = id,
-            command = d.command or "",
+            command = non_null(d.command) or "",
             status = "running",
             start_time = ts,
-            pid = d.pid,
-            output_file = d.outputFile,
+            pid = non_null(d.pid),
+            output_file = merge_output_file(nil, d.outputFile),
             session_id = session_id,
             tab = tab,
         }
@@ -208,14 +266,17 @@ function M.handle_event(ev, session_id, tab)
     end
 
     if d.kind == "completed" or d.kind == "failed" then
+        -- A JSON null decodes to vim.NIL, which is truthy: a bare
+        -- `d.exitCode or fallback` would keep the NIL instead of falling back.
+        local exit_code = non_null(d.exitCode)
+        ---@type pi.Task
         local task = store[id]
         if not task then
             -- Terminal event for a task we never saw start: synthesize a
             -- minimal record so the panel reflects reality.
-            ---@type pi.Task
             task = {
                 id = id,
-                command = d.command or "",
+                command = non_null(d.command) or "",
                 status = "running",
                 start_time = ts,
                 session_id = session_id,
@@ -223,22 +284,36 @@ function M.handle_event(ev, session_id, tab)
             }
             store[id] = task
         end
+        -- Merge outside any status guard: a locally-stopped task still gets the
+        -- payload's output path/pid/signal.
+        merge_terminal_fields(task, d)
         task.status = d.kind
         task.end_time = ts
-        task.exit_code = d.exitCode or (d.kind == "completed" and 0 or 1)
+        task.exit_code = exit_code or (d.kind == "completed" and 0 or 1)
         M.request_refresh()
         return true
     end
 
     if d.kind == "stopped" then
-        -- Idempotent: only a currently-running task transitions. A repeat
-        -- stopped event (or one for an unknown/already-finished task) is
-        -- recognized but changes nothing.
+        -- The `x` panel key marks a task stopped locally before the backend's
+        -- stopped event arrives, so the field merge must run for an already
+        -- stopped (or any existing) record too — the status guard below must
+        -- not gate it. A local stop keeps its mark_stopped end_time.
+        ---@type pi.Task
         local task = store[id]
-        if task and task.status == "running" then
+        if not task then
+            return true
+        end
+        local changed = merge_terminal_fields(task, d)
+        -- The transition (and only the transition) stamps exit_code/end_time:
+        -- a repeat stopped event is idempotent and must not add either.
+        if task.status == "running" then
             task.status = "stopped"
             task.end_time = ts
-            task.exit_code = d.exitCode
+            task.exit_code = non_null(d.exitCode)
+            changed = true
+        end
+        if changed then
             M.request_refresh()
         end
         return true
