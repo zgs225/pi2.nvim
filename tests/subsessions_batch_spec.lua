@@ -1,7 +1,10 @@
 -- Sub-session batch dispatch / poll / wait.
 
 local Batch = require("pi.subsessions.batch")
+local Config = require("pi.config")
 local Manifest = require("pi.subsessions.manifest")
+local Reaper = require("pi.subsessions.reaper")
+local Sessions = require("pi.sessions.manager")
 
 describe("subsession batch", function()
     local batch_tmp
@@ -10,6 +13,7 @@ describe("subsession batch", function()
     local real_revive
     local real_close
     local real_manifest_path
+    local real_subagent_opts
     local Subsessions
 
     before_each(function()
@@ -25,13 +29,19 @@ describe("subsession batch", function()
         real_spawn = Subsessions.spawn
         real_revive = Subsessions.revive
         real_close = Subsessions.close
+        real_subagent_opts = vim.deepcopy(Config.options.subagent)
         Manifest._reset()
+        Sessions._reset()
+        Reaper._reset()
     end)
 
     after_each(function()
         Subsessions.spawn = real_spawn
         Subsessions.revive = real_revive
         Subsessions.close = real_close
+        Config.options.subagent = real_subagent_opts
+        Sessions._reset()
+        Reaper._reset()
         os.remove(batch_tmp)
         os.remove(manifest_tmp)
         Batch._reset()
@@ -830,6 +840,122 @@ describe("subsession batch", function()
             local res = dispatch({ item })
             assert.is_nil(res.batch_id)
             assert.is_truthy(res.error and res.error:find("`model`", 1, true))
+        end)
+    end)
+
+    describe("dispatch concurrency limit and auto-reap", function()
+        local parent
+
+        before_each(function()
+            Config.options.subagent = vim.tbl_deep_extend("force", vim.deepcopy(Config.options.subagent or {}), {
+                enabled = true,
+                max_children = 1,
+            })
+            parent = {
+                id = "parent-limit-test",
+                rpc = {
+                    is_running = function()
+                        return true
+                    end,
+                },
+            }
+            Subsessions.spawn = function(_p, opts, cb)
+                cb({
+                    id = "child-" .. (opts.name or "x"),
+                    rpc = {
+                        is_running = function()
+                            return true
+                        end,
+                    },
+                }, nil)
+            end
+        end)
+
+        it("auto-reaps a completed-but-alive child to admit dispatch", function()
+            Manifest.upsert("child-completed", {
+                parent_id = "parent-limit-test",
+                parent_epoch = 0,
+                name = "worker-1",
+                task_prompt = "first task",
+                config = {},
+                status = "completed",
+                reported = false,
+                created_at = Manifest.iso_now(),
+                last_active_at = Manifest.iso_now(),
+                agent_spawned = true,
+                run_generation = 1,
+            })
+            local child_sess = {
+                id = "child-completed",
+                rpc = {
+                    is_running = function()
+                        return true
+                    end,
+                    stop = function() end,
+                },
+            }
+            Sessions._register_for_test(child_sess)
+
+            local res
+            Batch.dispatch(parent, {
+                items = {
+                    { ref = "new-item", task = "new work", name = "new-worker" },
+                },
+            }, function(r)
+                res = r
+            end)
+
+            assert.is_not_nil(res)
+            assert.is_nil(res.error)
+            assert.is_string(res.batch_id)
+            assert.equals("running", res.status)
+
+            assert.equals("dormant", Manifest.load()["child-completed"].status)
+            assert.is_nil(Sessions.get_by_id("child-completed"))
+
+            Batch.cancel(res.batch_id)
+        end)
+
+        it("fails dispatch when live children are all active and limit would be exceeded", function()
+            Manifest.upsert("child-active", {
+                parent_id = "parent-limit-test",
+                parent_epoch = 0,
+                name = "worker-active",
+                task_prompt = "first task",
+                config = {},
+                status = "active",
+                reported = false,
+                created_at = Manifest.iso_now(),
+                last_active_at = Manifest.iso_now(),
+                agent_spawned = true,
+                run_generation = 1,
+            })
+            local child_sess = {
+                id = "child-active",
+                rpc = {
+                    is_running = function()
+                        return true
+                    end,
+                    stop = function() end,
+                },
+            }
+            Sessions._register_for_test(child_sess)
+
+            local res
+            Batch.dispatch(parent, {
+                items = {
+                    { ref = "blocked-item", task = "new work", name = "blocked-worker" },
+                },
+            }, function(r)
+                res = r
+            end)
+
+            assert.is_not_nil(res)
+            assert.is_nil(res.batch_id)
+            assert.is_truthy(res.error and res.error:find("would exceed max 1 concurrent sub-sessions", 1, true))
+
+            assert.equals("active", Manifest.load()["child-active"].status)
+            assert.is_truthy(Sessions.get_by_id("child-active"))
         end)
     end)
 end)

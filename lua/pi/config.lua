@@ -314,7 +314,7 @@
 
 ---@class pi.SubagentConfig
 ---@field enabled? boolean Inject subagent.ts extension (default true)
----@field max_children? integer Max live child processes per parent lineage (default 5; completed-but-alive count, dead don't)
+---@field max_children? integer Max live child processes per lineage (default 5; auto-closes oldest settled child to make room)
 ---@field report_mode? "last_message" Report mode when sub-session completes (default "last_message")
 ---@field default_config? "inherit"|"default" Sub-session model/thinking default (default "inherit")
 ---@field max_batch_size? integer Max items per dispatch_subagents batch (default 5)

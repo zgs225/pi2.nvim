@@ -6,6 +6,7 @@ local Config = require("pi.config")
 local Manifest = require("pi.subsessions.manifest")
 local Read = require("pi.subsessions.read")
 local Sessions = require("pi.sessions.manager")
+local Reaper = require("pi.subsessions.reaper")
 
 local BATCH_FILE = ".pi2-sub-batches.json"
 
@@ -670,8 +671,16 @@ function M.dispatch(parent, opts, callback)
             lineage_id = parent_id
         end
 
+        -- Spawn pre-check shares the alive-process occupancy check with M.spawn.
+        local Subsessions = require("pi.subsessions")
         local max_children = subcfg.max_children or 5
-        if Manifest.spawn_occupancy(lineage_id) + new_spawns > max_children then
+        local occupancy = Manifest.spawn_occupancy(lineage_id, Subsessions.is_child_process_alive)
+        if occupancy + new_spawns > max_children then
+            local deficit = occupancy + new_spawns - max_children
+            Reaper.reap_oldest_settled(lineage_id, deficit)
+            occupancy = Manifest.spawn_occupancy(lineage_id, Subsessions.is_child_process_alive)
+        end
+        if occupancy + new_spawns > max_children then
             callback({ error = ("would exceed max %d concurrent sub-sessions"):format(max_children) })
             return
         end

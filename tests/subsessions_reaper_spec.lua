@@ -26,10 +26,11 @@ describe("subsession idle reaper", function()
 
     ---@param id string
     ---@param status string manifest status
-    ---@param opts? { running?: boolean, last_active_at?: string, bound?: boolean, parent_id?: string }
+    ---@param opts? { running?: boolean, last_active_at?: string | false, bound?: boolean, parent_id?: string }
     ---@return table session Registered fake child session.
     local function add_child(id, status, opts)
         opts = opts or {}
+        local last_active_at = opts.last_active_at ~= false and (opts.last_active_at or "2024-01-01T00:00:00Z") or nil
         Manifest.upsert(id, {
             parent_id = opts.parent_id or "lineage-a",
             parent_epoch = 0,
@@ -39,12 +40,12 @@ describe("subsession idle reaper", function()
             status = status,
             reported = false,
             created_at = "2024-01-01T00:00:00Z",
-            last_active_at = opts.last_active_at or "2024-01-01T00:00:00Z",
+            last_active_at = last_active_at,
         })
         ---@type table
         local session = {
             id = id,
-            parent_id = "lineage-a",
+            parent_id = opts.parent_id or "lineage-a",
             rpc = {
                 is_running = function()
                     return opts.running ~= false
@@ -174,6 +175,67 @@ describe("subsession idle reaper", function()
         it("rejects empty / non-string ids", function()
             assert.is_false(Reaper.reap(""))
             assert.is_false(Reaper.reap(nil --[[@as string]]))
+            assert.are.same({}, closed)
+        end)
+    end)
+
+    describe("reap_oldest_settled", function()
+        it("reaps the oldest child first when needed is 1 (LRU order)", function()
+            add_child("child-old", "completed", { last_active_at = "2024-01-01T00:00:00Z" })
+            add_child("child-new", "completed", { last_active_at = "2024-01-02T00:00:00Z" })
+            assert.are.equal(1, Reaper.reap_oldest_settled("lineage-a", 1))
+            assert.are.same({ "child-old" }, closed)
+        end)
+
+        it("reaps all settled children when needed covers all", function()
+            add_child("child-1", "completed", { last_active_at = "2024-01-01T00:00:00Z" })
+            add_child("child-2", "completed", { last_active_at = "2024-01-02T00:00:00Z" })
+            assert.are.equal(2, Reaper.reap_oldest_settled("lineage-a", 2))
+            assert.are.same({ "child-1", "child-2" }, closed)
+        end)
+
+        it("treats nil last_active_at as oldest", function()
+            add_child("child-nil", "completed", { last_active_at = false })
+            add_child("child-dated", "completed", { last_active_at = "2024-01-01T00:00:00Z" })
+            assert.are.equal(1, Reaper.reap_oldest_settled("lineage-a", 1))
+            assert.are.same({ "child-nil" }, closed)
+        end)
+
+        it("skips active children", function()
+            add_child("child-active", "active", { last_active_at = "2024-01-01T00:00:00Z" })
+            add_child("child-completed", "completed", { last_active_at = "2024-01-02T00:00:00Z" })
+            assert.are.equal(1, Reaper.reap_oldest_settled("lineage-a", 2))
+            assert.are.same({ "child-completed" }, closed)
+        end)
+
+        it("skips dormant children and dead processes", function()
+            add_child("child-dormant", "dormant", { last_active_at = "2024-01-01T00:00:00Z" })
+            add_child("child-dead", "completed", { last_active_at = "2024-01-01T01:00:00Z", running = false })
+            add_child("child-live", "completed", { last_active_at = "2024-01-01T02:00:00Z" })
+            assert.are.equal(1, Reaper.reap_oldest_settled("lineage-a", 3))
+            assert.are.same({ "child-live" }, closed)
+        end)
+
+        it("skips children viewed by a tabpage", function()
+            add_child("child-viewed", "completed", { last_active_at = "2024-01-01T00:00:00Z", bound = true })
+            add_child("child-unbound", "completed", { last_active_at = "2024-01-02T00:00:00Z" })
+            assert.are.equal(1, Reaper.reap_oldest_settled("lineage-a", 2))
+            assert.are.same({ "child-unbound" }, closed)
+        end)
+
+        it("only reaps children belonging to the specified lineage_id", function()
+            add_child("child-a", "completed", { parent_id = "lineage-a", last_active_at = "2024-01-01T00:00:00Z" })
+            add_child("child-b", "completed", { parent_id = "lineage-b", last_active_at = "2024-01-01T00:00:00Z" })
+            assert.are.equal(1, Reaper.reap_oldest_settled("lineage-a", 2))
+            assert.are.same({ "child-a" }, closed)
+        end)
+
+        it("returns 0 when needed <= 0 or lineage_id is empty/invalid", function()
+            add_child("child-1", "completed")
+            assert.are.equal(0, Reaper.reap_oldest_settled("lineage-a", 0))
+            assert.are.equal(0, Reaper.reap_oldest_settled("lineage-a", -1))
+            assert.are.equal(0, Reaper.reap_oldest_settled("", 1))
+            assert.are.equal(0, Reaper.reap_oldest_settled(nil --[[@as string]], 1))
             assert.are.same({}, closed)
         end)
     end)

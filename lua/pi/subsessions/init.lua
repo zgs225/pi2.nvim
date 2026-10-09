@@ -338,11 +338,12 @@ end
 --- whatever the manifest says — a completed (or interrupted) child whose
 --- process lingers must not let the lineage spawn past the cap, while a dead
 --- process (failed/dormant, or no registry row at all) frees its slot.
---- Lives here, not in manifest.lua, so the manifest never requires the
---- sessions manager (dependency direction).
+--- Shared between M.spawn and batch dispatch pre-checks. Lives here, not in
+--- manifest.lua, so the manifest never requires the sessions manager
+--- (dependency direction).
 ---@param child_id string
 ---@return boolean
-local function child_process_alive(child_id)
+function M.is_child_process_alive(child_id)
     local session = Sessions.get_by_id(child_id)
     if not session or not session.rpc then
         return false
@@ -392,9 +393,15 @@ function M.spawn(parent, opts, callback)
         local epoch = M.abort_epoch(lineage_id)
 
         local max = subcfg.max_children or 5
-        if not Manifest.try_reserve_spawn(lineage_id, max, child_process_alive) then
-            callback(nil, ("max %d concurrent sub-sessions"):format(max))
-            return
+        if not Manifest.try_reserve_spawn(lineage_id, max, M.is_child_process_alive) then
+            -- Slot pressure: auto-reap the oldest settled child to make room.
+            if
+                Reaper.reap_oldest_settled(lineage_id, 1) == 0
+                or not Manifest.try_reserve_spawn(lineage_id, max, M.is_child_process_alive)
+            then
+                callback(nil, ("max %d concurrent sub-sessions"):format(max))
+                return
+            end
         end
         local held = true
         local function unreserve()

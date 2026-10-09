@@ -2,9 +2,11 @@
 ---
 --- A finished/interrupted child keeps its `pi --mode rpc` process alive after
 --- `agent_settled` (the manifest is only patched to a settled status), so long
---- sessions accumulate dozens of idle processes. Two mechanisms close them:
---- event-driven (`M.schedule`, armed from `on_child_settled`) and a periodic
---- `M.sweep` backstop. Every close re-validates at fire time:
+--- sessions accumulate dozens of idle processes. Three mechanisms close them:
+--- event-driven (`M.schedule`, armed from `on_child_settled`), a periodic
+--- `M.sweep` backstop, and demand-driven auto-reap (`M.reap_oldest_settled`,
+--- triggered when dispatch or spawn hits the `max_children` limit). Every close
+--- re-validates at fire time:
 ---
 ---   a) the child is still in the Sessions registry with a live RPC process;
 ---   b) its manifest status is settled (`completed`/`interrupted`/`failed`) —
@@ -66,11 +68,10 @@ local function is_viewed_child(child_id)
     return false
 end
 
---- Fire-time check: close `child_id` only when conditions (a), (b) and (c)
---- all hold. Silent no-op otherwise.
+--- True when conditions (a), (b) and (c) all hold for `child_id`.
 ---@param child_id string
----@return boolean closed True when the child process was closed.
-function M.reap(child_id)
+---@return boolean
+local function can_reap(child_id)
     if type(child_id) ~= "string" or child_id == "" then
         return false
     end
@@ -92,8 +93,68 @@ function M.reap(child_id)
         return false
     end
 
+    return true
+end
+
+--- Fire-time check: close `child_id` only when conditions (a), (b) and (c)
+--- all hold. Silent no-op otherwise.
+---@param child_id string
+---@return boolean closed True when the child process was closed.
+function M.reap(child_id)
+    if not can_reap(child_id) then
+        return false
+    end
+
     require("pi.subsessions").close(child_id)
     return true
+end
+
+--- Reap up to `needed` settled-but-alive children of `lineage_id`, oldest
+--- first (manifest `last_active_at` ascending), to free spawn slots. Same
+--- safety conditions as M.reap: registry row with a running RPC, settled
+--- manifest status, and not the current session of any tabpage.
+---@param lineage_id string
+---@param needed integer
+---@return integer reaped
+function M.reap_oldest_settled(lineage_id, needed)
+    if type(needed) ~= "number" or needed <= 0 or type(lineage_id) ~= "string" or lineage_id == "" then
+        return 0
+    end
+
+    local manifest = Manifest.load()
+    local candidates = {}
+    for id, entry in pairs(manifest) do
+        if
+            Manifest.is_entry_id(id)
+            and type(entry) == "table"
+            and entry.parent_id == lineage_id
+            and settled_status[entry.status]
+        then
+            candidates[#candidates + 1] = {
+                id = id,
+                last_active_at = tostring(entry.last_active_at or ""),
+            }
+        end
+    end
+
+    table.sort(candidates, function(a, b)
+        if a.last_active_at ~= b.last_active_at then
+            return a.last_active_at < b.last_active_at
+        end
+        return a.id < b.id
+    end)
+
+    local reaped = 0
+    for _, candidate in ipairs(candidates) do
+        if reaped >= needed then
+            break
+        end
+        if M.reap(candidate.id) then
+            reaped = reaped + 1
+        end
+    end
+
+    return reaped
 end
 
 --- Event-driven arming: fire a single re-check after `reap_after_minutes`.

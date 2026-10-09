@@ -214,7 +214,7 @@ require("pi").setup({
     -- Children run as detached background processes with their own session files.
     subagent = {
         enabled = true,
-        max_children = 5,           -- max live child processes per parent lineage (any status; dead don't count)
+        max_children = 5,           -- max live child processes per parent lineage (auto-closes oldest settled child to make room; dead don't count)
         report_mode = "last_message", -- completion report uses child's last assistant output
         default_config = "inherit",   -- "inherit" parent model/thinking, or "default"
         max_batch_size = 5,           -- max items per dispatch_subagents batch
