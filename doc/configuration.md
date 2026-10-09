@@ -468,6 +468,30 @@ Notes on a few fields:
 - `panels.<panel>.name` takes a `fun(tab_id): string` that computes the underlying buffer name per tab — useful for distinguishing multiple π conversations in `:buffers`, statuslines, or tab bars.
 - Several fields (`diff.keys`, `dialog.keys`, `zen.keys`) accept **key specs** — plain strings, `{ key, modes = ... }` tables, or lists of those. See [Keymaps](keymaps.md#key-specs).
 
+## CLI args and version gating
+
+`cli.args` is passed straight through to the `pi` invocation (inserted before the injected `--extension` flags and `--mode rpc`). Args that conflict with RPC mode (`--mode`, `--print`, `--help`, …) are dropped with a one-time warning. There is no separate config key per flag — anything pi accepts can go in `cli.args`.
+
+Some flags only exist on newer pi versions, and passing an unknown flag makes pi exit immediately with an "unknown option" error. When `cli.args` contains such a flag, `pi2.nvim` probes `pi --version` **lazily** (only once, and only when a gated flag is actually present) and strips the flag with a one-time warning if the binary is too old:
+
+| Flag / syntax | Minimum pi |
+|---|---|
+| `--no-mcp` | 1.0.4 |
+| `--tools` with wildcard (`*`) patterns | 1.0.4 |
+| `--tools` with `+name` / `-name` entries | 1.1.0 |
+
+If the version cannot be determined (binary missing, non-zero exit, unparseable output), the flag is passed through unchanged and a one-time warning explains that the version could not be verified.
+
+`--provider` requires `--model` on pi ≥ 1.0.0; older versions ignore `--provider` silently, newer ones reject the combination outright. When `cli.args` sets `--provider` (either `--provider value` or `--provider=value`) without a matching `--model`, `pi2.nvim` emits a one-time warning.
+
+```lua
+require("pi").setup({
+    cli = {
+        args = { "--no-mcp" }, -- dropped with a warning on pi < 1.0.4
+    },
+})
+```
+
 ## Project trust
 
 `pi2.nvim` runs pi in RPC mode and does not currently implement the TUI's interactive project trust prompt or save trust decisions. It uses pi's non-interactive defaults, which means project-local settings, resources, packages, extensions, and project `.agents/skills` are not loaded.
