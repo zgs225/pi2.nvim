@@ -4,6 +4,7 @@
 
 - **ADDED:** Tool blocks show execution time on pi 1.1.0+. pi 1.1.0 adds a millisecond `durationMs` to the `tool_execution_end` RPC event and to replayed `ToolResultMessage`s; a completed tool block now prints `Took 1.2s` (or `Took 234ms` below one second) as inline status text next to the header, on both the inline and full-block render paths. The field is absent on pi < 1.1.0 and in legacy session records — then nothing is rendered and blocks look exactly as before. No config knob; the renderer `on_end` / `inline_status` signatures are unchanged, so custom renderers keep working.
 - **ADDED:** `gf` opens the full output of a truncated bash block. When a `!` command's output exceeds the backend cap, the truncation notice (`Output truncated. Full output: /tmp/…`) is now recognized by the file-under-cursor opener — put the cursor on the notice and press `gf` to open the complete output.
+- **ADDED:** Authoritative sub-session abort detection on pi 1.1.0. The `agent_settled` event carries an `aborted` boolean from pi 1.1.0; the child-settle path now prefers it over reading the session file's last stop reason, so a user-aborted child is recorded as `interrupted` without depending on a fresh file read. Older pi omits the field and behavior is byte-identical (the file-based fallback and the per-child abort generation watermark stay in place).
 
 ## 2026-10-08
 

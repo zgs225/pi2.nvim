@@ -82,7 +82,7 @@ Switching parent ↔ child or sibling children **rebinds the tab UI** and rebuil
 
 While viewing a child, `:PiNewSession` / `pi.new_session()` or a bare `/new` in the prompt (e.g. `<C-g>n` in a typical setup) **returns to the parent first**, then starts a fresh parent conversation — same as running `/new` on the parent. Prior-conversation sub-session rows are hidden in `:PiSessions` (press `H` or use `:PiSubSwitch` to recall them).
 
-When a user-spawned child finishes, its last assistant message is injected into the parent as `[子会话「name」已完成] …` or `[Sub-session "name" completed] …` (language follows `title.lang` / UI locale). A child interrupted by a user abort is recorded as `interrupted` in the manifest instead and injects no completion report. Agent-spawned children skip this injection — they receive a synchronous tool result instead. Configure via `subagent.*` in [Configuration](configuration.md).
+When a user-spawned child finishes, its last assistant message is injected into the parent as `[子会话「name」已完成] …` or `[Sub-session "name" completed] …` (language follows `title.lang` / UI locale). A child interrupted by a user abort is recorded as `interrupted` in the manifest instead and injects no completion report. From pi 1.1.0 the cancel detection prefers the `agent_settled.aborted` event field (authoritative) and only falls back to the session file's last stop reason on older pi. Agent-spawned children skip this injection — they receive a synchronous tool result instead. Configure via `subagent.*` in [Configuration](configuration.md).
 
 ### Idle process reaping
 

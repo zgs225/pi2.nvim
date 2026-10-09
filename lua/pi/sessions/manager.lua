@@ -820,7 +820,9 @@ function M.handle_event(session, msg)
         -- final fallback that converges any leftover spinner.
         mark_run_end(session)
         if session.parent_id then
-            require("pi.subsessions").on_child_settled(session)
+            -- `aborted` is authoritative on pi >= 1.1.0; older pi omits it, so
+            -- the child settle path falls back to the session file's stop reason.
+            require("pi.subsessions").on_child_settled(session, msg.aborted == true)
         end
         if chat then
             chat:set_status(nil)

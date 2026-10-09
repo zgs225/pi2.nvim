@@ -715,8 +715,15 @@ function M.on_child_session_name(session, name)
 end
 
 --- Called on child agent_settled — inject completion report into parent.
+---
+--- `aborted` is the authoritative cancel signal added in pi >= 1.1.0
+--- (`agent_settled.aborted`). Older pi omits the field, so the run's abort
+--- state falls back to the session file's last stop reason; the per-child
+--- generation watermark stays the guard that keeps a late settle of an aborted
+--- run from touching a newer run on the same child.
 ---@param child pi.Session
-function M.on_child_settled(child)
+---@param aborted? boolean
+function M.on_child_settled(child, aborted)
     local SessionList = require("pi.ui.sessions")
 
     local function after_completed(parent)
@@ -740,10 +747,11 @@ function M.on_child_settled(child)
 
     local path = child.session_file or Read.find_path(child.id)
     local report = path and Read.last_assistant_message(path) or nil
-    local aborted = path ~= nil and Read.last_stop_reason(path) == "aborted"
+    -- Prefer the event field when present; only read the file on older pi.
+    local was_aborted = aborted == true or (path ~= nil and Read.last_stop_reason(path) == "aborted")
     local parent = Sessions.find_by_lineage(entry.parent_id)
 
-    if aborted then
+    if was_aborted then
         -- Settle the aborted run's own items (waking a parent blocked in
         -- wait_subagents) without touching a newer run: prefer the recorded
         -- abort watermark over the manifest generation, which the parent may
