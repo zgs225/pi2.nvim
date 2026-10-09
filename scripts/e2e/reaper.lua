@@ -6,8 +6,9 @@
 --
 --   S1  spawn -> settle -> assert resident -> reaper fires -> assert dead/dormant/JSONL
 --       retained -> revive -> assert new process + old history readable -> close.
---   S2  reaping disabled, max_children=1: settled child stays resident and holds
---       its slot; a second spawn fails with "max 1 ..."; closing frees the slot.
+--   S2  reaping disabled, max_children=1: settled child stays resident; a second
+--       spawn auto-reaps it (dormant/closed) and succeeds.
+--   S2b active (unsettled) child blocks a new spawn under max_children=1.
 --
 -- Needs the pi binary + a configured provider, so it is NOT part of `make test`
 -- or CI. Run from the repo root:
@@ -284,7 +285,7 @@ local function scenario_s1(parent, report)
     step("S1 closed (dormant, process dead, history retained)")
 end
 
---- S2: reaping disabled + max_children=1 — settled-but-alive child holds its slot.
+--- S2: reaping disabled + max_children=1 — second spawn auto-reaps settled child.
 ---@param parent table
 ---@param report table
 local function scenario_s2(parent, report)
@@ -311,53 +312,82 @@ local function scenario_s2(parent, report)
     })
     step("S2 child-1 resident 14s after settle (completed + alive)")
 
+    local c2, e2 = spawn_child(parent)
+    check(c2 ~= nil, "S2: second spawn failed to auto-reap settled child: " .. tostring(e2))
+    local pid2 = record_child(report, c2)
+    check(pid2 ~= nil, "S2: could not read child-2 pid")
+    check(manifest_status(c1.id) == "dormant", "S2: child-1 not dormant after auto-reap", {
+        status = manifest_status(c1.id),
+    })
+    local dead1 = wait_os_dead(pid1, 15000)
+    check(dead1 and not os_alive(pid1), "S2: child-1 OS process survived auto-reap", { pid = pid1 })
+    check(c1.rpc:is_running() == false, "S2: child-1 rpc still running after auto-reap")
+    check(Sessions.get_by_id(c1.id) == nil, "S2: child-1 still registered after auto-reap")
+    print(("[S2] child-2 spawned id=%s pid=%d; child-1 auto-reaped"):format(c2.id, pid2))
+    step("S2 child-2 spawned, child-1 auto-reaped (dormant + dead)")
+
+    wait_settled(c2.id, 180)
+    check(manifest_status(c2.id) == "completed", "S2: child-2 not completed after settle", {
+        status = manifest_status(c2.id),
+    })
+    check(c2.rpc:is_running() == true and os_alive(pid2), "S2: child-2 not resident after settle", {
+        pid = pid2,
+    })
+    print(("[S2] child-2 settled id=%s pid=%d"):format(c2.id, pid2))
+    step("S2 child-2 settled")
+
+    local stopped2 = Subsessions.close(c2.id)
+    check(stopped2, "S2: close did not stop child-2")
+    wait_os_dead(pid2, 15000)
+    step("S2 child-2 closed")
+end
+
+--- S2b: active (unsettled) child blocks spawn under max_children=1.
+---@param parent table
+---@param report table
+local function scenario_s2b(parent, report)
+    apply_subagent_cfg({ reap_after_minutes = 0, max_children = 1 })
+    step("S2b config reap_after_minutes=0 max_children=1")
+
+    local c1, e1 = spawn_child(parent)
+    check(c1 ~= nil, "S2b: child-1 spawn failed: " .. tostring(e1))
+    local pid1 = record_child(report, c1)
+    check(pid1 ~= nil, "S2b: could not read child-1 pid")
+    check(manifest_status(c1.id) == "active", "S2b: child-1 not active after spawn", {
+        status = manifest_status(c1.id),
+    })
+    step("S2b child-1 active (task in flight)")
+
     local before = #Sessions.list_all()
     local c2, e2 = spawn_child(parent)
     if c2 ~= nil then
         record_child(report, c2)
     end
-    check(c2 == nil, "S2: spawn past max_children=1 unexpectedly succeeded", {
+    check(c2 == nil, "S2b: spawn while child-1 is active unexpectedly succeeded", {
         id = c2 ~= nil and c2.id or nil,
     })
-    check(type(e2) == "string" and e2:find("max 1", 1, true) ~= nil, "S2: error lacks 'max 1'", { err = e2 })
-    check(e2:find("concurrent sub-sessions", 1, true) ~= nil, "S2: error lacks 'concurrent sub-sessions'", {
+    check(type(e2) == "string" and e2:find("max 1", 1, true) ~= nil, "S2b: error lacks 'max 1'", { err = e2 })
+    check(e2:find("concurrent sub-sessions", 1, true) ~= nil, "S2b: error lacks 'concurrent sub-sessions'", {
         err = e2,
     })
-    check(#Sessions.list_all() == before, "S2: capped spawn leaked a registry session", {
+    check(#Sessions.list_all() == before, "S2b: capped spawn leaked a registry session", {
         before = before,
         after = #Sessions.list_all(),
     })
-    check(c1.rpc:is_running() == true and os_alive(pid1), "S2: child-1 died when the capped spawn failed")
-    print(("[S2] capped spawn rejected: %s"):format(e2))
-    step("S2 max_children=1 enforced (resident child holds the slot)")
+    check(c1.rpc:is_running() == true and os_alive(pid1), "S2b: child-1 died when capped spawn failed")
+    print(("[S2b] capped spawn rejected while active: %s"):format(e2))
+    step("S2b max_children=1 enforced (active child holds the slot)")
 
-    local stopped = Subsessions.close(c1.id)
-    check(stopped, "S2: close did not stop child-1")
-    local dead = wait_os_dead(pid1, 15000)
-    check(dead and not os_alive(pid1), "S2: child-1 OS process survived close", { pid = pid1 })
-    check(manifest_status(c1.id) == "dormant", "S2: child-1 not dormant after close", {
+    wait_settled(c1.id, 180)
+    check(manifest_status(c1.id) == "completed", "S2b: child-1 not completed after settle", {
         status = manifest_status(c1.id),
     })
-    step("S2 child-1 closed (slot freed)")
+    step("S2b child-1 settled")
 
-    local c3, e3 = spawn_child(parent)
-    check(c3 ~= nil, "S2: spawn after closing child-1 failed: " .. tostring(e3))
-    local pid3 = record_child(report, c3)
-    check(pid3 ~= nil, "S2: could not read child-3 pid")
-    wait_settled(c3.id, 180)
-    check(manifest_status(c3.id) == "completed", "S2: child-3 not completed after settle", {
-        status = manifest_status(c3.id),
-    })
-    check(c3.rpc:is_running() == true and os_alive(pid3), "S2: child-3 not resident after settle", {
-        pid = pid3,
-    })
-    print(("[S2] child-3 spawned+settled id=%s pid=%d"):format(c3.id, pid3))
-    step("S2 child-3 spawned after slot freed")
-
-    local stopped3 = Subsessions.close(c3.id)
-    check(stopped3, "S2: close did not stop child-3")
-    wait_os_dead(pid3, 15000)
-    step("S2 child-3 closed")
+    local stopped = Subsessions.close(c1.id)
+    check(stopped, "S2b: close did not stop child-1")
+    wait_os_dead(pid1, 15000)
+    step("S2b child-1 closed")
 end
 
 --- Always-run teardown: kill every spawned process, remove our session files,
@@ -481,6 +511,7 @@ local ok, failure = pcall(function()
 
     scenario_s1(parent, report)
     scenario_s2(parent, report)
+    scenario_s2b(parent, report)
 end)
 
 local notes = cleanup(report, manifest_path, manifest_snapshot)
@@ -496,6 +527,8 @@ if not ok then
 end
 
 print(
-    ("PASS: reaper e2e OK — S1 spawn/settle/reap/revive/close, S2 max_children=1 slot logic (in %.2fs)"):format(total)
+    ("PASS: reaper e2e OK — S1 spawn/settle/reap/revive/close, S2 auto-reap on max_children, S2b active blocks spawn (in %.2fs)"):format(
+        total
+    )
 )
 os.exit(0)

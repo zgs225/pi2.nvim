@@ -1,5 +1,6 @@
 local Config = require("pi.config")
 local Manifest = require("pi.subsessions.manifest")
+local Reaper = require("pi.subsessions.reaper")
 local Subsessions = require("pi.subsessions")
 local Sessions = require("pi.sessions.manager")
 
@@ -17,6 +18,7 @@ describe("subsession spawn limits and flags", function()
         manifest_tmp = vim.fn.tempname() .. "-spawn-manifest.json"
         real_path = Manifest.path
         Manifest._reset()
+        Reaper._reset()
         Manifest.path = function()
             return manifest_tmp
         end
@@ -54,6 +56,7 @@ describe("subsession spawn limits and flags", function()
         Sessions.create_detached = real_create
         Manifest.path = real_path
         Manifest._reset()
+        Reaper._reset()
         os.remove(manifest_tmp)
         Sessions._reset()
         Config.setup({})

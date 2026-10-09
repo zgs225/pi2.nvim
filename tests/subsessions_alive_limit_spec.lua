@@ -4,6 +4,7 @@
 
 local Config = require("pi.config")
 local Manifest = require("pi.subsessions.manifest")
+local Reaper = require("pi.subsessions.reaper")
 local Subsessions = require("pi.subsessions")
 local Sessions = require("pi.sessions.manager")
 
@@ -115,6 +116,7 @@ describe("spawn enforces max_children over live children", function()
         manifest_tmp = vim.fn.tempname() .. "-alive-spawn-manifest.json"
         real_path = Manifest.path
         Manifest._reset()
+        Reaper._reset()
         Manifest.path = function()
             return manifest_tmp
         end
@@ -152,6 +154,7 @@ describe("spawn enforces max_children over live children", function()
         Sessions.create_detached = real_create
         Manifest.path = real_path
         Manifest._reset()
+        Reaper._reset()
         os.remove(manifest_tmp)
         Sessions._reset()
         Config.setup({})
@@ -186,7 +189,7 @@ describe("spawn enforces max_children over live children", function()
         return child, err
     end
 
-    it("blocks a new spawn while a completed child process is still alive", function()
+    it("auto-reaps a completed-but-alive child to admit a new spawn", function()
         local child, err = spawn_sync("one")
         assert.is_nil(err)
         assert.is_truthy(child)
@@ -201,8 +204,36 @@ describe("spawn enforces max_children over live children", function()
         Manifest.patch("child-1", { status = "completed", last_active_at = Manifest.iso_now() })
         assert.is_truthy(Sessions.get_by_id("child-1"))
 
-        local _, second_err = spawn_sync("two")
-        assert.is_truthy(second_err, "second spawn must be refused while the completed child is alive")
+        local second_child, second_err = spawn_sync("two")
+        assert.is_nil(second_err)
+        assert.is_truthy(second_child, "second spawn should succeed after auto-reaping settled child")
+        assert.equals(2, created)
+        assert.equals("dormant", Manifest.load()["child-1"].status)
+        assert.is_nil(Sessions.get_by_id("child-1"))
+        assert.is_true(
+            vim.wait(3000, function()
+                return Manifest.load()["child-2"] ~= nil
+            end, 10),
+            "second child should register"
+        )
+    end)
+
+    it("blocks a new spawn while an active child process is still running", function()
+        local child, err = spawn_sync("one")
+        assert.is_nil(err)
+        assert.is_truthy(child)
+        assert.is_true(
+            vim.wait(3000, function()
+                return Manifest.load()["child-1"] ~= nil
+            end, 10),
+            "first child should register"
+        )
+        assert.equals("active", Manifest.load()["child-1"].status)
+        assert.is_truthy(Sessions.get_by_id("child-1"))
+
+        local second_child, second_err = spawn_sync("two")
+        assert.is_nil(second_child)
+        assert.is_truthy(second_err, "second spawn must be refused while the child is active")
         assert.is_truthy(second_err:find("max", 1, true))
         assert.equals(1, created)
     end)
