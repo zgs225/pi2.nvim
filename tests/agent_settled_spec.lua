@@ -184,4 +184,24 @@ describe("agent_settled routing", function()
         assert.is_true(await_status(chat, nil))
         assert.are.same({}, unhandled)
     end)
+
+    it("forwards agent_settled.aborted to on_child_settled for child sessions", function()
+        local Subsessions = require("pi.subsessions")
+        local captured = {} ---@type { id: string, aborted: boolean }[]
+        local orig = Subsessions.on_child_settled
+        Subsessions.on_child_settled = function(s, aborted)
+            captured[#captured + 1] = { id = s.id, aborted = aborted }
+        end
+
+        session.parent_id = "parent-1"
+        feed(session, { type = "agent_settled", aborted = true })
+        feed(session, { type = "agent_settled" })
+        Subsessions.on_child_settled = orig
+
+        assert.are.equal(2, #captured)
+        assert.are.equal(session.id, captured[1].id)
+        assert.is_true(captured[1].aborted)
+        assert.are.equal(session.id, captured[2].id)
+        assert.is_false(captured[2].aborted)
+    end)
 end)

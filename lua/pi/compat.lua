@@ -8,7 +8,7 @@
 local M = {
     -- Keep these in sync with release validation notes.
     min_supported = "0.65.2",
-    validated = "0.79.3",
+    validated = "1.1.0",
     -- The vision extension needs ctx.sessionManager.buildContextEntries()
     -- (pi 0.80.4+) and a public ModelRegistry.getProvider() (pi 0.81.0+);
     -- 0.81-0.83.x goes through provider.streamSimple(), 0.84.0+ through

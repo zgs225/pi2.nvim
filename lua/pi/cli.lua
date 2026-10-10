@@ -2,11 +2,38 @@
 
 local M = {}
 
+local Compat = require("pi.compat")
 local Config = require("pi.config")
 local Notify = require("pi.notify")
 
 ---@type table<string, true>
 local warned = {}
+
+-- Flags that only exist from a given pi version onward. Passing an unknown
+-- flag makes pi exit with an "unknown option" error before RPC starts, so a
+-- gated flag is stripped (with a one-time warning) when the probed binary is
+-- older than the floor.
+--
+--   --no-mcp  — added in pi 1.0.4 (single-run MCP disable; see CHANGELOG).
+---@type table<string, string>
+local GATED_ARGS = {
+    ["--no-mcp"] = "1.0.4",
+}
+
+---@type table<string, true>
+local warned_gated = {}
+
+---@type boolean
+local warned_version_unknown = false
+
+---@type boolean
+local warned_provider = false
+
+---@type string?
+local cached_version = nil
+
+---@type boolean
+local version_probed = false
 
 ---@type table<string, integer>
 local filtered_flags = {
@@ -51,6 +78,71 @@ function M.bin()
     return cli.bin or "pi"
 end
 
+--- Probe the pi binary for its raw `--version` output. Returns nil when the
+--- probe fails (binary missing, non-zero exit, empty output). Overridable in
+--- tests via `M._probe_version`.
+---@return string?
+function M._probe_version()
+    local ok, out = pcall(vim.fn.system, { M.bin(), "--version" })
+    if not ok or type(out) ~= "string" or out == "" or vim.v.shell_error ~= 0 then
+        return nil
+    end
+    return out
+end
+
+--- Lazily resolve the pi binary version (`x.y.z`), caching the first probe.
+--- Returns nil when the version could not be determined.
+---@return string?
+function M.pi_version()
+    if version_probed then
+        return cached_version
+    end
+    version_probed = true
+    local out = M._probe_version()
+    if out then
+        cached_version = Compat.extract_version(out)
+    end
+    return cached_version
+end
+
+--- Split an arg into its flag name (dropping a `=value` suffix).
+---@param arg string
+---@return string
+local function flag_name(arg)
+    local eq = arg:find("=", 1, true)
+    return eq and arg:sub(1, eq - 1) or arg
+end
+
+---@param args string[]
+local function check_provider_pairing(args)
+    local has_provider = false
+    local has_model = false
+    for _, arg in ipairs(args) do
+        if type(arg) == "string" then
+            local name = flag_name(arg)
+            if name == "--provider" then
+                has_provider = true
+            elseif name == "--model" then
+                has_model = true
+            end
+        end
+    end
+    if has_provider and not has_model and not warned_provider then
+        warned_provider = true
+        Notify.warn("cli.args sets --provider without --model; pi >= 1.0.0 requires both")
+    end
+end
+
+--- Drop warn-once state and the cached version probe. Test hook.
+function M._reset()
+    warned = {}
+    warned_gated = {}
+    warned_version_unknown = false
+    warned_provider = false
+    cached_version = nil
+    version_probed = false
+end
+
 ---@param args any
 ---@return string[]
 function M.filter_args(args)
@@ -74,10 +166,41 @@ function M.filter_args(args)
             warn_filtered(arg)
             i = skip_optional_values(args, i + 1, filtered_flags[arg])
         else
-            result[#result + 1] = arg
+            local name = flag_name(arg)
+            local min_version = GATED_ARGS[name]
+            if not min_version then
+                result[#result + 1] = arg
+            else
+                local version = M.pi_version()
+                local cmp = version and Compat.compare_versions(version, min_version) or nil
+                if version == nil then
+                    if not warned_version_unknown then
+                        warned_version_unknown = true
+                        Notify.warn(
+                            "Could not determine the pi version; passing "
+                                .. name
+                                .. " through unverified (requires pi "
+                                .. min_version
+                                .. "+)"
+                        )
+                    end
+                    result[#result + 1] = arg
+                elseif cmp == nil or cmp < 0 then
+                    if not warned_gated[name] then
+                        warned_gated[name] = true
+                        Notify.warn(
+                            "Ignoring " .. name .. ": requires pi " .. min_version .. " (found " .. version .. ")"
+                        )
+                    end
+                else
+                    result[#result + 1] = arg
+                end
+            end
             i = i + 1
         end
     end
+
+    check_provider_pairing(result)
 
     return result
 end

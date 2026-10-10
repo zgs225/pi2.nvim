@@ -820,7 +820,9 @@ function M.handle_event(session, msg)
         -- final fallback that converges any leftover spinner.
         mark_run_end(session)
         if session.parent_id then
-            require("pi.subsessions").on_child_settled(session)
+            -- `aborted` is authoritative on pi >= 1.1.0; older pi omits it, so
+            -- the child settle path falls back to the session file's stop reason.
+            require("pi.subsessions").on_child_settled(session, msg.aborted == true)
         end
         if chat then
             chat:set_status(nil)
@@ -862,6 +864,13 @@ function M.handle_event(session, msg)
         end
     elseif t == "tool_execution_end" then
         if chat then
+            -- pi 1.1.0+ carries the monotonic tool duration (ms) as a sibling
+            -- of `result` on the event; forward it on the result table so the
+            -- history renderer can show it without changing on_tool_end's
+            -- signature. Absent on older pi — nothing is attached then.
+            if type(msg.durationMs) == "number" and type(msg.result) == "table" then
+                msg.result.durationMs = msg.durationMs
+            end
             chat:on_tool_end(msg.toolName or "tool", msg.toolCallId, msg.result, msg.isError)
             vim.schedule(function()
                 require("pi.quickfix").on_tool_end(msg.toolName, msg.toolCallId, msg.result, msg.isError)
