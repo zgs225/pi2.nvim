@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-10
+
+- **CHANGED:** Validated against pi 1.1.0 (`compat.validated` 0.79.3 → 1.1.0; `:checkhealth pi` and doc/troubleshooting.md report the new floor). Validation ran the full hermetic suite plus three new real-process e2e scripts (`scripts/e2e/pi110_duration.lua`, `pi110_abort.lua`, `pi110_cli_gating.lua`) against the real pi 1.1.0 binary with live `glm-5.3-flash` calls, and a GUI pixel check of the tool-duration text and `gf`-on-truncation-notice. Wire-level confirmation: `tool_execution_end.durationMs` (2020 ms for a `sleep 2` bash, 11 ms for a `read`) and `agent_settled.aborted == true` on abort (plain session and user-spawned child → manifest `interrupted`, no completion report injected) both arrive as documented. Minimum supported stays `0.65.2`.
+
 ## 2026-10-09
 
 - **ADDED:** Tool blocks show execution time on pi 1.1.0+. pi 1.1.0 adds a millisecond `durationMs` to the `tool_execution_end` RPC event and to replayed `ToolResultMessage`s; a completed tool block now prints `Took 1.2s` (or `Took 234ms` below one second) as inline status text next to the header, on both the inline and full-block render paths. The field is absent on pi < 1.1.0 and in legacy session records — then nothing is rendered and blocks look exactly as before. No config knob; the renderer `on_end` / `inline_status` signatures are unchanged, so custom renderers keep working.
