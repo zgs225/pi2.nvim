@@ -247,11 +247,7 @@ local function run_suite()
         "Scenario A: response type must be 'response'",
         { resp = state_resp }
     )
-    check(
-        state_resp.success == true,
-        "Scenario A: get_state response success must be true",
-        { resp = state_resp }
-    )
+    check(state_resp.success == true, "Scenario A: get_state response success must be true", { resp = state_resp })
 
     -- Track session file for G18 hermetic cleanup
     if state_resp.data and type(state_resp.data.sessionFile) == "string" then
@@ -295,7 +291,11 @@ local function run_suite()
     check(probe_calls == 1, "Scenario B after _reset: probe_calls counter itself unchanged", { got = probe_calls })
 
     local b3 = Cli.filter_args({ "--no-mcp" })
-    check(probe_calls == 2, "Scenario B call 3: probe_calls should increment to 2 after _reset()", { got = probe_calls })
+    check(
+        probe_calls == 2,
+        "Scenario B call 3: probe_calls should increment to 2 after _reset()",
+        { got = probe_calls }
+    )
     check(vim.deep_equal(b3, { "--no-mcp" }), "Scenario B call 3: filter_args keeps --no-mcp")
 
     report.scenarios["B"] = {
