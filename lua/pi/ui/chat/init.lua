@@ -23,6 +23,7 @@
 ---@field _flushed_queue_entries pi.PendingQueueEntry[]
 ---@field _replay_flushed_queue_entries pi.PendingQueueEntry[]
 ---@field _compaction_queue pi.CompactionQueuedMessage[]
+---@field _queue_sync_paused boolean
 ---@field _active_verb string?
 ---@field _done_verb string?
 ---@field _last_turn_stop_reason "aborted"|"error"|nil
@@ -89,6 +90,7 @@ function Chat.new(tab, mode, agent)
     self._flushed_queue_entries = {}
     self._replay_flushed_queue_entries = {}
     self._compaction_queue = {}
+    self._queue_sync_paused = false
     self._active_verb = nil
     self._done_verb = nil
     self._last_turn_stop_reason = nil
@@ -368,6 +370,10 @@ function Chat:_set_keymaps()
         require("pi.subsessions").switch_to_parent(function() end)
     end, { buffer = hbuf, desc = "π: return to parent session" })
 
+    vim.keymap.set("n", "dd", function()
+        self:delete_pending_at_cursor()
+    end, { buffer = hbuf, desc = "π: delete queued message under cursor" })
+
     -- Zen toggle key — permanent on the prompt buffer.
     -- Enters zen when inactive, exits when active.
     local zen_cfg = Config.options.zen
@@ -612,6 +618,109 @@ function Chat:submit_follow_up()
     self:_send_message(self._streaming and "follow_up" or nil)
 end
 
+--- Delete the pending queued message under the cursor in the history buffer.
+--- Copies the raw text into the unnamed register (vim `dd` semantics).
+function Chat:delete_pending_at_cursor()
+    local row = vim.api.nvim_win_get_cursor(0)[1] - 1
+    local index = self._history:pending_index_at(row)
+    if not index then
+        return
+    end
+    local queue = self._history:get_pending_queue()
+    local entry = queue[index]
+    if not entry then
+        return
+    end
+
+    vim.fn.setreg('"', entry.text)
+
+    for i, comp_entry in ipairs(self._compaction_queue or {}) do
+        if comp_entry.expanded == entry.expanded_text then
+            table.remove(self._compaction_queue, i)
+            local removed = self._history.remove_pending_queue_entry_at
+                    and self._history:remove_pending_queue_entry_at(index)
+                or nil
+            if not removed and entry.expanded_text then
+                self._history:remove_pending_queue_entry(entry.expanded_text)
+            end
+            return
+        end
+    end
+
+    self:_delete_pi_queued_entry(index, entry)
+end
+
+---@param index integer
+---@param entry pi.PendingQueueEntry
+function Chat:_delete_pi_queued_entry(index, entry)
+    self._queue_sync_paused = true
+    local sent = self._agent.send({ type = "clear_queue" }, function(res)
+        vim.schedule(function()
+            if res and res.success == false then
+                self._queue_sync_paused = false
+                Notify.error("Failed to delete queued message" .. (res.error and (": " .. res.error) or ""))
+                return
+            end
+            local data = res and res.data
+            if type(data) ~= "table" then
+                self._queue_sync_paused = false
+                Notify.warn("Deleting queued messages requires pi 1.1.0 or newer")
+                return
+            end
+
+            local removed = self._history.remove_pending_queue_entry_at
+                    and self._history:remove_pending_queue_entry_at(index)
+                or nil
+            if not removed and entry and entry.expanded_text then
+                self._history:remove_pending_queue_entry(entry.expanded_text)
+            end
+
+            local held = {}
+            for _, comp_entry in ipairs(self._compaction_queue or {}) do
+                held[comp_entry.expanded] = true
+            end
+            ---@type pi.PendingQueueEntry[]
+            local survivors = {}
+            for _, pending_entry in ipairs(self._history:get_pending_queue()) do
+                if not held[pending_entry.expanded_text] then
+                    survivors[#survivors + 1] = pending_entry
+                end
+            end
+
+            local idle = self._streaming == false
+            for i, survivor in ipairs(survivors) do
+                local cmd_type = (idle and i == 1) and "prompt" or survivor.queue_type
+                ---@type pi.RpcCommand
+                local cmd = { type = cmd_type, message = survivor.expanded_text }
+                if survivor.images and #survivor.images > 0 then
+                    cmd.images = vim.tbl_map(function(img)
+                        if img.type == "image" or img.mimeType then
+                            return img
+                        end
+                        return { type = "image", data = img.data, mimeType = img.mime }
+                    end, survivor.images)
+                end
+                local on_response = nil
+                if cmd_type ~= "prompt" then
+                    local expanded = survivor.expanded_text
+                    on_response = function(r)
+                        vim.schedule(function()
+                            self:_reconcile_queue_disposition(expanded, r)
+                        end)
+                    end
+                end
+                self._agent.send(cmd, on_response)
+            end
+
+            self._queue_sync_paused = false
+        end)
+    end)
+    if sent == false then
+        self._queue_sync_paused = false
+        Notify.error("Failed to delete queued message (is the pi process running?)")
+    end
+end
+
 ---@return boolean
 function Chat:is_streaming()
     return self._streaming
@@ -804,7 +913,7 @@ end
 ---@param entry pi.CompactionQueuedMessage
 function Chat:_ensure_pending_compaction_entry(entry)
     self._history:remove_pending_queue_entry(entry.expanded)
-    self._history:add_pending_queue_entry(entry.mode, entry.text, entry.expanded, entry.image_count)
+    self._history:add_pending_queue_entry(entry.mode, entry.text, entry.expanded, entry.image_count, entry.images)
 end
 
 ---@param mode "steer"|"follow_up"
@@ -813,6 +922,14 @@ function Chat:_queue_compaction_message(mode)
     local image_count = self._attachments:count()
     if text == "" and image_count == 0 then
         return
+    end
+
+    local hist_store = self:_history_store()
+    if hist_store and text ~= "" then
+        hist_store:add(text)
+    end
+    if self._prompt_nav then
+        self._prompt_nav:reset()
     end
 
     if self._zen:is_active() then
@@ -838,7 +955,7 @@ function Chat:_queue_compaction_message(mode)
         image_count = attachments and #attachments or nil,
     }
     self._compaction_queue[#self._compaction_queue + 1] = entry
-    self._history:add_pending_queue_entry(mode, text, expanded, entry.image_count)
+    self._history:add_pending_queue_entry(mode, text, expanded, entry.image_count, entry.images)
     Notify.info("Queued message for after compaction")
 end
 
@@ -1072,6 +1189,13 @@ function Chat:_send_message(queue_type)
     local expanded = Mentions.expand(text)
 
     local image_count = attachments and #attachments or nil
+    ---@type pi.RpcImageContent[]?
+    local images = nil
+    if attachments and #attachments > 0 then
+        images = vim.tbl_map(function(item)
+            return { type = "image", data = item.data, mimeType = item.mime }
+        end, attachments)
+    end
     -- When the vision fallback applies, the bundled extension rewrites the
     -- submission (images -> description marker) before the agent sees it.
     -- Defer the final render until the user-message event arrives and keep a
@@ -1080,7 +1204,7 @@ function Chat:_send_message(queue_type)
 
     if queue_type then
         -- Queued message: show in pending area, render in history on delivery
-        self._history:add_pending_queue_entry(queue_type, text, expanded, image_count)
+        self._history:add_pending_queue_entry(queue_type, text, expanded, image_count, images)
     elseif vision_model then
         self._history:set_vision_pending({ text = text, image_count = image_count, model = vision_model })
         if not self._streaming and not self._compacting then
@@ -1116,13 +1240,24 @@ function Chat:_send_message(queue_type)
     else
         cmd = { type = "prompt", message = expanded }
     end
-    if attachments and #attachments > 0 then
-        cmd.images = vim.tbl_map(function(item)
-            return { type = "image", data = item.data, mimeType = item.mime }
-        end, attachments)
+    if images then
+        cmd.images = images
     end
 
-    if self._agent.send(cmd) == false then
+    -- For queued sends, reconcile the optimistic pending-queue entry with the
+    -- backend's disposition once its response arrives. pi >= 1.1.0 reports
+    -- `data.disposition` ("queued" / "handled" / "started"); older versions
+    -- omit it, in which case the callback is a no-op.
+    local on_response = nil
+    if queue_type then
+        on_response = function(res)
+            vim.schedule(function()
+                self:_reconcile_queue_disposition(expanded, res)
+            end)
+        end
+    end
+
+    if self._agent.send(cmd, on_response) == false then
         -- The RPC process is gone (or the send failed): never silently drop
         -- the user's message. Undo the optimistic UI state and put the text
         -- and attachments back into the prompt so they can be retried.
@@ -1142,6 +1277,37 @@ function Chat:_send_message(queue_type)
             self._attachments:restore(attachments)
         end
         Notify.error("Failed to send the message (is the pi process running?) — restored to the prompt")
+    end
+end
+
+--- Reconcile the optimistic pending-queue entry with pi's response disposition.
+---
+--- A steer/follow-up is normally queued (`disposition == "queued"`). When pi
+--- reports `"handled"` (an input handler consumed the message) or `"started"`
+--- (processed immediately), the message never sits in the queue, so drop the
+--- optimistic entry: a later `message_start` then renders it as a normal user
+--- message, and a consumed message leaves no phantom entry behind. Responses
+--- without a `data` table (pi < 1.1.0) are ignored.
+---@param expanded string mention-expanded text of the sent message
+---@param res pi.RpcEvent
+function Chat:_reconcile_queue_disposition(expanded, res)
+    local data = res and res.data
+    if type(data) ~= "table" then
+        return
+    end
+    local disposition = data.disposition
+    if disposition == nil or disposition == "queued" then
+        return
+    end
+
+    self._history:remove_pending_queue_entry(expanded)
+    if self._vision_inflight and self._vision_inflight.expanded == expanded then
+        -- The deferred vision preview belongs to this submission; drop it too.
+        self._vision_inflight = nil
+        self._history:set_vision_pending(nil)
+        if not self._streaming and not self._compacting then
+            self:set_status(nil)
+        end
     end
 end
 
@@ -1431,6 +1597,9 @@ end
 --- `{ steering: string[], followUp: string[] }` (expanded message texts).
 ---@param msg pi.RpcEvent
 function Chat:on_queue_update(msg)
+    if self._queue_sync_paused then
+        return
+    end
     -- Treat compaction as active: compaction-held entries are displayed in
     -- the pending queue but only sent to pi after compaction ends, so pi's
     -- payload legitimately lacks them until then.
@@ -1766,6 +1935,7 @@ function Chat:clear()
     self._flushed_queue_entries = {}
     self._replay_flushed_queue_entries = {}
     self._compaction_queue = {}
+    self._queue_sync_paused = false
     self._active_verb = nil
     self._done_verb = nil
     self._last_turn_stop_reason = nil

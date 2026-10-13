@@ -111,8 +111,10 @@ describe("vision fallback flow", function()
         assert.are.equal(2, #sent[1].images)
         assert.are.equal("image/png", sent[1].images[1].mimeType)
 
-        -- Render is deferred: no user message yet, pending preview active.
-        assert.is_false(buf_contains(chat._history:buf(), "fix this layout"))
+        -- Render is deferred: no user message yet; the pending preview row
+        -- (real lines) shows the text instead.
+        assert.is_true(buf_contains(chat._history:buf(), "fix this layout"))
+        assert.is_not_nil(chat._history._pending_block_extmark)
         assert.is_not_nil(chat._vision_inflight)
         assert.is_not_nil(chat._history._vision_pending)
         -- Short configurable statusline text (no model id by default).
@@ -244,9 +246,9 @@ describe("vision fallback flow", function()
         chat:_send_message("steer")
         pump(80)
 
-        -- Pending queue entry, not rendered yet.
+        -- Pending queue entry: preview row rendered, user message not yet.
         assert.are.equal(1, #chat._history:get_pending_queue())
-        assert.is_false(buf_contains(chat._history:buf(), "queued with image"))
+        assert.is_true(buf_contains(chat._history:buf(), "queued with image"))
 
         local transformed = "queued with image\n\n" .. Vision.make_marker("google/gemini-2.5-pro", "desc")
         deliver_user_message(chat, transformed)
@@ -331,21 +333,11 @@ describe("vision history rendering", function()
         h:set_vision_pending({ text = "describe this", image_count = 2, model = "p/m" })
         pump(60)
 
-        local ns = vim.api.nvim_create_namespace("pi-chat")
-        local marks = vim.api.nvim_buf_get_extmarks(h:buf(), ns, 0, -1, { details = true })
+        -- The preview renders as real buffer lines now.
         local found
-        for _, m in ipairs(marks) do
-            if m[4].virt_lines then
-                for _, row in ipairs(m[4].virt_lines) do
-                    for _, chunk in ipairs(row) do
-                        if chunk[1]:find("describe this", 1, true) then
-                            found = true
-                        end
-                        if chunk[1]:find("p/m", 1, true) then
-                            found = found and true
-                        end
-                    end
-                end
+        for _, line in ipairs(vim.api.nvim_buf_get_lines(h:buf(), 0, -1, false)) do
+            if line:find("describe this", 1, true) then
+                found = true
             end
         end
         assert.is_true(found)

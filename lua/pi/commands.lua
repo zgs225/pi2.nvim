@@ -33,6 +33,45 @@ local function complete_flags(prefix)
     end, candidates)
 end
 
+--- Handle :PiSteeringMode / :PiFollowUpMode. With a `mode` argument, set it
+--- directly (validated by the public setter); without one, read the backend's
+--- current value via `get_state` and switch to the other mode.
+---@param kind "steering"|"follow_up"
+---@param mode? string
+local function queue_mode_command(kind, mode)
+    local Pi = require("pi")
+    local is_steering = kind == "steering"
+    local setter = is_steering and Pi.set_steering_mode or Pi.set_follow_up_mode
+    local field = is_steering and "steeringMode" or "followUpMode"
+    local label = is_steering and "steering" or "follow-up"
+
+    if mode and mode ~= "" then
+        setter(mode)
+        return
+    end
+
+    local Notify = require("pi.notify")
+    local session = require("pi.sessions.manager").get()
+    if not session or not session.rpc:is_running() then
+        Notify.warn("No active session")
+        return
+    end
+
+    session.rpc:send({ type = "get_state" }, function(res)
+        vim.schedule(function()
+            local current
+            if res.success and type(res.data) == "table" then
+                current = res.data[field]
+            end
+            if current == nil then
+                Notify.error("Failed to read " .. label .. " mode")
+                return
+            end
+            setter(current == "all" and "one-at-a-time" or "all")
+        end)
+    end)
+end
+
 function M.setup()
     local Pi = require("pi")
 
@@ -67,6 +106,14 @@ function M.setup()
     vim.api.nvim_create_user_command("PiAbortBash", function()
         Pi.abort_bash()
     end, { desc = "Abort the running direct bash (!) command" })
+
+    vim.api.nvim_create_user_command("PiSteeringMode", function(cmd)
+        queue_mode_command("steering", cmd.args)
+    end, { nargs = "?", desc = "Set or cycle π steering queued-message mode (all/one-at-a-time)" })
+
+    vim.api.nvim_create_user_command("PiFollowUpMode", function(cmd)
+        queue_mode_command("follow_up", cmd.args)
+    end, { nargs = "?", desc = "Set or cycle π follow-up queued-message mode (all/one-at-a-time)" })
 
     vim.api.nvim_create_user_command("PiStop", function()
         Pi.stop()

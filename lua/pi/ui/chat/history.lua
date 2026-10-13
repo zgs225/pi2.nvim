@@ -7,7 +7,7 @@
 ---@field _scroll_scheduled boolean
 ---@field _auto_follow boolean whether streaming pins the window to the bottom (user cursor movement toggles it)
 ---@field _pending_cursor integer[]? landing spot of our last programmatic cursor move (CursorMoved guard)
----@field _status_extmark_id integer?
+---@field _status_extmark_id integer? (dead, kept for compat)
 ---@field _status_virt_line_count integer
 ---@field _status_text string?
 ---@field _status_start_time number?
@@ -43,7 +43,8 @@
 ---@field _startup_loaded boolean whether startup data has been fetched at least once
 ---@field _startup_errors pi.SystemErrorEntry[]
 ---@field _pending_queue pi.PendingQueueEntry[]
----@field _pending_queue_extmark_id integer?
+---@field _pending_queue_extmark_id integer? (dead, kept for compat)
+---@field _pending_block_extmark integer? first row of the real-line pending block at the buffer end
 ---@field _replaying boolean
 ---@field _cwd string? workspace cwd: base for shortening displayed tool paths and resolving them (see pi.path)
 ---@field _agent_text_start_row integer?
@@ -129,6 +130,7 @@ History._stream_flush_ms = 30
 ---@field text string
 ---@field expanded_text string
 ---@field image_count? integer
+---@field images? table[] RPC image payloads, cached so a deleted entry's queue-mates can be re-enqueued with attachments intact
 
 ---@class pi.ChatErrorOpts
 ---@field pad_top? boolean
@@ -513,6 +515,7 @@ function History.new(tab)
     self._vision_pending = nil
     self._vision_block_seq = 0
     self._pending_queue_extmark_id = nil
+    self._pending_block_extmark = nil
     self._status_virt_line_count = 0
     self._replaying = false
     self._agent_text_start_row = nil
@@ -647,14 +650,9 @@ function History:_scroll_to_bottom()
         return
     end
     vim.api.nvim_win_call(self._win, function()
-        -- G=last line, 0=col 1, zb=redraw with cursor at bottom
+        -- G=last line, 0=col 1, zb=redraw with cursor at bottom. The pending
+        -- block is real lines, so the last line IS the queue preview.
         vim.cmd("normal! G0zb")
-        -- Queue-preview virt_lines render below the last buffer line and
-        -- G0zb leaves them clipped below the cursor; scroll down to reveal.
-        local n = self._status_virt_line_count or 0
-        if n > 0 then
-            vim.cmd("normal! " .. n .. "\x05")
-        end
     end)
     self._auto_follow = true
     -- Remember where we parked the cursor so _on_cursor_moved can tell our
@@ -761,136 +759,177 @@ function History:_pick_spinner()
     self._spinner_rate = s.refresh_rate
 end
 
---- Rebuild the queue-preview virt_lines anchored below the last buffer line.
---- Only the pending-queue preview renders in the history window now; the
---- busy spinner and abort hints live in the prompt statusline (fixed
---- position), so the old bottom-padding machinery is gone and the preview
---- simply follows the content flow.
+--- Rebuild the pending-queue preview as REAL buffer lines at the buffer end.
+--- Unlike the old virt_lines rendering, real lines can hold the cursor, so a
+--- queued message can be targeted with `dd`. The cost is re-anchoring: every
+--- content append strips the block first (see _with_pending_stripped) and
+--- this function re-appends it after, so content never lands below the block.
 function History:_update_status_extmark()
     if not self._buf or not vim.api.nvim_buf_is_valid(self._buf) then
         return
     end
-    -- Hot path: with an empty queue there is nothing to render. Bail before
-    -- touching the window so per-delta calls stay O(1).
-    if #self._pending_queue == 0 and not self._vision_pending then
-        if self._status_extmark_id then
-            self:_clear_status_virt_lines()
-        end
+    local empty = #self._pending_queue == 0 and not self._vision_pending
+    -- Hot path: nothing to render and no stale block to strip.
+    if empty and not self._pending_block_extmark then
         return
     end
-    local win = self:win()
-
-    -- Build the status rows (rendered as virt_lines below the last buffer line).
-    -- hls entries are { start_col, end_col, hl_group } in 0-indexed byte offsets.
-    ---@type { text: string, hls: table[] }[]
-    local rows = {}
-
-    -- Vision fallback in progress: the latest submission is being rewritten
-    -- (images described by the configured vision model).
-    if self._vision_pending then
-        local label = Config.options.labels.vision_pending .. " "
-        local preview = self._vision_pending.text:gsub("\n", " ")
-        if preview == "" and self._vision_pending.image_count and self._vision_pending.image_count > 0 then
-            preview = format_attachment_info(self._vision_pending.image_count)
+    self:_with_modifiable(function()
+        self:_strip_pending_block()
+        if empty then
+            return
         end
-        if #preview > 80 then
-            preview = preview:sub(1, 77) .. "…"
-        end
-        local suffix = " → " .. self._vision_pending.model .. "…"
-        local prefix = "  " .. label
-        local line = prefix .. preview .. suffix
-        rows[#rows + 1] = {
-            text = line,
-            hls = {
-                { 2, #prefix, "PiPendingQueueLabel" },
-                { #prefix, #prefix + #preview, "PiPendingQueueText" },
-                { #prefix + #preview, #line, "PiPendingQueueLabel" },
-            },
-        }
-    end
 
-    -- Pending queue rows (left-aligned with a 2-space indent)
-    for _, entry in ipairs(self._pending_queue) do
-        local label = entry.queue_type == "steer" and (Config.options.labels.steer_message .. " ")
-            or (Config.options.labels.follow_up_message .. " ")
-        local preview = entry.text:gsub("\n", " ")
-        if preview == "" and entry.image_count and entry.image_count > 0 then
-            preview = format_attachment_info(entry.image_count)
-        end
-        if #preview > 80 then
-            preview = preview:sub(1, 77) .. "…"
-        end
-        local prefix = "  " .. label
-        local text = prefix .. preview
-        rows[#rows + 1] = {
-            text = text,
-            hls = { { 2, #prefix, "PiPendingQueueLabel" }, { #prefix, #text, "PiPendingQueueText" } },
-        }
-    end
+        -- Build the status rows.
+        -- hls entries are { start_col, end_col, hl_group } in 0-indexed byte offsets.
+        ---@type { text: string, hls: table[] }[]
+        local rows = {}
 
-    -- Text area width for right-padding (excludes signcolumn / foldcolumn).
-    local width = 80
-    if win then
-        local info = vim.fn.getwininfo(win)
-        if info and info[1] then
-            width = info[1].width - info[1].textoff
-        else
-            width = vim.api.nvim_win_get_width(win)
-        end
-    end
-
-    --- Convert a row's hls ({ start, end, hl } in 0-indexed byte offsets)
-    --- into virt_lines chunk format ({ { text, hl }, ... }).
-    local function row_to_chunks(row)
-        local chunks = {} ---@type string[][]
-        local pos = 0
-        for _, h in ipairs(row.hls) do
-            local s, e, hl = h[1], h[2], h[3]
-            if s > pos then
-                chunks[#chunks + 1] = { row.text:sub(pos + 1, s), "" }
+        -- Vision fallback in progress: the latest submission is being rewritten
+        -- (images described by the configured vision model).
+        if self._vision_pending then
+            local label = Config.options.labels.vision_pending .. " "
+            local preview = self._vision_pending.text:gsub("\n", " ")
+            if preview == "" and self._vision_pending.image_count and self._vision_pending.image_count > 0 then
+                preview = format_attachment_info(self._vision_pending.image_count)
             end
-            if e > s then
-                chunks[#chunks + 1] = { row.text:sub(s + 1, e), (hl and hl ~= "") and hl or "" }
+            if #preview > 80 then
+                preview = preview:sub(1, 77) .. "…"
             end
-            pos = e
+            local suffix = " → " .. self._vision_pending.model .. "…"
+            local prefix = "  " .. label
+            local line = prefix .. preview .. suffix
+            rows[#rows + 1] = {
+                text = line,
+                hls = {
+                    { 2, #prefix, "PiPendingQueueLabel" },
+                    { #prefix, #prefix + #preview, "PiPendingQueueText" },
+                    { #prefix + #preview, #line, "PiPendingQueueLabel" },
+                },
+            }
         end
-        if pos < #row.text then
-            chunks[#chunks + 1] = { row.text:sub(pos + 1), "" }
+
+        -- Pending queue rows (left-aligned with a 2-space indent)
+        for _, entry in ipairs(self._pending_queue) do
+            local label = entry.queue_type == "steer" and (Config.options.labels.steer_message .. " ")
+                or (Config.options.labels.follow_up_message .. " ")
+            local preview = entry.text:gsub("\n", " ")
+            if preview == "" and entry.image_count and entry.image_count > 0 then
+                preview = format_attachment_info(entry.image_count)
+            end
+            if #preview > 80 then
+                preview = preview:sub(1, 77) .. "…"
+            end
+            local prefix = "  " .. label
+            local text = prefix .. preview
+            rows[#rows + 1] = {
+                text = text,
+                hls = { { 2, #prefix, "PiPendingQueueLabel" }, { #prefix, #text, "PiPendingQueueText" } },
+            }
         end
-        -- Right-pad to full width so the background extends edge-to-edge.
-        local text_width = vim.fn.strdisplaywidth(row.text)
-        if text_width < width then
-            chunks[#chunks + 1] = { string.rep(" ", width - text_width), "" }
+
+        -- Append a blank margin line + one real line per row.
+        local start = vim.api.nvim_buf_line_count(self._buf)
+        local lines = { "" }
+        for _, r in ipairs(rows) do
+            lines[#lines + 1] = r.text
         end
-        return chunks
-    end
-
-    -- Build virt_lines: one blank margin line + queue rows.
-    ---@type string[][][]
-    local virt_lines = {}
-    local blank = { { string.rep(" ", width), "" } }
-    virt_lines[#virt_lines + 1] = blank
-    for _, r in ipairs(rows) do
-        virt_lines[#virt_lines + 1] = row_to_chunks(r)
-    end
-
-    self._status_virt_line_count = #virt_lines
-
-    -- Attach virt_lines to the last line of the history buffer.
-    local last_line = vim.api.nvim_buf_line_count(self._buf) - 1
-    if self._status_extmark_id then
-        pcall(vim.api.nvim_buf_set_extmark, self._buf, ns, last_line, 0, {
-            id = self._status_extmark_id,
-            virt_lines = virt_lines,
-        })
-    else
-        local ok, id = pcall(vim.api.nvim_buf_set_extmark, self._buf, ns, last_line, 0, {
-            virt_lines = virt_lines,
-        })
+        vim.api.nvim_buf_set_lines(self._buf, start, start, false, lines)
+        -- right_gravity defaults to true: a line inserted AT the anchor row
+        -- (tool output landing directly above the block) pushes the anchor
+        -- down instead of leaving it on the new line — otherwise the next
+        -- strip would delete the freshly written content.
+        local ok, id = pcall(vim.api.nvim_buf_set_extmark, self._buf, ns, start, 0, {})
         if ok then
-            self._status_extmark_id = id
+            self._pending_block_extmark = id
+        end
+        -- Row highlights (skip the blank margin at `start`).
+        for i, r in ipairs(rows) do
+            local row = start + i
+            for _, h in ipairs(r.hls) do
+                pcall(vim.api.nvim_buf_add_highlight, self._buf, ns, h[3], row, h[1], h[2])
+            end
+        end
+    end)
+end
+
+--- Delete the real-line pending block from the buffer end, if present.
+--- Must run inside a `_with_modifiable` context.
+function History:_strip_pending_block()
+    if not self._pending_block_extmark then
+        return
+    end
+    local pos = vim.api.nvim_buf_get_extmark_by_id(self._buf, ns, self._pending_block_extmark, {})
+    pcall(vim.api.nvim_buf_del_extmark, self._buf, ns, self._pending_block_extmark)
+    self._pending_block_extmark = nil
+    if pos and pos[1] then
+        local last = vim.api.nvim_buf_line_count(self._buf) - 1
+        if pos[1] <= last then
+            vim.api.nvim_buf_set_lines(self._buf, pos[1], -1, false, {})
         end
     end
+end
+
+--- Strip the pending block, run `fn` (a buffer write), then re-anchor the
+--- block at the new buffer end so content never lands below it.
+---@param fn fun()
+function History:_with_pending_stripped(fn)
+    self:_with_modifiable(function()
+        self:_strip_pending_block()
+        fn()
+    end)
+    self:_update_status_extmark()
+end
+
+--- Row of the last content line, excluding the pending-queue block.
+--- All structural renderers (tool/thinking/bash/agent start/end) must read
+--- geometry through this instead of raw `nvim_buf_line_count() - 1`, which
+--- would include the block's rows whenever the queue is non-empty.
+---@return integer
+function History:_content_end_row()
+    if self._pending_block_extmark then
+        local pos = vim.api.nvim_buf_get_extmark_by_id(self._buf, ns, self._pending_block_extmark, {})
+        if pos and pos[1] then
+            return math.max(pos[1] - 1, 0)
+        end
+    end
+    return vim.api.nvim_buf_line_count(self._buf) - 1
+end
+
+--- Map a 0-indexed buffer row to a 1-based pending-queue index, or nil when
+--- the row is not a pending-queue line. The first queue row sits one line
+--- below the block extmark (past the blank margin and the optional vision row).
+---@param row integer
+---@return integer?
+function History:pending_index_at(row)
+    if not self._pending_block_extmark then
+        return nil
+    end
+    local pos = vim.api.nvim_buf_get_extmark_by_id(self._buf, ns, self._pending_block_extmark, {})
+    if not pos or not pos[1] then
+        return nil
+    end
+    local first = pos[1] + 1
+    if self._vision_pending then
+        first = first + 1
+    end
+    local index = row - first + 1
+    if index >= 1 and index <= #self._pending_queue then
+        return index
+    end
+    return nil
+end
+
+--- Remove the pending-queue entry at a 1-based position (dd on a queue row).
+---@param index integer
+---@return pi.PendingQueueEntry?
+function History:remove_pending_queue_entry_at(index)
+    if index < 1 or index > #self._pending_queue then
+        return nil
+    end
+    local entry = table.remove(self._pending_queue, index)
+    self:_update_status_extmark()
+    self:_emit_queue_count()
+    return entry
 end
 
 --- Clear the status virt_lines from the history buffer.
@@ -950,14 +989,12 @@ end
 
 ---@param text string
 function History:_append_text(text)
-    local last_line = vim.api.nvim_buf_line_count(self._buf) - 1
-    local cur = vim.api.nvim_buf_get_lines(self._buf, last_line, last_line + 1, false)[1] or ""
-    local col = #cur
     local lines = vim.split(text, "\n", { plain = true })
-    self:_with_modifiable(function()
-        vim.api.nvim_buf_set_text(self._buf, last_line, col, last_line, col, lines)
+    self:_with_pending_stripped(function()
+        local last_line = vim.api.nvim_buf_line_count(self._buf) - 1
+        local cur = vim.api.nvim_buf_get_lines(self._buf, last_line, last_line + 1, false)[1] or ""
+        vim.api.nvim_buf_set_text(self._buf, last_line, #cur, last_line, #cur, lines)
     end)
-    self:_update_status_extmark()
     self:_maybe_scroll()
 end
 
@@ -1248,21 +1285,19 @@ end
 function History:_append_lines(lines_list)
     local start_row = 0
     lines_list = flatten_newlines(lines_list)
-    self:_with_modifiable(function()
+    self:_with_pending_stripped(function()
         local line_count = vim.api.nvim_buf_line_count(self._buf)
         if line_count == 1 then
             local first = vim.api.nvim_buf_get_lines(self._buf, 0, 1, false)[1]
             if first == "" then
                 vim.api.nvim_buf_set_lines(self._buf, 0, 1, false, lines_list)
                 start_row = 0
-                self:_maybe_scroll()
                 return
             end
         end
         start_row = line_count
         vim.api.nvim_buf_set_lines(self._buf, line_count, line_count, false, lines_list)
     end)
-    self:_update_status_extmark()
     self:_maybe_scroll()
     return start_row
 end
@@ -1681,10 +1716,13 @@ function History:add_user_message(msg, timestamp, image_count, queue_type)
         local time = timestamp or (os.time() * 1000)
         local time_str = format_time(time)
         local queue_tag = ""
+        local queue_tag_hl = nil
         if queue_type == "steer" then
             queue_tag = "  " .. Config.options.labels.steer_message
+            queue_tag_hl = "PiSteerDelivered"
         elseif queue_type == "follow_up" then
             queue_tag = "  " .. Config.options.labels.follow_up_message
+            queue_tag_hl = "PiFollowUpDelivered"
         end
         local time_sep = " "
         local label_line = icon .. time_sep .. time_str .. queue_tag
@@ -1716,7 +1754,7 @@ function History:add_user_message(msg, timestamp, image_count, queue_type)
         if queue_tag ~= "" then
             vim.api.nvim_buf_set_extmark(self._buf, ns, label_row, time_end, {
                 end_col = time_end + #queue_tag,
-                hl_group = "PiMessageQueueTag",
+                hl_group = queue_tag_hl,
             })
         end
         -- Color user body text with the user role hue (Title.fg)
@@ -1768,7 +1806,7 @@ function History:on_agent_start(timestamp)
         -- If the buffer already ends with a blank line (e.g. a thinking block's
         -- trailing margin, or a tool block's footer), skip one leading blank so
         -- we don't double up (#48).  tool_start / bash_start do the same check.
-        local last_line = vim.api.nvim_buf_line_count(self._buf) - 1
+        local last_line = self:_content_end_row()
         local last_text = vim.api.nvim_buf_get_lines(self._buf, last_line, last_line + 1, false)[1] or ""
         local ends_blank = last_text == ""
         -- End the label block exactly like a tool block's end (#48): one
@@ -1838,7 +1876,7 @@ function History:on_agent_end(done_verb, opts)
         self._agent_text_chunks = nil
         -- Render markdown tables in the agent response text.
         if self._agent_text_start_row then
-            local scan_end = vim.api.nvim_buf_line_count(self._buf) - 1
+            local scan_end = self:_content_end_row()
             self:_render_tables(self._agent_text_start_row, scan_end)
             self._agent_text_start_row = nil
         end
@@ -1872,7 +1910,7 @@ function History:on_agent_end(done_verb, opts)
             completion_hl = "PiError"
         end
         -- Attach completion as virtual text on the last non-empty prose line
-        local last_line_idx = vim.api.nvim_buf_line_count(self._buf) - 1
+        local last_line_idx = self:_content_end_row()
         local last_text = vim.api.nvim_buf_get_lines(self._buf, last_line_idx, last_line_idx + 1, false)[1] or ""
         local win_width = self._win and vim.api.nvim_win_is_valid(self._win) and vim.api.nvim_win_get_width(self._win)
             or 80
@@ -2577,7 +2615,7 @@ function History:on_tool_start(tool_name, tool_call_id, tool_input)
 
             -- Skip blank line between consecutive inline tools
             local need_gap = not self._last_was_inline
-            local last_line = vim.api.nvim_buf_line_count(self._buf) - 1
+            local last_line = self:_content_end_row()
             local cur = vim.api.nvim_buf_get_lines(self._buf, last_line, last_line + 1, false)[1] or ""
             local lines = (cur == "" or not need_gap) and { line } or { "", line }
             local start = self:_append_lines(lines)
@@ -2629,7 +2667,7 @@ function History:on_tool_start(tool_name, tool_call_id, tool_input)
         local header = fold .. icon .. " " .. display_name .. (detail and ("  " .. detail) or "")
         local name_end = #fold + #icon + 1 + #display_name
 
-        local last_line = vim.api.nvim_buf_line_count(self._buf) - 1
+        local last_line = self:_content_end_row()
         local cur = vim.api.nvim_buf_get_lines(self._buf, last_line, last_line + 1, false)[1] or ""
         -- Ensure exactly one blank line before block tool header
         local lines = cur == "" and { header } or { "", header }
@@ -2671,7 +2709,7 @@ function History:on_tool_start(tool_name, tool_call_id, tool_input)
             -- tail_extmark marks the last row of the block after on_start.
             -- on_tool_end uses it to insert output at the right position
             -- when multiple tools run in parallel.
-            local tail_row = vim.api.nvim_buf_line_count(self._buf) - 1
+            local tail_row = self:_content_end_row()
             self._tool_blocks[tool_call_id] = {
                 tool_name = tool_name,
                 icon_extmark = icon_extmark,
@@ -2815,7 +2853,7 @@ function History:on_tool_end(tool_name, tool_call_id, result, is_error)
             end
         end
 
-        local output_start = insert_at or vim.api.nvim_buf_line_count(self._buf)
+        local output_start = insert_at or (self:_content_end_row() + 1)
 
         local renderer = Tools.get_renderer(tool_name)
         if renderer.on_end then
@@ -2823,7 +2861,7 @@ function History:on_tool_end(tool_name, tool_call_id, result, is_error)
         end
 
         -- Mark the first output line (if renderer.on_end added anything)
-        local output_end = insert_at or vim.api.nvim_buf_line_count(self._buf)
+        local output_end = insert_at or (self:_content_end_row() + 1)
         if block and output_end > output_start then
             block.output_extmark = vim.api.nvim_buf_set_extmark(self._buf, ns, output_start, 0, {})
         end
@@ -3425,7 +3463,7 @@ function History:on_bash_start(id, command, exclude_from_context)
         local cmd_lines = vim.split(Tools.sanitize_text(command), "\n", { plain = true })
         local header = fold .. "$ " .. cmd_lines[1]
 
-        local last_line = vim.api.nvim_buf_line_count(self._buf) - 1
+        local last_line = self:_content_end_row()
         local cur = vim.api.nvim_buf_get_lines(self._buf, last_line, last_line + 1, false)[1] or ""
         -- Ensure exactly one blank line before the block header
         local lines = cur == "" and { header } or { "", header }
@@ -3757,7 +3795,7 @@ function History:on_thinking_start(opts)
         local measured = not self._unmeasured_thinking[gen]
         self._unmeasured_thinking[gen] = nil
         local label = Config.options.labels.thinking
-        local last_line = vim.api.nvim_buf_line_count(self._buf) - 1
+        local last_line = self:_content_end_row()
         local last_text = vim.api.nvim_buf_get_lines(self._buf, last_line, last_line + 1, false)[1] or ""
         -- The thinking block is placed as [blank breathing line, header]. Anchor
         -- it after all existing content so it renders in stream order. Normally
@@ -4059,17 +4097,19 @@ function History:clear_placeholder()
     self._placeholder_mode = nil
 end
 
---- Add a message to the pending queue (displayed as virtual text at the bottom).
+--- Add a message to the pending queue (displayed as real lines at the bottom).
 ---@param queue_type "steer"|"follow_up"
 ---@param display_text string raw user text (for display)
 ---@param expanded_text string expanded text (for matching on delivery)
 ---@param image_count? integer
-function History:add_pending_queue_entry(queue_type, display_text, expanded_text, image_count)
+---@param images? table[] RPC image payloads, cached for re-enqueue after a sibling is deleted
+function History:add_pending_queue_entry(queue_type, display_text, expanded_text, image_count, images)
     self._pending_queue[#self._pending_queue + 1] = {
         queue_type = queue_type,
         text = display_text,
         expanded_text = expanded_text,
         image_count = image_count,
+        images = images,
     }
     self:_update_status_extmark()
     self:_emit_queue_count()
@@ -4261,6 +4301,7 @@ function History:clear()
     self._status_extmark_id = nil
     self._pending_queue = {}
     self._pending_queue_extmark_id = nil
+    self._pending_block_extmark = nil
     self._thinking_accum = nil
     self._unmeasured_thinking = {}
     self._thinking_blocks = {}

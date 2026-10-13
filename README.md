@@ -252,6 +252,8 @@ require("pi").setup({
 | `:PiToggleLayout` | Switch between side and float layout |
 | `:PiAbort` | Abort the current agent operation |
 | `:PiAbortBash` | Abort the running direct bash (`!`) command |
+| `:PiSteeringMode [mode]` | Set or cycle steering delivery mode (`all` / `one-at-a-time`) |
+| `:PiFollowUpMode [mode]` | Set or cycle follow-up delivery mode (`all` / `one-at-a-time`) |
 | `:PiStop` | Stop the RPC process and close the chat |
 | `:PiAttention` | Open the next queued attention request |
 | `:PiNewSession` | Start a new conversation in the current tab/session |

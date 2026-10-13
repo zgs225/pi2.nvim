@@ -41,14 +41,18 @@ describe("history queue status rendering", function()
         return h
     end
 
-    local function status_virt_lines(h)
-        local marks = vim.api.nvim_buf_get_extmarks(h:buf(), ns, 0, -1, { details = true })
-        for _, m in ipairs(marks) do
-            if m[4].virt_lines then
-                return m[4].virt_lines
-            end
+    -- The pending queue renders as REAL buffer lines at the buffer end
+    -- (1 blank margin + one row per entry), not virt_lines.
+    ---@return string[] lines from the blank margin to the buffer end
+    local function pending_block_lines(h)
+        if not h._pending_block_extmark then
+            return {}
         end
-        return nil
+        local pos = vim.api.nvim_buf_get_extmark_by_id(h:buf(), ns, h._pending_block_extmark, {})
+        if not pos or not pos[1] then
+            return {}
+        end
+        return vim.api.nvim_buf_get_lines(h:buf(), pos[1], -1, false)
     end
 
     it("renders no status extmark when the queue is empty", function()
@@ -56,7 +60,8 @@ describe("history queue status rendering", function()
         h:set_status({ type = "agent", text = "Working…" })
         pump(50)
         h:_update_status_extmark()
-        assert.is_nil(status_virt_lines(h))
+        assert.are.equal(0, #pending_block_lines(h))
+        assert.is_nil(h._pending_block_extmark)
         assert.are.equal(0, h._status_virt_line_count)
     end)
 
@@ -85,21 +90,18 @@ describe("history queue status rendering", function()
         local h = setup_history(3)
         h:add_pending_queue_entry("follow_up", "first queued", "first queued")
         h:add_pending_queue_entry("steer", "second queued", "second queued")
-        local virt_lines = status_virt_lines(h)
-        assert.is_not_nil(virt_lines)
-        assert.are.equal(3, #virt_lines) -- 1 blank + 2 rows
-        local row_text = ""
-        for _, chunk in ipairs(virt_lines[2]) do
-            row_text = row_text .. chunk[1]
-        end
-        assert.is_not_nil(row_text:find("first queued", 1, true))
+        local lines = pending_block_lines(h)
+        assert.are.equal(3, #lines) -- 1 blank + 2 rows
+        assert.are.equal("", lines[1])
+        assert.is_not_nil(lines[2]:find("first queued", 1, true))
+        assert.is_not_nil(lines[3]:find("second queued", 1, true))
 
         h:remove_pending_queue_entry("first queued")
-        virt_lines = status_virt_lines(h)
-        assert.are.equal(2, #virt_lines) -- 1 blank + 1 row
+        lines = pending_block_lines(h)
+        assert.are.equal(2, #lines) -- 1 blank + 1 row
 
         h:clear_pending_queue()
-        assert.is_nil(status_virt_lines(h))
+        assert.are.equal(0, #pending_block_lines(h))
     end)
 
     it("pushes the busy display model to the status listener", function()

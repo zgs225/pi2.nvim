@@ -7,7 +7,8 @@ What the plugin does bind on its own:
 - Submission keys in the prompt buffer (`<CR>`, `<A-CR>`, `<S-CR>` — see [Usage → Prompt](usage.md#prompt)).
 - `<Esc>` / double-`<Esc>` abort gestures (see [Usage → Aborting](usage.md#aborting-with-double-esc)).
 - `<C-p>` / `<C-n>` / `<Up>` / `<Down>` prompt-history recall (see [Usage → Prompt history](usage.md#prompt-history)).
-- `<Tab>` block expand/collapse and `gf` open-file-under-cursor in the history buffer.
+- `<Tab>` block expand/collapse, `gf` open-file-under-cursor, and `dd` delete-queued-message in the history buffer.
+- `dd` on a queued steer/follow-up message in the history buffer deletes just that message (from pi's queue too) and yanks its text into the unnamed register (see [Usage → Deleting queued messages](usage.md#deleting-queued-messages)).
 - `gp` return to parent session when viewing a sub-session (see [Sessions → Sub-sessions](sessions.md#sub-sessions)).
 - `T` inside the sub-session viewer float toggles the viewed session's todo list panel (see [Usage → In the sub-session viewer](usage.md#in-the-sub-session-viewer)).
 - `dd` / `x` to remove an entry in the attachments buffer.

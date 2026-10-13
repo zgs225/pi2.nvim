@@ -300,6 +300,59 @@ function M.abort_retry()
     end
 end
 
+---@param command "set_steering_mode"|"set_follow_up_mode"
+---@param label string human-readable mode name for notifications ("Steering mode")
+---@param mode "all"|"one-at-a-time"
+local function set_queue_mode(command, label, mode)
+    local Notify = require("pi.notify")
+    if mode ~= "all" and mode ~= "one-at-a-time" then
+        Notify.error(label .. ' must be "all" or "one-at-a-time"')
+        return
+    end
+
+    local session = require("pi.sessions.manager").get()
+    if not session or not session.rpc:is_running() then
+        Notify.warn("No active session")
+        return
+    end
+
+    local cmd = { type = command, mode = mode }
+    local sent = session.rpc:send(cmd, function(res)
+        vim.schedule(function()
+            if res.success then
+                Notify.info(label .. ": " .. mode)
+            else
+                Notify.error("Failed to set " .. label:lower() .. ": " .. (res.error or "unknown error"))
+            end
+        end)
+    end)
+    if not sent then
+        Notify.error("Failed to send " .. label:lower() .. " command")
+    end
+end
+
+--- Set how the backend delivers queued steering messages (the `steer` RPC and
+--- `streamingBehavior = "steer"`). `"all"` delivers every queued steer after
+--- the current assistant turn finishes its tool calls; `"one-at-a-time"` (the
+--- backend default) delivers one steer per turn boundary. This is per-session
+--- backend state, so — like the other session settings (thinking level, model,
+--- auto-compaction) — it applies to the current tab's session and does not
+--- cascade to sub-sessions.
+---@param mode "all"|"one-at-a-time"
+function M.set_steering_mode(mode)
+    set_queue_mode("set_steering_mode", "Steering mode", mode)
+end
+
+--- Set how the backend delivers queued follow-up messages (the `follow_up`
+--- RPC). `"all"` delivers every queued follow-up once the agent finishes;
+--- `"one-at-a-time"` (the backend default) delivers one per completion. This
+--- is per-session backend state, so it applies to the current tab's session and
+--- does not cascade to sub-sessions.
+---@param mode "all"|"one-at-a-time"
+function M.set_follow_up_mode(mode)
+    set_queue_mode("set_follow_up_mode", "Follow-up mode", mode)
+end
+
 --- Stop the process and close the chat.
 function M.stop()
     require("pi.sessions.manager").stop()
