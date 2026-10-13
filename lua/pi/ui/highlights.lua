@@ -86,7 +86,11 @@ local function set_defaults()
     vim.api.nvim_set_hl(0, "PiCompactionText", { default = true, fg = comment.fg, italic = true, nocombine = true })
     vim.api.nvim_set_hl(0, "PiCompactionHint", { default = true, fg = comment.fg, italic = true, nocombine = true })
     vim.api.nvim_set_hl(0, "PiMessageDateTime", { default = true, fg = comment.fg })
-    vim.api.nvim_set_hl(0, "PiMessageQueueTag", { default = true, fg = comment.fg, italic = true })
+    -- Delivered steer/follow-up tag: a subdued mark on the message label that
+    -- records how the message entered the conversation. Pending queue entries
+    -- use PiPendingQueueLabel/Text instead; these apply once delivered.
+    vim.api.nvim_set_hl(0, "PiSteerDelivered", { default = true, fg = comment.fg, italic = true })
+    vim.api.nvim_set_hl(0, "PiFollowUpDelivered", { default = true, fg = comment.fg, italic = true })
     vim.api.nvim_set_hl(0, "PiPendingQueueLabel", { default = true, fg = warning.fg, italic = true })
     vim.api.nvim_set_hl(0, "PiPendingQueueText", { default = true, fg = comment.fg, italic = true })
     vim.api.nvim_set_hl(0, "PiMessageAttachments", { default = true, fg = comment.fg, italic = true })

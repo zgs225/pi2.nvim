@@ -20,7 +20,8 @@ All highlight groups are defined with `default = true`, so they can be overridde
 | `PiCompactionText` | Body text inside compaction summaries |
 | `PiCompactionHint` | Expand/collapse hint inside collapsed compaction summaries |
 | `PiMessageDateTime` | Timestamp next to messages |
-| `PiMessageQueueTag` | Queue tag (steer / follow-up) next to queued messages |
+| `PiSteerDelivered` | Delivered steer tag (`labels.steer_message`) next to a message that entered the conversation as a steer |
+| `PiFollowUpDelivered` | Delivered follow-up tag (`labels.follow_up_message`) next to a message that entered the conversation as a follow-up |
 | `PiMessageAttachments` | Attachment summary under a message |
 | `PiPendingQueueLabel` | Label/icon for pending queued messages (history preview rows and statusline `queue` count) |
 | `PiPendingQueueText` | Text of pending queued messages |

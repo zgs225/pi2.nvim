@@ -57,6 +57,12 @@ pi.abort()                    -- cancel the current agent turn, keep the session
 pi.abort_bash()               -- cancel the running direct bash (!) command
 pi.abort_retry()              -- cancel the auto-retry backoff ("Retrying…" state); only
                               -- takes effect while the core is between retry attempts
+pi.set_steering_mode(mode)    -- how queued steering messages are delivered: "all" (every
+                              -- queued steer after the current turn and its tool calls) or
+                              -- "one-at-a-time" (one per turn boundary; backend default)
+pi.set_follow_up_mode(mode)   -- how queued follow-up messages are delivered: "all" (every
+                              -- queued follow-up at completion) or "one-at-a-time" (one
+                              -- per completion; backend default)
 pi.stop()                     -- kill the RPC process and close the chat for the current tab
 
 -- Sub-sessions
@@ -109,3 +115,25 @@ pi.toggle_debug()             -- toggle RPC debug logging for the current Neovim
 ```
 
 Most functions are no-ops (or warn) when no session is active in the current tab — safe to bind unconditionally. See [Usage](usage.md) and [Keymaps](keymaps.md) for how these fit into a working setup.
+
+## Queue modes
+
+`pi.set_steering_mode(mode)` and `pi.set_follow_up_mode(mode)` map to the backend's
+`set_steering_mode` / `set_follow_up_mode` RPC commands and mirror the
+`:PiSteeringMode [mode]` / `:PiFollowUpMode [mode]` user commands. An invalid
+mode is rejected (an error notification), and a success notification reports the
+mode now in effect.
+
+- **Steering** controls messages queued while the agent is running (the `steer`
+  RPC / `streamingBehavior = "steer"`). `"all"` delivers every queued steer
+  after the current assistant turn's tool calls; `"one-at-a-time"` (backend
+  default) delivers one steer per turn boundary.
+- **Follow-up** controls messages queued for after completion (the `follow_up`
+  RPC). `"all"` delivers every queued message once the agent finishes;
+  `"one-at-a-time"` (backend default) delivers one per completion.
+
+With no argument the commands read the backend's current value (`get_state`)
+and switch to the other mode. The mode is per-session backend state, so — like
+thinking level, model, and auto-compaction — it applies to the current tab's
+session and is not cascaded to sub-sessions; a sub-session keeps its own mode
+and can be changed from its view.

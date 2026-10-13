@@ -1,5 +1,17 @@
 # Changelog
 
+## 2026-10-13
+
+- **ADDED:** `dd` deletes a single queued steer/follow-up message. Queued messages now render as real lines at the bottom of the history buffer (no longer virt_lines), so the cursor can rest on one; `dd` removes just that message — from pi's queue too, via `clear_queue` with the survivors re-enqueued in original order/type with attachments intact — and yanks its text into the unnamed register (prompt-history recall works too, so `<Up>`/`<C-p>` brings it back for editing). Messages held during compaction are removed locally only. Requires pi 1.1.0 (older pi warns and leaves the queue untouched).
+- **CHANGED:** Pending-queue preview renders as real buffer lines at the history bottom (one blank margin + one row per entry) instead of virt_lines, enabling the `dd` interaction. Content appends strip and re-anchor the block, so the preview always stays at the bottom.
+- **FIXED:** Messages queued while compaction is running are now recorded in the prompt history, so after a `dd` (or manual removal) they can be recalled with `<Up>`/`<C-p>` like any other submission.
+
+## 2026-10-12
+
+- **ADDED:** Queue delivery modes. `:PiSteeringMode [mode]` / `pi.set_steering_mode(mode)` and `:PiFollowUpMode [mode]` / `pi.set_follow_up_mode(mode)` set the backend's delivery mode to `all` (deliver every queued message together at the next boundary) or `one-at-a-time` (the backend default, one per boundary). With no argument the commands cycle. Per-session state, no sub-session cascade.
+- **ADDED:** Delivered steer/follow-up messages keep a subdued mark in the history. The `labels.steer_message` / `labels.follow_up_message` icon now stays on the user-message label line after delivery, rendered with the new `PiSteerDelivered` / `PiFollowUpDelivered` highlight groups (replacing `PiMessageQueueTag`), so you can still tell how a past message entered the conversation. Derived from the live event stream — pi's transcript does not record queue provenance, so resumed sessions lose the tag.
+- **FIXED:** Steer/follow-up optimistic queue entries are reconciled against pi's `disposition` response (pi 1.1.0+): a message reported as `handled`/`started` instead of `queued` has its pending entry dropped so it renders as an ordinary user message; older pi without the field is unaffected. Also fixed a type drift: `queue_update` and the queue-mode commands were missing from `pi.RpcEventType` / `pi.RpcCommandType`.
+
 ## 2026-10-10
 
 - **CHANGED:** Validated against pi 1.1.0 (`compat.validated` 0.79.3 → 1.1.0; `:checkhealth pi` and doc/troubleshooting.md report the new floor). Validation ran the full hermetic suite plus three new real-process e2e scripts (`scripts/e2e/pi110_duration.lua`, `pi110_abort.lua`, `pi110_cli_gating.lua`) against the real pi 1.1.0 binary with live `glm-5.3-flash` calls, and a GUI pixel check of the tool-duration text and `gf`-on-truncation-notice. Wire-level confirmation: `tool_execution_end.durationMs` (2020 ms for a `sleep 2` bash, 11 ms for a `read`) and `agent_settled.aborted == true` on abort (plain session and user-spawned child → manifest `interrupted`, no completion report injected) both arrive as documented. Minimum supported stays `0.65.2`.

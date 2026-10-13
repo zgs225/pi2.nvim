@@ -76,7 +76,20 @@ When the agent is **streaming**, the two diverge. Both options queue your messag
 - `<CR>` sends a **steer**. The agent finishes whatever tool calls are currently in flight, and your message is delivered just before the next LLM call. The agent doesn't stop mid-tool-call, but it also doesn't finish the whole task before reading you. Use it when you want to redirect the agent at the earliest possible boundary — e.g. you've spotted that it's going down the wrong path and want to correct course as soon as the current step lands.
 - `<A-CR>` sends a **follow-up**. The message waits until the agent has fully finished the current turn (no more tool calls, no pending steers) and is then delivered as the next message. Use it when you want to add something for the agent to address _after_ it's done with the current work, without interrupting the flow.
 
-Both queued messages are rendered in the history with distinct labels (`labels.steer_message` and `labels.follow_up_message`) so you can tell them apart later.
+Both queued messages are rendered in the history with distinct labels (`labels.steer_message` and `labels.follow_up_message`) so you can tell them apart later. The same icon stays on the message after delivery — a subdued mark (`PiSteerDelivered` / `PiFollowUpDelivered`) appended to the user-message label line, next to the timestamp — so you can still tell how a past message entered the conversation. pi's `disposition` response tells π whether a submitted steer/follow-up was actually queued (`queued`) or consumed/handled immediately; in the latter case the pending entry is dropped and the message, if it arrives at all, renders as an ordinary user message.
+
+> [!NOTE]
+> The delivered tag is derived from the live event stream, not from the session transcript: pi does not record whether a user message was a steer, a follow-up, or a regular prompt. Resuming a session (`:PiResume`, `:PiContinue`, or a compaction rebuild) therefore loses these tags on replayed messages — after a resume, old steer/follow-up messages render like regular user messages.
+
+### Deleting queued messages
+
+Queued messages render as real lines at the bottom of the history buffer (below a blank margin line, with the steer/follow-up label), so the cursor can rest on them.
+
+With the cursor on a queued message in the history buffer, press `dd`. π removes just that message — from pi's queue too (via `clear_queue`, then re-enqueueing the survivors in their original order and type, with attachments intact). The deleted text lands in the unnamed register, so you can paste it back with `p`; it's also in the prompt history, so `<Up>`/`<C-p>` in the prompt recalls it for editing and resubmission. Messages held locally during compaction (not yet sent to pi) are removed locally only. Deleting a queued message requires **pi 1.1.0**; older pi warns and leaves the queue untouched (`:checkhealth pi` reports the version).
+
+### Queue delivery modes
+
+By default pi delivers one queued steer per turn boundary (`one-at-a-time`) — a burst of steers is folded in one at a time. `:PiSteeringMode [mode]` (Lua: `pi.set_steering_mode(mode)`) switches steering delivery to `all` (every queued steer is delivered together after the current tool calls finish) or back to `one-at-a-time`. `:PiFollowUpMode [mode]` (Lua: `pi.set_follow_up_mode(mode)`) does the same for follow-up messages. With no argument, both commands cycle to the other mode; with an argument they set that mode. The mode is per-session backend state — it applies to the current tab's session and does not cascade to sub-sessions. See [Queue modes](api.md#queue-modes) for details.
 
 ## Aborting with double `<Esc>`
 
