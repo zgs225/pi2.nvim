@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-15
+
+- **FIXED:** `:PiTasks` preview (`p`) and the stop-confirmation dialog now flatten multi-line task commands onto a single display line, fixing an E5108 (`nvim_buf_set_lines` rejected a replacement string containing newlines) when a task was started from a multi-line command such as a multi-line bash script.
+
 ## 2026-10-13
 
 - **ADDED:** `dd` deletes a single queued steer/follow-up message. Queued messages now render as real lines at the bottom of the history buffer (no longer virt_lines), so the cursor can rest on one; `dd` removes just that message — from pi's queue too, via `clear_queue` with the survivors re-enqueued in original order/type with attachments intact — and yanks its text into the unnamed register (prompt-history recall works too, so `<Up>`/`<C-p>` brings it back for editing). Messages held during compaction are removed locally only. Requires pi 1.1.0 (older pi warns and leaves the queue untouched).
