@@ -782,6 +782,15 @@ local function preview_duration(task, now_ms)
     return text
 end
 
+--- Flatten a possibly multi-line task string into one display line. RPC
+--- command strings may contain newlines (multi-line bash), which
+--- nvim_buf_set_lines rejects; the row summary flattens the same way.
+---@param s string?
+---@return string
+local function one_line(s)
+    return ((s or ""):gsub("%s+", " "))
+end
+
 --- Compose the preview buffer: `$ command`, a blank, the id/status/pid line
 --- plus the optional duration and output path, then a blank and the tail. A
 --- `#<tab> · ` prefix marks only a task owned by another tab, matching the
@@ -791,7 +800,7 @@ end
 ---@return string[] lines
 ---@return integer[] meta 1-based line numbers rendered in PiTasksPreviewMeta
 local function preview_content(task, tail)
-    local lines = { "$ " .. (task.command or ""), "" }
+    local lines = { "$ " .. one_line(task.command), "" }
     local foreign = task.tab ~= nil and task.tab ~= current_tab()
     local head = (foreign and ("#" .. task.tab .. " · ") or "") .. task.id
     head = head .. " · " .. preview_status(task)
@@ -1045,7 +1054,7 @@ local function stop_under_cursor()
         Notify.info("Task " .. task.id .. " is not running (" .. row.status_label .. ")")
         return
     end
-    local choice = vim.fn.confirm("Stop task " .. task.id .. " (" .. task.command .. ")?", "&Yes\n&No", 2)
+    local choice = vim.fn.confirm("Stop task " .. task.id .. " (" .. one_line(task.command) .. ")?", "&Yes\n&No", 2)
     if choice ~= 1 then
         return
     end
