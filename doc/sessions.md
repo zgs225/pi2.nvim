@@ -153,6 +153,10 @@ Keys inside the list: `<CR>` / `o` jump to that session's tab and open its chat 
 
 Sub-session child rows are sorted **newest first** by `created_at`, with the session id as a stable tiebreaker so refresh does not reshuffle them.
 
+Each sub-session is listed under exactly one parent **session**. Two live sessions can share a lineage — a conversation started with `/new` and the original session resumed in another tab — and both would otherwise claim the same child: the conversation that spawned the child (matching conversation epoch) wins, otherwise the conversation the lineage originates from, and failing both, the first live session in tabline order. `H` / `h` never attribute a child to a second session.
+
+A tab that views a sub-session still renders it under its parent's row, marked as that tab's current view — the same parent session, so the marker survives without the child being attributed to a second one.
+
 By default the window follows the current tab's chat layout (a side split when the chat is in side layout, a centered float when it is in float layout); `mode` pins it to one style, and `auto_open` shows the list whenever the chat opens:
 
 ```lua

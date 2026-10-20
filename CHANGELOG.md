@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-20
+
+- **FIXED:** `:PiSessions` listed one sub-session under two parent sessions when two live sessions shared a lineage — a conversation started with `/new` in one tab (which keeps the previous conversation's lineage) and the original session resumed in another. Both rows attributed manifest children by lineage alone, so a child spawned in the `/new` conversation also appeared under the resumed, older-epoch session (its running process bypassed the epoch check), and `H` showed its hidden rows twice. A child now renders under exactly one parent session: the conversation that spawned it (matching conversation epoch) wins, otherwise the conversation the lineage originates from, and failing both, the first live session in tabline order. A tab viewing one of the children still marks it under its parent's row.
+
 ## 2026-10-15
 
 - **FIXED:** `:PiTasks` preview (`p`) and the stop-confirmation dialog now flatten multi-line task commands onto a single display line, fixing an E5108 (`nvim_buf_set_lines` rejected a replacement string containing newlines) when a task was started from a multi-line command such as a multi-line bash script.

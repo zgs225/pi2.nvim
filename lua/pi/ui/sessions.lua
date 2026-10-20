@@ -423,11 +423,116 @@ local function child_filter_ctx()
     }
 end
 
+--- One parent row's plan: the live session that produced the row and the
+--- session its children are attributed to (`view_parent_id` when the tab is
+--- viewing a child).
+---@class pi.SessionsListRowPlan
+---@field session pi.Session
+---@field root pi.Session
+---@field in_child_view boolean
+
+--- Live sessions sharing one manifest lineage, deduplicated by root id in
+--- tabline order.
+---@class pi.SessionsListLineageGroup
+---@field roots { id: string, session: pi.Session, index: integer }[]
+---@field viewers table<string, string> child session id -> root id of the row viewing it
+---@field seen table<string, true> root ids already collected
+
+--- Pick the owning root for one child entry: the row viewing the child, then
+--- the root whose conversation epoch spawned it (preferring the conversation the
+--- lineage is named after on ties), then the root the lineage is named after,
+--- then the first tabline row.
+---@param group pi.SessionsListLineageGroup
+---@param entry pi.SubsessionManifestEntry
+---@return string? owner_root_id
+local function resolve_owner_for_entry(group, entry)
+    local child_id = entry._id
+    if type(child_id) == "string" then
+        local viewer = group.viewers[child_id]
+        if viewer then
+            return viewer
+        end
+    end
+    local epoch = entry.parent_epoch or 0
+    ---@type { id: string, session: pi.Session, index: integer }?
+    local best = nil
+    for _, root in ipairs(group.roots) do
+        if (root.session.conversation_epoch or 0) == epoch then
+            if not best or (root.id == entry.parent_id and best.id ~= entry.parent_id) then
+                best = root
+            end
+        end
+    end
+    if best then
+        return best.id
+    end
+    for _, root in ipairs(group.roots) do
+        if root.id == entry.parent_id then
+            return root.id
+        end
+    end
+    return group.roots[1] and group.roots[1].id or nil
+end
+
+--- Resolve which live session owns each manifest child when several live
+--- sessions share one lineage (a `/new` conversation and the original session
+--- resumed in another tab): a lineage is not unique across live sessions, so
+--- attributing children by lineage alone renders the same child under two rows.
+---
+--- A lineage with a single live root gets no restriction, so a running child
+--- spawned before `/new` stays visible in the same tab and a resumed
+--- conversation keeps its own children.
+---@param rows pi.SessionsListRowPlan[]
+---@return table<string, table<string, string>>? lineage -> (child id -> owning session id)
+local function resolve_child_owners(rows)
+    local Manifest = require("pi.subsessions.manifest")
+    ---@type table<string, pi.SessionsListLineageGroup>
+    local groups = {}
+    for index, row in ipairs(rows) do
+        local lineage = Manifest.lineage_for_session(row.root)
+        if lineage ~= "" then
+            local group = groups[lineage]
+            if not group then
+                group = { roots = {}, viewers = {}, seen = {} }
+                groups[lineage] = group
+            end
+            local root_id = row.root.id
+            if type(root_id) == "string" and not group.seen[root_id] then
+                group.seen[root_id] = true
+                group.roots[#group.roots + 1] = { id = root_id, session = row.root, index = index }
+            end
+            if row.in_child_view and type(row.session.id) == "string" then
+                -- The child-view row owns the child its tab shows.
+                group.viewers[row.session.id] = root_id
+            end
+        end
+    end
+
+    ---@type table<string, table<string, string>>?
+    local owners = nil
+    for lineage, group in pairs(groups) do
+        if #group.roots > 1 then
+            owners = owners or {}
+            ---@type table<string, string>
+            local by_child = {}
+            for _, entry in ipairs(Manifest.children_of(lineage)) do
+                local child_id = entry._id
+                if type(child_id) == "string" and child_id ~= "" then
+                    by_child[child_id] = resolve_owner_for_entry(group, entry)
+                end
+            end
+            owners[lineage] = by_child
+        end
+    end
+    return owners
+end
+
 --- Get visible child entries for a parent session.
 ---@param parent_sess pi.Session?
 ---@param current_child_id? string
+---@param owned? table<string, string> child id -> owning session id (multi-root lineages only)
 ---@return { entry: pi.SubsessionManifestEntry, is_current: boolean }[]
-local function get_visible_children(parent_sess, current_child_id)
+local function get_visible_children(parent_sess, current_child_id, owned)
     if not parent_sess then
         return {}
     end
@@ -442,18 +547,26 @@ local function get_visible_children(parent_sess, current_child_id)
     local hidden_shown = show_hidden_children or (parent_hidden[parent_key(parent_sess) or lineage] == true)
     for _, entry in ipairs(Manifest.children_of(lineage)) do
         local child_id = entry._id
-        local is_current = type(current_child_id) == "string" and child_id == current_child_id
-        local same_epoch = (entry.parent_epoch or 0) == epoch
-        local alive = type(child_id) == "string"
-            and entry.status == "active"
-            and ctx.process_alive
-            and ctx.process_alive(child_id)
-        local visible = is_current or hidden_shown or alive or (same_epoch and ChildFilter.child_visible(entry, ctx))
-        if visible then
-            visible_entries[#visible_entries + 1] = {
-                entry = entry,
-                is_current = is_current,
-            }
+        local owner = type(child_id) == "string" and owned and owned[child_id] or nil
+        -- A child owned by another live session on the same lineage is rendered
+        -- by that session's row only, never here.
+        if owner == nil or owner == parent_sess.id then
+            local is_current = type(current_child_id) == "string" and child_id == current_child_id
+            local same_epoch = (entry.parent_epoch or 0) == epoch
+            local alive = type(child_id) == "string"
+                and entry.status == "active"
+                and ctx.process_alive
+                and ctx.process_alive(child_id)
+            local visible = is_current
+                or hidden_shown
+                or alive
+                or (same_epoch and ChildFilter.child_visible(entry, ctx))
+            if visible then
+                visible_entries[#visible_entries + 1] = {
+                    entry = entry,
+                    is_current = is_current,
+                }
+            end
         end
     end
     return visible_entries
@@ -540,52 +653,82 @@ end
 ---@return pi.SessionsListRow[]
 function M.build_rows(sessions, attention_count, name_of, flags_of, generating_of)
     local Sessions = require("pi.sessions.manager")
+    local Manifest = require("pi.subsessions.manifest")
+
+    -- Row plan first: ownership needs every root before any row renders.
+    ---@type pi.SessionsListRowPlan[]
+    local plans = {}
+    for _, session in ipairs(sessions) do
+        local in_child_view = session.view_parent_id ~= nil
+        ---@type pi.Session?
+        local root = session
+        if in_child_view then
+            root = Sessions.get_by_id(session.view_parent_id)
+        end
+        if root then
+            plans[#plans + 1] = { session = session, root = root, in_child_view = in_child_view }
+        end
+    end
+
+    local owners = resolve_child_owners(plans)
+
+    --- Child id -> root key of the parent session that claimed it in this call.
+    --- Rows of the SAME parent session (a parent's own tab row plus a tab
+    --- viewing one of its children) keep rendering the same children, so the
+    --- viewer row keeps its current-view marker; rows of a DIFFERENT parent
+    --- session never render a child another parent claimed.
+    ---@type table<string, string>
+    local claimed = {}
+
     ---@type pi.SessionsListRow[]
     local out = {}
-    for _, session in ipairs(sessions) do
+    for index, plan in ipairs(plans) do
+        local session = plan.session
+        local root = plan.root
         local tab = session.tab
-        local root_id = session.view_parent_id or session.id
-        local in_child_view = session.view_parent_id ~= nil
-
-        if in_child_view and root_id then
-            local parent_sess = Sessions.get_by_id(root_id)
-            local visible_children = get_visible_children(parent_sess, session.id)
-            local child_count = #visible_children
-            local has_children = child_count > 0
-            local is_active_parent = tab == nil or tab == current_tab()
-            local collapsed = has_children and is_parent_collapsed(parent_sess, is_active_parent) or false
-
-            if parent_sess then
-                append_parent_row(out, parent_sess, tab, {
-                    is_current_view = false,
-                    is_tree_parent = true,
-                    name = name_of(parent_sess) or name_from_session_file(parent_sess),
-                    has_children = has_children,
-                    collapsed = collapsed,
-                    child_count = child_count,
-                }, attention_count, name_of, flags_of, generating_of)
-            end
-            if not collapsed then
-                for _, item in ipairs(visible_children) do
-                    append_child_row(out, item.entry, tab, { is_current_view = item.is_current })
+        -- Stable key per parent session; a session without an id stays independent.
+        local root_key = type(root.id) == "string" and root.id or ("row:" .. tostring(index))
+        local owned = owners and owners[Manifest.lineage_for_session(root)] or nil
+        local visible_children = get_visible_children(root, plan.in_child_view and session.id or nil, owned)
+        ---@type { entry: pi.SubsessionManifestEntry, is_current: boolean }[]
+        local pending = {}
+        for _, item in ipairs(visible_children) do
+            local child_id = item.entry._id
+            local claimer = type(child_id) == "string" and claimed[child_id] or nil
+            if claimer == nil or claimer == root_key then
+                if type(child_id) == "string" then
+                    claimed[child_id] = root_key
                 end
+                pending[#pending + 1] = item
             end
-        else
-            local visible_children = get_visible_children(session, nil)
-            local child_count = #visible_children
-            local has_children = child_count > 0
-            local collapsed = has_children and is_parent_collapsed(session, false) or false
+        end
 
-            append_parent_row(out, session, tab, {
+        local child_count = #pending
+        local has_children = child_count > 0
+        local collapsed
+        if plan.in_child_view then
+            local is_active_parent = tab == nil or tab == current_tab()
+            collapsed = has_children and is_parent_collapsed(root, is_active_parent) or false
+            append_parent_row(out, root, tab, {
+                is_current_view = false,
+                is_tree_parent = true,
+                name = name_of(root) or name_from_session_file(root),
+                has_children = has_children,
+                collapsed = collapsed,
+                child_count = child_count,
+            }, attention_count, name_of, flags_of, generating_of)
+        else
+            collapsed = has_children and is_parent_collapsed(root, false) or false
+            append_parent_row(out, root, tab, {
                 is_current_view = true,
                 has_children = has_children,
                 collapsed = collapsed,
                 child_count = child_count,
             }, attention_count, name_of, flags_of, generating_of)
-            if not collapsed then
-                for _, item in ipairs(visible_children) do
-                    append_child_row(out, item.entry, tab, { is_current_view = item.is_current })
-                end
+        end
+        if not collapsed then
+            for _, item in ipairs(pending) do
+                append_child_row(out, item.entry, tab, { is_current_view = item.is_current })
             end
         end
     end
