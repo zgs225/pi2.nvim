@@ -20,6 +20,12 @@
 
 local M = {}
 
+--- Newest entries the reducer retains. The browser renders from the reducer
+--- state, so an unbounded `entries` array grows for the whole process lifetime;
+--- older turns stay available through the history pagination
+--- (`workspace.query{kind="entries"}`), which is authoritative.
+M.MAX_ENTRIES = 500
+
 --- Nested reference to the shared empty-dict metatable, used to tell a decoded
 --- JSON object (`{}` → `vim.empty_dict()`) from a decoded JSON array (`[]`).
 local EMPTY_DICT_MT = getmetatable(vim.empty_dict())
@@ -219,6 +225,12 @@ local function entry_of(self, id)
     return nil
 end
 
+--- Forward declarations: entry creation enforces the retention cap.
+--- @type fun(self: pi.web.State)
+local trim_entries
+--- @type fun(self: pi.web.State, entry: pi.web.Entry|nil)
+local forget_tool_blocks
+
 --- @param self pi.web.State
 --- @param role string
 --- @param ts number
@@ -236,7 +248,42 @@ local function new_entry(self, role, ts, blocks, done)
     self._next_entry = self._next_entry + 1
     local entries = self._state.entries
     entries[#entries + 1] = entry
+    trim_entries(self)
     return entry
+end
+
+--- Drop the oldest entries once the retention cap is exceeded. An entry the
+--- reducer is still streaming into (assistant/user) is never dropped, and tool
+--- block locations of dropped entries are forgotten so the index stays bounded.
+--- @param self pi.web.State
+trim_entries = function(self)
+    local entries = self._state.entries
+    while #entries > M.MAX_ENTRIES do
+        local keep_assistant = entries[1].id == self._assistant_entry_id
+        local keep_user = entries[1].id == self._user_entry_id
+        if (keep_assistant or keep_user) and #entries > 1 then
+            -- Drop the next oldest instead of the block being streamed into.
+            local dropped = table.remove(entries, 2)
+            forget_tool_blocks(self, dropped)
+        else
+            local dropped = table.remove(entries, 1)
+            forget_tool_blocks(self, dropped)
+        end
+    end
+end
+
+--- @param self pi.web.State
+--- @param entry pi.web.Entry|nil
+forget_tool_blocks = function(self, entry)
+    if not entry then
+        return
+    end
+    for tool_call_id, loc in pairs(self._tool_blocks) do
+        if loc.entry_id == entry.id then
+            self._tool_blocks[tool_call_id] = nil
+            self._tool_args[tool_call_id] = nil
+        end
+    end
 end
 
 --- Block at `slot` (1-based Lua array position), filling gaps with empty text
@@ -711,6 +758,13 @@ handlers["pi2:session"] = function(self, event)
         return
     end
     local state = self._state
+    -- Session id migration (`tmp-N` → backend id): the projection keeps its
+    -- entries, only its identity moves (the bridge announces `previousSessionId`
+    -- alongside; seq/subscription migration is the instance's job).
+    local session_id = str(patch.sessionId)
+    if session_id and session_id ~= "" then
+        state.sessionId = session_id
+    end
     for _, key in ipairs({ "status", "name", "model", "thinking", "usage", "contextUsage", "flags" }) do
         if patch[key] ~= nil then
             state[key] = patch[key]

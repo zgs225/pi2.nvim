@@ -298,6 +298,52 @@ describe("pi.web.bridge", function()
         assert.equals(0, #env.srv:records_of(Protocol.OUT.ACK))
     end)
 
+    it("routes an unknown method through pi.web.commands instead of failing internally", function()
+        started_bridge(env, {
+            handlers = {
+                ["prompt.send"] = function()
+                    return true
+                end,
+            },
+        })
+
+        env.srv:send({
+            v = 1,
+            type = Protocol.IN.CMD,
+            id = "req-unknown",
+            sessionId = "s1",
+            payload = { method = "does.not.exist" },
+        })
+        assert.is_true(
+            wait(function()
+                return #env.srv:records_of(Protocol.OUT.ERROR) == 1
+            end),
+            "no error record was sent"
+        )
+        local err = env.srv:records_of(Protocol.OUT.ERROR)[1]
+        assert.equals("req-unknown", err.id)
+        assert.equals(Protocol.ERR.METHOD_NOT_ALLOWED, err.payload.code)
+
+        -- A real Commands handler that the bridge was not given also runs.
+        env.srv:send({
+            v = 1,
+            type = Protocol.IN.CMD,
+            id = "req-query",
+            sessionId = "s1",
+            payload = { method = "workspace.query", params = {} },
+        })
+        assert.is_true(
+            wait(function()
+                return #env.srv:records_of(Protocol.OUT.ERROR) == 2
+            end),
+            "workspace.query was not dispatched"
+        )
+        local query_err = env.srv:records_of(Protocol.OUT.ERROR)[2]
+        assert.equals("req-query", query_err.id)
+        assert.equals(Protocol.ERR.BAD_REQUEST, query_err.payload.code)
+        assert.equals(0, #env.srv:records_of(Protocol.OUT.ACK))
+    end)
+
     it("routes subscribe/unsubscribe and shutdown records to their callbacks", function()
         local subscribed, unsubscribed, shutdown = {}, {}, nil
         started_bridge(env, {
@@ -424,16 +470,80 @@ describe("pi.web.bridge", function()
             by_index[idx] = rec
         end
         assert.equals("hello", by_index[0].payload.event.assistantMessageEvent.delta)
-        assert.equals(2, by_index[0].seq)
         assert.equals("hm", by_index[1].payload.event.assistantMessageEvent.delta)
         assert.equals("s1", by_index[0].sessionId)
         assert.equals("e1", by_index[0].epoch)
         assert.is_number(by_index[0].ts)
+        -- Coalesced frames get their seq when they are written (see `_flush_throttle`).
+        assert.is_true(by_index[1].seq > by_index[0].seq, "throttled seqs must increase in write order")
 
         wait(function()
             return false
         end, 150)
         assert.equals(2, #env.srv:records_of(Protocol.OUT.EVENT))
+    end)
+
+    it("stays monotonic when a coalesced frame flushes after a newer record", function()
+        local counter = 0
+        local bridge = started_bridge(env, {
+            delta_throttle_ms = 40,
+            tool_throttle_ms = 40,
+            seq_provider = function()
+                counter = counter + 1
+                return counter
+            end,
+        })
+
+        -- Mirrors `pi.web.instance`: only records written immediately consume a
+        -- seq up front; coalesced ones are numbered when flushed.
+        local function send(event)
+            local seq
+            if not bridge:coalesces(event) then
+                counter = counter + 1
+                seq = counter
+            end
+            bridge:send_event("s1", "e1", seq, event)
+        end
+
+        send(delta_event("text_delta", "late", 0)) -- held in the throttle window
+        send({ type = "agent_settled" }) -- written right away
+
+        assert.is_true(
+            wait(function()
+                return #env.srv:records_of(Protocol.OUT.EVENT) == 2
+            end),
+            "expected the delta to flush"
+        )
+
+        local seqs = {}
+        for _, rec in ipairs(env.srv:records_of(Protocol.OUT.EVENT)) do
+            seqs[#seqs + 1] = rec.seq
+        end
+        assert.equals(2, #seqs)
+        assert.is_true(
+            seqs[2] > seqs[1],
+            ("wire seq regressed: %s then %s"):format(tostring(seqs[1]), tostring(seqs[2]))
+        )
+    end)
+
+    it("numbers several coalesced streams in flush order", function()
+        local bridge = started_bridge(env, { delta_throttle_ms = 30, tool_throttle_ms = 30 })
+        bridge:send_event("s1", "e1", 16, delta_event("text_delta", "a", 0))
+        bridge:send_event("s1", "e1", 15, delta_event("thinking_delta", "b", 1))
+
+        assert.is_true(
+            wait(function()
+                return #env.srv:records_of(Protocol.OUT.EVENT) == 2
+            end),
+            "expected both throttled streams to flush"
+        )
+        local seqs = {}
+        for _, rec in ipairs(env.srv:records_of(Protocol.OUT.EVENT)) do
+            seqs[#seqs + 1] = rec.seq
+        end
+        -- The seq arguments passed above are ignored for coalesced frames, so a
+        -- caller cannot drag the wire backwards.
+        assert.is_true(seqs[2] > seqs[1], ("non-increasing seqs %s, %s"):format(seqs[1], seqs[2]))
     end)
 
     it("drops low-priority frames and emits one dropped marker on queue overflow", function()

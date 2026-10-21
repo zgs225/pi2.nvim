@@ -34,7 +34,6 @@
 ---@field kind "delta"|"tool"
 ---@field session_id string|nil
 ---@field epoch string|nil
----@field seq integer|nil
 ---@field event table
 ---@field timer uv.uv_timer_t
 
@@ -559,7 +558,21 @@ function Bridge:_handle_cmd(record)
     local handler = method and self._handlers[method]
 
     if type(handler) ~= "function" then
-        self:_send_error(record.id, Protocol.ERR.METHOD_NOT_ALLOWED, "unknown method: " .. tostring(method))
+        -- Not in the handler table: let `pi.web.commands` answer it. That path
+        -- maps an unknown method to `E_METHOD_NOT_ALLOWED` (a nil handler here
+        -- must never surface as `E_INTERNAL`).
+        local ok_cmd, Commands = pcall(require, "pi.web.commands")
+        if not ok_cmd or type(Commands) ~= "table" or type(Commands.dispatch) ~= "function" then
+            self:_send_error(record.id, Protocol.ERR.METHOD_NOT_ALLOWED, "unknown method: " .. tostring(method))
+            return
+        end
+        local ok, first, second = pcall(Commands.dispatch, method, payload.params, ctx)
+        if not ok then
+            self:_log("error", "dispatch for " .. tostring(method) .. " threw: " .. tostring(first))
+            self:_send_error(record.id, Protocol.ERR.INTERNAL, tostring(first))
+            return
+        end
+        self:_reply(record.id, ctx, first, second)
         return
     end
 
@@ -569,22 +582,25 @@ function Bridge:_handle_cmd(record)
         self:_send_error(record.id, Protocol.ERR.INTERNAL, tostring(first))
         return
     end
+    self:_reply(record.id, ctx, first, second)
+end
 
-    -- Contract: `true, result` (or a bare result) acks; `nil, err` errors.
+--- Turn a handler's return value into an `ack` or an `error` record.
+--- Contract: `true, result` (or a bare result) acks; `nil, err` errors.
+--- @param id string|nil request id being answered
+--- @param ctx pi.web.CmdContext
+--- @param first any
+--- @param second any
+function Bridge:_reply(id, ctx, first, second)
     local result
     if first == nil or first == false then
         local err = second
         if type(err) == "table" then
-            self:_send_error(
-                record.id,
-                err.code or Protocol.ERR.INTERNAL,
-                err.message or "command failed",
-                err.retryable
-            )
+            self:_send_error(id, err.code or Protocol.ERR.INTERNAL, err.message or "command failed", err.retryable)
         elseif err ~= nil then
-            self:_send_error(record.id, Protocol.ERR.INTERNAL, tostring(err))
+            self:_send_error(id, Protocol.ERR.INTERNAL, tostring(err))
         else
-            self:_send_error(record.id, Protocol.ERR.INTERNAL, "handler returned no result")
+            self:_send_error(id, Protocol.ERR.INTERNAL, "handler returned no result")
         end
         return
     end
@@ -595,7 +611,7 @@ function Bridge:_handle_cmd(record)
     else
         result = first ~= true and first or nil
     end
-    self:_send_ack(record.id, ctx.session_id, result)
+    self:_send_ack(id, ctx.session_id, result)
 end
 
 --- Per-session `ack` seq. The daemon only requires monotonicity inside one
@@ -848,20 +864,28 @@ function Bridge:_merge_throttle(pending, event)
     dst.delta = (dst.delta or "") .. (src.delta or "")
 end
 
+--- Whether `send_event` coalesces this event (i.e. writes it later than it was
+--- handed to the bridge). Callers that own the seq counter must not consume a
+--- seq for such an event: the bridge assigns it when the frame is written.
+--- @param event table
+--- @return boolean
+function Bridge:coalesces(event)
+    return self:_throttle_kind(event) ~= nil
+end
+
 --- @param session_id string|nil
 --- @param epoch string|nil
---- @param seq integer|nil
 --- @param event table
 --- @param kind "delta"|"tool"
 --- @param suffix string|nil
 --- @return boolean coalesced
-function Bridge:_throttle_event(session_id, epoch, seq, event, kind, suffix)
+function Bridge:_throttle_event(session_id, epoch, event, kind, suffix)
     local key = tostring(session_id) .. "|" .. kind .. "|" .. (suffix or "")
     local pending = self._throttles[key]
     if pending then
-        -- Keep the newest (epoch, seq): the merged frame represents every
-        -- event up to that point in the session's sequence.
-        pending.epoch, pending.seq = epoch, seq
+        -- The merged frame represents every event up to this one; its seq is
+        -- assigned when it is flushed (see `_flush_throttle`).
+        pending.epoch = epoch
         self:_merge_throttle(pending, event)
         return true
     end
@@ -875,7 +899,6 @@ function Bridge:_throttle_event(session_id, epoch, seq, event, kind, suffix)
         kind = kind,
         session_id = session_id,
         epoch = epoch,
-        seq = seq,
         event = vim.deepcopy(event),
         timer = timer,
     }
@@ -904,10 +927,20 @@ function Bridge:_flush_throttle(key)
     if self._stopped then
         return
     end
-    self:_write_event(pending.session_id, pending.epoch, pending.seq, pending.event, pending.kind)
+    -- Seq is assigned here, at write time: throttled frames from different
+    -- keys flush in timer order, not in arrival order, so a seq reserved when
+    -- the event was queued could reach the wire *after* a newer one.
+    self:_write_event(
+        pending.session_id,
+        pending.epoch,
+        self:_next_seq(pending.session_id),
+        pending.event,
+        pending.kind
+    )
 end
 
---- Send one session event. Streaming deltas are coalesced (protocol §2).
+--- Send one session event. Streaming deltas are coalesced (protocol §2); for
+--- those the `seq` argument is ignored and the bridge assigns one at flush.
 --- @param session_id string|nil
 --- @param epoch string|nil
 --- @param seq integer|nil
@@ -916,7 +949,7 @@ end
 function Bridge:send_event(session_id, epoch, seq, event)
     local kind, suffix = self:_throttle_kind(event)
     if kind then
-        return self:_throttle_event(session_id, epoch, seq, event, kind, suffix)
+        return self:_throttle_event(session_id, epoch, event, kind, suffix)
     end
     return self:_write_event(session_id, epoch, seq, event, "normal")
 end

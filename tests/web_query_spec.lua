@@ -28,10 +28,14 @@ describe("web workspace.query", function()
 
     before_each(function()
         original = package.loaded["pi.sessions.manager"]
+        -- The models cache is module state shared with `session.setModel`;
+        -- reset it so every test starts from the "not fetched yet" state.
+        Commands._reset_caches()
     end)
 
     after_each(function()
         package.loaded["pi.sessions.manager"] = original
+        Commands._reset_caches()
     end)
 
     it("lists pending attention across live sessions", function()

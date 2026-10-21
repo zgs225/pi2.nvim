@@ -16,6 +16,16 @@ Queued requests can be opened on demand with:
 
 Both are no-ops when there's nothing queued.
 
+## Expiry
+
+Every queued request expires. When pi sends its own `timeout`, the request expires then; otherwise pi2.nvim applies a default of **120 s** (`pi.attention.DEFAULT_TIMEOUT_MS`). One timer is scheduled for the nearest pending expiry, so a queue never accumulates requests the backend can no longer accept an answer for.
+
+Expiry is a cancellation: the entry is removed and the backend gets `extension_ui_response {cancelled = true}`, so its blocked `ctx.ui.*()` call returns instead of waiting forever. The same cancellation is used when a request goes stale for another reason — its session process exited, its tab was closed, or the session is being replaced (`/new`, resume, fork) while the request is still queued.
+
+## Answering from more than one client
+
+A request is answerable by any client, including a web console, even while a local dialog is on screen: opening it locally only marks it as on screen and keeps it in the queue. The first answer wins — it removes the entry, forwards the response to the backend, and announces `pi2:attention_resolved` to the other clients. A later answer is rejected (`E_ATTENTION_RESOLVED`) and sends nothing, so the backend never receives two responses for one request.
+
 ## Auto-open on prompt focus
 
 By default (`attention.auto_open_on_prompt_focus = true`), simply focusing the π prompt with an empty draft pulls the next queued request for the current tab automatically. This matches the mental model of "the prompt is the place where the agent talks to you" — when you show up at the prompt ready to interact, π dispatches whatever's pending.

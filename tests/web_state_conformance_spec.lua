@@ -446,6 +446,46 @@ else
             assert.equals("exited", null_exit:state().status)
         end)
 
+        it("caps retained entries at MAX_ENTRIES, dropping the oldest", function()
+            local state = fresh()
+            local total = State.MAX_ENTRIES + 10
+            for i = 1, total do
+                state:apply({
+                    type = "message_start",
+                    ts = i,
+                    message = { role = "assistant", content = {} },
+                })
+                state:apply({
+                    type = "message_end",
+                    ts = i,
+                    message = { role = "assistant", content = { { type = "text", text = "turn " .. i } } },
+                })
+            end
+
+            local snapshot = state:state()
+            assert.equals(State.MAX_ENTRIES, #snapshot.entries)
+            assert.equals("m11", snapshot.entries[1].id)
+            assert.equals("m" .. total, snapshot.entries[#snapshot.entries].id)
+            -- The newest content survives verbatim.
+            assert.equals("turn " .. total, snapshot.entries[#snapshot.entries].blocks[1].text)
+        end)
+
+        it("migrates sessionId from a pi2:session patch and keeps the entries", function()
+            local state = fresh()
+            state:apply({ type = "message_start", ts = 1, message = { role = "user", content = "hi" } })
+            state:apply({
+                type = "pi2:session",
+                ts = 2,
+                session = { sessionId = "real-1", previousSessionId = "s1", status = "busy" },
+            })
+
+            local snapshot = state:state()
+            assert.equals("real-1", snapshot.sessionId)
+            assert.equals("busy", snapshot.status)
+            assert.equals(1, #snapshot.entries)
+            assert.equals("user", snapshot.entries[1].role)
+        end)
+
         it("keeps session identity stable across a pi2:session patch", function()
             local state = fresh()
             state:apply({

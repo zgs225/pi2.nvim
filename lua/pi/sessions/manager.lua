@@ -103,6 +103,46 @@ local tab_session_id = {}
 --- Monotonic counter for temporary session ids before the backend reports `sessionId`.
 local next_temp_id = 0
 
+--- How long a migrated session id keeps resolving to its session. A web client
+--- that subscribed to `tmp-N` before the backend reported the real id must keep
+--- working (protocol §2: the daemon never renumbers), so `get_by_id` falls back
+--- to this alias table. Entries are dropped on close/stop.
+M.ALIAS_TTL_MS = 5 * 60 * 1000
+
+--- Former id → session, with the monotonic time the alias was created.
+---@type table<string, { session: pi.Session, at: number }>
+local id_aliases = {}
+
+---@return number monotonic milliseconds
+local function mono_ms()
+    return math.floor((vim.uv or vim.loop).hrtime() / 1e6)
+end
+
+--- Forward declaration: `migrate_session_id` notifies the web console.
+---@type fun(session: pi.Session?)|nil
+local notify_web_registry
+
+--- Remember `old_id` as a short-lived alias of `session` (id migration).
+---@param session pi.Session
+---@param old_id string|nil
+local function alias_session_id(session, old_id)
+    if type(old_id) ~= "string" or old_id == "" or old_id == session.id then
+        return
+    end
+    id_aliases[old_id] = { session = session, at = mono_ms() }
+end
+
+--- Drop every alias pointing at `session` (close/stop) plus expired aliases.
+---@param session pi.Session|nil
+local function forget_aliases(session)
+    local now = mono_ms()
+    for id, alias in pairs(id_aliases) do
+        if alias.session == session or now - alias.at > M.ALIAS_TTL_MS then
+            id_aliases[id] = nil
+        end
+    end
+end
+
 --- Load a session file into an existing RPC process (defined below).
 ---@type fun(session: pi.Session, session_path: string, opts?: pi.LoadSessionOpts, callback?: fun(ok: boolean))
 local load_session
@@ -147,6 +187,9 @@ local function migrate_session_id(session, new_id)
     if old_id and registry[old_id] == session then
         registry[old_id] = nil
     end
+    -- Keep the old id resolvable for a while: a web client that subscribed to
+    -- `tmp-N` before the backend reported the real id keeps reaching us.
+    alias_session_id(session, old_id)
     if session.attached_tab and tab_session_id[session.attached_tab] == old_id then
         tab_session_id[session.attached_tab] = new_id
     end
@@ -156,6 +199,12 @@ local function migrate_session_id(session, new_id)
         -- (e.g. aborts issued before migration) resolve to the real lineage.
         -- Never rewrite lineage mappings between two real ids.
         require("pi.subsessions.manifest").register_session_lineage(old_id, new_id)
+    end
+    -- The daemon caches the id in its session table and in every subscription:
+    -- re-announce the instance state so it learns the new id (and the web
+    -- console can migrate the state/seq/subscription it holds).
+    if notify_web_registry then
+        notify_web_registry(session)
     end
 end
 
@@ -240,7 +289,7 @@ end
 --- Lazy require + pcall mirror the todo/task hooks: a web module failure must
 --- never break session lifecycle.
 ---@param session pi.Session? session whose registry row changed
-local function notify_web_registry(session)
+notify_web_registry = function(session)
     local ok, inst = pcall(require, "pi.web.instance")
     if ok and inst.active() then
         pcall(inst.on_registry_change, session)
@@ -1294,7 +1343,24 @@ end
 ---@param id string
 ---@return pi.Session?
 function M.get_by_id(id)
-    return registry[id]
+    if type(id) ~= "string" or id == "" then
+        return nil
+    end
+    local session = registry[id]
+    if session then
+        return session
+    end
+    -- Fall back to a recent id alias (`tmp-N` → backend id). The alias is only
+    -- valid while the session is still live in the registry.
+    local alias = id_aliases[id]
+    if not alias then
+        return nil
+    end
+    if mono_ms() - alias.at > M.ALIAS_TTL_MS or registry[alias.session.id] ~= alias.session then
+        id_aliases[id] = nil
+        return nil
+    end
+    return alias.session
 end
 
 --- Find a live session whose manifest lineage matches `lineage_id`.
@@ -1443,6 +1509,7 @@ function M.close_session(session)
     if session.id then
         registry[session.id] = nil
     end
+    forget_aliases(session)
     prune_todo_state(session)
     require("pi.ui.sessions").request_refresh()
     notify_web_registry(nil)
@@ -1552,6 +1619,7 @@ function M.stop()
     session.rpc:stop()
     detach_tab(tab)
     registry[session_id] = nil
+    forget_aliases(session)
     prune_todo_state(session)
     require("pi.ui.sessions").request_refresh()
     notify_web_registry(nil)
@@ -2640,6 +2708,7 @@ function M._reset()
     mirror_shims = {}
     detached_shim = nil
     next_temp_id = 0
+    id_aliases = {}
 end
 
 --- Set up the TabClosed autocmd (called once from init.setup).

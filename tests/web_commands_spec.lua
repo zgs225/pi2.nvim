@@ -14,7 +14,7 @@ local Protocol = require("pi.web.protocol")
 
 local uv = vim.uv or vim.loop
 
---- @param opts? { id?: string, chat?: boolean }
+--- @param opts? { id?: string, chat?: boolean, queue?: table[], rpc_handler?: fun(cmd: table, callback: function|nil) }
 --- @return pi.Session
 local function fake_session(opts)
     opts = opts or {}
@@ -34,8 +34,11 @@ local function fake_session(opts)
                 return running
             end,
             stop = function() end,
-            send = function(_, cmd)
+            send = function(_, cmd, callback)
                 sent[#sent + 1] = cmd
+                if opts.rpc_handler then
+                    opts.rpc_handler(cmd, callback)
+                end
                 return true
             end,
         },
@@ -49,10 +52,16 @@ local function fake_session(opts)
         session.chat = {
             _history = {
                 get_pending_queue = function()
-                    return {
-                        { expanded = "first", text = "first", queue_type = "steer" },
-                        { expanded = "second", text = "second", queue_type = "follow_up" },
-                    }
+                    return opts.queue
+                        or {
+                            { expanded = "first", expanded_text = "first", text = "first", queue_type = "steer" },
+                            {
+                                expanded = "second",
+                                expanded_text = "second",
+                                text = "second",
+                                queue_type = "follow_up",
+                            },
+                        }
                 end,
             },
             _delete_pi_queued_entry = function(_, index, entry)
@@ -94,6 +103,8 @@ describe("pi.web.commands", function()
         restores = {}
         Sessions._reset()
         Tasks._reset()
+        Commands._reset_caches()
+        Commands._id_wait_ms = 5000
     end)
 
     after_each(function()
@@ -102,6 +113,8 @@ describe("pi.web.commands", function()
         end
         Sessions._reset()
         Tasks._reset()
+        Commands._reset_caches()
+        Commands._id_wait_ms = 5000
     end)
 
     --- @param module table
@@ -111,11 +124,70 @@ describe("pi.web.commands", function()
         restores[#restores + 1] = spy(module, name, replacement)
     end
 
+    --- Replace the instance singleton with a fake (the handlers call
+    --- `on_registry_change` / `emit` on it).
+    --- @param hooks table
+    local function stub_instance(hooks)
+        local key = "pi.web.instance"
+        local original = package.loaded[key]
+        package.loaded[key] = {
+            instance = function()
+                return hooks
+            end,
+            -- Module-level hooks (`manager.handle_event`, `pi.attention`) call
+            -- `active()` first; the fake instance is not a running bridge.
+            active = function()
+                return false
+            end,
+        }
+        restores[#restores + 1] = function()
+            package.loaded[key] = original
+        end
+    end
+
     it("maps unknown methods to E_METHOD_NOT_ALLOWED", function()
         local result, err = Commands.dispatch("nope.method", {}, {})
         assert.is_nil(result)
         assert.equals(Protocol.ERR.METHOD_NOT_ALLOWED, err.code)
         assert.is_nil(Commands.handlers["nope.method"])
+    end)
+
+    it("registers every command the daemon can route (task.output included)", function()
+        local methods = {
+            "session.create",
+            "session.open",
+            "session.resume",
+            "session.close",
+            "session.rename",
+            "session.fork",
+            "session.compact",
+            "session.setModel",
+            "session.setThinking",
+            "prompt.send",
+            "prompt.abort",
+            "queue.remove",
+            "queue.setSteer",
+            "attention.respond",
+            "subagent.dispatch",
+            "subagent.stop",
+            "subagent.steer",
+            "subagent.read",
+            "task.stop",
+            "task.output",
+            "workspace.query",
+        }
+        -- `session.create/open/resume` would spawn a real pi process without a
+        -- session file or a registered session; keep the probe hermetic.
+        stub(Sessions, "create_for_web", function()
+            return nil
+        end)
+        stub(Sessions, "load_session_path", function() end)
+
+        for _, method in ipairs(methods) do
+            assert.equals("function", type(Commands.handlers[method]), method)
+            local _, err = Commands.dispatch(method, {}, {})
+            assert.is_true(err == nil or err.code ~= Protocol.ERR.METHOD_NOT_ALLOWED, method)
+        end
     end)
 
     it("requires a known session for session-scoped methods", function()
@@ -464,6 +536,421 @@ describe("pi.web.commands", function()
         local ok, err = Commands.dispatch("workspace.query", { kind = "nope" }, {})
         assert.is_nil(ok)
         assert.equals(Protocol.ERR.BAD_REQUEST, err.code)
+    end)
+
+    it("acks a created session with the backend id, not the tmp placeholder", function()
+        local session = fake_session({ id = "tmp-7" })
+        Sessions._register_for_test(session)
+        stub(Sessions, "create_for_web", function()
+            return session
+        end)
+        local registry_changes = {}
+        stub_instance({
+            on_registry_change = function(_, target)
+                registry_changes[#registry_changes + 1] = target.id
+            end,
+        })
+        vim.defer_fn(function()
+            session.id = "real-9"
+        end, 25)
+
+        local ok, result = Commands.dispatch("session.create", {}, {})
+        assert.is_true(ok)
+        assert.equals("real-9", result.sessionId)
+        assert.is_nil(result.pending)
+        -- The instance is told about the registry entry only with the real id.
+        assert.same({ "real-9" }, registry_changes)
+    end)
+
+    it("waits for the loaded session id before acking session.open", function()
+        local session = fake_session({ id = "tmp-3" })
+        stub(Sessions, "create_for_web", function()
+            return session
+        end)
+        stub(Sessions, "load_session_path", function(target)
+            vim.defer_fn(function()
+                target.id = "opened-1"
+            end, 25)
+        end)
+
+        local ok, result = Commands.dispatch("session.open", { sessionFile = "/tmp/x.jsonl" }, {})
+        assert.is_true(ok)
+        assert.equals("opened-1", result.sessionId)
+        assert.equals("/tmp/x.jsonl", result.sessionFile)
+        assert.equals("started", result.disposition)
+        assert.is_nil(result.pending)
+    end)
+
+    it("acks pending = true when the backend id never arrives", function()
+        Commands._id_wait_ms = 40
+        local session = fake_session({ id = "tmp-1" })
+        stub(Sessions, "create_for_web", function()
+            return session
+        end)
+
+        local ok, result = Commands.dispatch("session.create", {}, {})
+        assert.is_true(ok)
+        assert.equals("tmp-1", result.sessionId)
+        assert.is_true(result.pending)
+    end)
+
+    it("accepts only known thinking levels (and the thinking alias)", function()
+        local session = fake_session()
+        Sessions._register_for_test(session)
+        stub(Sessions, "refresh_state", function() end)
+
+        local bad, err = Commands.dispatch("session.setThinking", { level = "turbo" }, ctx_for(session))
+        assert.is_nil(bad)
+        assert.equals(Protocol.ERR.BAD_REQUEST, err.code)
+        assert.equals(0, #session._sent)
+
+        bad, err = Commands.dispatch("session.setThinking", {}, ctx_for(session))
+        assert.is_nil(bad)
+        assert.equals(Protocol.ERR.BAD_REQUEST, err.code)
+
+        for _, level in ipairs({ "off", "minimal", "low", "medium", "high", "xhigh", "max" }) do
+            local ok, result = Commands.dispatch("session.setThinking", { level = level }, ctx_for(session))
+            assert.is_true(ok, level)
+            assert.equals(level, result.level)
+        end
+        assert.same({ type = "set_thinking_level", level = "max" }, session._sent[#session._sent])
+
+        local ok, result = Commands.dispatch("session.setThinking", { thinking = "low" }, ctx_for(session))
+        assert.is_true(ok)
+        assert.equals("low", result.level)
+        assert.same({ type = "set_thinking_level", level = "low" }, session._sent[#session._sent])
+    end)
+
+    it("mirrors an accepted thinking level into the projection", function()
+        local emits = {}
+        stub_instance({
+            emit = function(_, _, event)
+                emits[#emits + 1] = event
+            end,
+        })
+        local session = fake_session({
+            rpc_handler = function(cmd, callback)
+                if cmd.type == "set_thinking_level" and callback then
+                    callback({ success = true })
+                end
+            end,
+        })
+        Sessions._register_for_test(session)
+        stub(Sessions, "refresh_state", function() end)
+
+        local ok = Commands.dispatch("session.setThinking", { level = "low" }, ctx_for(session))
+        assert.is_true(ok)
+        vim.wait(1000, function()
+            return #emits > 0
+        end)
+        assert.equals(1, #emits)
+        assert.equals(Protocol.DERIVED.SESSION, emits[1].type)
+        assert.equals("low", emits[1].session.thinking)
+    end)
+
+    it("validates session.setModel against the models cache", function()
+        local session = fake_session({
+            rpc_handler = function(cmd, callback)
+                if cmd.type == "get_available_models" and callback then
+                    callback({
+                        success = true,
+                        data = {
+                            models = {
+                                { provider = "anthropic", id = "claude-opus-4", contextWindow = 200000 },
+                                { provider = "openai", id = "gpt-5", contextWindow = 128000 },
+                            },
+                        },
+                    })
+                end
+            end,
+        })
+        Sessions._register_for_test(session)
+
+        -- Populate the cache through the same path the web client polls.
+        Commands.handlers["workspace.query"]({ kind = "models" }, {})
+        vim.wait(1000, function()
+            local ok, res = Commands.handlers["workspace.query"]({ kind = "models" }, {})
+            return ok and res.pending == false
+        end)
+
+        local ok, result = Commands.dispatch(
+            "session.setModel",
+            { model = { provider = "anthropic", id = "claude-opus-4" } },
+            ctx_for(session)
+        )
+        assert.is_true(ok)
+        assert.same({ provider = "anthropic", id = "claude-opus-4" }, result)
+        assert.same(
+            { type = "set_model", provider = "anthropic", modelId = "claude-opus-4" },
+            session._sent[#session._sent]
+        )
+
+        -- `{provider, id}`: what the web client sends.
+        ok = Commands.dispatch("session.setModel", { provider = "openai", id = "gpt-5" }, ctx_for(session))
+        assert.is_true(ok)
+        assert.same({ type = "set_model", provider = "openai", modelId = "gpt-5" }, session._sent[#session._sent])
+
+        -- `{provider, modelId}`.
+        ok = Commands.dispatch("session.setModel", { provider = "openai", modelId = "gpt-5" }, ctx_for(session))
+        assert.is_true(ok)
+
+        local bad, err =
+            Commands.dispatch("session.setModel", { provider = "anthropic", id = "nope" }, ctx_for(session))
+        assert.is_nil(bad)
+        assert.equals(Protocol.ERR.BAD_REQUEST, err.code)
+
+        bad, err = Commands.dispatch("session.setModel", { provider = "ghost", id = "gpt-5" }, ctx_for(session))
+        assert.is_nil(bad)
+        assert.equals(Protocol.ERR.BAD_REQUEST, err.code)
+
+        bad, err = Commands.dispatch("session.setModel", {}, ctx_for(session))
+        assert.is_nil(bad)
+        assert.equals(Protocol.ERR.BAD_REQUEST, err.code)
+    end)
+
+    it("permits session.setModel while the models cache is empty", function()
+        local session = fake_session()
+        Sessions._register_for_test(session)
+        local ok, result = Commands.dispatch("session.setModel", { provider = "custom", id = "m1" }, ctx_for(session))
+        assert.is_true(ok)
+        assert.equals("custom", result.provider)
+    end)
+
+    it("removes a queued message by q:steer:N / q:follow:N id", function()
+        local session = fake_session({
+            queue = {
+                { expanded_text = "s1", text = "s1", queue_type = "steer" },
+                { expanded_text = "f1", text = "f1", queue_type = "follow_up" },
+                { expanded_text = "s2", text = "s2", queue_type = "steer" },
+            },
+        })
+        Sessions._register_for_test(session)
+
+        local ok, result = Commands.dispatch("queue.remove", { id = "q:steer:2" }, ctx_for(session))
+        assert.is_true(ok)
+        assert.equals(3, result.removed)
+        assert.equals("s2", session._deleted[#session._deleted].entry.text)
+
+        ok, result = Commands.dispatch("queue.remove", { queueId = "q:follow:1" }, ctx_for(session))
+        assert.is_true(ok)
+        assert.equals(2, result.removed)
+
+        -- 0-based ids (the daemon reducer's own numbering) still resolve.
+        ok, result = Commands.dispatch("queue.remove", { queueId = "q:steer:0" }, ctx_for(session))
+        assert.is_true(ok)
+        assert.equals(1, result.removed)
+
+        local bad, err = Commands.dispatch("queue.remove", { id = "q:follow:2" }, ctx_for(session))
+        assert.is_nil(bad)
+        assert.equals(Protocol.ERR.NOT_FOUND, err.code)
+
+        bad, err = Commands.dispatch("queue.remove", {}, ctx_for(session))
+        assert.is_nil(bad)
+        assert.equals(Protocol.ERR.NOT_FOUND, err.code)
+    end)
+
+    it("accepts the canonical steering mode and ignores queueId", function()
+        local session = fake_session()
+        Sessions._register_for_test(session)
+
+        local ok, result = Commands.dispatch("queue.setSteer", { mode = "all" }, ctx_for(session))
+        assert.is_true(ok)
+        assert.equals("all", result.mode)
+        assert.same({ type = "set_steering_mode", mode = "all" }, session._sent[1])
+
+        ok, result = Commands.dispatch("queue.setSteer", { queueId = "q:steer:1", steer = true }, ctx_for(session))
+        assert.is_true(ok)
+        assert.equals("all", result.mode)
+        assert.same({ type = "set_steering_mode", mode = "all" }, session._sent[2])
+
+        local bad, err = Commands.dispatch("queue.setSteer", {}, ctx_for(session))
+        assert.is_nil(bad)
+        assert.equals(Protocol.ERR.BAD_REQUEST, err.code)
+    end)
+
+    it("tails a task's output file", function()
+        local dir = vim.fn.tempname()
+        vim.fn.mkdir(dir, "p")
+        local path = dir .. "/out.log"
+        local lines = {}
+        for i = 1, 300 do
+            lines[i] = "line " .. i
+        end
+        vim.fn.writefile(lines, path)
+        Tasks.upsert({
+            id = "t-out",
+            command = "echo",
+            status = "completed",
+            start_time = 1000,
+            end_time = 1750,
+            exit_code = 0,
+            output_file = path,
+        })
+
+        local ok, result = Commands.dispatch("task.output", { taskId = "t-out" }, {})
+        assert.is_true(ok)
+        assert.equals("t-out", result.taskId)
+        assert.equals(path, result.outputFile)
+        assert.equals("completed", result.status)
+        assert.equals(0, result.exitCode)
+        assert.equals(750, result.durationMs)
+        assert.equals(1000, result.startTime)
+        -- default tail is 200 lines
+        assert.equals(199, select(2, result.output:gsub("\n", "\n")))
+        assert.is_truthy(result.output:find("line 300", 1, true))
+        assert.is_nil(result.output:find("line 100", 1, true))
+
+        ok, result = Commands.dispatch("task.output", { id = "t-out", tail = 2 }, {})
+        assert.is_true(ok)
+        assert.equals("line 299\nline 300", result.output)
+
+        -- tail is capped at 1000 lines
+        local many = {}
+        for i = 1, 1200 do
+            many[i] = "row " .. i
+        end
+        local big = dir .. "/big.log"
+        vim.fn.writefile(many, big)
+        Tasks.upsert({ id = "t-big", command = "x", status = "running", start_time = 1, output_file = big })
+        ok, result = Commands.dispatch("task.output", { taskId = "t-big", tail = 5000 }, {})
+        assert.is_true(ok)
+        assert.equals(999, select(2, result.output:gsub("\n", "\n")))
+    end)
+
+    it("answers task.output for unknown ids and tasks without an output file", function()
+        Tasks.upsert({ id = "t-plain", command = "x", status = "running", start_time = 5 })
+        local ok, result = Commands.dispatch("task.output", { taskId = "t-plain" }, {})
+        assert.is_true(ok)
+        assert.equals("", result.output)
+        assert.is_nil(result.outputFile)
+
+        local missing, err = Commands.dispatch("task.output", { taskId = "ghost" }, {})
+        assert.is_nil(missing)
+        assert.equals(Protocol.ERR.NOT_FOUND, err.code)
+
+        local bad, bad_err = Commands.dispatch("task.output", {}, {})
+        assert.is_nil(bad)
+        assert.equals(Protocol.ERR.BAD_REQUEST, bad_err.code)
+
+        -- An output file that vanished after the task settled degrades to "".
+        Tasks.upsert({
+            id = "t-gone",
+            command = "x",
+            status = "completed",
+            start_time = 1,
+            output_file = "/nope/missing.log",
+        })
+        ok, result = Commands.dispatch("task.output", { taskId = "t-gone" }, {})
+        assert.is_true(ok)
+        assert.equals("", result.output)
+        assert.equals("/nope/missing.log", result.outputFile)
+    end)
+
+    it("accepts thinking as an alias for thinking_level when dispatching sub-agents", function()
+        local session = fake_session()
+        Sessions._register_for_test(session)
+        local payloads = {}
+        local Subsessions = require("pi.subsessions")
+        stub(Subsessions, "handle_host", function(_, payload, on_done)
+            payloads[#payloads + 1] = vim.json.decode(payload)
+            if on_done then
+                on_done({ ok = true, batch_id = "b-1" })
+            end
+        end)
+
+        local ok, result = Commands.dispatch("subagent.dispatch", {
+            items = { { task = "do it", name = "child", thinking = "low", model = { provider = "p", id = "m" } } },
+            cancelSiblingsOnFail = true,
+        }, ctx_for(session))
+        assert.is_true(ok)
+        assert.equals("started", result.disposition)
+        assert.equals("b-1", result.batchId)
+        local item = payloads[1].params.items[1]
+        assert.equals("low", item.thinking_level)
+        assert.is_nil(item.thinking)
+        assert.equals("child", item.name)
+        assert.same({ provider = "p", id = "m" }, item.model)
+        assert.is_true(payloads[1].params.cancel_siblings_on_fail)
+
+        -- The canonical snake_case key wins over the alias.
+        ok = Commands.dispatch("subagent.dispatch", {
+            items = { { task = "x", thinking_level = "high", thinking = "low" } },
+            cancel_siblings_on_fail = false,
+        }, ctx_for(session))
+        assert.is_true(ok)
+        assert.equals("high", payloads[2].params.items[1].thinking_level)
+        assert.is_false(payloads[2].params.cancel_siblings_on_fail)
+
+        -- Single-task shorthand (the web sub-agent form sends the fields flat).
+        ok = Commands.dispatch("subagent.dispatch", { task = "flat", name = "flat-child" }, ctx_for(session))
+        assert.is_true(ok)
+        assert.equals("flat", payloads[3].params.items[1].task)
+        assert.equals("flat-child", payloads[3].params.items[1].name)
+
+        local bad, err = Commands.dispatch("subagent.dispatch", { items = "nope" }, ctx_for(session))
+        assert.is_nil(bad)
+        assert.equals(Protocol.ERR.BAD_REQUEST, err.code)
+    end)
+
+    it("wraps raw string and optionId attention answers into {value}", function()
+        local session = fake_session()
+        Sessions._register_for_test(session)
+
+        session.attention.pending = { { id = "req-1", kind = "select", seq = 1 } }
+        local ok, result = Commands.dispatch("attention.respond", {
+            requestId = "req-1",
+            response = "accept",
+        }, ctx_for(session))
+        assert.is_true(ok)
+        assert.equals("req-1", result.requestId)
+        assert.equals("accepted", result.disposition)
+        assert.equals("accept", session._sent[1].value)
+
+        session.attention.pending = { { id = "req-2", kind = "select", seq = 2 } }
+        ok = Commands.dispatch("attention.respond", { requestId = "req-2", optionId = "opt-1" }, ctx_for(session))
+        assert.is_true(ok)
+        assert.equals("opt-1", session._sent[2].value)
+
+        session.attention.pending = { { id = "req-3", kind = "confirm", seq = 3 } }
+        ok, result = Commands.dispatch("attention.respond", {
+            requestId = "req-3",
+            response = { value = '{"result":"Accepted"}' },
+        }, ctx_for(session))
+        assert.is_true(ok)
+        assert.equals("accepted", result.disposition)
+        assert.equals('{"result":"Accepted"}', session._sent[3].value)
+
+        session.attention.pending = { { id = "req-4", kind = "confirm", seq = 4 } }
+        ok, result = Commands.dispatch("attention.respond", {
+            requestId = "req-4",
+            response = { cancelled = true },
+        }, ctx_for(session))
+        assert.is_true(ok)
+        assert.equals("cancelled", result.disposition)
+        assert.is_true(session._sent[4].cancelled)
+    end)
+
+    it("maps prompt.send mode aliases onto the TUI send paths", function()
+        local session = fake_session()
+        Sessions._register_for_test(session)
+        local seen = {}
+        stub(Sessions, "prompt", function(_, _, opts)
+            seen[#seen + 1] = opts.queue_type or "plain"
+            return true
+        end)
+
+        for _, case in ipairs({
+            { mode = "steer", expect = "steer" },
+            { mode = "follow_up", expect = "follow_up" },
+            { mode = "followUp", expect = "follow_up" },
+            { mode = "follow-up", expect = "follow_up" },
+            { mode = "queue", expect = "plain" },
+            { mode = nil, expect = "plain" },
+        }) do
+            local ok = Commands.dispatch("prompt.send", { text = "hi", mode = case.mode }, ctx_for(session))
+            assert.is_true(ok)
+            assert.equals(case.expect, seen[#seen])
+        end
     end)
 
     it("keeps config untouched", function()

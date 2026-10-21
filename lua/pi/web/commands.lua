@@ -72,7 +72,82 @@ local function queue_type(mode)
     if mode == "follow_up" or mode == "followUp" or mode == "follow-up" then
         return "follow_up"
     end
+    -- `mode = "queue"` (what the web client sends) and any unknown value mean
+    -- "plain prompt": the TUI's normal submit path, not a queue injection.
     return nil
+end
+
+--- Thinking levels the backend accepts (mirrors the pi thinking-level union).
+--- @type table<string, true>
+local THINKING_LEVELS = {
+    off = true,
+    minimal = true,
+    low = true,
+    medium = true,
+    high = true,
+    xhigh = true,
+    max = true,
+}
+
+--- Session ids are placeholders (`tmp-N`) until the backend reports the real id
+--- in a `get_state` response; only then is the id stable across the instance.
+--- @param id unknown
+--- @return boolean
+local function is_placeholder_id(id)
+    return type(id) == "string" and id:match("^tmp%-") ~= nil
+end
+
+--- Upper bound for the id wait in `session.create`/`open`/`resume`. Mutable so
+--- specs can exercise both the settled and the timed-out path quickly.
+--- @type integer
+M._id_wait_ms = 5000
+
+--- Wait for the backend to replace the placeholder id with the real one.
+---
+--- `vim.wait` processes the event loop in between slices, so the RPC callback
+--- that migrates the id (`manager.refresh_state` → `capture_session_id`) runs
+--- while we wait. Never blocks past `M._id_wait_ms`.
+--- @param session pi.Session
+--- @return string id The settled id (or the placeholder on timeout).
+--- @return boolean settled
+local function await_backend_id(session)
+    local uv = vim.uv or vim.loop
+    local deadline = uv.now() + M._id_wait_ms
+    while is_placeholder_id(session.id) do
+        local remaining = deadline - uv.now()
+        if remaining <= 0 then
+            break
+        end
+        vim.wait(math.min(50, remaining), function()
+            return not is_placeholder_id(session.id)
+        end, 5)
+    end
+    return session.id, not is_placeholder_id(session.id)
+end
+
+--- Ack a freshly created/loaded session with its real id.
+---
+--- The instance is told about the registry entry only after the id settled, so
+--- the instance table and the session snapshot carry the backend id instead of
+--- the placeholder. A timeout still acks (with `pending = true`) so the client
+--- can poll instead of hanging.
+--- @param session pi.Session
+--- @param extra table|nil Extra ack fields.
+--- @return true, table
+local function ack_session(session, extra)
+    local id, settled = await_backend_id(session)
+    local instance = Instance()
+    if instance then
+        instance:on_registry_change(session)
+    end
+    local result = { sessionId = id }
+    for key, value in pairs(extra or {}) do
+        result[key] = value
+    end
+    if not settled then
+        result.pending = true
+    end
+    return true, result
 end
 
 --- @type table<string, fun(params: table|nil, ctx: pi.web.CmdContext): any, any>
@@ -94,11 +169,7 @@ handlers["session.create"] = function(params, _)
     if not session then
         return failure(Protocol.ERR.INTERNAL, "failed to start a session")
     end
-    local instance = Instance()
-    if instance then
-        instance:on_registry_change(session)
-    end
-    return true, { sessionId = session.id, cwd = session.cwd }
+    return ack_session(session, { cwd = session.cwd })
 end
 
 --- @param params table|nil
@@ -121,11 +192,7 @@ local function open_session(params, _)
             end
         end
     end)
-    local instance = Instance()
-    if instance then
-        instance:on_registry_change(session)
-    end
-    return true, { sessionId = session.id, sessionFile = path, disposition = "started" }
+    return ack_session(session, { sessionFile = path, disposition = "started" })
 end
 
 handlers["session.open"] = open_session
@@ -245,6 +312,51 @@ handlers["prompt.abort"] = function(_, ctx)
     return true, {}
 end
 
+--- Resolve a queue id to an index in the pending queue.
+---
+--- The daemon renders the queue as `q:steer:N` / `q:follow:N`, one counter per
+--- kind; the counters it ships are 0-based (`src/protocol/reducer.ts`), the
+--- contract here is 1-based. Both are accepted: `N >= 1` is the 1-based position
+--- inside that kind, `N == 0` is the 0-based first entry.
+--- @param queue pi.PendingQueueEntry[]
+--- @param id unknown
+--- @return integer|nil
+local function resolve_queue_id(queue, id)
+    if type(id) ~= "string" then
+        return nil
+    end
+    local kind, position = id:match("^q:(%a+):(%d+)$")
+    if not kind then
+        return nil
+    end
+    local want_steer
+    if kind == "steer" then
+        want_steer = true
+    elseif kind == "follow" or kind == "follow_up" then
+        want_steer = false
+    else
+        return nil
+    end
+    local n = tonumber(position)
+    if not n then
+        return nil
+    end
+    -- Entries keep their kind in `queue_type`; anything that is not a steer is a
+    -- follow-up (the TUI's sender groups them the same way).
+    local offset = n >= 1 and n or 1
+    local seen = 0
+    for i, entry in ipairs(queue) do
+        local is_steer = (entry.queue_type or "follow_up") == "steer"
+        if is_steer == want_steer then
+            seen = seen + 1
+            if seen == offset then
+                return i
+            end
+        end
+    end
+    return nil
+end
+
 --- @param params table|nil
 --- @param ctx pi.web.CmdContext
 handlers["queue.remove"] = function(params, ctx)
@@ -258,13 +370,18 @@ handlers["queue.remove"] = function(params, ctx)
         return failure(Protocol.ERR.UNSUPPORTED, "queue editing requires an attached chat")
     end
     local history = chat._history
-    ---@type any[]
+    ---@type pi.PendingQueueEntry[]
     local queue = history and history.get_pending_queue and history:get_pending_queue() or {}
+
     local index = tonumber(params.index)
-    if not index then
-        local id = params.id
+    local id = params.id ~= nil and params.id or params.queueId
+    if not index and id ~= nil then
+        index = resolve_queue_id(queue, id)
+    end
+    if not index and id ~= nil and #queue > 0 then
+        -- Legacy/text form: the raw queued text is accepted as the id too.
         for i, entry in ipairs(queue) do
-            if id ~= nil and (entry.id == id or entry.expanded == id or entry.text == id) then
+            if entry.text == id or entry.expanded_text == id then
                 index = i
                 break
             end
@@ -274,7 +391,11 @@ handlers["queue.remove"] = function(params, ctx)
         return failure(Protocol.ERR.NOT_FOUND, "no queued message at that position")
     end
     chat:_delete_pi_queued_entry(index, queue[index])
-    return true, { removed = index }
+    local ack = { removed = index }
+    if type(id) == "string" then
+        ack.id = id
+    end
+    return true, ack
 end
 
 --- @param params table|nil
@@ -285,6 +406,9 @@ handlers["queue.setSteer"] = function(params, ctx)
         return nil, err
     end
     params = params or {}
+    -- `{mode}` is canonical. The web client sends `{queueId, steer}`: the switch
+    -- is session-wide ("are steers delivered immediately or one at a time?"), so
+    -- the per-entry id is accepted and ignored.
     local mode = params.mode
     if mode == nil and type(params.steer) == "boolean" then
         mode = params.steer and "all" or "one-at-a-time"
@@ -300,6 +424,98 @@ handlers["queue.setSteer"] = function(params, ctx)
 end
 
 -- ---------------------------------------------------------------------------
+-- model cache (shared with `workspace.query{kind="models"}`)
+-- ---------------------------------------------------------------------------
+
+--- Cached `get_available_models` result for the web console. The web polls
+--- `/api/v1/models`; the first call kicks off the fetch and answers with an
+--- empty list (`pending = true`), later calls return the grouped providers.
+--- `session.setModel` validates against the same cache once it is populated.
+--- @type { provider: string, models: table[] }[]|nil
+local models_cache = nil
+local models_pending = false
+
+--- Group the flat pi model list by provider for the web contract.
+--- @param models table[]
+--- @return { provider: string, models: table[] }[]
+local function group_models(models)
+    local order, by_provider = {}, {}
+    for _, model in ipairs(models or {}) do
+        if type(model) == "table" then
+            local provider = model.provider or model.providerId or "unknown"
+            local group = by_provider[provider]
+            if not group then
+                group = { provider = provider, models = {} }
+                by_provider[provider] = group
+                order[#order + 1] = group
+            end
+            group.models[#group.models + 1] = {
+                id = model.id or model.model or "unknown",
+                contextWindow = model.contextWindow or model.contextWindowTokens or model.context_window,
+                reasoning = model.reasoning == true,
+            }
+        end
+    end
+    return order
+end
+
+--- Fetch the available models once, from the first live session.
+local function refresh_models()
+    if models_pending or models_cache then
+        return
+    end
+    local session
+    for _, candidate in ipairs(Sessions().list_all()) do
+        if candidate.rpc and candidate.rpc:is_running() then
+            session = candidate
+            break
+        end
+    end
+    if not session then
+        return
+    end
+    models_pending = true
+    session.rpc:send({ type = "get_available_models" }, function(res)
+        vim.schedule(function()
+            models_pending = false
+            if res and res.success then
+                local list = (res.data or {}).models or {}
+                if #list > 0 then
+                    models_cache = group_models(list)
+                end
+            end
+        end)
+    end)
+end
+
+--- Is `provider/id` a model the backend reported?
+--- @param provider string
+--- @param id string
+--- @return boolean|nil `true`/`false`, or `nil` while the cache is empty.
+local function model_is_known(provider, id)
+    if not models_cache then
+        return nil
+    end
+    for _, group in ipairs(models_cache) do
+        if group.provider == provider then
+            for _, model in ipairs(group.models or {}) do
+                if model.id == id then
+                    return true
+                end
+            end
+            return false
+        end
+    end
+    return false
+end
+
+--- Drop the cached model list (specs; also after a provider reconfiguration).
+function M._reset_caches()
+    models_cache = nil
+    models_pending = false
+end
+
+-- ---------------------------------------------------------------------------
 -- session settings
 -- ---------------------------------------------------------------------------
 
@@ -311,20 +527,31 @@ handlers["session.setModel"] = function(params, ctx)
         return nil, err
     end
     params = params or {}
+    -- Accepted shapes: `{model:{provider,id}}`, `{provider, modelId}`, and
+    -- `{provider, id}` (what the web client sends).
     local model = params.model
     local provider = type(model) == "table" and model.provider or params.provider
-    local model_id = type(model) == "table" and model.id or params.modelId
-    if type(provider) ~= "string" or type(model_id) ~= "string" then
+    local model_id
+    if type(model) == "table" then
+        model_id = model.id
+    elseif type(params.modelId) == "string" then
+        model_id = params.modelId
+    else
+        model_id = params.id
+    end
+    if type(provider) ~= "string" or provider == "" or type(model_id) ~= "string" or model_id == "" then
         return bad_request("model { provider, id } is required")
+    end
+    -- Only reject what we know is wrong: an unpopulated cache cannot validate.
+    if model_is_known(provider, model_id) == false then
+        return bad_request("unknown model: " .. provider .. "/" .. model_id)
     end
     if not session.rpc:is_running() then
         return failure(Protocol.ERR.INTERNAL, "session process is not running")
     end
-    session.rpc:send({ type = "set_model", provider = provider, modelId = model_id }, function()
-        vim.schedule(function()
-            Sessions().refresh_state(session)
-        end)
-    end)
+    -- The TUI switch path (`pi.models.set`): same `set_model` command, plus the
+    -- tab model pin and the state refresh on success.
+    require("pi.models").set(session, { provider = provider, id = model_id })
     return true, { provider = provider, id = model_id }
 end
 
@@ -337,15 +564,33 @@ handlers["session.setThinking"] = function(params, ctx)
     end
     params = params or {}
     local level = params.level or params.thinking
-    if type(level) ~= "string" or level == "" then
-        return bad_request("level is required")
+    if type(level) == "string" then
+        level = vim.trim(level)
+    end
+    if type(level) ~= "string" or not THINKING_LEVELS[level] then
+        return bad_request("level must be one of off, minimal, low, medium, high, xhigh, max")
     end
     if not session.rpc:is_running() then
         return failure(Protocol.ERR.INTERNAL, "session process is not running")
     end
-    session.rpc:send({ type = "set_thinking_level", level = level }, function()
+    session.rpc:send({ type = "set_thinking_level", level = level }, function(res)
         vim.schedule(function()
+            if res and res.success == false then
+                -- The model rejected the level; nothing to mirror.
+                return
+            end
             Sessions().refresh_state(session)
+            -- Mirror the accepted level into the projection right away. The
+            -- backend's `thinking_level_changed` notification is not one of the
+            -- manager's handled events, so without this a client reading the
+            -- state before the next `get_state` patch keeps the old level.
+            local instance = Instance()
+            if instance then
+                instance:emit(session, {
+                    type = Protocol.DERIVED.SESSION,
+                    session = { sessionId = session.id, thinking = level },
+                })
+            end
         end)
     end)
     return true, { level = level }
@@ -354,6 +599,42 @@ end
 -- ---------------------------------------------------------------------------
 -- attention
 -- ---------------------------------------------------------------------------
+
+--- Normalize an attention answer to the `pi.attention.resolve` response shape.
+---
+--- Canonical: `{response:{value|confirmed|cancelled}}`. Backward compatible: a
+--- raw string or `{optionId}`/`params.optionId` answer is wrapped into
+--- `{value=...}`; a missing response cancels (what `pi.attention` already did).
+--- @param params table
+--- @return table|nil response
+--- @return string disposition
+local function normalize_attention_response(params)
+    local response = params.response
+    if type(response) == "string" then
+        return { value = response }, "accepted"
+    end
+    if type(response) == "table" then
+        if response.cancelled ~= nil then
+            local cancelled = response.cancelled == true
+            return { cancelled = cancelled }, cancelled and "cancelled" or "accepted"
+        end
+        if response.confirmed ~= nil then
+            local confirmed = response.confirmed == true
+            return { confirmed = confirmed }, confirmed and "accepted" or "cancelled"
+        end
+        if response.value ~= nil then
+            return { value = response.value }, "accepted"
+        end
+        if response.optionId ~= nil then
+            return { value = response.optionId }, "accepted"
+        end
+        return nil, "cancelled"
+    end
+    if params.optionId ~= nil then
+        return { value = params.optionId }, "accepted"
+    end
+    return nil, "cancelled"
+end
 
 --- @param params table|nil
 --- @param ctx pi.web.CmdContext
@@ -367,11 +648,12 @@ handlers["attention.respond"] = function(params, ctx)
     if type(request_id) ~= "string" or request_id == "" then
         return bad_request("requestId is required")
     end
-    local ok, code = require("pi.attention").resolve(session, request_id, params.by or "web", params.response)
+    local response, disposition = normalize_attention_response(params)
+    local ok, code = require("pi.attention").resolve(session, request_id, params.by or "web", response)
     if not ok then
         return failure(code or Protocol.ERR.ATTENTION_RESOLVED, "attention request already resolved")
     end
-    return true, { requestId = request_id }
+    return true, { requestId = request_id, disposition = disposition }
 end
 
 -- ---------------------------------------------------------------------------
@@ -387,6 +669,28 @@ local function host_payload(params)
     })
 end
 
+--- Normalize one `subagent.dispatch` item: `thinking` is an alias for
+--- `thinking_level` (the canonical key the batch runner reads).
+--- @param raw any
+--- @return any
+local function normalize_dispatch_item(raw)
+    if type(raw) ~= "table" or type(raw.task) ~= "string" then
+        return raw
+    end
+    local thinking = raw.thinking_level
+    if thinking == nil then
+        thinking = raw.thinking
+    end
+    if thinking == nil then
+        return raw
+    end
+    local item = vim.deepcopy(raw)
+    item.thinking_level = thinking
+    -- Forwarded as the canonical key only; `thinking` is not a batch field.
+    item.thinking = nil
+    return item
+end
+
 --- @param params table|nil
 --- @param ctx pi.web.CmdContext
 handlers["subagent.dispatch"] = function(params, ctx)
@@ -395,26 +699,52 @@ handlers["subagent.dispatch"] = function(params, ctx)
         return nil, err
     end
     params = params or {}
-    if type(params.items) ~= "table" then
+    local items = params.items
+    if type(items) ~= "table" and type(params.task) == "string" then
+        -- Single-task shorthand: the web client's sub-agent form sends the item
+        -- fields flat, the canonical shape wraps them in `items`.
+        items = {
+            {
+                task = params.task,
+                name = params.name,
+                model = params.model,
+                thinking_level = params.thinking_level,
+                thinking = params.thinking,
+            },
+        }
+    end
+    if type(items) ~= "table" or #items == 0 then
         return bad_request("items is required")
+    end
+    local normalized = {}
+    for i, raw in ipairs(items) do
+        normalized[i] = normalize_dispatch_item(raw)
     end
     local ok, Subsessions = pcall(require, "pi.subsessions")
     if not ok then
         return failure(Protocol.ERR.UNSUPPORTED, "sub-sessions are not available")
     end
     local instance = Instance()
+    local batch_id
+    local cancel_siblings = params.cancel_siblings_on_fail
+    if cancel_siblings == nil then
+        cancel_siblings = params.cancelSiblingsOnFail
+    end
     Subsessions.handle_host(
         session,
         host_payload({
             action = "dispatch_subagents",
             params = {
-                items = params.items,
-                cancel_siblings_on_fail = params.cancel_siblings_on_fail,
+                items = normalized,
+                cancel_siblings_on_fail = cancel_siblings,
                 wait = params.wait,
                 timeout_ms = params.timeout_ms,
             },
         }),
         function(result)
+            if type(result) == "table" and type(result.batch_id) == "string" then
+                batch_id = result.batch_id
+            end
             if instance then
                 instance:publish_subagents(session)
                 if type(result) == "table" and result.error then
@@ -423,7 +753,13 @@ handlers["subagent.dispatch"] = function(params, ctx)
             end
         end
     )
-    return true, { disposition = "started" }
+    -- The batch is started asynchronously; a synchronously reported id (an
+    -- already-terminal dispatch) is included so the client can poll it.
+    local ack = { disposition = "started" }
+    if batch_id then
+        ack.batchId = batch_id
+    end
+    return true, ack
 end
 
 --- @param params table|nil
@@ -529,6 +865,87 @@ handlers["task.stop"] = function(params, _)
     return true, { taskId = id }
 end
 
+--- Cap on how much of an output file is read (the tail is all the modal shows).
+local TASK_OUTPUT_READ_BYTES = 512 * 1024
+local TASK_OUTPUT_DEFAULT_LINES = 200
+local TASK_OUTPUT_MAX_LINES = 1000
+
+--- Read the last `max_lines` lines of `path` with uv, without slurping a huge
+--- log: at most `TASK_OUTPUT_READ_BYTES` from the end of the file are read.
+--- @param path string
+--- @param max_lines integer
+--- @return string|nil
+local function read_output_tail(path, max_lines)
+    local uv = vim.uv or vim.loop
+    local stat = uv.fs_stat(path)
+    if not stat or stat.type ~= "file" then
+        return nil
+    end
+    local size = stat.size or 0
+    local offset = math.max(0, size - TASK_OUTPUT_READ_BYTES)
+    local fd = uv.fs_open(path, "r", 420)
+    if not fd then
+        return nil
+    end
+    local ok, data = pcall(uv.fs_read, fd, size - offset, offset)
+    pcall(uv.fs_close, fd)
+    if not ok or type(data) ~= "string" then
+        return nil
+    end
+    local lines = vim.split(data, "\n", { plain = true })
+    if offset > 0 then
+        -- The first line may be a fragment of a line we cut in half.
+        table.remove(lines, 1)
+    end
+    if #lines > 0 and lines[#lines] == "" then
+        table.remove(lines, #lines)
+    end
+    if #lines > max_lines then
+        local tail = {}
+        for i = #lines - max_lines + 1, #lines do
+            tail[#tail + 1] = lines[i]
+        end
+        lines = tail
+    end
+    return table.concat(lines, "\n")
+end
+
+--- @param params table|nil
+--- @param _ pi.web.CmdContext
+handlers["task.output"] = function(params, _)
+    params = params or {}
+    local id = params.taskId or params.id
+    if type(id) ~= "string" or id == "" then
+        return bad_request("taskId is required")
+    end
+    local task = require("pi.tasks").get(id)
+    if not task then
+        return failure(Protocol.ERR.NOT_FOUND, "unknown task: " .. id)
+    end
+    local tail = math.floor(tonumber(params.tail) or TASK_OUTPUT_DEFAULT_LINES)
+    tail = math.max(1, math.min(TASK_OUTPUT_MAX_LINES, tail))
+    local output_file = type(task.output_file) == "string" and task.output_file ~= "" and task.output_file or nil
+    local output = output_file and read_output_tail(output_file, tail) or nil
+    local duration
+    if type(task.start_time) == "number" then
+        local stop = task.end_time
+        if type(stop) ~= "number" then
+            stop = (vim.uv or vim.loop).now()
+        end
+        duration = math.max(0, stop - task.start_time)
+    end
+    local result = {
+        taskId = id,
+        output = output or "",
+        outputFile = output_file,
+        status = task.status,
+        exitCode = task.exit_code,
+        durationMs = duration,
+        startTime = task.start_time,
+    }
+    return true, result
+end
+
 -- ---------------------------------------------------------------------------
 -- workspace reads
 -- ---------------------------------------------------------------------------
@@ -552,66 +969,6 @@ local function live_session_row(session, instance)
         end
     end
     return row
-end
-
---- Cached `get_available_models` result for the web console. The web polls
---- `/api/v1/models`; the first call kicks off the fetch and answers with an
---- empty list (`pending = true`), later calls return the grouped providers.
---- @type { provider: string, models: table[] }[]|nil
-local models_cache = nil
-local models_pending = false
-
---- Group the flat pi model list by provider for the web contract.
---- @param models table[]
---- @return { provider: string, models: table[] }[]
-local function group_models(models)
-    local order, by_provider = {}, {}
-    for _, model in ipairs(models or {}) do
-        if type(model) == "table" then
-            local provider = model.provider or model.providerId or "unknown"
-            local group = by_provider[provider]
-            if not group then
-                group = { provider = provider, models = {} }
-                by_provider[provider] = group
-                order[#order + 1] = group
-            end
-            group.models[#group.models + 1] = {
-                id = model.id or model.model or "unknown",
-                contextWindow = model.contextWindow or model.contextWindowTokens or model.context_window,
-                reasoning = model.reasoning == true,
-            }
-        end
-    end
-    return order
-end
-
---- Fetch the available models once, from the first live session.
-local function refresh_models()
-    if models_pending or models_cache then
-        return
-    end
-    local session
-    for _, candidate in ipairs(Sessions().list_all()) do
-        if candidate.rpc and candidate.rpc:is_running() then
-            session = candidate
-            break
-        end
-    end
-    if not session then
-        return
-    end
-    models_pending = true
-    session.rpc:send({ type = "get_available_models" }, function(res)
-        vim.schedule(function()
-            models_pending = false
-            if res and res.success then
-                local list = (res.data or {}).models or {}
-                if #list > 0 then
-                    models_cache = group_models(list)
-                end
-            end
-        end)
-    end)
 end
 
 --- @param params table|nil

@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-10-21
+
+- **ADDED:** Web-console plumbing for `pi2d`. The plugin now serves authoritative session state over the JSONL bridge (`:PiWeb*` / headless host), returns the real backend session id from `session.create`/`open` (announcing `tmp-N` → backend-id migrations), snapshots the newest entries tail, and exposes validated model/thinking/queue/task-output/attention/subagent commands. Attention requests default to a 120 s expiry and resolve from any client with first-answer-wins semantics.
+- **FIXED:** The web console now pairs through the public `POST /api/v1/pair`, authenticates its WebSocket with the raw device token, renders exactly one assistant message per turn (no duplicated/`PONGONG` streamed text), recovers an unknown `/chat/<id>` deep link with an error + retry instead of silently showing another session, lists and revokes devices from the real API shape, mints a live pairing code, and reports real server identity and WebSocket state.
+
 ## 2026-10-20
 
 - **FIXED:** `:PiSessions` listed one sub-session under two parent sessions when two live sessions shared a lineage — a conversation started with `/new` in one tab (which keeps the previous conversation's lineage) and the original session resumed in another. Both rows attributed manifest children by lineage alone, so a child spawned in the `/new` conversation also appeared under the resumed, older-epoch session (its running process bypassed the epoch check), and `H` showed its hidden rows twice. A child now renders under exactly one parent session: the conversation that spawned it (matching conversation epoch) wins, otherwise the conversation the lineage originates from, and failing both, the first live session in tabline order. A tab viewing one of the children still marks it under its parent's row.

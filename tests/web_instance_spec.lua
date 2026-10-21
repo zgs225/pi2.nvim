@@ -407,37 +407,97 @@ describe("pi.web.instance", function()
         assert.equals("exited", instance:snapshot_for(session).status)
     end)
 
-    it("keeps attention requests in the state until resolved", function()
+    it("projects queued attention requests into the snapshot (full fields, diff payload)", function()
         local bridge = fake_bridge()
         local instance = Instance.setup({ workspace_id = "ws-test", cwd = "/repo", bridge = bridge })
         local session = fake_session({ id = "s-attn" })
         Sessions._register_for_test(session)
         instance:on_subscribe("s-attn")
 
-        local entry = { id = "req-1", kind = "confirm", created_at = 1234 }
+        session.attention.pending = {
+            {
+                id = "req-1",
+                kind = "confirm",
+                created_at = 1234,
+                expires_at = 999999,
+                msg = {
+                    id = "req-1",
+                    method = "confirm",
+                    title = "Confirm?",
+                    message = "Do it",
+                    options = { { id = "a", label = "A" } },
+                    timeout = 30000,
+                },
+            },
+        }
+
+        local state = instance:snapshot_for(session)
+        assert.equals(1, #state.attention)
+        local item = state.attention[1]
+        assert.equals("req-1", item.requestId)
+        assert.equals("confirm", item.method)
+        assert.equals("Confirm?", item.title)
+        assert.equals("Do it", item.message)
+        assert.same({ { id = "a", label = "A" } }, item.options)
+        assert.equals(30, item.timeoutSec)
+        assert.equals(1234, item.createdAt)
+        assert.is_true(state.flags.attention)
+
+        -- A diff review is projected as method="diff" with the decoded payload.
+        local payload = { toolName = "edit", files = { { path = "a.lua" } } }
+        session.attention.pending = {
+            {
+                id = "req-diff",
+                kind = "diff",
+                created_at = 2000,
+                msg = { id = "req-diff", method = "select", title = vim.json.encode(payload) },
+            },
+        }
+        state = instance:snapshot_for(session)
+        assert.equals("diff", state.attention[1].method)
+        assert.same(payload, state.attention[1].payload)
+
+        -- An empty queue always clears the projection (a pruned request must not
+        -- leave a phantom entry or flag behind).
+        session.attention.pending = {}
+        state = instance:snapshot_for(session)
+        assert.same({}, state.attention)
+        assert.is_false(state.flags.attention)
+    end)
+
+    it("keeps attention requests in the state until resolved", function()
+        local bridge = fake_bridge()
+        local instance = Instance.setup({ workspace_id = "ws-test", cwd = "/repo", bridge = bridge })
+        local session = fake_session({ id = "s-attn2" })
+        Sessions._register_for_test(session)
+        instance:on_subscribe("s-attn2")
+
+        local entry = { id = "req-2", kind = "confirm", created_at = 1234, expires_at = 999999 }
         Instance.emit_attention_request(session, {
-            id = "req-1",
+            id = "req-2",
             method = "confirm",
             title = "Confirm?",
             message = "Do it",
             timeout = 30000,
         }, entry)
+        session.attention.pending = { entry }
 
         local state = instance:snapshot_for(session)
         assert.equals(1, #state.attention)
-        assert.equals("req-1", state.attention[1].requestId)
+        assert.equals("req-2", state.attention[1].requestId)
         assert.is_true(state.flags.attention)
         local request = events_of(bridge, Protocol.DERIVED.ATTENTION_REQUEST)[1].event
-        assert.equals("req-1", request.requestId)
+        assert.equals("req-2", request.requestId)
         assert.equals(30, request.timeoutSec)
 
-        Instance.emit_attention_resolved(session, "req-1", "web", { confirmed = true })
+        Instance.emit_attention_resolved(session, "req-2", "web", { confirmed = true })
+        session.attention.pending = {}
         state = instance:snapshot_for(session)
         assert.equals(0, #state.attention)
         assert.is_false(state.flags.attention)
     end)
 
-    it("keeps seq monotonic across a session id migration", function()
+    it("announces a session id migration on the old id and moves the subscription", function()
         local bridge = fake_bridge()
         local instance = Instance.setup({ workspace_id = "ws-test", cwd = "/repo", bridge = bridge })
         local session = fake_session({ id = "tmp-1" })
@@ -446,18 +506,193 @@ describe("pi.web.instance", function()
         instance:on_event(session, { type = "agent_start" })
         local before = bridge.events[#bridge.events].seq
 
-        session.id = "real-1"
-        Sessions._register_for_test(session)
-        instance:on_registry_change(session)
+        -- The real migration path: registry row + alias + web notification.
+        Sessions.ensure_id(session, "real-1")
+
+        local migration = bridge.events[#bridge.events]
+        assert.equals("tmp-1", migration.session_id)
+        assert.equals(Protocol.DERIVED.SESSION, migration.event.type)
+        assert.equals("real-1", migration.event.session.sessionId)
+        assert.equals("tmp-1", migration.event.session.previousSessionId)
+        assert.equals(before + 1, migration.seq)
+
+        -- The daemon learns the new id through a fresh instance_state.
+        local announced = bridge.instance_states[#bridge.instance_states]
+        assert.is_not_nil(announced)
+        local ids = {}
+        for _, row in ipairs(announced.sessions) do
+            ids[#ids + 1] = row.sessionId
+        end
+        assert.same({ "real-1" }, ids)
+
+        -- Subscription + seq continue on the new id and the snapshot follows it.
+        assert.is_true(instance._subscribed["real-1"] == true)
+        assert.is_nil(instance._subscribed["tmp-1"])
+        instance:on_subscribe("real-1")
+        assert.equals("real-1", bridge.snapshots[#bridge.snapshots].session_id)
         assert.equals("real-1", bridge.snapshots[#bridge.snapshots].state.sessionId)
+        assert.equals("real-1", instance:snapshot_for(session).sessionId)
 
         instance:on_event(session, { type = "agent_settled" })
-        local after
-        for _, record in ipairs(events_of(bridge, "agent_settled")) do
-            after = record
-        end
+        local after = events_of(bridge, "agent_settled")[1]
         assert.equals("real-1", after.session_id)
-        assert.equals(before + 1, after.seq)
+        assert.equals(before + 2, after.seq)
+
+        -- The old id keeps resolving for a while, then stops.
+        assert.equals(session, Sessions.get_by_id("tmp-1"))
+        local ttl = Sessions.ALIAS_TTL_MS
+        Sessions.ALIAS_TTL_MS = -1
+        assert.is_nil(Sessions.get_by_id("tmp-1"))
+        Sessions.ALIAS_TTL_MS = ttl
+    end)
+
+    it("forgets the id alias when the session closes", function()
+        local instance = Instance.setup({ workspace_id = "ws-test", cwd = "/repo", bridge = fake_bridge() })
+        local session = fake_session({ id = "tmp-9" })
+        Sessions._register_for_test(session)
+        instance:state_for(session)
+        Sessions.ensure_id(session, "real-9")
+        assert.equals(session, Sessions.get_by_id("tmp-9"))
+
+        Sessions.close_session(session)
+        assert.is_nil(Sessions.get_by_id("tmp-9"))
+        assert.is_nil(Sessions.get_by_id("real-9"))
+    end)
+
+    it("carries the newest entries (capped) in the snapshot", function()
+        local bridge = fake_bridge()
+        local instance = Instance.setup({ workspace_id = "ws-test", cwd = "/repo", bridge = bridge })
+        local session = fake_session({ id = "s-big" })
+        Sessions._register_for_test(session)
+        instance:on_subscribe("s-big")
+
+        for i = 1, 60 do
+            instance:on_event(session, {
+                type = "message_start",
+                message = { role = "assistant", content = {} },
+            })
+            instance:on_event(session, {
+                type = "message_end",
+                message = { role = "assistant", content = { { type = "text", text = "turn " .. i } } },
+            })
+        end
+
+        instance:send_snapshot(session)
+        local snapshot = bridge.snapshots[#bridge.snapshots]
+        assert.equals(50, #snapshot.entries)
+        -- Newest last, and the state itself still holds every entry.
+        assert.equals("turn 60", snapshot.entries[50].blocks[1].text)
+        assert.equals("turn 11", snapshot.entries[1].blocks[1].text)
+        assert.equals(60, #snapshot.state.entries)
+
+        -- A single entry larger than the byte budget is not shipped.
+        assert.same(
+            {},
+            instance:snapshot_entries({
+                {
+                    id = "m1",
+                    role = "assistant",
+                    ts = 1,
+                    blocks = { { type = "text", text = string.rep("x", 300 * 1024) } },
+                    done = true,
+                },
+            })
+        )
+    end)
+
+    it("emits pi2:batch only when the batch signature changed", function()
+        local root = vim.fn.tempname()
+        vim.fn.mkdir(root, "p")
+        local workspace = root .. "/repo"
+        vim.fn.mkdir(workspace, "p")
+        Config.options.agent_dir = root .. "/agent"
+        vim.fn.mkdir(Config.options.agent_dir .. "/sessions", "p")
+        vim.cmd("cd " .. vim.fn.fnameescape(workspace))
+
+        local sessions_dir = require("pi.sessions.history").get_sessions_dir()
+        vim.fn.mkdir(sessions_dir, "p")
+        require("pi.subsessions.manifest")._reset()
+        local Batch = require("pi.subsessions.batch")
+        Batch._reset()
+        local batch_path = sessions_dir .. "/.pi2-batches.json"
+        Batch._set_path(batch_path)
+        local function write_batch(status, item_status)
+            vim.fn.writefile({
+                vim.json.encode({
+                    b1 = {
+                        id = "b1",
+                        parent_id = "parent",
+                        status = status,
+                        created_at = "2026-01-01T00:00:00.000Z",
+                        updated_at = "2026-01-01T00:00:00.000Z",
+                        items = { { ref = "r1", status = item_status } },
+                    },
+                }),
+            }, batch_path)
+            Batch._reset()
+            Batch._set_path(batch_path)
+            Batch.load()
+        end
+        write_batch("running", "running")
+
+        local bridge = fake_bridge()
+        local instance = Instance.setup({ workspace_id = "ws-test", cwd = workspace, bridge = bridge })
+        local session = fake_session({ id = "parent" })
+        session.cwd = workspace
+        Sessions._register_for_test(session)
+        instance:on_subscribe("parent")
+        assert.equals(1, #events_of(bridge, Protocol.DERIVED.BATCH))
+
+        -- settle/tool-end hooks re-run the projection: unchanged batches stay quiet.
+        instance:publish_subagents(session)
+        instance:on_event(session, { type = "agent_settled" })
+        instance:on_event(session, { type = "tool_execution_end", toolCallId = "c1" })
+        assert.equals(1, #events_of(bridge, Protocol.DERIVED.BATCH))
+
+        -- A real change ships again.
+        write_batch("failed", "failed")
+        instance:publish_subagents(session)
+        local batches = events_of(bridge, Protocol.DERIVED.BATCH)
+        assert.equals(2, #batches)
+        assert.equals("failed", batches[2].event.status)
+        assert.equals("failed", batches[2].event.items[1].status)
+    end)
+
+    it("drops the cached model list when a session switches model", function()
+        local bridge = fake_bridge()
+        local instance = Instance.setup({ workspace_id = "ws-test", cwd = "/repo", bridge = bridge })
+        local session = fake_session({ id = "s-model" })
+        Sessions._register_for_test(session)
+        instance:on_subscribe("s-model")
+
+        local Commands = require("pi.web.commands")
+        local original = Commands._reset_caches
+        local invalidations = 0
+        Commands._reset_caches = function()
+            invalidations = invalidations + 1
+        end
+        local function get_state(model)
+            instance:on_event(session, {
+                type = "response",
+                command = "get_state",
+                success = true,
+                data = { model = model },
+            })
+        end
+
+        local ok, err = pcall(function()
+            get_state({ provider = "anthropic", id = "claude-sonnet-4-5" })
+            -- First observation only seeds the signature (the cache is empty).
+            assert.equals(0, invalidations)
+
+            get_state({ provider = "anthropic", id = "claude-sonnet-4-5" })
+            assert.equals(0, invalidations)
+
+            get_state({ provider = "openai", id = "gpt-5" })
+            assert.equals(1, invalidations)
+        end)
+        Commands._reset_caches = original
+        assert.is_true(ok, tostring(err))
     end)
 
     it("does not emit events buffered for a view rebuild (replayed once)", function()

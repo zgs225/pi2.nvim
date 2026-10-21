@@ -153,3 +153,14 @@ web.enabled()     -- boolean: configured or currently running
 ```
 
 The daemon-side entry point is `require("pi.host").start(workspace?)`, which `pi2d` calls from a headless Neovim (`--headless --listen <sock> -c 'lua require("pi.host").start()'`). See [Web console](usage.md#web-console).
+
+The protocol surface is not part of the public API, but it is reachable for extensions that need to answer a daemon record themselves:
+
+```lua
+local commands = require("pi.web.commands")
+
+commands.handlers["workspace.query"]  -- fun(params, ctx): ack, result
+commands.dispatch(method, params, ctx) -- same, with unknown-method handling; errors as { code, message }
+```
+
+`ctx` carries `session_id`, `id` (request id being answered), `bridge`, and the daemon's `method`, `params` and `client_request_id`. The state a snapshot is built from lives in `require("pi.web.instance")` (`instance()` returns the singleton; it is `nil` while the bridge is stopped). Command contracts and event names are documented in [Web console](usage.md#command-contracts).

@@ -181,4 +181,117 @@ describe("web attention request/resolve", function()
         assert.equals("nvim", resolved[1].by)
         assert.is_true(resolved[1].response.cancelled)
     end)
+
+    it("gives a request without a pi timeout the 120 s default expiry", function()
+        Attention.present(session, { id = "req-default", method = "confirm", title = "Confirm" })
+
+        local entry = session.attention.pending[1]
+        assert.is_number(entry.expires_at)
+        assert.is_number(entry.created_at)
+        assert.equals(120000, entry.expires_at - entry.created_at)
+
+        -- With a pi-level timeout the request keeps it.
+        Attention.present(session, { id = "req-timed", method = "confirm", title = "Confirm", timeout = 5000 })
+        local timed = session.attention.pending[2]
+        assert.equals(5000, timed.expires_at - timed.created_at)
+    end)
+
+    it("emits pi2:attention_resolved (and cancels) when a request expires", function()
+        Attention.present(session, {
+            id = "req-expire",
+            method = "confirm",
+            title = "Confirm",
+            timeout = 60000,
+        })
+        assert.equals(1, #session.attention.pending)
+        -- Force the entry to be stale, then run the prune timer's body.
+        session.attention.pending[1].expires_at = 0
+        Attention.prune_stale_queue()
+
+        assert.equals(0, #session.attention.pending)
+        local resolved = events_of(bridge, Protocol.DERIVED.ATTENTION_RESOLVED)
+        assert.equals(1, #resolved)
+        assert.equals("req-expire", resolved[1].requestId)
+        assert.equals("timeout", resolved[1].by)
+
+        local response = session._sent[#session._sent]
+        assert.equals("extension_ui_response", response.type)
+        assert.equals("req-expire", response.id)
+        assert.is_true(response.cancelled)
+
+        local state = instance:snapshot_for(session)
+        assert.equals(0, #state.attention)
+        assert.is_false(state.flags.attention)
+    end)
+
+    it("emits pi2:attention_resolved when a session transition drops requests", function()
+        Attention.present(session, { id = "req-old", method = "confirm", title = "Confirm" })
+        Attention.begin_session_transition(session)
+        Attention.end_session_transition(session, true)
+
+        assert.equals(0, #session.attention.pending)
+        local resolved = events_of(bridge, Protocol.DERIVED.ATTENTION_RESOLVED)
+        assert.equals(1, #resolved)
+        assert.equals("req-old", resolved[1].requestId)
+        assert.equals("session", resolved[1].by)
+        assert.is_false(instance:snapshot_for(session).flags.attention)
+    end)
+
+    it("keeps an entry pending while a local dialog is open so the web can answer", function()
+        local opened = 0
+        session.attention.pending = {
+            {
+                id = "req-local",
+                seq = 1,
+                kind = "confirm",
+                created_at = vim.uv.now(),
+                expires_at = vim.uv.now() + 60000,
+                open = function()
+                    opened = opened + 1
+                    return true
+                end,
+            },
+        }
+
+        assert.is_true(Attention.open_next())
+        assert.equals(1, opened)
+        -- Still pending (the web may answer it), but not counted/openable twice.
+        assert.equals(1, #session.attention.pending)
+        assert.equals(0, Attention.count(session.tab))
+        assert.is_true(Attention.open_next() == false)
+        assert.equals(1, opened)
+
+        local ok = Attention.resolve(session, "req-local", "web", { confirmed = true })
+        assert.is_true(ok)
+        assert.equals(0, #session.attention.pending)
+
+        -- The local dialog answering afterwards must not send a second response.
+        local sent = #session._sent
+        assert.is_true(Attention.resolve(session, "req-local", "nvim", { confirmed = true }) == false)
+        assert.equals(sent, #session._sent)
+    end)
+
+    it("drops an entry that is already expired before opening it", function()
+        local opened = 0
+        session.attention.pending = {
+            {
+                id = "req-stale",
+                seq = 1,
+                kind = "confirm",
+                created_at = 0,
+                expires_at = 0,
+                open = function()
+                    opened = opened + 1
+                    return true
+                end,
+            },
+        }
+
+        assert.is_false(Attention.open_next())
+        assert.equals(0, opened)
+        assert.equals(0, #session.attention.pending)
+        local resolved = events_of(bridge, Protocol.DERIVED.ATTENTION_RESOLVED)
+        assert.equals(1, #resolved)
+        assert.equals("req-stale", resolved[1].requestId)
+    end)
 end)

@@ -127,7 +127,7 @@ The parent agent also gets orchestration tools of its own (`dispatch_subagents`,
 
 ## Web console
 
-An opt-in `pi2d` bridge exports the same sessions to a browser (`:PiWebStart` / `:PiWebStop` / `:PiWebStatus`): the plugin remains the only authority, the browser is a render client, and every web command runs through the plugin's own manager/chat/attention paths. The daemon can also run a headless Neovim host per workspace — attach a UI to it later with `nvim --server <sock> --remote-ui`. See [Web console](doc/usage.md#web-console).
+An opt-in `pi2d` bridge exports the same sessions to a browser (`:PiWebStart` / `:PiWebStop` / `:PiWebStatus`): the plugin remains the only authority, the browser is a render client, and every web command runs through the plugin's own manager/chat/attention paths. A new browser pairs with the daemon by redeeming a short-lived code, so no token has to be copied by hand; snapshots carry the newest 50 transcript entries (≤ 256 KB) and older history is paged, and every announced session id settles — or migrates — before the client depends on it. The daemon can also run a headless Neovim host per workspace — attach a UI to it later with `nvim --server <sock> --remote-ui`. See [Web console](doc/usage.md#web-console).
 
 ## Requirements
 

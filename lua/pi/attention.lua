@@ -15,8 +15,14 @@ local Notify = require("pi.notify")
 ---@field seq integer Global arrival order across sessions
 ---@field kind pi.AttentionKind
 ---@field created_at? integer Wall-clock arrival time (ms), reported to web clients
----@field expires_at integer?
+---@field expires_at integer? Always set: the request expires (default 120 s)
+---@field opened? boolean A local dialog is on screen for this request
+---@field msg? pi.RpcEvent Raw `extension_ui_request`, projected into snapshots
 ---@field open fun(): boolean opened
+
+--- Lifetime of a request the backend gave no `timeout` for. Protocol §6: the
+--- plugin cancels such a request after 120 s so no client keeps a phantom.
+M.DEFAULT_TIMEOUT_MS = 120 * 1000
 
 ---@class pi.AttentionTabState
 ---@field count integer
@@ -107,6 +113,45 @@ local function ensure_timer()
     return prune_timer
 end
 
+--- Remove one queued entry by identity without announcing it (the caller owns
+--- the `pi2:attention_resolved` emission).
+---@param session pi.Session
+---@param entry pi.AttentionEntry|string|nil table or request id
+---@return boolean removed true when the entry was still queued
+local function take_entry(session, entry)
+    if entry == nil then
+        return false
+    end
+    local pending = pending_entries(session)
+    local id = type(entry) == "table" and entry.id or entry
+    for i, existing in ipairs(pending) do
+        if existing == entry or (id ~= nil and existing.id == id) then
+            table.remove(pending, i)
+            reschedule_timer(true)
+            request_redraw()
+            return true
+        end
+    end
+    return false
+end
+
+--- Tell every other client that a request is no longer answerable. Every
+--- removal path (answered, expired, dropped by a session transition, closed)
+--- calls this, so a web client never keeps a phantom `attention[]` entry.
+---@param session pi.Session
+---@param request_id string|nil
+---@param by string client that resolved it
+---@param response table|nil
+local function emit_resolved(session, request_id, by, response)
+    if type(request_id) ~= "string" or request_id == "" then
+        return
+    end
+    local ok, Instance = pcall(require, "pi.web.instance")
+    if ok and Instance.active() then
+        pcall(Instance.emit_attention_resolved, session, request_id, by, response)
+    end
+end
+
 ---@param tab? pi.TabId|0
 ---@return pi.TabId
 local function resolve_tab(tab)
@@ -142,12 +187,47 @@ local function send_response(session, cmd, by)
     -- Every answer — local dialog, :PiAttention or a web client — resolves the
     -- request for all other clients (protocol §6, first answer wins). Emitting
     -- here (not at each closure) keeps the fanout in one place.
-    if type(cmd) == "table" and cmd.id then
-        local ok, Instance = pcall(require, "pi.web.instance")
-        if ok and Instance.active() then
-            pcall(Instance.emit_attention_resolved, session, cmd.id, by or "nvim", cmd)
-        end
+    if type(cmd) == "table" then
+        emit_resolved(session, cmd.id, by or "nvim", cmd)
     end
+end
+
+--- Answer a request from a local dialog: the queue entry goes first (so the web
+--- stops seeing it as answerable), then the response is forwarded, which emits
+--- `pi2:attention_resolved` for everyone else.
+---@param session pi.Session
+---@param entry pi.AttentionEntry|nil
+---@param cmd pi.RpcCommand
+---@return boolean answered false when another client already answered it
+local function answer_entry(session, entry, cmd)
+    if type(entry) ~= "table" then
+        return false
+    end
+    entry.opened = nil
+    if not take_entry(session, entry) then
+        -- Another client answered while our dialog was open: its response is
+        -- already on the wire, a second one would be E_ATTENTION_RESOLVED.
+        return false
+    end
+    send_response(session, cmd, "nvim")
+    return true
+end
+
+--- Drop an expired request and cancel it so the backend unblocks (protocol §6).
+---@param session pi.Session
+---@param entry pi.AttentionEntry|nil
+---@param by? string
+---@return boolean expired true when the entry was still queued
+local function expire_entry(session, entry, by)
+    if type(entry) ~= "table" then
+        return false
+    end
+    entry.opened = nil
+    if not take_entry(session, entry) then
+        return false
+    end
+    send_response(session, { type = "extension_ui_response", id = entry.id, cancelled = true }, by or "timeout")
+    return true
 end
 
 ---@param session pi.Session
@@ -170,6 +250,11 @@ end
 ---@param now? integer
 ---@return boolean
 local function is_visible(session, entry, now)
+    if entry.opened then
+        -- A dialog is already on screen for it: still pending (a web client may
+        -- answer it — first answer wins), but not openable a second time.
+        return false
+    end
     if is_stale(session, entry, now) then
         return false
     end
@@ -326,42 +411,55 @@ end
 ---@return pi.AttentionEntry?
 local function build_entry(session, msg)
     local id = tostring(msg.id or "")
-    local expires_at = type(msg.timeout) == "number" and (now_ms() + msg.timeout) or nil
+    -- Every request expires: without a pi-level timeout the plugin cancels it
+    -- after `DEFAULT_TIMEOUT_MS` (protocol §6), so no client keeps a phantom
+    -- entry forever and the backend never stays blocked.
+    local timeout = type(msg.timeout) == "number" and msg.timeout or M.DEFAULT_TIMEOUT_MS
+    local expires_at = now_ms() + timeout
+    local entry ---@type pi.AttentionEntry?
+
+    --- Answer through the shared path: drop the queue entry, forward the answer.
+    ---@param cmd pi.RpcCommand
+    local function answer(cmd)
+        answer_entry(session, entry, cmd)
+    end
 
     if msg.method == "select" then
         local payload = decode_diff_payload(msg.title)
         if payload then
-            return {
+            entry = {
                 id = id,
                 seq = next_attention_seq(),
                 kind = "diff",
                 expires_at = expires_at,
                 open = function()
-                    local timeout = remaining_timeout_ms(expires_at)
-                    if timeout ~= nil and timeout <= 0 then
+                    local remaining = remaining_timeout_ms(expires_at)
+                    if remaining ~= nil and remaining <= 0 then
                         return false
                     end
                     Diff.open(payload, function(result)
-                        send_response(session, { type = "extension_ui_response", id = id, value = result })
+                        answer({ type = "extension_ui_response", id = id, value = result })
                     end, {
-                        timeout = timeout,
+                        timeout = remaining,
                         on_timeout = function()
                             notify_expired("diff")
+                            expire_entry(session, entry)
                         end,
                     })
                     return true
                 end,
             }
+            return entry
         end
 
-        return {
+        entry = {
             id = id,
             seq = next_attention_seq(),
             kind = "select",
             expires_at = expires_at,
             open = function()
-                local timeout = remaining_timeout_ms(expires_at)
-                if timeout ~= nil and timeout <= 0 then
+                local remaining = remaining_timeout_ms(expires_at)
+                if remaining ~= nil and remaining <= 0 then
                     return false
                 end
                 Dialog.select({
@@ -370,81 +468,87 @@ local function build_entry(session, msg)
                     options = msg.options or {},
                     kind = "pi-extension-select",
                 }, function(choice)
-                    local remaining = remaining_timeout_ms(expires_at)
-                    if remaining ~= nil and remaining <= 0 then
+                    local left = remaining_timeout_ms(expires_at)
+                    if left ~= nil and left <= 0 then
                         notify_expired("select")
+                        expire_entry(session, entry)
                         return
                     end
                     if choice then
-                        send_response(session, { type = "extension_ui_response", id = id, value = choice })
+                        answer({ type = "extension_ui_response", id = id, value = choice })
                     else
-                        send_response(session, { type = "extension_ui_response", id = id, cancelled = true })
+                        answer({ type = "extension_ui_response", id = id, cancelled = true })
                     end
                 end)
                 return true
             end,
         }
+        return entry
     end
 
     if msg.method == "confirm" then
-        return {
+        entry = {
             id = id,
             seq = next_attention_seq(),
             kind = "confirm",
             expires_at = expires_at,
             open = function()
-                local timeout = remaining_timeout_ms(expires_at)
-                if timeout ~= nil and timeout <= 0 then
+                local remaining = remaining_timeout_ms(expires_at)
+                if remaining ~= nil and remaining <= 0 then
                     return false
                 end
                 Dialog.confirm({
                     title = msg.title,
                     message = msg.message --[[@as string?]],
                 }, function(confirmed)
-                    local remaining = remaining_timeout_ms(expires_at)
-                    if remaining ~= nil and remaining <= 0 then
+                    local left = remaining_timeout_ms(expires_at)
+                    if left ~= nil and left <= 0 then
                         notify_expired("confirm")
+                        expire_entry(session, entry)
                         return
                     end
                     if confirmed then
-                        send_response(session, { type = "extension_ui_response", id = id, confirmed = true })
+                        answer({ type = "extension_ui_response", id = id, confirmed = true })
                     else
-                        send_response(session, { type = "extension_ui_response", id = id, cancelled = true })
+                        answer({ type = "extension_ui_response", id = id, cancelled = true })
                     end
                 end)
                 return true
             end,
         }
+        return entry
     end
 
     if msg.method == "input" or msg.method == "editor" then
-        return {
+        entry = {
             id = id,
             seq = next_attention_seq(),
             kind = msg.method,
             expires_at = expires_at,
             open = function()
-                local timeout = remaining_timeout_ms(expires_at)
-                if timeout ~= nil and timeout <= 0 then
+                local remaining = remaining_timeout_ms(expires_at)
+                if remaining ~= nil and remaining <= 0 then
                     return false
                 end
                 Dialog.input({
                     title = msg.title or "Input",
                     default = msg.prefill or msg.placeholder or "",
-                    timeout = timeout,
+                    timeout = remaining,
                     on_timeout = function()
                         notify_expired(msg.method --[[@as pi.AttentionKind]])
+                        expire_entry(session, entry)
                     end,
                 }, function(value)
                     if value then
-                        send_response(session, { type = "extension_ui_response", id = id, value = value })
+                        answer({ type = "extension_ui_response", id = id, value = value })
                     else
-                        send_response(session, { type = "extension_ui_response", id = id, cancelled = true })
+                        answer({ type = "extension_ui_response", id = id, cancelled = true })
                     end
                 end)
                 return true
             end,
         }
+        return entry
     end
 
     return nil
@@ -452,14 +556,19 @@ end
 
 ---@param session pi.Session
 ---@param predicate fun(entry: pi.AttentionEntry): boolean
+---@param by string|nil client to attribute the resolution to; nil = silent (replaced)
 ---@return integer removed
-local function remove_matching(session, predicate)
+local function remove_matching(session, predicate, by)
     local removed = 0
     local pending = pending_entries(session)
     for i = #pending, 1, -1 do
-        if predicate(pending[i]) then
+        local entry = pending[i]
+        if predicate(entry) then
             table.remove(pending, i)
             removed = removed + 1
+            if by then
+                emit_resolved(session, entry.id, by)
+            end
         end
     end
     return removed
@@ -485,9 +594,11 @@ function M.end_session_transition(session, committed)
         return
     end
     if committed then
+        -- The session (or its view) is being replaced: those requests can no
+        -- longer be answered, so tell the web they are gone.
         remove_matching(session, function(entry)
             return entry.seq <= transition_seq
-        end)
+        end, "session")
     end
     session.attention.transition_seq = nil
     reschedule_timer(true)
@@ -537,10 +648,23 @@ prune_stale_queue = function()
     local removed = 0
     local now = now_ms()
     for _, session in ipairs(sessions()) do
-        removed = removed
-            + remove_matching(session, function(entry)
-                return is_stale(session, entry, now)
-            end)
+        local pending = pending_entries(session)
+        for i = #pending, 1, -1 do
+            local entry = pending[i]
+            if is_stale(session, entry, now) then
+                table.remove(pending, i)
+                removed = removed + 1
+                -- Cancel first: the backend is blocked in ctx.ui.*() until it
+                -- receives an extension_ui_response (protocol §6). This also
+                -- emits `pi2:attention_resolved`, so no phantom stays on the web.
+                local expired = entry.expires_at ~= nil and now >= entry.expires_at
+                send_response(
+                    session,
+                    { type = "extension_ui_response", id = entry.id, cancelled = true },
+                    expired and "timeout" or "expiry"
+                )
+            end
+        end
     end
     reschedule_timer(true)
     if removed > 0 then
@@ -571,19 +695,26 @@ function M.present(session, msg)
         pcall(Instance.emit_attention_request, session, msg, entry)
     end
 
-    if has_ui() and session.chat and session.chat:has_prompt_focus() and not session.chat:has_draft() then
-        if not entry.open() then
-            notify_expired(entry.kind)
-        end
-        return true
-    end
-
+    -- Queue before opening: the entry must stay answerable by every client
+    -- (including the web) while a local dialog is on screen, and the local
+    -- dialog must not be opened twice (`opened`).
     remove_matching(session, function(existing)
         return existing.id == entry.id
     end)
     local pending = pending_entries(session)
     pending[#pending + 1] = entry
     reschedule_timer()
+
+    if has_ui() and session.chat and session.chat:has_prompt_focus() and not session.chat:has_draft() then
+        entry.opened = true
+        request_redraw()
+        if not entry.open() then
+            notify_expired(entry.kind)
+            expire_entry(session, entry)
+        end
+        return true
+    end
+
     request_redraw()
     if has_ui() then
         notify_pending(session, entry)
@@ -618,6 +749,7 @@ function M.resolve(session, request_id, by, response)
     if not index then
         return false, "E_ATTENTION_RESOLVED"
     end
+    pending[index].opened = nil
     table.remove(pending, index)
     reschedule_timer(true)
     request_redraw()
@@ -683,19 +815,15 @@ local function find_oldest_visible_entry_for_tab(tab)
 end
 
 ---@param session pi.Session
----@param index integer
 ---@param entry pi.AttentionEntry
 ---@param opts? { switch_tab?: boolean }
 ---@return boolean opened
 ---@return boolean expired
-local function open_pending_entry(session, index, entry, opts)
-    table.remove(pending_entries(session), index)
-    reschedule_timer(true)
-    request_redraw()
-
+local function open_pending_entry(session, entry, opts)
     local timeout = remaining_timeout_ms(entry.expires_at)
     if timeout ~= nil and timeout <= 0 then
         notify_expired(entry.kind)
+        expire_entry(session, entry)
         return false, true
     end
 
@@ -705,11 +833,16 @@ local function open_pending_entry(session, index, entry, opts)
         end
     end
 
+    -- Keep the entry queued (see `M.present`): `opened` hides it from the
+    -- "open next" search while the web can still answer it.
+    entry.opened = true
+    request_redraw()
     if entry.open() then
         return true, false
     end
 
     notify_expired(entry.kind)
+    expire_entry(session, entry)
     return false, true
 end
 
@@ -723,12 +856,12 @@ function M.open_next_for_tab(tab)
     prune_stale_queue()
 
     while true do
-        local session, index, entry = find_oldest_visible_entry_for_tab(target_tab)
-        if not session or not index or not entry then
+        local session, _, entry = find_oldest_visible_entry_for_tab(target_tab)
+        if not session or not entry then
             return false
         end
 
-        local opened = open_pending_entry(session, index, entry)
+        local opened = open_pending_entry(session, entry)
         if opened then
             return true
         end
@@ -745,15 +878,15 @@ function M.open_next()
     local expired = false
 
     while true do
-        local session, index, entry = find_oldest_visible_entry()
-        if not session or not index or not entry then
+        local session, _, entry = find_oldest_visible_entry()
+        if not session or not entry then
             if not expired then
                 Notify.info("No pending π requests")
             end
             return false
         end
 
-        local opened, entry_expired = open_pending_entry(session, index, entry, { switch_tab = true })
+        local opened, entry_expired = open_pending_entry(session, entry, { switch_tab = true })
         if opened then
             return true
         end
@@ -771,9 +904,11 @@ function M.clear_session(session)
     end
     -- Cancel each queued request before dropping it: the backend is blocked in
     -- ctx.ui.*() until it receives an extension_ui_response, and dropping the
-    -- queue without one would leave it waiting forever.
+    -- queue without one would leave it waiting forever. `send_response` also
+    -- emits `pi2:attention_resolved` for every one of them.
     for _, entry in ipairs(pending) do
-        send_response(session, { type = "extension_ui_response", id = entry.id, cancelled = true })
+        entry.opened = nil
+        send_response(session, { type = "extension_ui_response", id = entry.id, cancelled = true }, "nvim")
     end
     session.attention.pending = {}
     reschedule_timer(true)

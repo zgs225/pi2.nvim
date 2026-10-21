@@ -204,7 +204,48 @@ A real UI can attach to that instance at any time (Neovim 0.9+):
 nvim --server <runtime>/i/<hash>.sock --remote-ui
 ```
 
-Queued attention requests are re-presented locally as soon as the UI attaches, so you can answer them in Neovim or in the browser — the first answer wins and everyone else sees the request resolved. Headless instances never open a dialog; they queue the request and emit it for the web client.
+Queued attention requests are re-presented locally as soon as the UI attaches, so you can answer them in Neovim or in the browser — the first answer wins and everyone else sees the request resolved. Headless instances never open a dialog; they queue the request and emit it for the web client. Requests also expire: see [Attention & dialogs](attention.md#expiry).
+
+### Session identity
+
+`session.create`, `session.open` and `session.resume` answer only once the backend's real session id is known. pi starts a session under a placeholder (`tmp-N`); the plugin waits up to 5 s for the first `get_state` response that names the real id, then acks with it — `{sessionId, cwd}` for `session.create`, `{sessionId, sessionFile, disposition = "started"}` for open/resume. If the id has not settled in time the ack adds `pending = true` instead of hanging, and the client keeps polling `workspace.query{kind="sessions"}`.
+
+An id can also migrate after a session was already announced. The plugin then emits `pi2:session` **on the old id** with `{sessionId = <new>, previousSessionId = <old>}`, moves the subscription and seq counter to the new id, and refreshes `instance_state` — so a client that subscribed to `tmp-N` can rebind without a full resync.
+
+### Snapshots, seq and reconnects
+
+- A `snapshot` replaces the client's cache: `payload.state` plus `payload.entries`, the newest entries that fit the caps (**≤ 50 entries, ≤ 256 KB** encoded). Anything older is paginated through `workspace.query{kind="entries", before = <entryId>, limit = N}`.
+- The plugin's reducer keeps at most **500 entries** per session. `seq` and `epoch` come from the instance, never from the reducer.
+- `seq` is strictly increasing on the wire, per session. Streaming deltas and tool updates are coalesced and get their seq **at flush time**, so a coalesced frame can never overtake a newer one.
+- A WS `subscribe` may carry `since: {sessionId, epoch, seq}`. The daemon answers with the cached snapshot while the pair is valid and sends `resync_required` when the epoch changed or the seq is ahead of what it has.
+
+### Command contracts
+
+Handlers live in `lua/pi/web/commands.lua` and delegate to the plugin path the TUI uses (manager, chat queue, `pi.attention`, `pi.tasks`, `pi.subsessions`). Methods that start asynchronous work ack immediately with `disposition = "started"`; progress arrives as `pi2:*` events.
+
+| Method | Params | Notes |
+| --- | --- | --- |
+| `session.create` | `{sessionId?}` | New tab-backed session; an existing `sessionId` is returned unchanged |
+| `session.open` / `session.resume` | `{sessionFile}` | Resume a session file |
+| `session.close` | `{mode = "stop"}` | `"hibernate"` is accepted and behaves the same: the process stops, the session file stays on disk |
+| `session.rename` | `{name}` | |
+| `session.fork` / `session.compact` | `{entryId}` / `{instructions}` | |
+| `prompt.send` | `{text, images?, mode?}` | `mode = "steer"` or `"follow_up"`; `"queue"` and anything unknown mean a plain prompt, sent via `manager.prompt` (same command as `Chat:submit`) |
+| `prompt.abort` | — | Sends `abort` and clears the session's attention queue |
+| `queue.remove` | `{id = "q:steer:N" \| "q:follow:N"}` | `N` is a 1-based position inside that kind (`N = 0` is the 0-based first entry, which pi ships); `{index}` and the raw queued text are accepted too |
+| `queue.setSteer` | `{mode = "all" \| "one-at-a-time"}` | Session-wide steering mode (`set_steering_mode`), not per entry: the web client's `{queueId, steer}` shape is accepted and the id ignored |
+| `session.setModel` | `{model = {provider, id}}` | Validated against the instance's model cache once it is populated, then switched through the TUI path (`pi.models.set`) |
+| `session.setThinking` | `{level}` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`; anything else is rejected with `E_BAD_REQUEST` |
+| `attention.respond` | `{requestId, response = {value} \| {confirmed} \| {cancelled}}` | First answer wins; an already-resolved id returns `E_ATTENTION_RESOLVED` |
+| `subagent.dispatch` | `{items = [{task, name?, model?, thinking_level?}], wait?, cancel_siblings_on_fail?}` | Batch dispatch (a flat single-task form is accepted); async with `disposition = "started"` |
+| `task.output` | `{taskId, tail?}` | Output tail (default 200 lines, max 1000), read from the end of the output file |
+| `task.stop` | `{taskId}` | SIGTERM to the recorded pid |
+
+The remaining methods are `subagent.stop {targets}`, `subagent.steer {target, message}`, `subagent.read {target|sessionFile, tail?}` and `workspace.query {kind = "sessions"|"entries"|"attention"|"models", …}` (`entries` also takes `sessionFile`, `before`, `limit`).
+
+### Pairing and daemon info
+
+A browser redeems a pairing code with `POST /api/v1/pair {code, kind, deviceName}` — that redemption is public, which is how a fresh browser obtains its device token. *Creating* a new code requires an authenticated request (`POST /api/v1/pair` without `code`, optionally `{ttlSec}`). `GET /api/v1/devices` returns a bare JSON array of devices, and `GET /api/v1/info` reports `hostname`, `os`, `version`, `uptimeMs`, `pid` and `port` alongside `v`, `daemonId`, `machineId`, `platform`, `capabilities` and `limits`.
 
 Notes and current limits:
 

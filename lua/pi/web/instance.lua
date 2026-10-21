@@ -37,10 +37,17 @@ local uv = vim.uv or vim.loop
 --- @field _todo_sig table<pi.Session, string>
 --- @field _task_sig table<string, string>
 --- @field _sub_sig table<pi.Session, string>
+--- @field _batch_sig table<pi.Session, table<string, string>> per-batchId signature
+--- @field _model_sig table<pi.Session, string> last model emitted per session
 --- @field _stats_at table<string, number>
 --- @field _active boolean
 local Instance = {}
 Instance.__index = Instance
+
+--- Newest entries a snapshot may carry.
+local MAX_SNAPSHOT_ENTRIES = 50
+--- Byte budget for the entries a snapshot carries (encoded JSON, approximate).
+local MAX_SNAPSHOT_ENTRY_BYTES = 256 * 1024
 
 --- @type pi.web.Instance|nil
 local current = nil
@@ -104,6 +111,8 @@ function M.setup(opts)
     instance._todo_sig = setmetatable({}, { __mode = "k" })
     instance._task_sig = {}
     instance._sub_sig = setmetatable({}, { __mode = "k" })
+    instance._batch_sig = setmetatable({}, { __mode = "k" })
+    instance._model_sig = setmetatable({}, { __mode = "k" })
     instance._stats_at = {}
     instance._active = true
     current = instance
@@ -161,18 +170,7 @@ function Instance:state_for(session)
     local id = session.id
     local previous = self._ids[session]
     if previous and id and previous ~= id then
-        self._seq[id] = self._seq[previous] or 0
-        self._seq[previous] = nil
-        if self._subscribed[previous] then
-            self._subscribed[id] = true
-            self._subscribed[previous] = nil
-        end
-        local state = self._states[session]
-        if state then
-            -- Keep snapshots addressed by the live id. `_state` is the model's
-            -- own projection; there is no public setter for the id.
-            state._state.sessionId = id
-        end
+        self:_migrate_session(session, previous, id)
     end
     self._ids[session] = id
 
@@ -190,6 +188,43 @@ function Instance:state_for(session)
         self._states[session] = state
     end
     return state
+end
+
+--- Migrate everything keyed by the old session id.
+---
+--- A daemon/web client that subscribed to `tmp-N` addresses the session by that
+--- id, so the migration is announced *on the old id* first (`pi2:session` with
+--- `sessionId` + `previousSessionId`), and only then is the subscription/seq
+--- mapping moved to the new id.
+--- @param session pi.Session
+--- @param old_id string
+--- @param new_id string
+function Instance:_migrate_session(session, old_id, new_id)
+    local subscribed = self._subscribed[old_id] == true
+    local old_seq = self._seq[old_id] or 0
+    local announced = old_seq
+    if subscribed and self.bridge then
+        announced = old_seq + 1
+        self.bridge:send_event(old_id, self.epoch, announced, {
+            type = Protocol.DERIVED.SESSION,
+            ts = now_ms(),
+            session = { sessionId = new_id, previousSessionId = old_id },
+        })
+    end
+    -- The new id continues the old counter (so the wire never goes backwards)
+    -- but never regresses a seq the new key already earned. The old counter is
+    -- kept: a delta still coalescing in the bridge may flush under the old id.
+    self._seq[new_id] = math.max(announced, self._seq[new_id] or 0)
+    if subscribed then
+        self._subscribed[new_id] = true
+        self._subscribed[old_id] = nil
+    end
+    local state = self._states[session]
+    if state then
+        -- Keep snapshots addressed by the live id. `_state` is the model's own
+        -- projection; there is no public setter for the id.
+        state._state.sessionId = new_id
+    end
 end
 
 --- Next sequence number for a session (shared by events, snapshots and acks).
@@ -221,16 +256,43 @@ end
 -- outbound
 -- ---------------------------------------------------------------------------
 
+--- Whether the bridge coalesces this event, i.e. writes it later than it is
+--- handed over (and therefore owns its seq).
+--- @param event table
+--- @return boolean
+function Instance:_coalesces(event)
+    local bridge = self.bridge
+    if not bridge or type(bridge.coalesces) ~= "function" then
+        return false
+    end
+    local ok, result = pcall(bridge.coalesces, bridge, event)
+    return ok and result == true
+end
+
+--- Send an already-applied event when the daemon is subscribed to the id.
+--- @param session_id string|nil
+--- @param event table
+--- @return boolean queued
+function Instance:_send_to(session_id, event)
+    if not session_id or not self.bridge or not self._subscribed[session_id] then
+        return false
+    end
+    -- A coalesced frame is written after this call returns, so its seq is
+    -- assigned by the bridge at flush time; burning one here would leave a
+    -- hole the wire order could overtake.
+    local seq
+    if not self:_coalesces(event) then
+        seq = self:next_seq(session_id)
+    end
+    return self.bridge:send_event(session_id, self.epoch, seq, event)
+end
+
 --- Send an already-applied event when the daemon is subscribed to the session.
 --- @param session pi.Session
 --- @param event table
 --- @return boolean queued
 function Instance:_send(session, event)
-    local id = session.id
-    if not id or not self.bridge or not self._subscribed[id] then
-        return false
-    end
-    return self.bridge:send_event(id, self.epoch, self:next_seq(id), event)
+    return self:_send_to(session.id, event)
 end
 
 --- Apply one event to the projection and ship it.
@@ -251,6 +313,24 @@ end
 --- @param message string
 function Instance:emit_error(session, message)
     self:emit(session, { type = Protocol.DERIVED.ERROR, message = tostring(message or "error") })
+end
+
+--- Drop the lazily fetched model list `pi.web.commands` caches for
+--- `/api/v1/models`. That cache is keyed by nothing, so a provider
+--- reconfiguration would otherwise keep a stale list until nvim restarts. A
+--- session switching to a different model is the cheapest available signal.
+--- Best effort: the cache lives in another module, so a missing hook is fine.
+--- @return boolean invalidated
+function Instance:invalidate_models()
+    local ok, Commands = pcall(require, "pi.web.commands")
+    if not ok or type(Commands) ~= "table" then
+        return false
+    end
+    local reset = Commands._reset_caches
+    if type(reset) ~= "function" then
+        return false
+    end
+    return pcall(reset)
 end
 
 --- @param session pi.Session
@@ -464,19 +544,45 @@ function Instance:project_subagents(session)
     return batches, subagents
 end
 
+--- Signature of a projected batch: status + items + summary.
+--- @param batch table
+--- @return string
+local function batch_signature(batch)
+    local ok, encoded = pcall(vim.json.encode, {
+        status = batch.status,
+        items = batch.items or {},
+        summary = batch.summary,
+    })
+    if ok and type(encoded) == "string" then
+        return encoded
+    end
+    return table.concat({ tostring(batch.status), tostring(#(batch.items or {})), tostring(batch.summary ~= nil) }, "|")
+end
+
 --- @param session pi.Session
 function Instance:publish_subagents(session)
     local batches, subagents = self:project_subagents(session)
     local parts = {}
+    local sigs = self._batch_sig[session]
+    if not sigs then
+        sigs = {}
+        self._batch_sig[session] = sigs
+    end
     for _, batch in ipairs(batches) do
         parts[#parts + 1] = batch.batchId .. ":" .. tostring(batch.status)
-        self:emit(session, {
-            type = Protocol.DERIVED.BATCH,
-            batchId = batch.batchId,
-            status = batch.status,
-            items = batch.items,
-            summary = batch.summary,
-        })
+        -- This runs on every settle/tool_end; only ship a batch whose status,
+        -- items or summary actually changed.
+        local sig = batch_signature(batch)
+        if sigs[batch.batchId] ~= sig then
+            sigs[batch.batchId] = sig
+            self:emit(session, {
+                type = Protocol.DERIVED.BATCH,
+                batchId = batch.batchId,
+                status = batch.status,
+                items = batch.items,
+                summary = batch.summary,
+            })
+        end
     end
     for _, child in ipairs(subagents) do
         parts[#parts + 1] = child.id .. ":" .. tostring(child.status)
@@ -546,6 +652,45 @@ end
 -- snapshots
 -- ---------------------------------------------------------------------------
 
+--- Project one queued attention request as a protocol `attention[]` item
+--- (`pi2d/docs/protocol.md` §4/§6). Diffs are reported as method "diff" with
+--- the decoded request payload, not as the pi-level "select".
+--- @param entry pi.AttentionEntry
+--- @param msg table|nil raw `extension_ui_request`
+--- @param now integer
+--- @return table
+local function project_attention_entry(entry, msg, now)
+    if type(msg) ~= "table" then
+        msg = type(entry.msg) == "table" and entry.msg or {}
+    end
+    local item = {
+        requestId = tostring(entry.id or msg.id or ""),
+        method = entry.kind or msg.method or "select",
+        createdAt = entry.created_at or now,
+        receivedAt = entry.created_at or now,
+    }
+    if type(msg.title) == "string" then
+        item.title = msg.title
+    end
+    if type(msg.message) == "string" then
+        item.message = msg.message
+    end
+    if type(msg.options) == "table" then
+        item.options = msg.options
+    end
+    if type(msg.timeout) == "number" then
+        item.timeoutSec = math.max(0, math.floor(msg.timeout / 1000))
+    end
+    if item.method == "diff" then
+        -- A diff review carries its payload as JSON in `title`.
+        local ok, payload = pcall(vim.json.decode, type(msg.title) == "string" and msg.title or "")
+        if ok and type(payload) == "table" then
+            item.payload = payload
+        end
+    end
+    return item
+end
+
 --- Project the attention queue of a session for a snapshot.
 --- @param session pi.Session
 --- @return table[]
@@ -554,12 +699,7 @@ local function project_attention(session)
     local out = {}
     local now = now_ms()
     for _, entry in ipairs(pending) do
-        out[#out + 1] = {
-            requestId = entry.id,
-            method = entry.kind or "select",
-            createdAt = entry.created_at or now,
-            receivedAt = entry.created_at or now,
-        }
+        out[#out + 1] = project_attention_entry(entry, entry.msg, now)
     end
     return out
 end
@@ -607,14 +747,45 @@ function Instance:snapshot_for(session)
     state.batches = batches
     state.subagents = subagents
     -- The queued attention entries are authoritative for what can still be
-    -- answered; when the queue is empty the reducer's records stand (a request
-    -- that was presented while no queue existed, e.g. an immediate dialog).
+    -- answered, so the snapshot always carries them: an empty array clears a
+    -- request that was answered/pruned elsewhere (protocol §6).
     local attention = project_attention(session)
-    if #attention > 0 then
-        state.attention = attention
-    end
+    state.attention = attention
+    state.flags.attention = #attention > 0
 
     return state
+end
+
+--- Entries a snapshot carries: the newest that fit the cap (`pi2d/docs/protocol.md`
+--- §2 — a snapshot replaces the client's cache, so it must include a transcript
+--- tail, not an empty list). Older history stays with the paginated
+--- `workspace.query{kind="entries"}` path, which is authoritative.
+--- @param entries pi.web.Entry[]|nil
+--- @return pi.web.Entry[]
+function Instance:snapshot_entries(entries)
+    local out = {}
+    if type(entries) ~= "table" then
+        return out
+    end
+    local bytes = 0
+    for i = #entries, 1, -1 do
+        if #out >= MAX_SNAPSHOT_ENTRIES then
+            break
+        end
+        local entry = entries[i]
+        local ok, size = pcall(function()
+            return #vim.json.encode(entry)
+        end)
+        if not ok then
+            break
+        end
+        if bytes + size > MAX_SNAPSHOT_ENTRY_BYTES then
+            break
+        end
+        bytes = bytes + size
+        table.insert(out, 1, entry)
+    end
+    return out
 end
 
 --- @param session pi.Session
@@ -623,7 +794,14 @@ function Instance:send_snapshot(session)
     if not self.bridge or not session.id then
         return false
     end
-    return self.bridge:send_snapshot(session.id, self.epoch, self:seq(session.id), self:snapshot_for(session), {})
+    local state = self:snapshot_for(session)
+    return self.bridge:send_snapshot(
+        session.id,
+        self.epoch,
+        self:seq(session.id),
+        state,
+        self:snapshot_entries(state.entries)
+    )
 end
 
 --- Instance-wide state (`instance_state`): session table + transport status.
@@ -746,6 +924,17 @@ function Instance:on_event(session, msg)
                 if type(data.thinkingLevel) == "string" then
                     patch.thinking = data.thinkingLevel
                 end
+                if patch.model then
+                    -- A different model may come from a provider that was just
+                    -- (re)configured: drop the cached model list so the web
+                    -- picks the new one up instead of a stale snapshot.
+                    local sig = tostring(patch.model.provider) .. "/" .. tostring(patch.model.id)
+                    local previous = self._model_sig[session]
+                    if previous and previous ~= sig then
+                        self:invalidate_models()
+                    end
+                    self._model_sig[session] = sig
+                end
                 if type(data.sessionName) == "string" then
                     patch.name = data.sessionName
                 elseif data.sessionName == vim.NIL then
@@ -816,30 +1005,8 @@ end
 --- @param msg table the raw `extension_ui_request`
 --- @param entry pi.AttentionEntry
 function Instance:emit_attention_request(session, msg, entry)
-    local event = {
-        type = Protocol.DERIVED.ATTENTION_REQUEST,
-        requestId = tostring(msg.id or entry.id),
-        method = msg.method or entry.kind,
-        createdAt = entry.created_at,
-    }
-    if type(msg.title) == "string" then
-        event.title = msg.title
-    end
-    if type(msg.message) == "string" then
-        event.message = msg.message
-    end
-    if type(msg.options) == "table" then
-        event.options = msg.options
-    end
-    if type(msg.timeout) == "number" then
-        event.timeoutSec = math.max(0, math.floor(msg.timeout / 1000))
-    end
-    if entry.kind == "diff" and type(msg.title) == "string" then
-        local ok, payload = pcall(vim.json.decode, msg.title)
-        if ok and type(payload) == "table" then
-            event.payload = payload
-        end
-    end
+    local event = project_attention_entry(entry, msg, now_ms())
+    event.type = Protocol.DERIVED.ATTENTION_REQUEST
     self:emit(session, event)
 end
 
