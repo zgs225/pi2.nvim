@@ -125,6 +125,10 @@ A session per tab is the baseline; `pi2.nvim` adds **sub-sessions** — a parent
 
 The parent agent also gets orchestration tools of its own (`dispatch_subagents`, `poll_subagents`, `wait_subagents`, `stop_subagents`), and both sides carry static system-prompt notes on how to behave. Full workflow, list keys, and `subagent.*` options: [Sub-sessions](doc/sessions.md#sub-sessions).
 
+## Web console
+
+An opt-in [`pi2d`](https://github.com/earendil-works/pi2) bridge exports the same sessions to a browser (`:PiWebStart` / `:PiWebStop` / `:PiWebStatus`): the plugin remains the only authority, the browser is a render client, and every web command runs through the plugin's own manager/chat/attention paths. The daemon can also run a headless Neovim host per workspace — attach a UI to it later with `nvim --server <sock> --remote-ui`. See [Web console](doc/usage.md#web-console).
+
 ## Requirements
 
 - Neovim 0.10+
@@ -269,6 +273,7 @@ require("pi").setup({
 | `:PiSubClose` | Close the current sub-session's RPC process (session file retained) |
 | `:PiSubView` | View a child sub-session in a read-only float viewer with real-time streaming |
 | `:PiTodo` | Toggle the todo side panel: the current session's `todo_write` checklist (see [doc/usage.md](doc/usage.md#todo-list)) |
+| `:PiWebStart` / `:PiWebStop` / `:PiWebStatus` | Start, stop, or inspect the `pi2d` web-console bridge (see [doc/usage.md](doc/usage.md#web-console)) |
 | `:PiDiff` | Review the git diff of every file changed by the current session in one panel: file list + diff, grouped per git work tree |
 | `:PiToggleStartupDetails` | Toggle the startup block between compact and expanded |
 | `:PiToggleThinking` | Show or hide thinking blocks |

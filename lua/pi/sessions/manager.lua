@@ -235,6 +235,18 @@ local function notify_todo_view_changed(tab)
     end
 end
 
+--- Notify the web console instance that the session registry changed
+--- (create/close/switch/id migration). No-op unless `pi.web` is running.
+--- Lazy require + pcall mirror the todo/task hooks: a web module failure must
+--- never break session lifecycle.
+---@param session pi.Session? session whose registry row changed
+local function notify_web_registry(session)
+    local ok, inst = pcall(require, "pi.web.instance")
+    if ok and inst.active() then
+        pcall(inst.on_registry_change, session)
+    end
+end
+
 --- Prune the todo panel's per-session state for a REMOVED session (closed or
 --- process-exited). Detached-but-alive sessions keep their state — a
 --- background child may still be writing todos. Nil-safe and pcall'd like
@@ -749,7 +761,7 @@ end
 ---@param session pi.Session
 ---@param msg pi.RpcEvent
 ---@return boolean handled
-function M.handle_event(session, msg)
+local function handle_event_impl(session, msg)
     local t = msg.type
     local chat = session.chat
 
@@ -1113,6 +1125,23 @@ function M.handle_event(session, msg)
     return true
 end
 
+--- Public event entry point: built-in handling first, then the web console
+--- fanout. The fanout lives *outside* `handle_event_impl` so its early returns
+--- (buffered replay, responses, ignored events) all still reach the web state;
+--- buffered events are replayed through this wrapper exactly once, after the
+--- rebuild, which is why the hook is not at the top of the handler.
+---@param session pi.Session
+---@param msg pi.RpcEvent
+---@return boolean handled
+function M.handle_event(session, msg)
+    local handled = handle_event_impl(session, msg)
+    local ok, inst = pcall(require, "pi.web.instance")
+    if ok and inst.active() then
+        pcall(inst.on_event, session, msg)
+    end
+    return handled
+end
+
 ---@param session pi.Session
 ---@param flush_queue? boolean default true
 ---@param will_retry? boolean
@@ -1322,7 +1351,71 @@ function M.create_detached(tab, opts)
 
     refresh_state_and_pin(session)
     require("pi.ui.sessions").request_refresh()
+    notify_web_registry(session)
     return session
+end
+
+--- Create a session for the web console: a normal tab-backed session, so the
+--- Chat queue/model/render paths remain the only implementation, created
+--- without leaving focus in the new tab. Headless instances have no UI, so the
+--- round-trip through the new tab is invisible there.
+---@param opts? pi.SessionCreateOpts
+---@return pi.Session?
+function M.create_for_web(opts)
+    local previous_tab = current_tab()
+    local previous_win = vim.api.nvim_get_current_win()
+    if not pcall(vim.cmd, "tabnew") then
+        return M.get_or_create(opts)
+    end
+    local session = M.get_or_create(opts)
+    if vim.api.nvim_tabpage_is_valid(previous_tab) then
+        pcall(vim.api.nvim_set_current_tabpage, previous_tab)
+        if vim.api.nvim_win_is_valid(previous_win) then
+            pcall(vim.api.nvim_set_current_win, previous_win)
+        end
+    end
+    return session
+end
+
+--- Send a prompt, steer or follow-up for a specific session.
+---
+--- Mirrors the RPC construction of `Chat:_send_message` (mention expansion,
+--- command type, images) without touching the prompt buffer, so the web console
+--- and the TUI send byte-identical commands. Rendering still happens from the
+--- resulting `message_start` event, and the queue from `queue_update`, so no
+--- client-side optimistic state is duplicated here.
+---@param session pi.Session
+---@param text string
+---@param opts? { queue_type?: "steer"|"follow_up", images?: pi.RpcImageContent[] }
+---@return boolean sent
+function M.prompt(session, text, opts)
+    opts = opts or {}
+    if type(text) ~= "string" or text == "" then
+        return false
+    end
+    if not session or not session.rpc or not session.rpc:is_running() then
+        return false
+    end
+
+    local expanded = text
+    local ok, Mentions = pcall(require, "pi.ui.chat.mentions")
+    if ok and type(Mentions.expand) == "function" then
+        expanded = Mentions.expand(text)
+    end
+
+    ---@type pi.RpcCommand
+    local cmd
+    if opts.queue_type == "steer" then
+        cmd = { type = "steer", message = expanded }
+    elseif opts.queue_type == "follow_up" then
+        cmd = { type = "follow_up", message = expanded }
+    else
+        cmd = { type = "prompt", message = expanded }
+    end
+    if type(opts.images) == "table" and #opts.images > 0 then
+        cmd.images = opts.images
+    end
+    return session.rpc:send(cmd) ~= false
 end
 
 --- Stop a session process and remove it from the registry.
@@ -1338,6 +1431,7 @@ function M.close_session(session)
     end
     prune_todo_state(session)
     require("pi.ui.sessions").request_refresh()
+    notify_web_registry(nil)
 end
 
 ---@class pi.LoadSessionOpts
@@ -1424,6 +1518,7 @@ function M.get_or_create(opts)
     -- capture the initial config pin.
     refresh_state_and_pin(session)
 
+    notify_web_registry(session)
     return session
 end
 
@@ -1445,6 +1540,7 @@ function M.stop()
     registry[session_id] = nil
     prune_todo_state(session)
     require("pi.ui.sessions").request_refresh()
+    notify_web_registry(nil)
 end
 
 ---@param session pi.Session
@@ -1901,6 +1997,7 @@ function load_session(session, session_path, opts, callback)
         -- The resumed session's model was restored from its session file by
         -- core; adopt it as this tab's pin.
         refresh_state_and_pin(session)
+        notify_web_registry(session)
         done(true)
 
         -- Revive (and other headless loads) switch the file before the chat is

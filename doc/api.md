@@ -137,3 +137,19 @@ and switch to the other mode. The mode is per-session backend state, so — like
 thinking level, model, and auto-compaction — it applies to the current tab's
 session and is not cascaded to sub-sessions; a sub-session keeps its own mode
 and can be changed from its view.
+
+## Web console
+
+The web-console bridge is its own module (it is not required for normal editor use, and `pi.setup()` only starts it when [`web.enabled = true`](configuration.md)):
+
+```lua
+local web = require("pi.web")
+
+web.setup(opts?)  -- { host?: boolean, start?: boolean, autocmds?: boolean }
+web.start()       -- start the bridge; lazily spawns `pi2d` when the socket is missing
+web.stop()        -- stop the bridge (sessions and the daemon keep running)
+web.status()      -- table: enabled/started/ready/socket/workspace/instance/sessions/host
+web.enabled()     -- boolean: configured or currently running
+```
+
+The daemon-side entry point is `require("pi.host").start(workspace?)`, which `pi2d` calls from a headless Neovim (`--headless --listen <sock> -c 'lua require("pi.host").start()'`). See [Web console](usage.md#web-console).

@@ -91,11 +91,17 @@ describe("detached session attention support", function()
         assert.equals(0, state.current_tab_count)
         assert.is_nil(state.tabs[nil])
 
-        -- Notification dispatched with background id and suffix
-        assert.is_true(#notifications > 0)
-        local last = notifications[#notifications]
-        assert.equals("pi-attention-background", last.opts and last.opts.id)
-        assert.is_truthy(last.msg:find("%(background%)"))
+        -- Notifications are UI-only: headless instances queue + emit the web
+        -- event but must never print (the daemon's host contract). With a UI
+        -- attached the usual background notification is dispatched.
+        if #vim.api.nvim_list_uis() > 0 then
+            assert.is_true(#notifications > 0)
+            local last = notifications[#notifications]
+            assert.equals("pi-attention-background", last.opts and last.opts.id)
+            assert.is_truthy(last.msg:find("%(background%)"))
+        else
+            assert.equals(0, #notifications)
+        end
     end)
 
     it(

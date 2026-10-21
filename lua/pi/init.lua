@@ -38,6 +38,16 @@ function M.setup(opts)
     pcall(function()
         require("pi.subsessions").rebuild_statuses()
     end)
+
+    -- Web console (opt-in via `web.enabled`). Never let a bridge failure break
+    -- the editor: the failure is surfaced and the plugin keeps working.
+    local web = Config.options.web
+    if type(web) == "table" and web.enabled == true then
+        local ok, err = pcall(require("pi.web").setup)
+        if not ok then
+            require("pi.notify").error("Web console failed to start: " .. tostring(err))
+        end
+    end
 end
 
 --- Open a fresh session in a new tabpage. Uses `layout.default` from config.

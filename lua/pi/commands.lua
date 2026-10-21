@@ -236,6 +236,26 @@ function M.setup()
     vim.api.nvim_create_user_command("PiTodo", function()
         require("pi.todo").toggle()
     end, { desc = "Toggle the todo sidebar panel" })
+
+    vim.api.nvim_create_user_command("PiWebStart", function()
+        local ok, err = pcall(require("pi.web").start)
+        if not ok then
+            require("pi.notify").error("Web console failed to start: " .. tostring(err))
+            return
+        end
+        require("pi.notify").info(
+            "Web console started (workspace " .. tostring(require("pi.web").status().workspace_id) .. ")"
+        )
+    end, { desc = "Start the π² web console bridge (pi2d)" })
+
+    vim.api.nvim_create_user_command("PiWebStop", function()
+        require("pi.web").stop()
+        require("pi.notify").info("Web console stopped")
+    end, { desc = "Stop the π² web console bridge" })
+
+    vim.api.nvim_create_user_command("PiWebStatus", function()
+        require("pi.notify").info(table.concat(require("pi.web").status_lines(), "\n"))
+    end, { desc = "Show π² web console bridge status" })
 end
 
 return M

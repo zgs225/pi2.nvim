@@ -333,6 +333,14 @@
 ---@field collapse_children? boolean Collapse sub-sessions by default (alias for sessions_list.collapse_subsessions)
 ---@field collapsed? boolean Alias for collapse_children
 
+---@class pi.WebConfig
+---@field enabled? boolean Start the headless web bridge when `pi.setup()` runs (default false)
+---@field auto_start? boolean Spawn the pi2d daemon when its socket is missing (default true)
+---@field daemon? string Daemon executable; an absolute path or a name resolved with `exepath` (default "pi2d")
+---@field daemon_args? string[] Extra arguments passed to the daemon on lazy start
+---@field workspace_roots? string[] Workspace roots advertised to the daemon via `PI2_WORKSPACE_ROOTS`
+---@field log? boolean|string Write bridge diagnostics to `stdpath("log")/pi2-web.log` (true) or to this path
+
 ---@class pi.Options
 ---@field cli pi.CliConfig
 ---@field rpc pi.RpcConfig
@@ -360,6 +368,7 @@
 ---@field todo pi.TodoConfig
 ---@field sessions_list pi.SessionsListConfig
 ---@field tasks_panel pi.TasksPanelConfig
+---@field web pi.WebConfig Web console bridge (headless pi2d instance + browser UI)
 ---@field diff_review pi.DiffReviewConfig
 ---@field zen pi.ZenConfig
 ---@field prompt pi.PromptConfig
@@ -570,6 +579,14 @@ local defaults = {
         width = 40,
         height = 12,
         auto_open = false,
+    },
+    web = {
+        enabled = false,
+        auto_start = true,
+        daemon = "pi2d",
+        daemon_args = {},
+        workspace_roots = nil,
+        log = false,
     },
     diff_review = {
         width = 0.8,

@@ -351,6 +351,28 @@ require("pi").setup({
         -- rounded border); width/height/position apply to the side layout only.
     },
 
+    -- Web console bridge (pi2d + browser UI). Off by default. See
+    -- doc/usage.md#web-console.
+    web = {
+        -- Start the bridge together with pi.setup() (lazily starting the
+        -- daemon when its socket is missing). :PiWebStart starts it explicitly.
+        enabled = false,
+        -- Spawn `daemon` detached when <runtime>/d.sock does not exist. A
+        -- daemon that already started this Neovim (headless host) is reused.
+        auto_start = true,
+        -- Daemon executable: a bare name resolved with exepath(), or an
+        -- absolute path.
+        daemon = "pi2d",
+        -- Extra arguments for the lazy daemon start.
+        daemon_args = {},
+        -- Workspace roots advertised to the daemon (PI2_WORKSPACE_ROOTS).
+        -- nil keeps the daemon's own default ($HOME).
+        workspace_roots = nil,
+        -- Bridge diagnostics: false (silent), true (stdpath("log")/pi2-web.log),
+        -- or a file path. stdout/stderr are never used.
+        log = false,
+    },
+
     -- Session diff review (:PiDiff): one floating panel — an outer border
     -- framing the file list and the diff of the selected file — showing
     -- the `git diff` of every file the current session changed. See

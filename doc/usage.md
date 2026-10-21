@@ -7,6 +7,7 @@ This page walks through how `pi2.nvim` actually works in practice. Each subsecti
 - [Aborting with double `<Esc>`](#aborting-with-double-esc)
 - [Direct bash mode (`!`)](#direct-bash-mode-)
 - [Background tasks](#background-tasks)
+- [Web console](#web-console)
 - [Prompt history](#prompt-history)
 - [Draft persistence](#draft-persistence)
 - [Mentions](#mentions)
@@ -173,6 +174,44 @@ From the panel (all buffer-local, only inside the tasks list):
 Output views are read-only (`pi-task-output` filetype, `q` closes) and tail-read large outputs: files over 256 KB are read from the end, capped at 10000 lines. The `p` preview opens a live float for the task under the cursor: a header shows the full command (`$ …`) over a dimmed metadata block — id, status (with exit code/signal once terminal), pid, a `running for mm:ss` clock that becomes `ran for mm:ss · ended … ago`, and the output path — followed by the output tail (up to 1000 lines). While the task runs the tail is re-read every 500 ms and the view follows the newest line (the cursor sticks to the bottom only when it was already there, or the float is unfocused); a terminal status updates the header one last time and then the preview freezes. Stopping a task sends SIGTERM to the recorded pid; the authoritative `stopped` state arrives from the backend's own event, so the row updates even if you stop it elsewhere. Task state lives in memory only — it is not persisted, so tasks from past sessions don't survive a Neovim restart.
 
 Whenever a task reaches a terminal state — completed, failed, or stopped — the extension wakes the agent, which reports the outcome in the chat; the panel row updates in place at the same moment. Panel placement and sizing are configured under [`tasks_panel`](configuration.md); the colors are the [`PiTasksList*`](highlight-groups.md#background-tasks-panel) highlight groups.
+
+## Web console
+
+`pi2.nvim` can expose its sessions to a browser through `pi2d`. The plugin stays the only authority: the browser keeps a render cache and receives `snapshot`/`event` records, while every command (prompt, abort, queue edit, model change, attention answer, sub-agent dispatch) is routed back into the same manager/chat/attention/subsession code the TUI uses. Nothing is re-implemented on the web path.
+
+| Command | Action |
+| --- | --- |
+| `:PiWebStart` | Start the bridge; spawns `pi2d` detached if `<runtime>/d.sock` is missing |
+| `:PiWebStop` | Stop the bridge (sessions and the daemon keep running) |
+| `:PiWebStatus` | Show bridge/socket/workspace/instance/session counts |
+
+The bridge only starts automatically when [`web.enabled = true`](configuration.md) is set before `require("pi").setup()`. `:PiWebStart` works without that flag. The daemon must be installed (`pi2d` on `PATH`, or an absolute [`web.daemon`](configuration.md) path) and serves the browser UI on its own port; `web.log = true` writes bridge diagnostics to `stdpath("log")/pi2-web.log` — stdout/stderr are never used, because a headless instance may share them with nothing useful and must never print.
+
+### Headless instance and `--remote-ui`
+
+The daemon runs one Neovim per workspace as a headless host:
+
+```sh
+nvim --headless --listen <runtime>/i/<hash>.sock -u <init> \
+  -c 'lua require("pi.host").start()'
+```
+
+`pi.host.start()` adopts the daemon's environment (`PI2_RUNTIME_DIR`, `PI2_DAEMON_SOCKET`, `PI2_WORKSPACE_ID`), boots the plugin + web bridge, and keeps the event loop alive until the daemon sends `instance.shutdown` (which drains the sessions and then quits). Starting the host by hand is supported too: set `PI2_SOCKET` to the daemon socket, then inspect `:PiWebStatus`.
+
+A real UI can attach to that instance at any time (Neovim 0.9+):
+
+```sh
+nvim --server <runtime>/i/<hash>.sock --remote-ui
+```
+
+Queued attention requests are re-presented locally as soon as the UI attaches, so you can answer them in Neovim or in the browser — the first answer wins and everyone else sees the request resolved. Headless instances never open a dialog; they queue the request and emit it for the web client.
+
+Notes and current limits:
+
+- **One managed instance per workspace.** A second Neovim for the same cwd is reported as `unmanaged` by the daemon and receives no browser commands.
+- **Session leases are not implemented yet.** Opening the same session file from two places is allowed (the plugin warns in the TUI); the two processes diverge.
+- **Queue editing needs a chat.** Web-created sessions are normal tab-backed sessions, but `queue.remove` on a session without an attached chat returns `E_UNSUPPORTED`.
+- **Prompt text is rendered from events.** The web path sends the same `prompt`/`steer`/`follow_up` RPC commands as `Chat:submit`; the user message appears when its `message_start` event arrives.
 
 ## Prompt history
 

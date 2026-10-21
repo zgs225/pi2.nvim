@@ -14,6 +14,7 @@ local Notify = require("pi.notify")
 ---@field id string
 ---@field seq integer Global arrival order across sessions
 ---@field kind pi.AttentionKind
+---@field created_at? integer Wall-clock arrival time (ms), reported to web clients
 ---@field expires_at integer?
 ---@field open fun(): boolean opened
 
@@ -34,6 +35,13 @@ local next_seq = 0
 
 local prune_stale_queue
 local reschedule_timer
+
+--- Whether this Neovim process has an attached UI. Headless instances (the
+--- daemon's `pi.host`) must never open a dialog; they only queue + emit.
+---@return boolean
+local function has_ui()
+    return #vim.api.nvim_list_uis() > 0
+end
 
 ---@return pi.Session[]
 local function sessions()
@@ -126,9 +134,19 @@ end
 
 ---@param session pi.Session
 ---@param cmd pi.RpcCommand
-local function send_response(session, cmd)
+---@param by? string client that answered (default "nvim")
+local function send_response(session, cmd, by)
     if session.rpc:is_running() then
         session.rpc:send(cmd)
+    end
+    -- Every answer — local dialog, :PiAttention or a web client — resolves the
+    -- request for all other clients (protocol §6, first answer wins). Emitting
+    -- here (not at each closure) keeps the fanout in one place.
+    if type(cmd) == "table" and cmd.id then
+        local ok, Instance = pcall(require, "pi.web.instance")
+        if ok and Instance.active() then
+            pcall(Instance.emit_attention_resolved, session, cmd.id, by or "nvim", cmd)
+        end
     end
 end
 
@@ -535,6 +553,8 @@ M._prune_stale_queue = prune_stale_queue
 
 --- Present a blocking extension UI request immediately only when the π
 --- prompt has focus and there is no draft; otherwise queue it for later.
+--- A `pi2:attention_request` event is always emitted first (even headless), so
+--- web clients see every request regardless of local UI state.
 ---@param session pi.Session
 ---@param msg pi.RpcEvent
 ---@return boolean handled
@@ -543,8 +563,14 @@ function M.present(session, msg)
     if not entry then
         return false
     end
+    entry.created_at = entry.created_at or now_ms()
 
-    if session.chat and session.chat:has_prompt_focus() and not session.chat:has_draft() then
+    local ok_web, Instance = pcall(require, "pi.web.instance")
+    if ok_web and Instance.active() then
+        pcall(Instance.emit_attention_request, session, msg, entry)
+    end
+
+    if has_ui() and session.chat and session.chat:has_prompt_focus() and not session.chat:has_draft() then
         if not entry.open() then
             notify_expired(entry.kind)
         end
@@ -558,8 +584,59 @@ function M.present(session, msg)
     pending[#pending + 1] = entry
     reschedule_timer()
     request_redraw()
-    notify_pending(session, entry)
+    if has_ui() then
+        notify_pending(session, entry)
+    end
     emit_requested(session, entry)
+    return true
+end
+
+--- Resolve a pending attention request from another client (the web console).
+--- First answer wins: an id that is no longer queued returns
+--- `E_ATTENTION_RESOLVED` to the caller. Removal happens *before* the response
+--- is sent, so a local :PiAttention can never pop a ghost dialog for an entry
+--- the web client already answered.
+---@param session pi.Session
+---@param request_id string
+---@param by string|nil client that answered (default "web")
+---@param response table|nil { value = any } | { confirmed = boolean } | { cancelled = true }
+---@return boolean ok
+---@return string|nil code protocol error code when not ok
+function M.resolve(session, request_id, by, response)
+    if type(request_id) ~= "string" or request_id == "" then
+        return false, "E_BAD_REQUEST"
+    end
+    local pending = pending_entries(session)
+    local index
+    for i, entry in ipairs(pending) do
+        if entry.id == request_id then
+            index = i
+            break
+        end
+    end
+    if not index then
+        return false, "E_ATTENTION_RESOLVED"
+    end
+    table.remove(pending, index)
+    reschedule_timer(true)
+    request_redraw()
+
+    ---@type pi.RpcCommand
+    local cmd = { type = "extension_ui_response", id = request_id }
+    if type(response) == "table" then
+        if response.cancelled == true then
+            cmd.cancelled = true
+        elseif response.confirmed ~= nil then
+            cmd.confirmed = response.confirmed == true
+        elseif response.value ~= nil then
+            cmd.value = response.value
+        else
+            cmd.cancelled = true
+        end
+    else
+        cmd.cancelled = true
+    end
+    send_response(session, cmd, by or "web")
     return true
 end
 
