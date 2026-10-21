@@ -1136,7 +1136,21 @@ end
 function M.handle_event(session, msg)
     local handled = handle_event_impl(session, msg)
     local ok, inst = pcall(require, "pi.web.instance")
-    if ok and inst.active() then
+    if not ok or not inst.active() then
+        return handled
+    end
+    -- Events buffered for a rebuild (view switch / compaction) are replayed
+    -- through this wrapper once the rebuild finishes; emitting them now would
+    -- ship *and reduce* every delta twice. `_process_exit` ends the rebuild
+    -- inline (flags cleared above), so it is never buffered at this point.
+    local is_subagent_host = msg.type == "extension_ui_request"
+        and msg.method == "select"
+        and msg.title == "__pi_subagent__"
+    local buffered = (session._compaction_rebuilding or session._view_rebuilding)
+        and msg.type ~= "response"
+        and msg.type ~= "_process_exit"
+        and not is_subagent_host
+    if not buffered then
         pcall(inst.on_event, session, msg)
     end
     return handled

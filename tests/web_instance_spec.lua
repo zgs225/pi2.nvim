@@ -460,6 +460,37 @@ describe("pi.web.instance", function()
         assert.equals(before + 1, after.seq)
     end)
 
+    it("does not emit events buffered for a view rebuild (replayed once)", function()
+        local bridge = fake_bridge()
+        local instance = Instance.setup({ workspace_id = "ws-test", cwd = "/repo", bridge = bridge })
+        local session = fake_session({ id = "s-rebuild" })
+        Sessions._register_for_test(session)
+        instance:on_subscribe("s-rebuild")
+
+        instance:on_event(session, {
+            type = "message_start",
+            message = { role = "assistant", content = {} },
+        })
+
+        session._view_rebuilding = true
+        session._view_event_queue = {}
+        local delta = {
+            type = "message_update",
+            assistantMessageEvent = { type = "text_delta", delta = "a", contentIndex = 0 },
+        }
+        assert.is_true(Sessions.handle_event(session, delta))
+        assert.equals(0, #events_of(bridge, "message_update"))
+
+        session._view_rebuilding = false
+        local queued = session._view_event_queue[1]
+        assert.equals("message_update", queued.type)
+        assert.is_true(Sessions.handle_event(session, queued))
+        assert.equals(1, #events_of(bridge, "message_update"))
+
+        local state = instance:snapshot_for(session)
+        assert.equals("a", state.entries[1].blocks[1].text)
+    end)
+
     it("does not fan out before the daemon subscribes", function()
         local bridge = fake_bridge()
         local instance = Instance.setup({ workspace_id = "ws-test", cwd = "/repo", bridge = bridge })

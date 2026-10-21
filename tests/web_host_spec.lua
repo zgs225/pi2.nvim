@@ -39,6 +39,39 @@ describe("pi.host", function()
         assert.is_true(Host._stopping)
     end)
 
+    it("pi.web.start creates the bridge lazily and stop tears it down", function()
+        local Config = require("pi.config")
+        local Web = require("pi.web")
+        local Instance = require("pi.web.instance")
+        local dir = vim.fn.tempname()
+        vim.fn.mkdir(dir, "p")
+
+        local prev_socket = vim.env.PI2_SOCKET
+        local prev_auto = Config.options.web.auto_start
+        local prev_daemon = Config.options.web.daemon
+        local prev_enabled = Config.options.web.enabled
+        vim.env.PI2_SOCKET = dir .. "/d.sock"
+        Config.options.web.auto_start = false
+        Config.options.web.daemon = dir .. "/missing-pi2d"
+
+        local bridge = Web.start()
+        assert.is_true(bridge ~= nil)
+        local status = Web.status()
+        assert.is_true(status.enabled)
+        assert.is_false(status.daemon_present)
+        assert.is_true(status.started)
+        assert.equals(Instance.instance().workspace_id, status.workspace_id)
+
+        Web.stop()
+        assert.is_true(Instance.instance() == nil)
+        assert.is_false(Web.status().enabled)
+
+        Config.options.web.auto_start = prev_auto
+        Config.options.web.daemon = prev_daemon
+        Config.options.web.enabled = prev_enabled
+        vim.env.PI2_SOCKET = prev_socket
+    end)
+
     it("boots headless, keeps the process alive, and exits on stop without printing", function()
         local dir = vim.fn.tempname()
         vim.fn.mkdir(dir, "p")

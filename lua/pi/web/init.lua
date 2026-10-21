@@ -233,6 +233,43 @@ local function ensure_task_listener()
     end)
 end
 
+--- Adopt the daemon coordinates a headless host inherits: `pi2d` passes its
+--- socket separately (`PI2_DAEMON_SOCKET`) while `pi.web.runtime` resolves
+--- everything from `PI2_SOCKET`. Also read a custom token file once; the
+--- default `<socket>.token` is read lazily by the bridge on every handshake.
+--- @return string|nil explicit_token
+local function adopt_daemon_env()
+    local daemon_socket = vim.env.PI2_DAEMON_SOCKET
+    if type(daemon_socket) == "string" and daemon_socket ~= "" then
+        local explicit = vim.env.PI2_SOCKET
+        if explicit == nil or explicit == "" then
+            vim.env.PI2_SOCKET = daemon_socket
+        end
+    end
+    local token_path = vim.env.PI2_DAEMON_TOKEN_PATH
+    if type(token_path) ~= "string" or token_path == "" or token_path == Runtime.token_path() then
+        return nil
+    end
+    local fd = uv.fs_open(token_path, "r", 0)
+    if not fd then
+        return nil
+    end
+    local stat = uv.fs_fstat(fd)
+    local data
+    if stat then
+        local ok, content = pcall(uv.fs_read, fd, stat.size, 0)
+        if ok then
+            data = content
+        end
+    end
+    pcall(uv.fs_close, fd)
+    if type(data) ~= "string" then
+        return nil
+    end
+    data = vim.trim(data)
+    return data ~= "" and data or nil
+end
+
 --- Start the bridge (idempotent). Lazy-spawns the daemon when needed.
 --- @return pi.web.Bridge|nil
 function M.start()
@@ -241,6 +278,7 @@ function M.start()
     end
     local cfg = config()
     cfg.enabled = true
+    local explicit_token = adopt_daemon_env()
 
     local ok_daemon, daemon_err = M.start_daemon()
     if not ok_daemon then
@@ -294,6 +332,9 @@ function M.start()
         end,
     }
 
+    if explicit_token then
+        opts.token = explicit_token
+    end
     bridge = Bridge.setup(opts)
     instance.bridge = bridge
     M.log("info", "web bridge started for workspace " .. instance.workspace_id)
