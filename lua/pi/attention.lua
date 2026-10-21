@@ -564,6 +564,7 @@ function M.present(session, msg)
         return false
     end
     entry.created_at = entry.created_at or now_ms()
+    entry.msg = entry.msg or msg
 
     local ok_web, Instance = pcall(require, "pi.web.instance")
     if ok_web and Instance.active() then

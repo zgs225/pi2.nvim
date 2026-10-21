@@ -180,6 +180,9 @@ handlers["session.fork"] = function(params, ctx)
     if type(entry_id) ~= "string" or entry_id == "" then
         return bad_request("entryId is required")
     end
+    if not session.chat then
+        return failure(Protocol.ERR.UNSUPPORTED, "forking requires an attached chat")
+    end
     local ok, Fork = pcall(require, "pi.fork")
     if not ok or type(Fork._do_fork) ~= "function" then
         return failure(Protocol.ERR.UNSUPPORTED, "fork is not available")
@@ -196,6 +199,9 @@ handlers["session.compact"] = function(params, ctx)
         return nil, err
     end
     params = params or {}
+    if not session.chat then
+        return failure(Protocol.ERR.UNSUPPORTED, "compaction requires an attached chat")
+    end
     require("pi").compact(params.instructions or params.customInstructions, session)
     return true, { disposition = "started" }
 end
@@ -548,6 +554,66 @@ local function live_session_row(session, instance)
     return row
 end
 
+--- Cached `get_available_models` result for the web console. The web polls
+--- `/api/v1/models`; the first call kicks off the fetch and answers with an
+--- empty list (`pending = true`), later calls return the grouped providers.
+--- @type { provider: string, models: table[] }[]|nil
+local models_cache = nil
+local models_pending = false
+
+--- Group the flat pi model list by provider for the web contract.
+--- @param models table[]
+--- @return { provider: string, models: table[] }[]
+local function group_models(models)
+    local order, by_provider = {}, {}
+    for _, model in ipairs(models or {}) do
+        if type(model) == "table" then
+            local provider = model.provider or model.providerId or "unknown"
+            local group = by_provider[provider]
+            if not group then
+                group = { provider = provider, models = {} }
+                by_provider[provider] = group
+                order[#order + 1] = group
+            end
+            group.models[#group.models + 1] = {
+                id = model.id or model.model or "unknown",
+                contextWindow = model.contextWindow or model.contextWindowTokens or model.context_window,
+                reasoning = model.reasoning == true,
+            }
+        end
+    end
+    return order
+end
+
+--- Fetch the available models once, from the first live session.
+local function refresh_models()
+    if models_pending or models_cache then
+        return
+    end
+    local session
+    for _, candidate in ipairs(Sessions().list_all()) do
+        if candidate.rpc and candidate.rpc:is_running() then
+            session = candidate
+            break
+        end
+    end
+    if not session then
+        return
+    end
+    models_pending = true
+    session.rpc:send({ type = "get_available_models" }, function(res)
+        vim.schedule(function()
+            models_pending = false
+            if res and res.success then
+                local list = (res.data or {}).models or {}
+                if #list > 0 then
+                    models_cache = group_models(list)
+                end
+            end
+        end)
+    end)
+end
+
 --- @param params table|nil
 --- @param ctx pi.web.CmdContext
 --- @return any, any
@@ -618,7 +684,34 @@ local function workspace_query(params, ctx)
         return true, page
     end
 
-    return bad_request('kind must be "sessions" or "entries"')
+    if kind == "attention" then
+        local items = {}
+        for _, session in ipairs(Sessions().list_all()) do
+            local pending = session.attention and session.attention.pending or {}
+            for _, entry in ipairs(pending) do
+                local msg = entry.msg or {}
+                items[#items + 1] = {
+                    requestId = entry.id,
+                    sessionId = session.id,
+                    method = entry.kind,
+                    title = msg.title,
+                    message = msg.message,
+                    options = msg.options,
+                    timeoutSec = type(msg.timeout) == "number" and math.floor(msg.timeout / 1000) or nil,
+                    expiresAt = entry.expires_at,
+                    createdAt = entry.created_at,
+                }
+            end
+        end
+        return true, { attention = items }
+    end
+
+    if kind == "models" then
+        refresh_models()
+        return true, { providers = models_cache or {}, pending = models_cache == nil }
+    end
+
+    return bad_request('kind must be "sessions", "entries", "attention" or "models"')
 end
 
 handlers["workspace.query"] = workspace_query
