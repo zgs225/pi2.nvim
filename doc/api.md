@@ -146,13 +146,13 @@ The web-console bridge is its own module (it is not required for normal editor u
 local web = require("pi.web")
 
 web.setup(opts?)  -- { host?: boolean, start?: boolean, autocmds?: boolean }
-web.start()       -- start the bridge; lazily spawns `pi2d` when the socket is missing
+web.start()       -- start the bridge; lazily spawns `pi2 daemon` when the socket is missing
 web.stop()        -- stop the bridge (sessions and the daemon keep running)
 web.status()      -- table: enabled/started/ready/socket/workspace/instance/sessions/host
 web.enabled()     -- boolean: configured or currently running
 ```
 
-The daemon-side entry point is `require("pi.host").start(workspace?)`, which `pi2d` calls from a headless Neovim (`--headless --listen <sock> -c 'lua require("pi.host").start()'`). See [Web console](usage.md#web-console).
+The daemon-side entry point is `require("pi.host").start(workspace?)`, which the daemon (`pi2 daemon`) calls from a headless Neovim (`--headless --listen <sock> -c 'lua require("pi.host").start()'`). See [Web console](usage.md#web-console).
 
 The protocol surface is not part of the public API, but it is reachable for extensions that need to answer a daemon record themselves:
 

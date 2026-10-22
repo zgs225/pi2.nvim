@@ -177,15 +177,15 @@ Whenever a task reaches a terminal state — completed, failed, or stopped — t
 
 ## Web console
 
-`pi2.nvim` can expose its sessions to a browser through `pi2d`. The plugin stays the only authority: the browser keeps a render cache and receives `snapshot`/`event` records, while every command (prompt, abort, queue edit, model change, attention answer, sub-agent dispatch) is routed back into the same manager/chat/attention/subsession code the TUI uses. Nothing is re-implemented on the web path.
+`pi2.nvim` can expose its sessions to a browser through the web-console daemon (`pi2 daemon`). The plugin stays the only authority: the browser keeps a render cache and receives `snapshot`/`event` records, while every command (prompt, abort, queue edit, model change, attention answer, sub-agent dispatch) is routed back into the same manager/chat/attention/subsession code the TUI uses. Nothing is re-implemented on the web path.
 
 | Command | Action |
 | --- | --- |
-| `:PiWebStart` | Start the bridge; spawns `pi2d` detached if `<runtime>/d.sock` is missing |
+| `:PiWebStart` | Start the bridge; spawns `pi2 daemon` detached if `<runtime>/d.sock` is missing |
 | `:PiWebStop` | Stop the bridge (sessions and the daemon keep running) |
 | `:PiWebStatus` | Show bridge/socket/workspace/instance/session counts |
 
-The bridge only starts automatically when [`web.enabled = true`](configuration.md) is set before `require("pi").setup()`. `:PiWebStart` works without that flag. The daemon must be installed (`pi2d` on `PATH`, or an absolute [`web.daemon`](configuration.md) path) and serves the browser UI on its own port; `web.log = true` writes bridge diagnostics to `stdpath("log")/pi2-web.log` — stdout/stderr are never used, because a headless instance may share them with nothing useful and must never print.
+The bridge only starts automatically when [`web.enabled = true`](configuration.md) is set before `require("pi").setup()`. `:PiWebStart` works without that flag. The daemon must be installed (`pi2` on `PATH`, which provides the `daemon` subcommand, or an absolute [`web.daemon`](configuration.md) path) and serves the browser UI on its own port; `web.log = true` writes bridge diagnostics to `stdpath("log")/pi2-web.log` — stdout/stderr are never used, because a headless instance may share them with nothing useful and must never print.
 
 ### Headless instance and `--remote-ui`
 

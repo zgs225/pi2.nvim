@@ -1,6 +1,6 @@
--- Headless host entry point used by `pi2d`.
+-- Headless host entry point used by the daemon (`pi2 daemon`).
 --
--- `pi2d` spawns one Neovim per workspace as
+-- The daemon spawns one Neovim per workspace as
 --
 --   nvim --headless --listen <runtime>/i/<hash>.sock -u <init> -c 'lua require("pi.host").start()'
 --

@@ -1,7 +1,7 @@
 -- Specs for `pi.host`: environment adoption, the headless boot/stop loop, and
 -- the "prints nothing" contract. The boot test runs a real `nvim -l` child
 -- (that is the only way to observe `vim.wait` + quit semantics) with a dummy
--- daemon socket so no `pi2d` is spawned.
+-- daemon socket so no daemon is spawned.
 
 local Host = require("pi.host")
 
@@ -52,7 +52,7 @@ describe("pi.host", function()
         local prev_enabled = Config.options.web.enabled
         vim.env.PI2_SOCKET = dir .. "/d.sock"
         Config.options.web.auto_start = false
-        Config.options.web.daemon = dir .. "/missing-pi2d"
+        Config.options.web.daemon = dir .. "/missing-pi2-daemon"
 
         local bridge = Web.start()
         assert.is_true(bridge ~= nil)

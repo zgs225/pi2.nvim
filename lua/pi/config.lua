@@ -335,9 +335,9 @@
 
 ---@class pi.WebConfig
 ---@field enabled? boolean Start the headless web bridge when `pi.setup()` runs (default false)
----@field auto_start? boolean Spawn the pi2d daemon when its socket is missing (default true)
----@field daemon? string Daemon executable; an absolute path or a name resolved with `exepath` (default "pi2d")
----@field daemon_args? string[] Extra arguments passed to the daemon on lazy start
+---@field auto_start? boolean Spawn the web-console daemon (`pi2 daemon`) when its socket is missing (default true)
+---@field daemon? string Daemon executable (default "pi2"); absolute path or `exepath` name. The bridge appends the `daemon` subcommand.
+---@field daemon_args? string[] Extra arguments appended after `daemon` on lazy start
 ---@field workspace_roots? string[] Workspace roots advertised to the daemon via `PI2_WORKSPACE_ROOTS`
 ---@field log? boolean|string Write bridge diagnostics to `stdpath("log")/pi2-web.log` (true) or to this path
 
@@ -368,7 +368,7 @@
 ---@field todo pi.TodoConfig
 ---@field sessions_list pi.SessionsListConfig
 ---@field tasks_panel pi.TasksPanelConfig
----@field web pi.WebConfig Web console bridge (headless pi2d instance + browser UI)
+---@field web pi.WebConfig Web console bridge (headless Neovim host managed by `pi2 daemon` + browser UI)
 ---@field diff_review pi.DiffReviewConfig
 ---@field zen pi.ZenConfig
 ---@field prompt pi.PromptConfig
@@ -583,7 +583,7 @@ local defaults = {
     web = {
         enabled = false,
         auto_start = true,
-        daemon = "pi2d",
+        daemon = "pi2",
         daemon_args = {},
         workspace_roots = nil,
         log = false,

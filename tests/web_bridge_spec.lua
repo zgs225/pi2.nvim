@@ -1,4 +1,4 @@
--- Transport-level specs for `pi.web.bridge` (plugin <-> pi2d JSONL over a unix
+-- Transport-level specs for `pi.web.bridge` (plugin <-> daemon JSONL over a unix
 -- socket) and `pi.web.runtime` (daemon socket/token path resolution).
 --
 -- No session semantics are covered here: framing, handshake, dispatch, replies,

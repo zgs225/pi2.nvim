@@ -351,7 +351,7 @@ require("pi").setup({
         -- rounded border); width/height/position apply to the side layout only.
     },
 
-    -- Web console bridge (pi2d + browser UI). Off by default. See
+    -- Web console bridge (`pi2 daemon` + browser UI). Off by default. See
     -- doc/usage.md#web-console.
     web = {
         -- Start the bridge together with pi.setup() (lazily starting the
@@ -361,9 +361,10 @@ require("pi").setup({
         -- daemon that already started this Neovim (headless host) is reused.
         auto_start = true,
         -- Daemon executable: a bare name resolved with exepath(), or an
-        -- absolute path.
-        daemon = "pi2d",
-        -- Extra arguments for the lazy daemon start.
+        -- absolute path. The bridge always appends the `daemon` subcommand
+        -- (`pi2 daemon ...`).
+        daemon = "pi2",
+        -- Extra arguments appended after the `daemon` subcommand on lazy start.
         daemon_args = {},
         -- Workspace roots advertised to the daemon (PI2_WORKSPACE_ROOTS).
         -- nil keeps the daemon's own default ($HOME).

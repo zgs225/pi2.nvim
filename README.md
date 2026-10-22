@@ -127,7 +127,7 @@ The parent agent also gets orchestration tools of its own (`dispatch_subagents`,
 
 ## Web console
 
-An opt-in `pi2d` bridge exports the same sessions to a browser (`:PiWebStart` / `:PiWebStop` / `:PiWebStatus`): the plugin remains the only authority, the browser is a render client, and every web command runs through the plugin's own manager/chat/attention paths. A new browser pairs with the daemon by redeeming a short-lived code, so no token has to be copied by hand; snapshots carry the newest 50 transcript entries (≤ 256 KB) and older history is paged, and every announced session id settles — or migrates — before the client depends on it. The daemon can also run a headless Neovim host per workspace — attach a UI to it later with `nvim --server <sock> --remote-ui`. See [Web console](doc/usage.md#web-console).
+An opt-in web-console bridge (`pi2 daemon`) exports the same sessions to a browser (`:PiWebStart` / `:PiWebStop` / `:PiWebStatus`): the plugin remains the only authority, the browser is a render client, and every web command runs through the plugin's own manager/chat/attention paths. A new browser pairs with the daemon by redeeming a short-lived code, so no token has to be copied by hand; snapshots carry the newest 50 transcript entries (≤ 256 KB) and older history is paged, and every announced session id settles — or migrates — before the client depends on it. The daemon can also run a headless Neovim host per workspace — attach a UI to it later with `nvim --server <sock> --remote-ui`. See [Web console](doc/usage.md#web-console).
 
 ## Requirements
 
@@ -273,7 +273,7 @@ require("pi").setup({
 | `:PiSubClose` | Close the current sub-session's RPC process (session file retained) |
 | `:PiSubView` | View a child sub-session in a read-only float viewer with real-time streaming |
 | `:PiTodo` | Toggle the todo side panel: the current session's `todo_write` checklist (see [doc/usage.md](doc/usage.md#todo-list)) |
-| `:PiWebStart` / `:PiWebStop` / `:PiWebStatus` | Start, stop, or inspect the `pi2d` web-console bridge (see [doc/usage.md](doc/usage.md#web-console)) |
+| `:PiWebStart` / `:PiWebStop` / `:PiWebStatus` | Start, stop, or inspect the web-console bridge (the daemon runs as `pi2 daemon`; see [doc/usage.md](doc/usage.md#web-console)) |
 | `:PiDiff` | Review the git diff of every file changed by the current session in one panel: file list + diff, grouped per git work tree |
 | `:PiToggleStartupDetails` | Toggle the startup block between compact and expanded |
 | `:PiToggleThinking` | Show or hide thinking blocks |

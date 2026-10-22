@@ -246,7 +246,7 @@ function M.setup()
         require("pi.notify").info(
             "Web console started (workspace " .. tostring(require("pi.web").status().workspace_id) .. ")"
         )
-    end, { desc = "Start the π² web console bridge (pi2d)" })
+    end, { desc = "Start the π² web console bridge (pi2 daemon)" })
 
     vim.api.nvim_create_user_command("PiWebStop", function()
         require("pi.web").stop()

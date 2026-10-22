@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-22
+
+- **BREAKING:** The web-console daemon is now the `pi2 daemon` subcommand of the single `pi2` binary; the separate `pi2d` executable is gone. `web.daemon` now defaults to `"pi2"` and the bridge always appends `daemon` before `web.daemon_args` — point it at the `pi2` binary (or an absolute path to it) instead of `pi2d`.
+
 ## 2026-10-21
 
 - **ADDED:** Web-console plumbing for `pi2d`. The plugin now serves authoritative session state over the JSONL bridge (`:PiWeb*` / headless host), returns the real backend session id from `session.create`/`open` (announcing `tmp-N` → backend-id migrations), snapshots the newest entries tail, and exposes validated model/thinking/queue/task-output/attention/subagent commands. Attention requests default to a 120 s expiry and resolve from any client with first-answer-wins semantics.

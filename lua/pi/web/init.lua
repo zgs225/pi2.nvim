@@ -45,7 +45,7 @@ function M.has_ui()
     return #vim.api.nvim_list_uis() > 0
 end
 
---- True when this process was started by `pi2d` for one workspace.
+--- True when this process was started by the daemon (`pi2 daemon`) for one workspace.
 --- @return boolean
 function M.is_host()
     return host_mode
@@ -93,7 +93,7 @@ function M.start_daemon()
         return true
     end
 
-    local name = cfg.daemon or "pi2d"
+    local name = cfg.daemon or "pi2"
     local bin = name
     if not name:find("/", 1, true) then
         bin = vim.fn.exepath(name)
@@ -102,7 +102,8 @@ function M.start_daemon()
         return false, "daemon not found: " .. tostring(name)
     end
 
-    local argv = { bin }
+    -- The daemon is a subcommand of the CLI: `pi2 daemon [args...]`.
+    local argv = { bin, "daemon" }
     for _, extra in ipairs(cfg.daemon_args or {}) do
         argv[#argv + 1] = tostring(extra)
     end
@@ -233,7 +234,7 @@ local function ensure_task_listener()
     end)
 end
 
---- Adopt the daemon coordinates a headless host inherits: `pi2d` passes its
+--- Adopt the daemon coordinates a headless host inherits: `pi2 daemon` passes its
 --- socket separately (`PI2_DAEMON_SOCKET`) while `pi.web.runtime` resolves
 --- everything from `PI2_SOCKET`. Also read a custom token file once; the
 --- default `<socket>.token` is read lazily by the bridge on every handshake.
