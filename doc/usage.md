@@ -243,6 +243,27 @@ Handlers live in `lua/pi/web/commands.lua` and delegate to the plugin path the T
 
 The remaining methods are `subagent.stop {targets}`, `subagent.steer {target, message}`, `subagent.read {target|sessionFile, tail?}` and `workspace.query {kind = "sessions"|"entries"|"attention"|"models", …}` (`entries` also takes `sessionFile`, `before`, `limit`).
 
+### Session list rows
+
+`workspace.query{kind="sessions"}` answers `{sessions: SessionListRow[]}`: one row per session file plus every live session, deduplicated by session id — a session that is both on disk and running is a single row. Row fields:
+
+| Field | Notes |
+| --- | --- |
+| `sessionId`, `sessionFile`, `name`, `timestamp`, `modified`, `firstMessage` | Disk projection |
+| `cwd`, `tab`, `live` | Live projection (`tab` is the owning tabpage) |
+| `status` | Live status when `live` and the web instance is up (`busy`, `compacting`, `idle`, `exited`); otherwise the sub-session manifest status: `dormant`, `done` (completed), `error` (failed), `interrupted`, `exited` (manifest says active but nothing runs). Absent on a non-live root row. |
+| `model` | Per-session model pin |
+| `visible` | Default `:PiSessions` visibility (see below); always present, always `true` for roots |
+| `parentId` | Sub-sessions only: parent session id, normalized through the manifest lineage map. The parent row is normally in the same list, but can be absent if that session file was pruned — a client must still handle the orphan. |
+| `thinking`, `task`, `agentSpawned`, `reported` | Sub-sessions only: manifest projection |
+| `createdAt`, `lastActiveAt` | Sub-sessions only: epoch milliseconds |
+
+Rows without `parentId` are roots, so the client builds the tree by grouping on `parentId`. Grandchildren work the same way: a child that spawns its own children has `lineage == its own id`, so the grandchild's `parentId` is the child's session id.
+
+`visible` is the **default `:PiSessions` policy** ([`subagent.sessions_list`](configuration.md) — `show_dormant`, `show_completed`, `show_failed`, plus the running-child override) evaluated as "not the current view, hidden rows off", assuming the parent's current conversation epoch. The query never acknowledges anything, so a completed child stays visible until the user opens its parent in Neovim. It is a projection, not a filter: hidden rows are still sent, and a client may render them (behind its own toggle) or hide them.
+
+The `pi2:subagents` event carries the same per-child fields it already had (`id`, `status`, `name`, `task`, `model`, `thinking`) plus `parentId`, `visible`, `createdAt` and `lastActiveAt`; unlike the session-list rows, `status` keeps the manifest vocabulary (`active`, `completed`, …). The event re-emits when the instance next publishes (subscribe, settle, tool end) and whenever the signature changes — acknowledging a child in Neovim does not push an event by itself, but the next `workspace.query{kind="sessions"}` already reflects it.
+
 ### Pairing and daemon info
 
 A browser redeems a pairing code with `POST /api/v1/pair {code, kind, deviceName}` — that redemption is public, which is how a fresh browser obtains its device token. *Creating* a new code requires an authenticated request (`POST /api/v1/pair` without `code`, optionally `{ttlSec}`). `GET /api/v1/devices` returns a bare JSON array of devices, and `GET /api/v1/info` reports `hostname`, `os`, `version`, `uptimeMs`, `pid` and `port` alongside `v`, `daemonId`, `machineId`, `platform`, `capabilities` and `limits`.

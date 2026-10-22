@@ -382,6 +382,9 @@ describe("pi.web.instance", function()
         assert.equals("m", state.subagents[1].model)
         assert.equals("low", state.subagents[1].thinking)
         assert.equals("implement it", state.subagents[1].task)
+        assert.equals("parent", state.subagents[1].parentId)
+        assert.is_true(state.subagents[1].visible)
+        assert.is_nil(state.subagents[1].createdAt)
 
         assert.equals(1, #state.batches)
         assert.equals("b1", state.batches[1].batchId)
@@ -389,6 +392,65 @@ describe("pi.web.instance", function()
 
         assert.equals(1, #events_of(bridge, Protocol.DERIVED.BATCH))
         assert.equals(1, #events_of(bridge, Protocol.DERIVED.SUBAGENTS))
+    end)
+
+    it("emits pi2:subagents again when only a child's visibility changes", function()
+        local root = vim.fn.tempname()
+        vim.fn.mkdir(root, "p")
+        local workspace = root .. "/repo"
+        vim.fn.mkdir(workspace, "p")
+        Config.options.agent_dir = root .. "/agent"
+        vim.fn.mkdir(Config.options.agent_dir .. "/sessions", "p")
+        vim.cmd("cd " .. vim.fn.fnameescape(workspace))
+
+        local sessions_dir = require("pi.sessions.history").get_sessions_dir()
+        vim.fn.mkdir(sessions_dir, "p")
+        require("pi.subsessions.manifest")._reset()
+        local ChildFilter = require("pi.subsessions.sessions_list")
+        ChildFilter._reset_completion_seen()
+        vim.fn.writefile({
+            vim.json.encode({
+                ["child-1"] = {
+                    parent_id = "parent",
+                    name = "Child",
+                    task_prompt = "implement it",
+                    config = { model = { provider = "p", id = "m" } },
+                    status = "completed",
+                    reported = true,
+                    created_at = "2026-01-01T00:00:00Z",
+                    last_active_at = "2026-01-01T00:05:00Z",
+                },
+            }),
+        }, sessions_dir .. "/.pi2-subsessions.json")
+
+        local bridge = fake_bridge()
+        local instance = Instance.setup({ workspace_id = "ws-test", cwd = workspace, bridge = bridge })
+        local session = fake_session({ id = "parent" })
+        session.cwd = workspace
+        Sessions._register_for_test(session)
+        instance:on_subscribe("parent")
+
+        local events = events_of(bridge, Protocol.DERIVED.SUBAGENTS)
+        assert.equals(1, #events)
+        local child = events[1].event.subagents[1]
+        assert.equals("parent", child.parentId)
+        assert.is_true(child.visible)
+        assert.equals(1767225600000, child.createdAt)
+        assert.equals(1767225900000, child.lastActiveAt)
+
+        -- Same status, only the acknowledgement changed: the signature must
+        -- still differ so the browser can drop the row.
+        assert.is_true(ChildFilter.mark_completion_seen("child-1"))
+        instance:publish_subagents(session)
+        events = events_of(bridge, Protocol.DERIVED.SUBAGENTS)
+        assert.equals(2, #events)
+        assert.is_false(events[2].event.subagents[1].visible)
+        assert.equals("completed", events[2].event.subagents[1].status)
+
+        -- Idempotent: nothing changed means nothing ships.
+        instance:publish_subagents(session)
+        assert.equals(2, #events_of(bridge, Protocol.DERIVED.SUBAGENTS))
+        ChildFilter._reset_completion_seen()
     end)
 
     it("emits pi2:process_exit and marks the session exited", function()

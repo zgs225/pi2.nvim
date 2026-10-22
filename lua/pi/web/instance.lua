@@ -150,6 +150,19 @@ function Instance:live_status(session, fallback)
     if rpc and type(rpc.is_running) == "function" and not rpc:is_running() then
         return "exited"
     end
+    -- A tab-backed session reports its live turn through `chat`; prefer it over
+    -- the detached flags (which a web-created/headless session does not set),
+    -- so this matches `pi.ui.sessions.status_of` — `:PiSessions` and the web
+    -- console must agree on whether a child is running.
+    local chat = session.chat
+    if chat then
+        if type(chat.is_compacting) == "function" and chat:is_compacting() then
+            return "compacting"
+        end
+        if type(chat.is_streaming) == "function" and chat:is_streaming() then
+            return "busy"
+        end
+    end
     if session._detached_compacting then
         return "compacting"
     end
@@ -517,11 +530,34 @@ function Instance:project_subagents(session)
 
     local ok_manifest, Manifest = pcall(require, "pi.subsessions.manifest")
     if ok_manifest and type(Manifest.children_of) == "function" then
+        local ok_filter, ChildFilter = pcall(require, "pi.subsessions.sessions_list")
+        -- Same policy source as `:PiSessions` (`pi.ui.sessions.status_of`), so a
+        -- chat-bound streaming child counts as running here too.
+        local ctx = ok_filter and ChildFilter.make_ctx() or nil
+        local epoch_ms = type(Manifest.epoch_ms) == "function" and Manifest.epoch_ms or nil
         for _, row in ipairs(Manifest.children_of(lineage)) do
             local child = {
                 id = row._id or "",
                 status = row.status or "dormant",
             }
+            local ok_parent, parent_id = pcall(Manifest.resolve_lineage, row.parent_id)
+            if ok_parent and type(parent_id) == "string" and parent_id ~= "" then
+                child.parentId = parent_id
+            elseif type(row.parent_id) == "string" and row.parent_id ~= "" then
+                child.parentId = row.parent_id
+            end
+            if ok_filter and ctx then
+                -- Same default :PiSessions policy the session list uses. The
+                -- query path never acknowledges anything, so this is read-only.
+                child.visible = ChildFilter.row_visible(row, {
+                    is_current = false,
+                    hidden = false,
+                    same_epoch = true,
+                    ctx = ctx,
+                })
+            end
+            child.createdAt = epoch_ms and epoch_ms(row.created_at) or nil
+            child.lastActiveAt = epoch_ms and epoch_ms(row.last_active_at) or nil
             if type(row.name) == "string" and row.name ~= "" then
                 child.name = row.name
             end
@@ -585,7 +621,14 @@ function Instance:publish_subagents(session)
         end
     end
     for _, child in ipairs(subagents) do
-        parts[#parts + 1] = child.id .. ":" .. tostring(child.status)
+        -- `visible` and `parentId` are part of the signature: a change that only
+        -- flips visibility (ack, settled worker, config toggle) must still ship.
+        parts[#parts + 1] = table.concat({
+            child.id,
+            tostring(child.status),
+            tostring(child.parentId),
+            tostring(child.visible),
+        }, ":")
     end
     local sig = table.concat(parts, "\0")
     if self._sub_sig[session] == sig then

@@ -313,18 +313,12 @@ function M.format_line(row, tick)
     return line, chunks
 end
 
---- Child rows whose completion green blink was acknowledged by the user.
----@type table<string, true>
-local child_completion_seen = {}
-
 --- Acknowledge a sub-session's completion notification (stops the green blink).
+--- The acknowledgement store itself lives in `pi.subsessions.sessions_list`, so
+--- the web console reads the same state.
 ---@param child_id string
 function M.mark_child_completion_seen(child_id)
-    if type(child_id) ~= "string" or child_id == "" then
-        return
-    end
-    if not child_completion_seen[child_id] then
-        child_completion_seen[child_id] = true
+    if ChildFilter.mark_completion_seen(child_id) then
         M.request_refresh()
     end
 end
@@ -341,17 +335,7 @@ function M.acknowledge_reported_children(parent)
     if lineage == "" then
         return
     end
-    local changed = false
-    for _, entry in ipairs(Manifest.children_of(lineage)) do
-        local child_id = entry._id
-        if entry.status == "completed" and entry.reported and type(child_id) == "string" and child_id ~= "" then
-            if not child_completion_seen[child_id] then
-                child_completion_seen[child_id] = true
-                changed = true
-            end
-        end
-    end
-    if changed then
+    if ChildFilter.acknowledge_reported(lineage) then
         M.request_refresh()
     end
 end
@@ -389,7 +373,8 @@ local function append_child_row(out, entry, tab, opts)
         status = dormant and "exited" or (child and M.status_of(child) or "idle"),
         attention = 0,
         -- Sub-session rows never use the parent-style green "done" blink; completion is
-        -- surfaced in the parent chat instead. `child_completion_seen` only controls list visibility.
+        -- surfaced in the parent chat instead. `ChildFilter`'s completion-seen store only
+        -- controls list visibility.
         done = false,
         error = entry.status == "failed",
         name = entry.name,
@@ -401,26 +386,10 @@ local function append_child_row(out, entry, tab, opts)
     }
 end
 
+--- Liveness/policy ctx for the sub-session filter (owned by ChildFilter).
 ---@return pi.SessionsListChildFilterCtx
 local function child_filter_ctx()
-    local Sessions = require("pi.sessions.manager")
-    return {
-        completion_seen = function(id)
-            return child_completion_seen[id] == true
-        end,
-        process_alive = function(id)
-            local child = Sessions.get_by_id(id)
-            return child ~= nil and child.rpc:is_running()
-        end,
-        process_running = function(id)
-            local child = Sessions.get_by_id(id)
-            if not child or not child.rpc:is_running() then
-                return false
-            end
-            local st = M.status_of(child)
-            return st == "busy" or st == "compacting"
-        end,
-    }
+    return ChildFilter.make_ctx({ status_of = M.status_of })
 end
 
 --- One parent row's plan: the live session that produced the row and the
@@ -553,14 +522,12 @@ local function get_visible_children(parent_sess, current_child_id, owned)
         if owner == nil or owner == parent_sess.id then
             local is_current = type(current_child_id) == "string" and child_id == current_child_id
             local same_epoch = (entry.parent_epoch or 0) == epoch
-            local alive = type(child_id) == "string"
-                and entry.status == "active"
-                and ctx.process_alive
-                and ctx.process_alive(child_id)
-            local visible = is_current
-                or hidden_shown
-                or alive
-                or (same_epoch and ChildFilter.child_visible(entry, ctx))
+            local visible = ChildFilter.row_visible(entry, {
+                is_current = is_current,
+                hidden = hidden_shown,
+                same_epoch = same_epoch,
+                ctx = ctx,
+            })
             if visible then
                 visible_entries[#visible_entries + 1] = {
                     entry = entry,
@@ -2062,7 +2029,7 @@ function M._reset()
     rows = {}
     name_cache = setmetatable({}, { __mode = "k" })
     refresh_scheduled = false
-    child_completion_seen = {}
+    ChildFilter._reset_completion_seen()
     parent_folds = {}
     parent_hidden = {}
 end

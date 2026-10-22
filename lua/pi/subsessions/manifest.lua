@@ -250,6 +250,31 @@ function M.children_of(parent_id)
     return result
 end
 
+--- Shallow snapshot of every child row (`_id` injected), sorted by id. Rows are
+--- copies so callers cannot mutate the cache; nested tables (`config`) are
+--- shared and read-only.
+---@return pi.SubsessionManifestEntry[]
+function M.entries()
+    local manifest = M.load()
+    ---@type pi.SubsessionManifestEntry[]
+    local result = {}
+    for id, entry in pairs(manifest) do
+        if is_child_entry_key(id) and type(entry) == "table" then
+            local row = {}
+            for k, v in pairs(entry) do
+                row[k] = v
+            end
+            ---@diagnostic disable-next-line: inject-field
+            row._id = id
+            result[#result + 1] = row
+        end
+    end
+    table.sort(result, function(a, b)
+        return (a._id or "") < (b._id or "")
+    end)
+    return result
+end
+
 --- True when `session_id` is registered as a sub-session child in the manifest.
 ---@param session_id? string
 ---@return boolean
@@ -299,6 +324,80 @@ end
 ---@return string
 function M.iso_now()
     return tostring(os.date("!%Y-%m-%dT%H:%M:%SZ"))
+end
+
+---@param year integer
+---@param month integer
+---@return integer
+local function days_in_month(year, month)
+    local lengths = { 31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 }
+    if month == 2 and year % 4 == 0 and (year % 100 ~= 0 or year % 400 == 0) then
+        return 29
+    end
+    return lengths[month]
+end
+
+--- Parse a manifest timestamp (`os.date("!%Y-%m-%dT%H:%M:%SZ")`, optionally with
+--- fractional seconds) to epoch milliseconds. Nil when unparseable: only the
+--- strict `YYYY-MM-DDTHH:MM:SS[.fff]Z` / `YYYY-MM-DD` shapes with a real calendar
+--- date are accepted, so an offset, trailing junk or `2026-02-30` never silently
+--- shifts the value.
+---@param iso? string
+---@return number|nil
+function M.epoch_ms(iso)
+    if type(iso) ~= "string" or iso == "" then
+        return nil
+    end
+    local y, mo, d, h, mi, s, frac = iso:match("^(%d%d%d%d)-(%d%d)-(%d%d)T(%d%d):(%d%d):(%d%d)%.?(%d*)Z$")
+    if not y then
+        y, mo, d = iso:match("^(%d%d%d%d)-(%d%d)-(%d%d)$")
+        if not y then
+            return nil
+        end
+        h, mi, s, frac = "0", "0", "0", ""
+    end
+    ---@param digits? string
+    ---@return integer|nil
+    local function int(digits)
+        local n = tonumber(digits or "")
+        if not n then
+            return nil
+        end
+        return math.floor(n)
+    end
+    local year, month, day = int(y), int(mo), int(d)
+    local hour, min, sec = int(h), int(mi), int(s)
+    if not (year and month and day and hour and min and sec) then
+        return nil
+    end
+    if month < 1 or month > 12 or day < 1 or hour > 23 or min > 59 or sec > 60 then
+        return nil
+    end
+    if day > days_in_month(year, month) then
+        return nil
+    end
+    -- os.time() reads the fields as local wall clock; the stamp is UTC. Correct
+    -- with the zone offset in force *at that instant*, so a DST boundary between
+    -- now and the stamp cannot skew it.
+    local guess = os.time({
+        year = year,
+        month = month,
+        day = day,
+        hour = hour,
+        min = min,
+        sec = sec,
+        isdst = false,
+    })
+    if type(guess) ~= "number" then
+        return nil
+    end
+    local utc = os.date("!*t", guess) --[[@as osdate]]
+    local secs = guess - (os.time(utc) - guess)
+    local millis = 0
+    if type(frac) == "string" and frac ~= "" then
+        millis = math.floor(tonumber(frac:sub(1, 3) .. string.rep("0", 3 - math.min(3, #frac))) or 0)
+    end
+    return secs * 1000 + millis
 end
 
 ---@param parent_id string Lineage id.

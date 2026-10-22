@@ -3,6 +3,7 @@
 ## 2026-10-22
 
 - **BREAKING:** The web-console daemon is now the `pi2 daemon` subcommand of the single `pi2` binary; the separate `pi2d` executable is gone. `web.daemon` now defaults to `"pi2"` and the bridge always appends `daemon` before `web.daemon_args` — point it at the `pi2` binary (or an absolute path to it) instead of `pi2d`.
+- **FIXED:** The web console's session list rendered parent and sub-session sessions as flat siblings and listed every sub-session regardless of the `:PiSessions` policy. `workspace.query{kind="sessions"}` rows now carry `parentId`, the sub-session manifest metadata and the shared visibility verdict, so each sub-session nests under its parent (deduplicated against the `pi2:subagents` projection), settled/dormant/failed children follow the same `subagent.sessions_list` rules as `:PiSessions`, and the console offers a "show hidden sub-sessions" toggle plus a way back to the parent session. `pi2:subagents` also carries `parentId`, `visible` and epoch-millisecond timestamps.
 
 ## 2026-10-21
 

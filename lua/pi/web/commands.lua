@@ -950,9 +950,33 @@ end
 -- workspace reads
 -- ---------------------------------------------------------------------------
 
+--- @class pi.web.SessionListRow
+--- One `workspace.query{kind="sessions"}` row: a session JSONL on disk, a live
+--- session, or both merged into one row. Sub-session rows carry the manifest
+--- projection (`parentId` + metadata + the default :PiSessions `visible`).
+--- @field sessionId string
+--- @field sessionFile? string
+--- @field name? string
+--- @field timestamp? string
+--- @field modified? integer
+--- @field firstMessage? string
+--- @field cwd? string
+--- @field tab? integer
+--- @field live? boolean
+--- @field status? string Live status when the row is live, manifest status otherwise.
+--- @field model? pi.ModelRef
+--- @field visible? boolean Always set on the wire; roots are always `true`.
+--- @field parentId? string Manifest parent, normalized through `Manifest.resolve_lineage`.
+--- @field thinking? string Child thinking level (manifest config).
+--- @field task? string Child task prompt.
+--- @field agentSpawned? boolean
+--- @field reported? boolean
+--- @field createdAt? number Epoch ms.
+--- @field lastActiveAt? number Epoch ms.
+
 --- @param session pi.Session
 --- @param instance pi.web.Instance|nil
---- @return table
+--- @return pi.web.SessionListRow
 local function live_session_row(session, instance)
     local row = {
         sessionId = session.id,
@@ -971,6 +995,105 @@ local function live_session_row(session, instance)
     return row
 end
 
+--- Manifest status of a child row, in the list's status vocabulary.
+--- `active` here means "manifest says active but nothing runs" (the live
+--- projection wins whenever the row is live).
+--- @param entry pi.SubsessionManifestEntry
+--- @return string|nil
+local function manifest_row_status(entry)
+    local status = entry.status
+    if status == "dormant" then
+        return "dormant"
+    end
+    if status == "completed" then
+        return "done"
+    end
+    if status == "failed" then
+        return "error"
+    end
+    if status == "interrupted" then
+        return "interrupted"
+    end
+    if status == "active" then
+        return "exited"
+    end
+    return nil
+end
+
+--- Project the sub-session manifest onto the merged session rows: `parentId`,
+--- child metadata and the default :PiSessions `visible` policy
+--- (`ChildFilter.row_visible`, never acknowledging anything). One index build
+--- plus one pass; a corrupt manifest leaves the rows unfiltered.
+--- @param sessions pi.web.SessionListRow[]
+local function enrich_session_rows(sessions)
+    for _, row in ipairs(sessions) do
+        row.visible = true
+    end
+    local ok, Manifest = pcall(require, "pi.subsessions.manifest")
+    if not ok or Manifest.decode_failed() then
+        return
+    end
+    local ok_filter, ChildFilter = pcall(require, "pi.subsessions.sessions_list")
+    if not ok_filter then
+        return
+    end
+    local ok_entries, entries = pcall(Manifest.entries)
+    if not ok_entries or type(entries) ~= "table" or #entries == 0 then
+        return
+    end
+    --- @type table<string, pi.SubsessionManifestEntry>
+    local index = {}
+    for _, entry in ipairs(entries) do
+        if type(entry._id) == "string" then
+            index[entry._id] = entry
+        end
+    end
+    -- Use the same liveness/status source as `:PiSessions` (`pi.ui.sessions.status_of`):
+    -- a chat-bound child that is streaming (without a `_detached_busy` flag) must
+    -- still count as running, or `visible`/`status` would disagree with the TUI.
+    local ctx = ChildFilter.make_ctx()
+    for _, row in ipairs(sessions) do
+        local session_id = row.sessionId
+        if type(session_id) == "string" and session_id ~= "" then
+            -- A resumed child keeps its own id but the manifest is keyed by lineage.
+            local ok_lineage, lineage = pcall(Manifest.resolve_lineage, session_id)
+            local entry = ok_lineage and type(lineage) == "string" and index[lineage] or nil
+            if entry then
+                local ok_parent, parent_id = pcall(Manifest.resolve_lineage, entry.parent_id)
+                if not ok_parent or type(parent_id) ~= "string" or parent_id == "" then
+                    parent_id = entry.parent_id
+                end
+                row.parentId = parent_id
+                if type(row.name) ~= "string" or row.name == "" then
+                    if type(entry.name) == "string" and entry.name ~= "" then
+                        row.name = entry.name
+                    end
+                end
+                if type(entry.task_prompt) == "string" and entry.task_prompt ~= "" then
+                    row.task = entry.task_prompt
+                end
+                local config = entry.config
+                if type(config) == "table" and type(config.thinking_level) == "string" then
+                    row.thinking = config.thinking_level
+                end
+                row.agentSpawned = entry.agent_spawned == true
+                row.reported = entry.reported == true
+                row.createdAt = Manifest.epoch_ms(entry.created_at)
+                row.lastActiveAt = Manifest.epoch_ms(entry.last_active_at)
+                if row.live ~= true then
+                    row.status = manifest_row_status(entry) or row.status
+                end
+                row.visible = ChildFilter.row_visible(entry, {
+                    is_current = false,
+                    hidden = false,
+                    same_epoch = true,
+                    ctx = ctx,
+                })
+            end
+        end
+    end
+end
+
 --- @param params table|nil
 --- @param ctx pi.web.CmdContext
 --- @return any, any
@@ -980,6 +1103,7 @@ local function workspace_query(params, ctx)
     local instance = Instance()
 
     if kind == "sessions" then
+        --- @type pi.web.SessionListRow[]
         local sessions = {}
         local seen = {}
         local ok, History = pcall(require, "pi.sessions.history")
@@ -1012,6 +1136,7 @@ local function workspace_query(params, ctx)
                 sessions[#sessions + 1] = row
             end
         end
+        enrich_session_rows(sessions)
         return true, { sessions = sessions }
     end
 
