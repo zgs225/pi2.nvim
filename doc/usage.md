@@ -774,6 +774,8 @@ Every full-block tool has two collapse thresholds:
 
 When a tool's input or output exceeds its threshold, the block is auto-collapsed on first render (the fold indicator changes from `▾` to `▸`). You can toggle between the collapsed and fully-expanded view with `<Tab>` while the cursor is on the block in the history buffer. The same `<Tab>` also toggles the [startup block](#startup-block) and [thinking blocks](#thinking) when the cursor is on one of those instead — pi2.nvim dispatches based on what you're hovering over.
 
+A few renderers opt out. `always_expanded` (used by `todo_write`) bypasses the auto-collapse path entirely — window-width elision included — so the block keeps the `▾` fold indicator and `<Tab>` has nothing to toggle on it. `dispatch_subagents` simply declares no thresholds, so it never folds by line count but is still elided when a line is too wide for the window, and `<Tab>` expands it back.
+
 A collapsed line that is still wider than the window is elided in the **middle** (`apps/web-antd/src/views…/ReportMetricsFormDrawer.vue`) rather than cut off at the right edge, so the file name of a path — or the end of a command — stays readable. Expanding the block (`<Tab>`) always shows the full line.
 
 Bind `pi.toggle_history_blocks()` to expand/collapse all expandable history blocks at once; the [Keymaps](keymaps.md) example uses `<C-o>`.
@@ -800,7 +802,7 @@ Built-in thresholds:
 | `poll_subagents` | — | — | Always inline |
 | `wait_subagents` | — | — | Always inline |
 | `stop_subagents` | — | — | Always inline |
-| `todo_write` | — | 8 | Session todo checklist — no input line; collapsed output shows the progress header + first items, expanded renders the full ✓/◐/○ list. See [Todo list](#todo-list) |
+| `todo_write` | — | unlimited | Session todo checklist — no input line; the full ✓/◐/○ checklist (progress header plus one row per item) is always rendered and the block never auto-collapses (no fold to toggle, no window-width elision either). See [Todo list](#todo-list) |
 | (unknown) | 1 | 1 | Default renderer picks the first string argument as summary |
 
 ### Status resolution
@@ -842,7 +844,7 @@ Each `todo_write` call renders as a [tool block](#tool-blocks) with a checklist 
   ○ Update the changelog
 ```
 
-`✓` marks completed items, `◐` the single in-progress item (shown as its `activeForm` when provided, else its content), and `○` pending items; the first line is the progress count (`2/5 completed` / `2/5 已完成`). Collapsed, the block shows the progress header plus the first seven items and `+N lines` for the rest — expand it with `<Tab>` (see [Auto-collapse and `<Tab>`](#auto-collapse-and-tab)). Even expanded, the item list truncates at `todo.max_items` lines with a `… N more` tail. Validation errors and empty-list writes fall back to the extension's fixed reply text (e.g. `Todo list cleared`) instead of the checklist.
+`✓` marks completed items, `◐` the single in-progress item (shown as its `activeForm` when provided, else its content), and `○` pending items; the first line is the progress count (`2/5 completed` / `2/5 已完成`). The block never folds — no collapsed state, no `…N lines` elision summary, nothing for `<Tab>` to toggle (see [Auto-collapse and `<Tab>`](#auto-collapse-and-tab)) — so the progress header plus every item is rendered however long the list gets, and an over-long row soft-wraps because the history window has `wrap = true`. `todo.max_items` caps only what the extension accepts when the model submits a list, never what the block shows. Validation errors and empty-list writes fall back to the extension's fixed reply text (e.g. `Todo list cleared`) instead of the checklist.
 
 ### The `:PiTodo` panel
 
@@ -940,7 +942,7 @@ Hiding thinking doesn't change anything on the backend or affect how the agent w
 
 ### Presentation
 
-When visible, each thinking block renders as a **single header line** with an inline preview of the content (truncated to fit the window width). During streaming the preview rolls with the latest text; once finished it freezes to a head summary. Press `<Tab>` on the header to expand the full multi-line thinking text, and `<Tab>` again to collapse it back. `pi.toggle_history_blocks()` (`<C-o>` in the example keymaps) expands/collapses all blocks — tool and thinking — at once.
+When visible, each thinking block renders as a **single header line** with an inline preview of the content (truncated to fit the window width). During streaming the preview rolls with the latest text; once finished it freezes to a head summary. Press `<Tab>` on the header to expand the full multi-line thinking text, and `<Tab>` again to collapse it back. `pi.toggle_history_blocks()` (`<C-o>` in the example keymaps) expands/collapses every expandable block — tool and thinking — at once; blocks that never fold (like `todo_write`) are skipped.
 
 ### Thinking levels
 

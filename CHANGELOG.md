@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-10-23
+
+- **CHANGED:** The `todo_write` tool block no longer auto-collapses. Its renderer drops the `output_visible = 8` threshold in favour of `always_expanded`, which bypasses the whole auto-collapse path (window-width elision included), so the block always renders the complete ✓/◐/○ checklist — progress header plus one row per item, however long the list is — and `<Tab>` / `pi.toggle_history_blocks()` have nothing to toggle on it. The chat block also stops truncating the list at `todo.max_items` (the `… N more` tail is gone); `todo.max_items` still caps what the extension accepts, and the `:PiTodo` panel and the sub-session viewer's `T` panel are unchanged.
+
 ## 2026-10-20
 
 - **FIXED:** `:PiSessions` listed one sub-session under two parent sessions when two live sessions shared a lineage — a conversation started with `/new` in one tab (which keeps the previous conversation's lineage) and the original session resumed in another. Both rows attributed manifest children by lineage alone, so a child spawned in the `/new` conversation also appeared under the resumed, older-epoch session (its running process bypassed the epoch check), and `H` showed its hidden rows twice. A child now renders under exactly one parent session: the conversation that spawned it (matching conversation epoch) wins, otherwise the conversation the lineage originates from, and failing both, the first live session in tabline order. A tab viewing one of the children still marks it under its parent's row.

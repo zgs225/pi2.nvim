@@ -2946,6 +2946,12 @@ function History:_maybe_collapse_tool(tool_call_id)
     local inner_start = header_row + 1
 
     local renderer = Tools.get_renderer(block.tool_name)
+    -- Return before the width computation below: width elision lives inside
+    -- Tools.should_collapse, and leaving collapsed_inner_lines nil is what makes
+    -- <Tab> / pi.toggle_history_blocks() inert for a never-folding block.
+    if renderer.always_expanded then
+        return
+    end
     local input_vis = renderer.input_visible or math.huge
     local output_vis = renderer.output_visible or math.huge
 
