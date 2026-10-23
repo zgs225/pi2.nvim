@@ -150,7 +150,31 @@ web.start()       -- start the bridge; lazily spawns `pi2 daemon` when the socke
 web.stop()        -- stop the bridge (sessions and the daemon keep running)
 web.status()      -- table: enabled/started/ready/socket/workspace/instance/sessions/host
 web.enabled()     -- boolean: configured or currently running
+web.start_daemon() -- boolean, err?; spawns the resolved `pi2 daemon` when the socket is missing
 ```
+
+Daemon resolution, the remembered access mode and the local login handshake are separate modules, so extensions can reuse them without starting the bridge:
+
+```lua
+local runtime = require("pi.web.runtime")
+
+runtime.resolve_daemon(opts?) -- { bin, source = "config"|"path"|"plugin-data"|"checkout"|"npx" } | nil
+runtime.read_daemon_json(dir?) -- decoded <runtime>/daemon.json or nil (pure, never throws)
+
+local access = require("pi.web.access")
+
+access.get()        -- "local" | "lan" | "tailscale": web.access → remembered → "local"
+access.set(mode)    -- persist atomically (0600, temp file + rename); returns mode, err?
+access.choose(cb?)  -- vim.ui.select prompt; asynchronous with cb, otherwise returns the mode|nil
+access.remembered() -- persisted value or nil (pure, never throws on malformed JSON)
+
+local login = require("pi.web.login")
+
+login.url(opts?)  -- POST /api/v1/console/session; signed-in URL or nil + reason
+login.open(opts?) -- login.url() + the platform opener; returns url, opener_err?
+```
+
+`opts` exists for tests and custom openers: `runtime_dir`, `timeout` (ms, default 5000), `system` (a `vim.system` replacement), `opener` (a `fun(url): boolean, err?`) and `config`. Callers must only use `login.open()` for `access == "local"`: `lan`/`tailscale` never auto-sign-in, they pair via `:PiWebPair`. The CLI token from `<runtime>/cli.token` is sent on stdin and never printed, logged, or placed in argv.
 
 The daemon-side entry point is `require("pi.host").start(workspace?)`, which the daemon (`pi2 daemon`) calls from a headless Neovim (`--headless --listen <sock> -c 'lua require("pi.host").start()'`). See [Web console](usage.md#web-console).
 

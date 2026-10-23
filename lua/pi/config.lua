@@ -340,6 +340,11 @@
 ---@field daemon_args? string[] Extra arguments appended after `daemon` on lazy start
 ---@field workspace_roots? string[] Workspace roots advertised to the daemon via `PI2_WORKSPACE_ROOTS`
 ---@field log? boolean|string Write bridge diagnostics to `stdpath("log")/pi2-web.log` (true) or to this path
+---@field access? "local"|"lan"|"tailscale"|"ask" Console access mode: `local` (loopback only), `lan`, `tailscale`, or `ask` to prompt once and remember the answer (default "ask")
+---@field public_url? string External base URL advertised to the daemon (PI2_PUBLIC_URL), e.g. "https://myhost.tail1234.ts.net"
+---@field install_dir? string Where `:PiWebInstall` puts the pi2d npm package (default `<stdpath("data")>/pi2d`)
+---@field open? boolean Open the browser from `:PiWeb` (default true)
+---@field browser? string Opener command override for `:PiWeb` (default: `vim.ui.open`, then `xdg-open`/`open`)
 
 ---@class pi.Options
 ---@field cli pi.CliConfig
@@ -587,6 +592,20 @@ local defaults = {
         daemon_args = {},
         workspace_roots = nil,
         log = false,
+        -- Console access mode (`:PiWeb`/`:PiWebAccess`). "ask" prompts once on the
+        -- first `:PiWeb` and remembers the answer in
+        -- stdpath("state")/pi2/access.json; a concrete mode pins it.
+        access = "ask",
+        -- External base URL advertised to the daemon (PI2_PUBLIC_URL), e.g.
+        -- "https://myhost.tail1234.ts.net". Required for `tailscale`.
+        public_url = nil,
+        -- Where :PiWebInstall puts the pi2d npm package (resolved as
+        -- <install_dir>/node_modules/.bin/pi2).
+        install_dir = vim.fn.stdpath("data") .. "/pi2d",
+        -- Open the browser from `:PiWeb` (true) or just report the console URL.
+        open = true,
+        -- Opener override for `:PiWeb` (default: vim.ui.open → xdg-open/open).
+        browser = nil,
     },
     diff_review = {
         width = 0.8,

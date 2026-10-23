@@ -372,6 +372,22 @@ require("pi").setup({
         -- Bridge diagnostics: false (silent), true (stdpath("log")/pi2-web.log),
         -- or a file path. stdout/stderr are never used.
         log = false,
+        -- Console access mode, passed to the daemon as PI2_ACCESS_MODE.
+        -- "ask" (default) prompts once on the first :PiWeb and remembers the
+        -- answer in stdpath("state")/pi2/access.json; "local" (loopback only),
+        -- "lan" and "tailscale" pin it. :PiWebAccess changes it later.
+        access = "ask",
+        -- External base URL advertised to the daemon (PI2_PUBLIC_URL), e.g.
+        -- "https://myhost.tail1234.ts.net" (no trailing slash). Needed for
+        -- `tailscale` so :PiWebPair can hand out a reachable URL.
+        public_url = nil,
+        -- Where :PiWebInstall puts the daemon npm package; the executable is
+        -- then resolved as <install_dir>/node_modules/.bin/pi2.
+        install_dir = vim.fn.stdpath("data") .. "/pi2d",
+        -- Open the browser from :PiWeb (true) or only report the console URL.
+        open = true,
+        -- Opener override for :PiWeb (default: vim.ui.open, then xdg-open/open).
+        browser = nil,
     },
 
     -- Session diff review (:PiDiff): one floating panel — an outer border

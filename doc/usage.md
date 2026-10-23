@@ -181,9 +181,41 @@ Whenever a task reaches a terminal state — completed, failed, or stopped — t
 
 | Command | Action |
 | --- | --- |
+| `:PiWeb` | The whole flow: asks for the access mode once (then remembers it), resolves and starts the daemon, waits up to 10 s for `<runtime>/daemon.json`, then opens an already-signed-in browser (`local`) or shows the external URL plus the `:PiWebPair` hint (`lan`/`tailscale`) |
+| `:PiWebInstall [--global]` | `npm i --prefix <web.install_dir> pi2d@latest` (`--global`: `npm i -g pi2d@latest`), then reports which executable the resolution ladder picked |
+| `:PiWebUpdate [--global]` | Same install as `:PiWebInstall` plus a reminder that a running daemon must be restarted (`pi2 daemon --force`) |
+| `:PiWebDoctor` | Runs `<pi2> doctor --json` and shows the `name status detail` lines |
+| `:PiWebAccess [mode]` | Choose (`local`/`lan`/`tailscale`, via `vim.ui.select`) or set the access mode; a running daemon must be restarted to apply it |
+| `:PiWebPair` | Mints a pairing code (`--public-url` when one is configured) and shows the URL + code |
 | `:PiWebStart` | Start the bridge; spawns `pi2 daemon` detached if `<runtime>/d.sock` is missing |
 | `:PiWebStop` | Stop the bridge (sessions and the daemon keep running) |
 | `:PiWebStatus` | Show bridge/socket/workspace/instance/session counts |
+
+### How `:PiWeb` finds the daemon
+
+`pi.web.runtime.resolve_daemon()` walks a fixed ladder and returns `{ bin, source }`; every candidate must exist **and** be executable:
+
+| # | source | candidate |
+| --- | --- | --- |
+| 1 | `config` | `web.daemon` (an absolute path is used as-is, a bare name goes through `exepath`) |
+| 2 | `path` | `exepath("pi2")` |
+| 3 | `plugin-data` | `<web.install_dir>/node_modules/.bin/pi2` (default `<stdpath("data")>/pi2d/...`) |
+| 4 | `checkout` | `node_modules/.bin/pi2` walked up from the cwd (daemon development) |
+| 5 | `npx` | `npx -y pi2d@latest daemon …`, only when `npx` is on `PATH` |
+
+Nothing is ever auto-installed: when no candidate qualifies, `:PiWeb` tells you to run `:PiWebInstall`.
+
+### Access modes
+
+| Mode | Bind | Browser |
+| --- | --- | --- |
+| `local` (default) | `127.0.0.1` | `:PiWeb` signs the local browser in through `POST /api/v1/console/session` and `#t=<token>` |
+| `lan` | `0.0.0.0` | never auto-signed-in — `:PiWeb` prints the URL and `:PiWebPair` pairs each device |
+| `tailscale` | `127.0.0.1` | reachable through [`web.public_url`](configuration.md); pairing, no auto-sign-in |
+
+The choice is `web.access` when it is not `"ask"`, otherwise the remembered value in `stdpath("state")/pi2/access.json` (written 0600, atomic rename), otherwise `local`. The daemon gets it as `PI2_ACCESS_MODE` (and `web.public_url` as `PI2_PUBLIC_URL`) when the plugin spawns it.
+
+The login handshake reads the real port from `<runtime>/daemon.json` and the local admin token from `<runtime>/cli.token`, `POST`s `/api/v1/console/session` (loopback only, 5 s bounded `vim.system` call) and hands the returned URL to `vim.ui.open` (`xdg-open`/`open` as fallback). The token travels on stdin, is never printed or logged, and the URL is only passed to the opener — use `pi2 open --print` if you need it in a terminal.
 
 The bridge only starts automatically when [`web.enabled = true`](configuration.md) is set before `require("pi").setup()`. `:PiWebStart` works without that flag. The daemon must be installed (`pi2` on `PATH`, which provides the `daemon` subcommand, or an absolute [`web.daemon`](configuration.md) path) and serves the browser UI on its own port; `web.log = true` writes bridge diagnostics to `stdpath("log")/pi2-web.log` — stdout/stderr are never used, because a headless instance may share them with nothing useful and must never print.
 

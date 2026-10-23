@@ -256,6 +256,68 @@ function M.setup()
     vim.api.nvim_create_user_command("PiWebStatus", function()
         require("pi.notify").info(table.concat(require("pi.web").status_lines(), "\n"))
     end, { desc = "Show π² web console bridge status" })
+
+    -- One-command console surface. Every entry point is wrapped so a broken
+    -- install degrades to a one-line notify instead of a stack trace.
+    local function pi_web(name, ...)
+        local ok, Ctl = pcall(require, "pi.web.ctl")
+        if not ok then
+            require("pi.notify").error("web console unavailable: " .. tostring(Ctl))
+            return
+        end
+        Ctl.call(name, ...)
+    end
+
+    --- Fixed candidate list as a completion function (`complete` only takes a
+    --- function or a string).
+    --- @param items string[]
+    --- @return fun(lead: string): string[]
+    local function complete_from(items)
+        return function(lead)
+            return vim.tbl_filter(function(item)
+                return vim.startswith(item, lead or "")
+            end, items)
+        end
+    end
+
+    local complete_modes = complete_from({ "local", "lan", "tailscale" })
+    local complete_flags_pi_web = complete_from({ "--global" })
+
+    vim.api.nvim_create_user_command("PiWeb", function()
+        pi_web("open_console")
+    end, { desc = "Open the π² web console (asks for the access mode once, installs/starts as needed)" })
+
+    vim.api.nvim_create_user_command("PiWebInstall", function(cmd)
+        pi_web("install", vim.split(cmd.args, "%s+", { trimempty = true }))
+    end, {
+        nargs = "*",
+        complete = complete_flags_pi_web,
+        desc = "Install pi2d (npm i --prefix <web.install_dir>); --global installs it globally",
+    })
+
+    vim.api.nvim_create_user_command("PiWebUpdate", function(cmd)
+        pi_web("update", vim.split(cmd.args, "%s+", { trimempty = true }))
+    end, {
+        nargs = "*",
+        complete = complete_flags_pi_web,
+        desc = "Update pi2d@latest (restart the daemon afterwards)",
+    })
+
+    vim.api.nvim_create_user_command("PiWebDoctor", function()
+        pi_web("doctor")
+    end, { desc = "Run `pi2 doctor --json` and show the checks" })
+
+    vim.api.nvim_create_user_command(
+        "PiWebAccess",
+        function(cmd)
+            pi_web("access", vim.split(cmd.args, "%s+", { trimempty = true }))
+        end,
+        { nargs = "?", complete = complete_modes, desc = "Choose or set the console access mode (local/lan/tailscale)" }
+    )
+
+    vim.api.nvim_create_user_command("PiWebPair", function()
+        pi_web("pair")
+    end, { desc = "Mint a pairing code and show the URL + code" })
 end
 
 return M

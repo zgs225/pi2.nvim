@@ -83,6 +83,10 @@ end
 
 --- Spawn the daemon detached when no socket is present. Never blocks and never
 --- raises: the bridge retries (with backoff) until the daemon is up.
+---
+--- The executable comes from `pi.web.runtime.resolve_daemon()` (config → PATH →
+--- plugin data → checkout → npx). `npx` runs through the pinned package
+--- (`npx -y pi2d@latest daemon`); every other source runs `<bin> daemon`.
 --- @return boolean started, string|nil err
 function M.start_daemon()
     local cfg = config()
@@ -93,31 +97,47 @@ function M.start_daemon()
         return true
     end
 
-    local name = cfg.daemon or "pi2"
-    local bin = name
-    if not name:find("/", 1, true) then
-        bin = vim.fn.exepath(name)
-    end
-    if type(bin) ~= "string" or bin == "" then
-        return false, "daemon not found: " .. tostring(name)
+    local resolved = Runtime.resolve_daemon()
+    if not resolved then
+        return false, "daemon not found: " .. tostring(cfg.daemon or "pi2")
     end
 
     -- The daemon is a subcommand of the CLI: `pi2 daemon [args...]`.
-    local argv = { bin, "daemon" }
+    local argv
+    if resolved.source == "npx" then
+        argv = { "npx", "-y", "pi2d@latest", "daemon" }
+    else
+        argv = { resolved.bin, "daemon" }
+    end
     for _, extra in ipairs(cfg.daemon_args or {}) do
         argv[#argv + 1] = tostring(extra)
     end
 
     --- @type table
     local job_opts = { detach = true }
+    local env = {}
+    local mode = cfg.access
+    if mode == "ask" or mode == nil then
+        local ok_access, Access = pcall(require, "pi.web.access")
+        mode = ok_access and Access.get() or nil
+    end
+    if type(mode) == "string" and mode ~= "" then
+        env.PI2_ACCESS_MODE = mode
+    end
+    if type(cfg.public_url) == "string" and cfg.public_url ~= "" then
+        env.PI2_PUBLIC_URL = cfg.public_url
+    end
     if type(cfg.workspace_roots) == "table" and #cfg.workspace_roots > 0 then
-        job_opts.env = { PI2_WORKSPACE_ROOTS = table.concat(cfg.workspace_roots, ",") }
+        env.PI2_WORKSPACE_ROOTS = table.concat(cfg.workspace_roots, ",")
+    end
+    if next(env) ~= nil then
+        job_opts.env = env
     end
     local ok, pid = pcall(vim.fn.jobstart, argv, job_opts)
     if not ok or type(pid) ~= "number" or pid <= 0 then
-        return false, "failed to spawn " .. bin
+        return false, "failed to spawn " .. argv[1]
     end
-    M.log("info", ("spawned daemon %s (pid %d)"):format(bin, pid))
+    M.log("info", ("spawned daemon %s (%s, pid %d)"):format(argv[1], resolved.source, pid))
     return true
 end
 

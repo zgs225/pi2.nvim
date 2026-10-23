@@ -413,6 +413,62 @@ function M.instance_dir()
     return join(M.runtime_dir(), "i")
 end
 
+--- Path of the daemon discovery file (`<runtime>/daemon.json`, written by
+--- `pi2 daemon` after `listen()`; it carries the *actual* bound port).
+--- @param dir? string runtime dir override
+--- @return string
+function M.daemon_json_path(dir)
+    return join(dir or M.runtime_dir(), "daemon.json")
+end
+
+--- Path of the local CLI admin token (`<runtime>/cli.token`, 0600).
+--- @param dir? string runtime dir override
+--- @return string
+function M.cli_token_path(dir)
+    return join(dir or M.runtime_dir(), "cli.token")
+end
+
+--- Read a small text file and trim it. Never throws.
+--- @param path string
+--- @return string|nil
+function M.read_text(path)
+    local uv = vim.uv or vim.loop
+    local ok, fd = pcall(uv.fs_open, path, "r", 0)
+    if not ok or not fd then
+        return nil
+    end
+    local data
+    local stat_ok, stat = pcall(uv.fs_fstat, fd)
+    if stat_ok and stat then
+        local read_ok, content = pcall(uv.fs_read, fd, stat.size, 0)
+        if read_ok then
+            data = content
+        end
+    end
+    pcall(uv.fs_close, fd)
+    if type(data) ~= "string" then
+        return nil
+    end
+    data = vim.trim(data)
+    return data ~= "" and data or nil
+end
+
+--- Decoded `<runtime>/daemon.json`, or nil when it is missing/malformed.
+--- Pure: no side effects, never throws.
+--- @param dir? string runtime dir override
+--- @return table|nil
+function M.read_daemon_json(dir)
+    local raw = M.read_text(M.daemon_json_path(dir))
+    if not raw then
+        return nil
+    end
+    local ok, decoded = pcall(vim.json.decode, raw)
+    if not ok or type(decoded) ~= "table" then
+        return nil
+    end
+    return decoded
+end
+
 --- Socket path for one managed instance. The name is a 16-hex sha256 slice of
 --- `workspace_id:instance_id`, so it is stable for the daemon and short enough
 --- for the ~104-byte unix-socket limit (macOS); if the runtime dir is unusually
@@ -428,6 +484,142 @@ function M.instance_socket_path(workspace_id, instance_id)
         path = join(uv.os_tmpdir() or "/tmp", "pi2-i-" .. uid(), name)
     end
     return path
+end
+
+-- ---------------------------------------------------------------------------
+-- Daemon resolution ladder
+-- ---------------------------------------------------------------------------
+
+--- Where a resolved `pi2` executable came from (ladder order).
+---@alias pi.web.DaemonSource "config"|"path"|"plugin-data"|"checkout"|"npx"
+
+---@class pi.web.DaemonCandidate
+---@field bin string executable to spawn (`npx` for the last-resort candidate)
+---@field source pi.web.DaemonSource
+
+---@class pi.web.ResolveOpts
+---@field config? pi.WebConfig daemon settings (defaults to `pi.config`)
+---@field cwd? string start of the checkout walk-up (defaults to the process cwd)
+---@field data_dir? string plugin-data root (defaults to `stdpath("data")`)
+---@field exepath? fun(name: string): string
+---@field executable? fun(path: string): boolean
+
+--- `true` when `path` exists and is executable. Never throws.
+--- @param path string
+--- @param executable fun(path: string): boolean
+--- @return boolean
+local function is_runnable(path, executable)
+    if type(path) ~= "string" or path == "" then
+        return false
+    end
+    local uv = vim.uv or vim.loop
+    local ok_stat, stat = pcall(uv.fs_stat, path)
+    if not ok_stat or not stat or stat.type ~= "file" then
+        return false
+    end
+    local ok_exec, runnable = pcall(executable, path)
+    return ok_exec and runnable == true
+end
+
+--- Every ancestor of `dir`, starting with `dir` itself (string-only, so it works
+--- for paths that do not exist and on Windows separators too).
+--- @param dir string
+--- @return string[]
+local function ancestors(dir)
+    local out = {}
+    local current = (dir:gsub("[/\\]+$", ""))
+    while current ~= "" do
+        out[#out + 1] = current
+        local parent = current:match("^(.*)[/\\][^/\\]*$")
+        if not parent or parent == current then
+            break
+        end
+        current = parent
+    end
+    return out
+end
+
+--- @param opts pi.web.ResolveOpts
+--- @return pi.web.DaemonCandidate|nil
+local function do_resolve(opts)
+    local ok_cfg, config = pcall(require, "pi.config")
+    local cfg = opts.config or (ok_cfg and config.options.web) or {}
+    local exepath = opts.exepath or function(name)
+        return vim.fn.exepath(name)
+    end
+    local executable = opts.executable or function(path)
+        return vim.fn.executable(path) == 1
+    end
+    --- @param fn fun(arg: string): string
+    --- @param arg string
+    --- @return string
+    local function call(fn, arg)
+        local pok, value = pcall(fn, arg)
+        if pok and type(value) == "string" then
+            return value
+        end
+        return ""
+    end
+
+    -- 1. config: an absolute path is used as-is, a bare name goes through exepath.
+    local configured = cfg.daemon
+    if type(configured) == "string" and configured ~= "" then
+        local bin = configured
+        if not bin:find("[/\\]") then
+            bin = call(exepath, configured)
+        end
+        if is_runnable(bin, executable) then
+            return { bin = bin, source = "config" }
+        end
+    end
+
+    -- 2. PATH
+    local on_path = call(exepath, "pi2")
+    if is_runnable(on_path, executable) then
+        return { bin = on_path, source = "path" }
+    end
+
+    -- 3. plugin data: the npm package `:PiWebInstall` maintains.
+    local data_root = opts.data_dir or vim.fn.stdpath("data")
+    local dir = cfg.install_dir
+    if type(dir) ~= "string" or dir == "" then
+        dir = join(data_root, "pi2d")
+    end
+    local plugin_data = join(dir, "node_modules", ".bin", "pi2")
+    if is_runnable(plugin_data, executable) then
+        return { bin = plugin_data, source = "plugin-data" }
+    end
+
+    -- 4. checkout: `node_modules/.bin/pi2` walked up from the cwd (daemon devs).
+    for _, base in ipairs(ancestors(opts.cwd or vim.fn.getcwd())) do
+        local candidate = join(base, "node_modules", ".bin", "pi2")
+        if is_runnable(candidate, executable) then
+            return { bin = candidate, source = "checkout" }
+        end
+    end
+
+    -- 5. npx, only when it is actually installed.
+    local npx = call(exepath, "npx")
+    if npx ~= "" then
+        return { bin = "npx", source = "npx" }
+    end
+
+    return nil
+end
+
+--- Resolve the `pi2` daemon executable through the fixed ladder
+--- (`config` → `path` → `plugin-data` → `checkout` → `npx`). Every candidate is
+--- checked for existence + executability; `npx` is the last resort and is only
+--- used when it is on `PATH`. Never throws: an undetectable executable yields
+--- `nil`.
+--- @param opts? pi.web.ResolveOpts
+--- @return pi.web.DaemonCandidate|nil
+function M.resolve_daemon(opts)
+    local ok, resolved = pcall(do_resolve, opts or {})
+    if ok then
+        return resolved
+    end
+    return nil
 end
 
 return M
