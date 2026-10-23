@@ -907,6 +907,7 @@ end
 ---@field on_end? fun(history: pi.ChatHistory, args: table?, result: table?, is_error: boolean?, insert_at: integer?): integer?
 ---@field input_visible? integer  lines to show when collapsed (default: show all)
 ---@field output_visible? integer lines to show when collapsed (default: show all)
+---@field always_expanded? boolean  never auto-collapse: no line-count threshold and no window-width elision
 ---@field inline? boolean|fun(args: table?): boolean  render as a single line (no header/footer)
 ---@field display_name? fun(args: table?): string?  user-facing tool label (defaults to RPC tool name)
 ---@field inline_text? fun(history: pi.ChatHistory, args: table?): string?  text to show after tool name
@@ -1438,9 +1439,11 @@ local renderers = {
 
     -- Todo tool: the result's details carry the full list, so the block body
     -- renders the three-state checklist itself (✓ / ◐ / ○) instead of the
-    -- extension's fixed reply text (see lua/pi/todo/tool_ui.lua).
+    -- extension's fixed reply text (see lua/pi/todo/tool_ui.lua). The block
+    -- always renders the whole checklist and never auto-collapses, whatever
+    -- the item count: a folded checklist would hide the state it conveys.
     todo_write = {
-        output_visible = 8,
+        always_expanded = true,
         display_name = function()
             return TodoToolUi.display_name("todo_write")
         end,
@@ -1457,8 +1460,9 @@ local renderers = {
                 -- reply text (same behavior as default_renderer.on_end).
                 return render_result_output(history, nil, result, nil, insert_at)
             end
-            local todo_cfg = require("pi.config").options.todo or {}
-            local lines = TodoToolUi.format_lines(details, { max_items = todo_cfg.max_items })
+            -- No max_items here: the chat block shows the entire list (the
+            -- sub-session viewer still truncates via format_lines' option).
+            local lines = TodoToolUi.format_lines(details)
             for _, line in ipairs(lines) do
                 insert_at = render_body_line(history, line, nil, insert_at)
             end

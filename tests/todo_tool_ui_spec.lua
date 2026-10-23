@@ -272,13 +272,52 @@ end)
 describe("todo_write renderer", function()
     after_each(function()
         Config.setup({})
+        -- The window-width spec below splits the screen to get a narrow
+        -- history window; restore a single full-width window. (vim.cmd.silent
+        -- is not a plain function — pcall it as vim.cmd with the bar form.)
+        pcall(vim.cmd, "silent only")
+        pcall(vim.api.nvim_win_set_width, 0, 80)
     end)
+
+    --- Exact match on the trimmed line (avoids substring collisions like
+    --- "task 1" inside "task 15").
+    ---@param lines string[]
+    ---@param line string
+    ---@return boolean
+    local function has_exact_line(lines, line)
+        for _, l in ipairs(lines) do
+            if vim.trim(l) == line then
+                return true
+            end
+        end
+        return false
+    end
+
+    --- Collapsed views summarise the elided remainder as "…N lines" (the closed
+    --- fold glyph is asserted separately); such a summary must be absent.
+    ---@param lines string[]
+    ---@return boolean
+    local function has_summary_line(lines)
+        for _, l in ipairs(lines) do
+            if vim.trim(l):match("^…%d+ lines$") then
+                return true
+            end
+        end
+        return false
+    end
 
     it("registers the icon and the renderer", function()
         assert.is_not.equal(require("pi.config").options.labels.tool, Tools.get_tool_icon("todo_write"))
         local renderer = Tools.get_renderer("todo_write")
         assert.is_nil(renderer.on_start)
         assert.is_not.is_nil(renderer.on_end)
+    end)
+
+    it("has no collapse thresholds and is marked always_expanded", function()
+        local renderer = Tools.get_renderer("todo_write")
+        assert.is_nil(renderer.input_visible, "expected nil input_visible (unlimited)")
+        assert.is_nil(renderer.output_visible, "expected nil output_visible (unlimited)")
+        assert.is_true(renderer.always_expanded)
     end)
 
     it("renders the three-state checklist without an input line", function()
@@ -358,7 +397,9 @@ describe("todo_write renderer", function()
         assert.not_matches("keep me", text)
     end)
 
-    it("truncates long lists at todo.max_items", function()
+    it("renders every item even when todo.max_items is smaller", function()
+        -- The chat block shows the whole checklist: todo.max_items only limits
+        -- the model's list length / the sub-session viewer panel.
         local History = require("pi.ui.chat.history")
         Config.setup({ title = { lang = "en" }, todo = { max_items = 2 }, render = { engine = "builtin" } })
         local h = History.new(998)
@@ -375,6 +416,100 @@ describe("todo_write renderer", function()
         vim.wait(100)
         local text = table.concat(vim.api.nvim_buf_get_lines(h:buf(), 0, -1, false), "\n")
         assert.matches("0/4 completed", text)
-        assert.matches("… 2 more", text)
+        for i = 1, 4 do
+            assert.matches("○ task " .. i, text)
+        end
+        assert.not_matches("… 2 more", text)
+        assert.not_matches("… %d+ more", text)
+    end)
+
+    it("stays expanded for a 15-item checklist", function()
+        local History = require("pi.ui.chat.history")
+        Config.setup({ title = { lang = "en" }, render = { engine = "builtin" } })
+        local h = History.new(995)
+        local todos = {}
+        for i = 1, 15 do
+            todos[i] = { content = "task " .. i, status = "pending" }
+        end
+        h:on_tool_start("todo_write", "todo-5", { todos = todos })
+        vim.wait(100)
+        h:on_tool_end("todo_write", "todo-5", {
+            content = { { type = "text", text = "Todos updated." } },
+            details = { todos = todos, completed = 0, total = 15 },
+        }, false)
+        vim.wait(100)
+
+        local lines = vim.api.nvim_buf_get_lines(h:buf(), 0, -1, false)
+        for i = 1, 15 do
+            assert.is_true(has_exact_line(lines, "○ task " .. i), "missing checklist item " .. i)
+        end
+        assert.is_false(has_summary_line(lines), "unexpected collapse summary line")
+
+        local block = h._tool_blocks["todo-5"]
+        assert.is_not_nil(block)
+        assert.is_true(block.expanded)
+        assert.is_nil(block.collapsed_inner_lines)
+
+        local header
+        for _, l in ipairs(lines) do
+            if l:find("todo·write", 1, true) then
+                header = l
+                break
+            end
+        end
+        assert.is_not_nil(header, "missing block header")
+        assert.are.equal(Tools.GLYPHS.FOLD_OPEN, header:sub(1, #Tools.GLYPHS.FOLD_OPEN))
+
+        -- Nothing is expandable, so the global toggle must leave it untouched.
+        local before = table.concat(lines, "\n")
+        h:set_blocks_expanded(false)
+        vim.wait(50)
+        local after = table.concat(vim.api.nvim_buf_get_lines(h:buf(), 0, -1, false), "\n")
+        assert.are.equal(before, after, "toggle_history_blocks must not fold a todo_write block")
+        assert.is_true(block.expanded)
+        assert.is_nil(block.collapsed_inner_lines)
+    end)
+
+    it("stays expanded when a line overflows a narrow window", function()
+        -- Width-based elision lives in Tools.should_collapse and needs a real
+        -- window: History.new() has _win == nil, so max_width would be 0 and
+        -- the width fold never triggers (false pass). nvim_win_set_width
+        -- no-ops on the only window in headless Neovim → split first.
+        local History = require("pi.ui.chat.history")
+        Config.setup({ title = { lang = "en" }, render = { engine = "builtin" } })
+        local h = History.new(994)
+        vim.api.nvim_win_set_buf(0, h:buf())
+        vim.cmd("vsplit")
+        vim.api.nvim_win_set_width(0, 40)
+        h:set_win(0)
+        assert.is_true(vim.api.nvim_win_get_width(0) < 60, "window did not narrow")
+
+        local long_content = string.rep("abcdefghij", 30) -- 300 chars
+        local todos = {
+            { content = "short item", status = "pending" },
+            { content = long_content, status = "pending" },
+        }
+        h:on_tool_start("todo_write", "todo-6", { todos = todos })
+        vim.wait(100)
+        h:on_tool_end("todo_write", "todo-6", {
+            content = { { type = "text", text = "Todos updated." } },
+            details = { todos = todos, completed = 0, total = 2 },
+        }, false)
+        vim.wait(100)
+
+        local lines = vim.api.nvim_buf_get_lines(h:buf(), 0, -1, false)
+        assert.is_true(has_exact_line(lines, "○ " .. long_content), "long item line was elided")
+        assert.is_false(has_summary_line(lines), "unexpected collapse summary line")
+
+        local block = h._tool_blocks["todo-6"]
+        assert.is_not_nil(block)
+        assert.is_true(block.expanded)
+        assert.is_nil(block.collapsed_inner_lines)
+        for _, l in ipairs(lines) do
+            if l:find("todo·write", 1, true) then
+                assert.are.equal(Tools.GLYPHS.FOLD_OPEN, l:sub(1, #Tools.GLYPHS.FOLD_OPEN))
+                break
+            end
+        end
     end)
 end)

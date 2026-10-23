@@ -37,7 +37,7 @@ History buffer is `modifiable=false` by default. All writes go through `History:
 Extmarks (namespace `pi-chat`) are used extensively for: tool block borders (virtual text), highlighting, status spinners, thinking block anchors, and tool block expand/collapse range tracking. When replacing lines, extmarks must be captured before and restored after (`capture_extmarks` / `restore_extmarks` in history.lua).
 
 ### Tool Renderers
-Each tool has a renderer in `tools.lua` (`pi.ToolRenderer`). Renderers define `on_start`/`on_end` for content, plus `input_visible`/`output_visible` thresholds for auto-collapse. Inline tools (like `read`) render as a single line. Custom renderers can be added to the `renderers` table.
+Each tool has a renderer in `tools.lua` (`pi.ToolRenderer`). Renderers define `on_start`/`on_end` for content, plus `input_visible`/`output_visible` thresholds for auto-collapse; a renderer sets `always_expanded = true` to never auto-collapse (line count *and* window width). Inline tools (like `read`) render as a single line. Custom renderers can be added to the `renderers` table.
 
 ### Layout Modes
 Side layout uses `vsplit`/`split`. Float layout uses `nvim_open_win` with a stacked vertical arrangement (history float → prompt float → attachments float). Both are managed by `layout.lua` and share the same buffer instances.
