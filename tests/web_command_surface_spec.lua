@@ -25,7 +25,7 @@ describe(":PiWeb command surface", function()
 
     it("builds the npx argv for the pinned package and the plain argv otherwise", function()
         assert.same(
-            { "npx", "-y", "pi2d@latest", "doctor", "--json" },
+            { "npx", "-y", "@yuez/pi2d@latest", "doctor", "--json" },
             Ctl.cli_argv({ bin = "npx", source = "npx" }, "doctor", { "--json" })
         )
         assert.same(

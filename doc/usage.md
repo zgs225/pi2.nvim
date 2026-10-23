@@ -182,7 +182,7 @@ Whenever a task reaches a terminal state — completed, failed, or stopped — t
 | Command | Action |
 | --- | --- |
 | `:PiWeb` | The whole flow: asks for the access mode once (then remembers it), resolves and starts the daemon, waits up to 10 s for `<runtime>/daemon.json`, then opens an already-signed-in browser (`local`) or shows the external URL plus the `:PiWebPair` hint (`lan`/`tailscale`) |
-| `:PiWebInstall [--global]` | `npm i --prefix <web.install_dir> pi2d@latest` (`--global`: `npm i -g pi2d@latest`), then reports which executable the resolution ladder picked |
+| `:PiWebInstall [--global]` | `npm i --prefix <web.install_dir> @yuez/pi2d@latest` (`--global`: `npm i -g @yuez/pi2d@latest`), then reports which executable the resolution ladder picked |
 | `:PiWebUpdate [--global]` | Same install as `:PiWebInstall` plus a reminder that a running daemon must be restarted (`pi2 daemon --force`) |
 | `:PiWebDoctor` | Runs `<pi2> doctor --json` and shows the `name status detail` lines |
 | `:PiWebAccess [mode]` | Choose (`local`/`lan`/`tailscale`, via `vim.ui.select`) or set the access mode; a running daemon must be restarted to apply it |
@@ -201,7 +201,7 @@ Whenever a task reaches a terminal state — completed, failed, or stopped — t
 | 2 | `path` | `exepath("pi2")` |
 | 3 | `plugin-data` | `<web.install_dir>/node_modules/.bin/pi2` (default `<stdpath("data")>/pi2d/...`) |
 | 4 | `checkout` | `node_modules/.bin/pi2` walked up from the cwd (daemon development) |
-| 5 | `npx` | `npx -y pi2d@latest daemon …`, only when `npx` is on `PATH` |
+| 5 | `npx` | `npx -y @yuez/pi2d@latest daemon …`, only when `npx` is on `PATH` |
 
 Nothing is ever auto-installed: when no candidate qualifies, `:PiWeb` tells you to run `:PiWebInstall`.
 

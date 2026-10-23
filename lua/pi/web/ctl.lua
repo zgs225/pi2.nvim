@@ -66,7 +66,7 @@ function M.install_dir(cfg)
 end
 
 --- Build the argv for a CLI subcommand, honouring the resolved source.
---- `npx` always runs the pinned package: `npx -y pi2d@latest <sub> …`.
+--- `npx` always runs the pinned package: `npx -y @yuez/pi2d@latest <sub> …`.
 --- @param resolved pi.web.DaemonCandidate
 --- @param sub string
 --- @param extra? string[]
@@ -74,7 +74,7 @@ end
 function M.cli_argv(resolved, sub, extra)
     local argv
     if resolved.source == "npx" then
-        argv = { "npx", "-y", "pi2d@latest", sub }
+        argv = { "npx", "-y", "@yuez/pi2d@latest", sub }
     else
         argv = { resolved.bin, sub }
     end
@@ -234,18 +234,18 @@ function M.launch(mode)
     Notify.info(("web console: opened http://127.0.0.1:%s in your browser"):format(tostring(port or "?")))
 end
 
---- npm install of `pi2d@latest`, then report the newly resolved source.
+--- npm install of `@yuez/pi2d@latest`, then report the newly resolved source.
 --- @param global boolean
 --- @param kind "install"|"update"
 function M.npm_install(global, kind)
     local cfg = web_config()
     local argv, target
     if global then
-        argv = { "npm", "i", "-g", "pi2d@latest" }
-        target = "pi2d@latest (global)"
+        argv = { "npm", "i", "-g", "@yuez/pi2d@latest" }
+        target = "@yuez/pi2d@latest (global)"
     else
         target = M.install_dir(cfg)
-        argv = { "npm", "i", "--prefix", target, "pi2d@latest" }
+        argv = { "npm", "i", "--prefix", target, "@yuez/pi2d@latest" }
     end
     Notify.info("web console: installing " .. target .. "…")
     M.run(argv, function(res)

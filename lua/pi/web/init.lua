@@ -86,7 +86,7 @@ end
 ---
 --- The executable comes from `pi.web.runtime.resolve_daemon()` (config → PATH →
 --- plugin data → checkout → npx). `npx` runs through the pinned package
---- (`npx -y pi2d@latest daemon`); every other source runs `<bin> daemon`.
+--- (`npx -y @yuez/pi2d@latest daemon`); every other source runs `<bin> daemon`.
 --- @return boolean started, string|nil err
 function M.start_daemon()
     local cfg = config()
@@ -105,7 +105,7 @@ function M.start_daemon()
     -- The daemon is a subcommand of the CLI: `pi2 daemon [args...]`.
     local argv
     if resolved.source == "npx" then
-        argv = { "npx", "-y", "pi2d@latest", "daemon" }
+        argv = { "npx", "-y", "@yuez/pi2d@latest", "daemon" }
     else
         argv = { resolved.bin, "daemon" }
     end

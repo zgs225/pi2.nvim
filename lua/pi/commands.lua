@@ -300,7 +300,7 @@ function M.setup()
     end, {
         nargs = "*",
         complete = complete_flags_pi_web,
-        desc = "Update pi2d@latest (restart the daemon afterwards)",
+        desc = "Update @yuez/pi2d@latest (restart the daemon afterwards)",
     })
 
     vim.api.nvim_create_user_command("PiWebDoctor", function()
