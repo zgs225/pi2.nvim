@@ -4,6 +4,7 @@ local Path = require("pi.path")
 local Render = require("pi.ui.render")
 local SubToolUi = require("pi.subsessions.tool_ui")
 local TodoToolUi = require("pi.todo.tool_ui")
+local CodemodeToolUi = require("pi.codemode.tool_ui")
 
 local M = {}
 
@@ -26,6 +27,7 @@ end
 ---@type table<string, string>
 local TOOL_ICONS = {
     bash = nf(0xE795), -- nf-dev-terminal
+    codemode = nf(0xF031E), -- nf-md-language_javascript
     read = nf(0xF0219), -- nf-md-file-document
     edit = nf(0xF03EB), -- nf-md-pencil
     write = nf(0xF0193), -- nf-md-content-save
@@ -243,6 +245,35 @@ local function render_body_line(history, text, hl_group, insert_at)
     return insert_at
 end
 
+--- Like render_body_line(), but newlines only: runs of spaces survive.
+---
+--- codemode sections carry indentation that *means* something (pretty-printed
+--- JSON, stack traces, TypeScript declarations), and flatten_line() collapses
+--- every whitespace run, which renders them flush-left. Only the embedded
+--- newlines have to go — one buffer row per display row.
+---@param history pi.ChatHistory
+---@param text string
+---@param hl_group? string
+---@param insert_at? integer  when set, insert at this row instead of appending
+---@return integer? next_insert_at  advanced insertion cursor (nil when appending)
+local function render_code_row(history, text, hl_group, insert_at)
+    text = (M.sanitize_text(text):gsub("[\r\n]+", " "))
+    local start
+    if insert_at then
+        start, insert_at = history:_insert_lines(insert_at, { text })
+    else
+        start = history:_append_lines({ text })
+    end
+    M.set_border(history, start, M.GLYPHS.INDENT)
+    if #text > 0 then
+        vim.api.nvim_buf_set_extmark(history:buf(), history:ns(), start, 0, {
+            end_col = #text,
+            hl_group = hl_group or "PiToolCall",
+        })
+    end
+    return insert_at
+end
+
 --- Paint border + highlight spans for one dispatch status row: the whole row
 --- in PiToolCall, with the state mark overriding in its own group.
 ---@param history pi.ChatHistory
@@ -287,6 +318,17 @@ local function display_path(history, path)
     return Path.display(path, { base = history and history._cwd })
 end
 
+--- Priority for the builtin-engine treesitter captures over tool input code.
+--- The flat PiToolCall span that covers the whole input line is written
+--- without a priority, so it uses Neovim's default of 4096; a lower number
+--- would be completely invisible. 4100 wins for the captures only.
+local CODE_SYNTAX_PRIORITY = 4100
+
+--- Treesitter-highlight freshly rendered code input under the builtin engine.
+--- Declared ahead of render_input(), defined after ts_highlights() which it uses.
+---@type fun(history: pi.ChatHistory, start_row: integer, lines: string[], lang: string?)
+local apply_code_syntax
+
 --- Render input lines, wrapping in a fenced code block when render-markdown
 --- is active so that shell comments (#) and other markdown-significant syntax
 --- in tool input are not misparsed as headings, lists, etc.
@@ -327,6 +369,9 @@ local function render_input(history, lines, lang, insert_at)
             })
         end
     end
+    -- render-markdown colours fenced code itself; the builtin engine gets no
+    -- syntax highlighting from the fence, so paint it here.
+    apply_code_syntax(history, start, lines, lang)
     return insert_at
 end
 
@@ -436,6 +481,42 @@ local function ts_highlights(text, lang)
         end
     end
     return result
+end
+
+--- Apply builtin-engine treesitter syntax highlighting to a rendered code
+--- input block (codemode's JavaScript, bash's shell). ts_highlights() returns
+--- an empty map when the parser or the highlight query is unavailable, so a
+--- Neovim without the language installed silently renders flat text.
+---@param history pi.ChatHistory
+---@param start_row integer 0-indexed buffer row of the first code line
+---@param lines string[] raw code lines (unfenced)
+---@param lang? string treesitter language
+apply_code_syntax = function(history, start_row, lines, lang)
+    -- The render-markdown fence already gives the code block a background and
+    -- its own highlights; adding ts extmarks there duplicates them.
+    if Render.engine() == "render-markdown" then
+        return
+    end
+    if type(lang) ~= "string" or lang == "" or #lines == 0 then
+        return
+    end
+    local hl_map = ts_highlights(table.concat(lines, "\n"), lang)
+    for row0, hls in pairs(hl_map) do
+        local row = start_row + row0
+        for _, h in ipairs(hls) do
+            -- A capture may reference a row past the rendered lines when the
+            -- buffer insertion shifted (defensive: pcall keeps it silent).
+            -- Priority must beat the flat PiToolCall span render_body_line()
+            -- paints over the whole line: extmarks default to priority 4096,
+            -- so a lower number is simply invisible. 4100 wins without
+            -- touching the container's own highlight.
+            pcall(vim.api.nvim_buf_set_extmark, history:buf(), history:ns(), row, h.sc, {
+                end_col = h.ec,
+                hl_group = h.hl,
+                priority = CODE_SYNTAX_PRIORITY,
+            })
+        end
+    end
 end
 
 --- Apply treesitter syntax highlights to rendered diff lines.
@@ -669,6 +750,32 @@ local function truncate_line(line, max_width)
     return cut_prefix(line, head_width) .. "…" .. cut_suffix(line, tail_width)
 end
 
+--- Length of the code fence left open at the end of `lines`, or nil when every
+--- fence is closed.
+---
+--- Markdown closes a fence opened with N backticks only on a row carrying at
+--- least N backticks, so a ``` row inside a ```` block is content, not a fence.
+--- Counting fence rows alone mis-reads that nesting and would "close" an
+--- already balanced block, adding a fresh unmatched opener.
+---@param lines string[]
+---@return integer? fence_len backtick run of the unclosed fence
+local function open_fence_length(lines)
+    local open = nil ---@type integer?
+    for _, line in ipairs(lines) do
+        local ticks = line:match("^%s*(`+)")
+        -- Markdown only recognises a fence from three backticks up; a line
+        -- that merely starts with one or two is ordinary text.
+        if ticks and #ticks >= 3 then
+            if not open then
+                open = #ticks
+            elseif #ticks >= open then
+                open = nil
+            end
+        end
+    end
+    return open
+end
+
 --- Build a structured collapsed view for a tool block.
 --- Input: ≤ input_visible as-is, otherwise first input_visible line(s) + "+N lines".
 --- Separator + output hidden entirely when output_visible = 0.
@@ -692,8 +799,11 @@ function M.build_collapsed_view(input_lines, output_lines, has_output, input_vis
         specs[#specs + 1] = spec
     end
 
-    -- Input
+    -- Input: the visible lines first, the elision summary after them. The
+    -- summary counts the lines it stands for, so printing it above the line it
+    -- summarises reads as a header for nothing.
     local visible_input = {}
+    local elided_input = 0
     if #input_lines <= input_visible then
         for _, l in ipairs(input_lines) do
             visible_input[#visible_input + 1] = l
@@ -702,8 +812,7 @@ function M.build_collapsed_view(input_lines, output_lines, has_output, input_vis
         for i = 1, input_visible do
             visible_input[#visible_input + 1] = input_lines[i]
         end
-        lines[#lines + 1] = " +" .. (#input_lines - input_visible) .. " lines"
-        specs[#specs + 1] = "summary"
+        elided_input = #input_lines - input_visible
     end
 
     -- When render-markdown is active, wrap visible input in a code fence
@@ -726,6 +835,13 @@ function M.build_collapsed_view(input_lines, output_lines, has_output, input_vis
         for _, l in ipairs(visible_input) do
             add(l, "input")
         end
+    end
+
+    -- The input elision summary goes *under* the input rows it stands for (it
+    -- used to be emitted first, as if it were a header above them).
+    if elided_input > 0 then
+        lines[#lines + 1] = " +" .. elided_input .. " lines"
+        specs[#specs + 1] = "summary"
     end
 
     -- Separator + Output (hidden entirely when output_visible = 0)
@@ -768,6 +884,18 @@ function M.build_collapsed_view(input_lines, output_lines, has_output, input_vis
                 add(l, "output")
             end
         end
+    end
+
+    -- Close a fence the visible window left open. The input/output slots can
+    -- cut a fenced block in half: collapsing to the last rows of a codemode or
+    -- bash output whose tail is a ```snippet``` keeps only its closing fence.
+    -- An unmatched ``` opens a code block that swallows the footer and every
+    -- later message, so close it explicitly. Engine-independent — the builtin
+    -- engine's treesitter markdown parses fences too.
+    local open_fence = open_fence_length(lines)
+    if open_fence then
+        lines[#lines + 1] = string.rep("`", open_fence)
+        specs[#specs + 1] = "output"
     end
 
     return lines, specs
@@ -905,6 +1033,12 @@ end
 ---@class pi.ToolRenderer
 ---@field on_start? fun(history: pi.ChatHistory, args: table?)
 ---@field on_end? fun(history: pi.ChatHistory, args: table?, result: table?, is_error: boolean?, insert_at: integer?): integer?
+--- Live rows for a still-running tool, derived from a `tool_execution_update` message instead of
+--- its streamed text. The returned lines MUST start with the empty separator row the live-update
+--- region expects (the painter skips `lines[1]` and colours `lines[2..n]` as `PiToolOutput`).
+--- Return nil to fall back to the streamed-text path (the default when a tool streams
+--- `partialResult.content` text).
+---@field on_update? fun(history: pi.ChatHistory, args: table?, msg: table?): string[]?
 ---@field input_visible? integer  lines to show when collapsed (default: show all)
 ---@field output_visible? integer lines to show when collapsed (default: show all)
 ---@field always_expanded? boolean  never auto-collapse: no line-count threshold and no window-width elision
@@ -912,6 +1046,60 @@ end
 ---@field display_name? fun(args: table?): string?  user-facing tool label (defaults to RPC tool name)
 ---@field inline_text? fun(history: pi.ChatHistory, args: table?): string?  text to show after tool name
 ---@field inline_status? fun(result: table?, is_error: boolean?): string?  extra text next to status icon
+
+--- Rows kept by codemode's live call list while the script runs (the most
+--- recent ones — a long-running script would otherwise scroll away).
+local CODEMODE_LIVE_CALLS = 8
+
+--- Live rows for a running codemode script: the nested calls it has made so
+--- far. pi publishes `onUpdate({ content = {}, details = snapshot() })`, so a
+--- live `tool_execution_update` for codemode carries the call records and no
+--- text at all — without this hook the block stays empty until the script ends.
+---
+--- Returns nil when the script has not called a tool yet (or the message is not
+--- a codemode update), so the caller falls back to the streamed-text path and
+--- nothing extra is shown.
+---@param msg table? raw `tool_execution_update` message
+---@return string[]? lines rows starting with the empty separator row the live-update region expects
+local function codemode_live_rows(msg)
+    local partial = msg and msg.partialResult
+    if type(partial) ~= "table" then
+        return nil
+    end
+    -- parse() already normalizes whatever call record shape the message uses
+    -- (`details.calls`, `details.nestedCalls.calls`, `partialResult.nestedCalls.calls`)
+    -- and returns nil when a record carries neither text nor calls.
+    local parsed = CodemodeToolUi.parse({
+        content = type(partial.content) == "table" and partial.content or {},
+        details = partial.details,
+        nestedCalls = partial.nestedCalls,
+    })
+    if not parsed or #parsed.calls == 0 then
+        return nil
+    end
+
+    -- format_calls() elides the *tail*, which is wrong for a live view: the
+    -- newest calls are the interesting ones. Slice the tail here instead and
+    -- announce the elided head ourselves.
+    local calls = parsed.calls
+    local first = math.max(1, #calls - CODEMODE_LIVE_CALLS + 1)
+    local tail = {} ---@type pi.CodemodeCall[]
+    for i = first, #calls do
+        tail[#tail + 1] = calls[i]
+    end
+    ---@type string[]
+    local lines = { "" }
+    if first > 1 then
+        local earlier = first - 1
+        lines[#lines + 1] = ("… %d earlier %s"):format(earlier, earlier == 1 and "call" or "calls")
+    end
+    ---@type pi.CodemodeOutput
+    local snapshot = { calls = tail, calls_complete = true, sections = {}, failed = false, outputs = 0 }
+    for _, row in ipairs(CodemodeToolUi.format_calls(snapshot)) do
+        lines[#lines + 1] = row.text
+    end
+    return lines
+end
 
 ---@type table<string, pi.ToolRenderer>
 local renderers = {
@@ -943,6 +1131,77 @@ local renderers = {
                 insert_at = render_output(history, text, insert_at)
             end
             return insert_at
+        end,
+    },
+    -- codemode: the input is raw JavaScript, so the block body is the script
+    -- itself; the result body is rebuilt from the parsed wire record (nested
+    -- tool-call rows, then the numbered/console/error output sections) by
+    -- lua/pi/codemode/tool_ui.lua. The first on_end row MUST be the empty
+    -- separator: extract_tool_sections() treats it as render_output()'s blank
+    -- line and uses it to split input from output.
+    codemode = {
+        input_visible = 1,
+        output_visible = 3,
+        -- The live rows come from the message, not from the tool input.
+        on_update = function(_, _, msg)
+            return codemode_live_rows(msg)
+        end,
+        on_start = function(history, args)
+            local code = args and args.code
+            if type(code) ~= "string" then
+                return
+            end
+            code = code:gsub("\r", "")
+            -- Parenthesised: gsub returns the replacement count as a second
+            -- value, which vim.trim() would take as its options mask.
+            code = vim.trim((code:gsub("%s+$", ""))) -- drop trailing blank lines only
+            if code == "" then
+                return
+            end
+            render_input(history, vim.split(code, "\n", { plain = true }), "javascript")
+        end,
+        on_end = function(history, _, result, is_error, insert_at)
+            local parsed = CodemodeToolUi.parse(result)
+            if not parsed then
+                -- Not a codemode-shaped result (e.g. a blocked call): default rendering.
+                return render_result_output(history, nil, result, is_error, insert_at)
+            end
+            -- Every row goes through render_code_row(), not render_body_line():
+            -- call args, JSON payloads and stack traces carry indentation that
+            -- flatten_line() would collapse.
+            ---@type pi.CodemodeRow[]
+            local body = { { text = "" } }
+            vim.list_extend(body, CodemodeToolUi.format_calls(parsed))
+            vim.list_extend(body, CodemodeToolUi.format_sections(parsed))
+
+            -- Close a fence the script's own output left open: pi truncates
+            -- long output, so a ```snippet``` pair can arrive half-eaten and
+            -- an unmatched ``` opens a code block that swallows the footer and
+            -- every later message. The hint is virtual text — it must never
+            -- become part of the fence row itself.
+            local quoted = {} ---@type string[]
+            for _, row in ipairs(body) do
+                quoted[#quoted + 1] = row.text
+            end
+            local open_fence = open_fence_length(quoted)
+            if open_fence then
+                body[#body + 1] = { text = string.rep("`", open_fence) }
+            end
+
+            for _, row in ipairs(body) do
+                insert_at = render_code_row(history, row.text, row.hl, insert_at)
+            end
+            if open_fence then
+                local close_row = insert_at and (insert_at - 1) or (vim.api.nvim_buf_line_count(history:buf()) - 1)
+                vim.api.nvim_buf_set_extmark(history:buf(), history:ns(), close_row, open_fence, {
+                    virt_text = { { " ← auto-closed", "PiWarning" } },
+                    virt_text_pos = "inline",
+                })
+            end
+            return insert_at
+        end,
+        inline_status = function(result)
+            return CodemodeToolUi.summary(result)
         end,
     },
     read = {

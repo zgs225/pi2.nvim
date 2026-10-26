@@ -3305,12 +3305,18 @@ function History:_apply_tool_update(tool_call_id, msg)
         return
     end
 
-    local text = extract_tool_update_text(msg)
-    if not text then
-        return
+    -- A renderer may derive live rows from the message itself (codemode streams
+    -- its nested calls in `partialResult.details`, with no text at all).
+    local renderer = Tools.get_renderer(block.tool_name)
+    local lines = renderer.on_update and renderer.on_update(self, block.tool_input, msg) or nil
+    if not lines then
+        local text = extract_tool_update_text(msg)
+        if not text then
+            return
+        end
+        lines = build_tool_live_update_lines(text)
     end
 
-    local lines = build_tool_live_update_lines(text)
     local start_row
     local old_line_count = block.live_update_line_count
     if block.live_update_extmark and old_line_count then

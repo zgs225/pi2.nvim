@@ -754,7 +754,7 @@ Successful tool calls end silently (a blank breathing line); only errors print a
 Tools come in two rendering styles:
 
 - **Inline tools** render as a single line. `read` is the canonical example — it shows `read tools.lua (42 lines)` and stays on one line even when the file is huge, because inlining the content would just be noise. Consecutive inline tool calls are grouped without blank lines between them.
-- **Full-block tools** get the multi-line indented block shown above. `bash`, `edit`, `write`, the built-in read-only search tools (`grep`, `find`, `ls`), the four [pi-web-access](https://github.com/nicobailon/pi-web-access) tools (`web_search`, `fetch_content`, `source_check`, `get_search_content`), and any tool pi2.nvim doesn't have a dedicated renderer for fall into this category.
+- **Full-block tools** get the multi-line indented block shown above. `bash`, `edit`, `write`, the built-in read-only search tools (`grep`, `find`, `ls`), the four [pi-web-access](https://github.com/nicobailon/pi-web-access) tools (`web_search`, `fetch_content`, `source_check`, `get_search_content`), [`codemode`](#code-mode-codemode), and any tool pi2.nvim doesn't have a dedicated renderer for fall into this category.
 
 ### Path display
 
@@ -778,6 +778,8 @@ A few renderers opt out. `always_expanded` (used by `todo_write`) bypasses the a
 
 A collapsed line that is still wider than the window is elided in the **middle** (`apps/web-antd/src/views…/ReportMetricsFormDrawer.vue`) rather than cut off at the right edge, so the file name of a path — or the end of a command — stays readable. Expanding the block (`<Tab>`) always shows the full line.
 
+A collapsed block puts the `+N lines` input marker **below** the visible input line(s) rather than above them, so the first line of the block is the first line of the call — the script, the command, the pattern — and only the elision marker follows. A collapsed block also auto-closes an unbalanced markdown fence: when the visible output contains ```` ``` ````, a closing fence is appended for the collapsed render, so tool output can never bleed code styling into the rest of the conversation.
+
 Bind `pi.toggle_history_blocks()` to expand/collapse all expandable history blocks at once; the [Keymaps](keymaps.md) example uses `<C-o>`.
 
 Built-in thresholds:
@@ -791,6 +793,7 @@ Built-in thresholds:
 | `grep` | 1 | 1 | Built-in search — `/{pattern}/ in {path}`, with optional `({glob})` and `limit {limit}` |
 | `find` | 1 | 1 | Built-in search — `{pattern} in {path}`, with optional `(limit {limit})` (`glob` is accepted as an alias) |
 | `ls` | 1 | 1 | Built-in listing — `{path}` (defaults to `.`), with optional `(limit {limit})` |
+| `codemode` | 1 | 3 | Code-mode tool — the JavaScript script is the input; nested tool calls plus numbered output sections are the output |
 | `web_search` | 1 | 1 | [pi-web-access](https://github.com/nicobailon/pi-web-access) — the `query`, or up to three `queries` joined with ` · ` (longer lists truncate as `…(+N)`) |
 | `fetch_content` | 1 | 1 | pi-web-access — the `url`, or each entry of `urls` on its own line |
 | `source_check` | 1 | 1 | pi-web-access — the `claim` being checked |
@@ -823,6 +826,32 @@ The prefix is stripped from the displayed text before the block is rendered, so 
 
 > [!NOTE]
 > Tool renderers are currently **hard-coded** in `lua/pi/ui/chat/tools.lua`. There's no config surface for registering your own renderer or adjusting built-in thresholds. If you'd like any of these to be configurable, please open an issue.
+
+### Code mode (`codemode`)
+
+`codemode` is a pi tool whose input is raw JavaScript, run in a QuickJS sandbox where the script can call other tools and `models` itself — only what the script prints reaches the model. pi2.nvim renders it as a full block:
+
+```
+▾ 󰌞 codemode                        1 call · 2 outputs   Took 0.5s
+  const r = await tools.mcp__trilium__search_notes({ query: "note.type = text" });
+  ↳ ✓ mcp__trilium__search_notes {"query":"note.type = text","limit":3…  418ms
+  ── text 1/2 ──
+  isError=false blocks=1
+  ── text 2/2 ──
+  {"totalResults":1288,…
+```
+
+The script is the block input, syntax-highlighted as JavaScript when the treesitter `javascript` parser is installed (the same highlighting now applies to `bash` input). Under `render = { engine = "render-markdown" }` it is a fenced `javascript` code block instead.
+
+pi's wire boilerplate is dropped: the `Script completed` / `Script failed` line, `Wall time … seconds`, and `Output:` never reach the buffer, because the block header already carries the status and `Took …`.
+
+Nested tool calls render before the output, one row each — `↳ ✓ mcp__trilium__search_notes {"query":"note.type = text"} 418ms`. The glyph vocabulary is the one shared with the [sub-agent tree](extensions.md#bundled-sub-agent-extension-extensionssubagentts) (`◐` running, `✓` ok, `✗` error, `⊘` cancelled), arguments are cut at 40 characters, a duration is appended as `418ms` or `1.2s`, and a call that reports a cost gets a `$0.0012` tail. A failing call adds one indented continuation row with the first line of its error, and past 50 calls the tail collapses to a `… N more calls` row. While the script runs, the block lists the calls it has made so far — the most recent eight, prefixed with `… N earlier calls` once there are more — and replaces them with the final rows when it finishes.
+
+Output is split into sections with headers instead of pi's raw `==> text N/M <==` markers: `── text 1/2 ──` appears only when the script printed more than one item, `── console ──` holds `console.*` output (its `<console_output>` tags are stripped), and `── error ──` carries a failed script's message plus its `Tool calls made before the failure …` line, highlighted as an error. When pi spills a truncated output to a file, a closing `Full output: <path>` row points at it.
+
+The block header carries a badge with the call and item counts — `▾ 󰌞 codemode  1 call · 2 outputs  Took 0.5s` — and omits the part that would say nothing (no calls, or a single output next to no calls). Collapsed, the block shows the script's first line and the last three output lines, with the usual [`+N lines` / `…N lines`](#auto-collapse-and-tab) markers; `<Tab>` expands it to the full script, every call row, and every output section.
+
+No highlight groups were added for this renderer: the block reuses `PiToolCall`, `PiToolOutput`, `PiToolStatus`, `PiToolError`, and `PiToolRunning`.
 
 ## Todo list
 
