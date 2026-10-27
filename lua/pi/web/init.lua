@@ -116,13 +116,8 @@ function M.start_daemon()
     --- @type table
     local job_opts = { detach = true }
     local env = {}
-    local mode = cfg.access
-    if mode == "ask" or mode == nil then
-        local ok_access, Access = pcall(require, "pi.web.access")
-        mode = ok_access and Access.get() or nil
-    end
-    if type(mode) == "string" and mode ~= "" then
-        env.PI2_ACCESS_MODE = mode
+    if type(cfg.host) == "string" and cfg.host ~= "" then
+        env.PI2_HOST = cfg.host
     end
     if type(cfg.public_url) == "string" and cfg.public_url ~= "" then
         env.PI2_PUBLIC_URL = cfg.public_url

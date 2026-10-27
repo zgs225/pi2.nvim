@@ -340,7 +340,7 @@
 ---@field daemon_args? string[] Extra arguments appended after `daemon` on lazy start
 ---@field workspace_roots? string[] Workspace roots advertised to the daemon via `PI2_WORKSPACE_ROOTS`
 ---@field log? boolean|string Write bridge diagnostics to `stdpath("log")/pi2-web.log` (true) or to this path
----@field access? "local"|"lan"|"tailscale"|"ask" Console access mode: `local` (loopback only), `lan`, `tailscale`, or `ask` to prompt once and remember the answer (default "ask")
+---@field host? string Bind address for `pi2 daemon` (PI2_HOST); nil → the daemon default 0.0.0.0, set "127.0.0.1" for loopback-only
 ---@field public_url? string External base URL advertised to the daemon (PI2_PUBLIC_URL), e.g. "https://myhost.tail1234.ts.net"
 ---@field install_dir? string Where `:PiWebInstall` puts the pi2d npm package (default `<stdpath("data")>/pi2d`)
 ---@field open? boolean Open the browser from `:PiWeb` (default true)
@@ -592,12 +592,13 @@ local defaults = {
         daemon_args = {},
         workspace_roots = nil,
         log = false,
-        -- Console access mode (`:PiWeb`/`:PiWebAccess`). "ask" prompts once on the
-        -- first `:PiWeb` and remembers the answer in
-        -- stdpath("state")/pi2/access.json; a concrete mode pins it.
-        access = "ask",
+        -- Bind address for `pi2 daemon` (PI2_HOST). nil keeps the daemon
+        -- default, 0.0.0.0 (reachable from the LAN); "127.0.0.1" restricts the
+        -- console to this machine. Loopback is always accepted, so :PiWeb signs
+        -- in either way; other devices pair through :PiWebPair.
+        host = nil,
         -- External base URL advertised to the daemon (PI2_PUBLIC_URL), e.g.
-        -- "https://myhost.tail1234.ts.net". Required for `tailscale`.
+        -- "https://myhost.tail1234.ts.net" (no trailing slash).
         public_url = nil,
         -- Where :PiWebInstall puts the pi2d npm package (resolved as
         -- <install_dir>/node_modules/.bin/pi2).

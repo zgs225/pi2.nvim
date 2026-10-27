@@ -1,9 +1,8 @@
 -- Local-browser login handshake (`POST /api/v1/console/session`).
 --
--- `:PiWeb` in `local` access mode must land in an *already signed in* browser:
--- the daemon mints (rotates) the local-browser device token and returns a
--- `#t=<token>` handoff URL. The credentials for that call live next to the
--- daemon: `<runtime>/daemon.json` (actual bound port) and `<runtime>/cli.token`
+-- `:PiWeb` must land in an *already signed in* browser: the daemon mints
+-- (rotates) the local-browser device token and returns a `#t=<token>` handoff
+-- URL. The credentials for that call live next to the daemon: `<runtime>/daemon.json` (actual bound port) and `<runtime>/cli.token`
 -- (local admin token, 0600).
 --
 -- The token never appears in argv (world-readable through `ps`): curl reads the
@@ -220,8 +219,9 @@ function M.open_url(url, opts)
     return M.spawn({ "xdg-open", url }, o)
 end
 
---- Sign in and open the browser. Callers must only use this for
---- `access == "local"` (non-loopback modes pair instead of auto-signing-in).
+--- Sign in and open the browser. This is the loopback handshake: the daemon
+--- only accepts it from this machine, so other devices pair via `:PiWebPair`
+--- instead of being signed in.
 --- @param opts? pi.web.LoginOpts
 --- @return string|nil url, string|nil err
 function M.open(opts)

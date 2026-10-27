@@ -181,15 +181,29 @@ Whenever a task reaches a terminal state — completed, failed, or stopped — t
 
 | Command | Action |
 | --- | --- |
-| `:PiWeb` | The whole flow: asks for the access mode once (then remembers it), resolves and starts the daemon, waits up to 10 s for `<runtime>/daemon.json`, then opens an already-signed-in browser (`local`) or shows the external URL plus the `:PiWebPair` hint (`lan`/`tailscale`) |
+| `:PiWeb` | The whole flow: resolves and starts the daemon, waits up to 10 s for `<runtime>/daemon.json`, then signs a local browser in (`web.open = false` only reports the URL) |
 | `:PiWebInstall [--global]` | `npm i --prefix <web.install_dir> @yuez/pi2d@latest` (`--global`: `npm i -g @yuez/pi2d@latest`), then reports which executable the resolution ladder picked |
 | `:PiWebUpdate [--global]` | Same install as `:PiWebInstall` plus a reminder that a running daemon must be restarted (`pi2 daemon --force`) |
 | `:PiWebDoctor` | Runs `<pi2> doctor --json` and shows the `name status detail` lines |
-| `:PiWebAccess [mode]` | Choose (`local`/`lan`/`tailscale`, via `vim.ui.select`) or set the access mode; a running daemon must be restarted to apply it |
-| `:PiWebPair` | Mints a pairing code (`--public-url` when one is configured) and shows the URL + code |
+| `:PiWebPair` | Mints a pairing code (the daemon picks the base) and draws it as a **scannable QR code** in a floating window, together with the link, the code and the expiry — point a phone camera at it and the console opens on the connect page with the code already filled in. `q`/`<Esc>` close, `r` mints a fresh code, `y` copies the link. The picker chooses which host goes into the link, so the code is reachable from the phone; an unreachable address is refused with what to change. Hosts without a UI get the URL + code as a notify instead |
 | `:PiWebStart` | Start the bridge; spawns `pi2 daemon` detached if `<runtime>/d.sock` is missing |
 | `:PiWebStop` | Stop the bridge (sessions and the daemon keep running) |
 | `:PiWebStatus` | Show bridge/socket/workspace/instance/session counts |
+
+### Scanning the code
+
+`:PiWebPair` draws the pairing link as a QR code so a phone can join without typing a host, port or code:
+
+- **It asks which address to use first.** The `POST /api/v1/pair` mint response reports every base the daemon can see — interface name, IPv4 address and URL, best first (`public` → `LAN` → routed → `tailscale`) — and the picker lists them. It goes through `vim.ui.select`, so telescope/fzf-lua replace it like anywhere else, and the menu is skipped when there is only one choice.
+- The chosen base is then **probed with a TCP connect** before anything is drawn. If nothing answers there, the command says why and what to change instead of drawing an unreachable code — a daemon bound to loopback fails it, so it points at `web.host`/`PI2_HOST` plus a daemon restart.
+- The matrix is minted on the chosen base (the re-mint sends `base=<url>`, and the daemon only accepts a base it just offered → `qr.rows`, byte mode, ECC M), so the symbol and the link always encode the same URL.
+- Scanning `http://<host>:<port>/pair/<CODE>` pairs the device **immediately**: the link carries host, port and code, the page redeems it against its own origin with a default device name, and the browser lands on the console. No form, no typing. Only a rejected/expired code falls back to the form (prefilled) with the inline error; tokens are per device and revocable.
+- `:PiWeb` only signs a local browser in; `:PiWebPair` is the way to put the console on another device, and the one-command path never opens a code you did not ask for.
+- The code expires after 10 minutes (`r` mints a new one); the footer under the symbol shows the countdown.
+
+The symbol is drawn with the [`PiWebQr`](highlight-groups.md#web-console-qr) highlight group, which forces a black-on-white palette regardless of your colorscheme — scanners need the contrast. Override it if you want different colors.
+
+Loopback links are never drawn: a code pointing at `127.0.0.1` cannot be opened by any other device, so the command tells you to set `web.host = "0.0.0.0"` (or `PI2_HOST`), restart the daemon (`pi2 daemon --force`), and run `:PiWebPair` again.
 
 ### How `:PiWeb` finds the daemon
 
@@ -205,15 +219,11 @@ Whenever a task reaches a terminal state — completed, failed, or stopped — t
 
 Nothing is ever auto-installed: when no candidate qualifies, `:PiWeb` tells you to run `:PiWebInstall`.
 
-### Access modes
+### Binding and reachability
 
-| Mode | Bind | Browser |
-| --- | --- | --- |
-| `local` (default) | `127.0.0.1` | `:PiWeb` signs the local browser in through `POST /api/v1/console/session` and `#t=<token>` |
-| `lan` | `0.0.0.0` | never auto-signed-in — `:PiWeb` prints the URL and `:PiWebPair` pairs each device |
-| `tailscale` | `127.0.0.1` | reachable through [`web.public_url`](configuration.md); pairing, no auto-sign-in |
+`pi2 daemon` binds `0.0.0.0` by default, so the console is reachable from the LAN (or a tailnet) as soon as it runs. [`web.host`](configuration.md) is passed to the daemon as `PI2_HOST` when the plugin spawns it; `PI2_HOST=127.0.0.1` restricts the daemon to this machine (set the same value in `web.host` so a restart keeps it).
 
-The choice is `web.access` when it is not `"ask"`, otherwise the remembered value in `stdpath("state")/pi2/access.json` (written 0600, atomic rename), otherwise `local`. The daemon gets it as `PI2_ACCESS_MODE` (and `web.public_url` as `PI2_PUBLIC_URL`) when the plugin spawns it.
+Loopback is always accepted, so `:PiWeb` keeps signing the local browser in (`POST /api/v1/console/session` → `#t=<token>`) whatever the bind address is. Signing in from another device is a pairing, not a login: `:PiWebPair` mints a code, the picker chooses which host goes into the link/QR code (so the phone gets an address it can actually reach), and the chosen base is probed before the symbol is drawn. `web.public_url` (passed as `PI2_PUBLIC_URL`) advertises an external base, e.g. a [`tailscale serve`](https://tailscale.com/kb/1242/tailscale-serve) URL, and is what the pairing picker offers first.
 
 The login handshake reads the real port from `<runtime>/daemon.json` and the local admin token from `<runtime>/cli.token`, `POST`s `/api/v1/console/session` (loopback only, 5 s bounded `vim.system` call) and hands the returned URL to `vim.ui.open` (`xdg-open`/`open` as fallback). The token travels on stdin, is never printed or logged, and the URL is only passed to the opener — use `pi2 open --print` if you need it in a terminal.
 

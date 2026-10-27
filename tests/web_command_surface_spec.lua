@@ -1,7 +1,7 @@
--- `:PiWeb*` command surface: all seven console commands are registered, and the
--- pure helpers behind them (`cli_argv`, doctor/pairing rendering, the external
--- URL) behave. The command bodies themselves are exercised through the module
--- entry points elsewhere; here the contract is "they exist and degrade".
+-- `:PiWeb*` command surface: all five console commands are registered, and the
+-- pure helpers behind them (`cli_argv`, doctor/pairing rendering, the local
+-- launch flow) behave. The command bodies themselves are exercised through the
+-- module entry points elsewhere; here the contract is "they exist and degrade".
 
 local Config = require("pi.config")
 Config.setup({})
@@ -12,14 +12,14 @@ local Ctl = require("pi.web.ctl")
 describe(":PiWeb command surface", function()
     it("registers every console command", function()
         local cmds = vim.api.nvim_get_commands({})
-        for _, name in ipairs({ "PiWeb", "PiWebInstall", "PiWebUpdate", "PiWebDoctor", "PiWebAccess", "PiWebPair" }) do
+        for _, name in ipairs({ "PiWeb", "PiWebInstall", "PiWebUpdate", "PiWebDoctor", "PiWebPair" }) do
             assert.is_not_nil(cmds[name], "missing :" .. name)
         end
         -- The pre-existing lifecycle commands stay registered.
         for _, name in ipairs({ "PiWebStart", "PiWebStop", "PiWebStatus" }) do
             assert.is_not_nil(cmds[name], "missing :" .. name)
         end
-        assert.equals("?", cmds.PiWebAccess.nargs)
+        assert.is_nil(cmds.PiWebAccess, ":PiWebAccess is gone with the access modes")
         assert.equals("*", cmds.PiWebInstall.nargs)
     end)
 
@@ -29,12 +29,8 @@ describe(":PiWeb command surface", function()
             Ctl.cli_argv({ bin = "npx", source = "npx" }, "doctor", { "--json" })
         )
         assert.same(
-            { "/usr/local/bin/pi2", "pairing", "--public-url", "https://h.ts.net" },
-            Ctl.cli_argv(
-                { bin = "/usr/local/bin/pi2", source = "path" },
-                "pairing",
-                { "--public-url", "https://h.ts.net" }
-            )
+            { "/usr/local/bin/pi2", "daemon", "--force" },
+            Ctl.cli_argv({ bin = "/usr/local/bin/pi2", source = "path" }, "daemon", { "--force" })
         )
     end)
 
@@ -43,37 +39,41 @@ describe(":PiWeb command surface", function()
             ok = false,
             checks = {
                 { name = "node", status = "ok", detail = "v22.1.0" },
-                { name = "access", status = "warn", detail = "lan (bind 0.0.0.0/7676)" },
+                { name = "bind", status = "warn", detail = "127.0.0.1:7676" },
             },
         })
-        assert.same({ "node ok v22.1.0", "access warn lan (bind 0.0.0.0/7676)" }, Ctl.render_doctor(report))
+        assert.same({ "node ok v22.1.0", "bind warn 127.0.0.1:7676" }, Ctl.render_doctor(report))
         assert.same({}, Ctl.render_doctor(""))
         assert.same({ "plain text report" }, Ctl.render_doctor("plain text report\n"))
     end)
 
-    it("renders the pairing url + code", function()
-        local stdout = "url     http://127.0.0.1:7676/pair/ABCD-1234\n"
-            .. "code    ABCD-1234\n"
-            .. "expires 2026-01-01T00:00:00.000Z (60s)\n"
-            .. 'qr      {"v":1}\n'
+    it("summarises a pairing report on hosts without a UI", function()
         assert.equals(
-            "web console: pair a device at http://127.0.0.1:7676/pair/ABCD-1234 (code ABCD-1234)",
-            Ctl.render_pairing(stdout)
+            "web console: pair a device at http://192.168.2.10:7676/pair/ABCD2345 (code ABCD2345)",
+            Ctl.pairing_line({ url = "http://192.168.2.10:7676/pair/ABCD2345", code = "ABCD2345" })
         )
     end)
 
-    it("prefers the daemon's publicUrl for the external URL", function()
-        local saved = Config.options.web.public_url
-        Config.options.web.public_url = nil
-        assert.equals(
-            "https://myhost.tail1234.ts.net",
-            Ctl.external_url("tailscale", { port = 7676, publicUrl = "https://myhost.tail1234.ts.net/" })
-        )
-        Config.options.web.public_url = nil
-        assert.is_truthy(Ctl.external_url("lan", { port = 7676 }):find("other devices", 1, true))
-        Config.options.web.public_url = "https://cfg.example"
-        assert.equals("https://cfg.example", Ctl.external_url("lan", { port = 7676 }))
-        Config.options.web.public_url = saved
+    it("reports the URL instead of opening a browser when web.open is false", function()
+        local saved_open = Config.options.web.open
+        local saved_ensure = Ctl.ensure_running
+        local real_notify = vim.notify
+        local notes = {}
+        vim.notify = function(msg)
+            notes[#notes + 1] = tostring(msg)
+        end
+        Config.options.web.open = false
+        Ctl.ensure_running = function()
+            return { port = 7676 }
+        end
+        Ctl.launch()
+        Ctl.ensure_running = saved_ensure
+        Config.options.web.open = saved_open
+        vim.notify = real_notify
+
+        local reported = table.concat(notes, "\n")
+        assert.is_truthy(reported:find("http://127.0.0.1:7676", 1, true))
+        assert.is_truthy(reported:find("web.open is off", 1, true))
     end)
 
     it("degrades to a one-line notify instead of throwing", function()
@@ -87,7 +87,7 @@ describe(":PiWeb command surface", function()
         Ctl.launch = function()
             error("boom")
         end
-        local ok2 = Ctl.call("launch", "local")
+        local ok2 = Ctl.call("launch")
         Ctl.launch = real_launch
         vim.notify = real_notify
 

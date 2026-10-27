@@ -109,6 +109,14 @@ All highlight groups are defined with `default = true`, so they can be overridde
 | --- | --- |
 | `PiDialogTitle` | Dialog title bar |
 
+## Web console QR
+
+| Group | Role |
+| --- | --- |
+| `PiWebQr` | The QR code of the pairing link drawn by `:PiWebPair`; forces black on white (scanners need the contrast), so override both colors if you change it |
+| `PiWebQrInfo` | Link and code lines under the QR code (links to `Normal`) |
+| `PiWebQrHint` | Key hint line under the QR code (`q close · r new code · y copy link`, links to `Comment`) |
+
 ## Diff review
 
 | Group | Role |

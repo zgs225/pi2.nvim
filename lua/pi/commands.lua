@@ -280,12 +280,11 @@ function M.setup()
         end
     end
 
-    local complete_modes = complete_from({ "local", "lan", "tailscale" })
     local complete_flags_pi_web = complete_from({ "--global" })
 
     vim.api.nvim_create_user_command("PiWeb", function()
         pi_web("open_console")
-    end, { desc = "Open the π² web console (asks for the access mode once, installs/starts as needed)" })
+    end, { desc = "Open the π² web console (installs/starts the daemon as needed)" })
 
     vim.api.nvim_create_user_command("PiWebInstall", function(cmd)
         pi_web("install", vim.split(cmd.args, "%s+", { trimempty = true }))
@@ -306,14 +305,6 @@ function M.setup()
     vim.api.nvim_create_user_command("PiWebDoctor", function()
         pi_web("doctor")
     end, { desc = "Run `pi2 doctor --json` and show the checks" })
-
-    vim.api.nvim_create_user_command(
-        "PiWebAccess",
-        function(cmd)
-            pi_web("access", vim.split(cmd.args, "%s+", { trimempty = true }))
-        end,
-        { nargs = "?", complete = complete_modes, desc = "Choose or set the console access mode (local/lan/tailscale)" }
-    )
 
     vim.api.nvim_create_user_command("PiWebPair", function()
         pi_web("pair")

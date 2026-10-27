@@ -1,9 +1,10 @@
 -- `:PiWeb*` command implementations (the user-facing control surface).
 --
 -- This module is the only place that shells out for the console workflows:
--- install/update (npm), doctor, pairing and the one-command `:PiWeb` flow
--- (choose/remember access mode → resolve daemon → start the bridge → wait for
--- `<runtime>/daemon.json` → sign in a local browser or show the pairing hint).
+-- install/update (npm), doctor, pairing + the QR view and the one-command
+-- `:PiWeb` flow (resolve daemon → start the bridge → wait for
+-- `<runtime>/daemon.json` → sign in a local browser) and the `:PiWebPair`
+-- QR view.
 --
 -- Rules:
 --   * never throw at the user — `call()` wraps every entry point and degrades to
@@ -131,87 +132,55 @@ function M.daemon_running()
     return Runtime.read_daemon_json() ~= nil
 end
 
---- External base URL for `lan`/`tailscale` (never contains a token).
---- @param mode pi.web.AccessMode
---- @param info? table decoded `daemon.json`
---- @return string
-function M.external_url(mode, info)
-    info = info or {}
-    local public = info.publicUrl
-    if type(public) ~= "string" or public == "" then
-        public = web_config().public_url
-    end
-    if type(public) == "string" and public ~= "" then
-        return (public:gsub("/+$", ""))
-    end
-    local port = tonumber(info.port) or 7676
-    if mode == "tailscale" then
-        return ("http://127.0.0.1:%d (set web.public_url to your tailnet URL)"):format(port)
-    end
-    return ("http://127.0.0.1:%d (other devices: http://<this-host>:%d)"):format(port, port)
-end
-
 --- `:PiWeb`: the whole one-command flow.
 function M.open_console()
-    local ok, Access = pcall(require, "pi.web.access")
-    if not ok then
-        Notify.error("web console unavailable: " .. one_line(Access))
-        return
-    end
-    if Access.pinned() == nil and Access.remembered() == nil then
-        -- First run (or `web.access = "ask"` with nothing remembered): ask once,
-        -- then remember so the next `:PiWeb` is a single keystroke.
-        Access.choose(function(mode)
-            if not mode then
-                Notify.info("web console: no access mode chosen")
-                return
-            end
-            M.launch(mode)
-        end)
-        return
-    end
-    M.launch(Access.get())
+    M.launch()
 end
 
---- Run the console flow for one access mode.
---- @param mode pi.web.AccessMode
-function M.launch(mode)
+--- Resolve the daemon binary, spawn it when nothing publishes `daemon.json`, and
+--- wait (bounded) for it. Notifies the reason and returns `nil` on failure.
+--- @return table|nil info decoded `daemon.json`
+function M.ensure_running()
     local ok, Runtime = pcall(require, "pi.web.runtime")
     if not ok then
         Notify.error("web console unavailable: " .. one_line(Runtime))
-        return
+        return nil
     end
-    local resolved = Runtime.resolve_daemon()
-    if not resolved then
+    if not Runtime.resolve_daemon() then
         -- Never run npm behind the user's back: point at the explicit command.
         Notify.warn("pi2 daemon not found — run :PiWebInstall to install it")
-        return
+        return nil
+    end
+    local info = Runtime.read_daemon_json()
+    if info then
+        return info
     end
 
     local Web = require("pi.web")
     local valid, start_err = Web.start_daemon()
     if not valid and start_err and start_err:find("auto_start", 1, true) then
         Notify.error("web console: " .. one_line(start_err) .. " — start it with `pi2 daemon`")
-        return
+        return nil
     end
     pcall(Web.start)
 
-    local info = M.wait_for_daemon(M.START_TIMEOUT_MS)
+    info = M.wait_for_daemon(M.START_TIMEOUT_MS)
     if not info then
         local hint = start_err and (" (" .. one_line(start_err) .. ")") or ""
         Notify.error("web console: pi2 daemon did not start" .. hint .. " — run :PiWebDoctor")
+        return nil
+    end
+    return info
+end
+
+--- `:PiWeb`'s second half: sign a local browser in once the daemon is up.
+function M.launch()
+    local info = M.ensure_running()
+    if not info then
         return
     end
 
     local port = tonumber(info.port)
-    if mode ~= "local" then
-        -- Non-loopback access never auto-signs-in: pair the other device instead.
-        Notify.info(
-            ("web console (%s): %s — run :PiWebPair to pair a device"):format(mode, M.external_url(mode, info))
-        )
-        return
-    end
-
     if web_config().open == false then
         Notify.info(("web console ready at http://127.0.0.1:%s (web.open is off)"):format(tostring(port or "?")))
         return
@@ -354,111 +323,396 @@ function M.doctor()
     end)
 end
 
---- Report the effective mode, plus the restart hint when a daemon is live.
---- @param mode pi.web.AccessMode
-function M.report_access(mode)
-    local message = ("web console access mode: %s"):format(tostring(mode))
-    if M.daemon_running() then
-        message = message .. " — restart the running daemon to apply it (`pi2 daemon --force`)"
-    end
-    Notify.info(message)
-end
-
---- `:PiWebAccess [mode]`
---- @param args? string[]
-function M.access(args)
-    local ok, Access = pcall(require, "pi.web.access")
-    if not ok then
-        Notify.error("web console unavailable: " .. one_line(Access))
-        return
-    end
-    local mode = vim.trim(table.concat(args or {}, " "))
-    if mode == "" then
-        Access.choose(function(chosen)
-            if not chosen then
-                Notify.info("web console: access mode unchanged")
-                return
-            end
-            M.report_access(chosen)
-        end)
-        return
-    end
-    if not Access.is_mode(mode) then
-        Notify.error("web console: access mode must be local, lan or tailscale")
-        return
-    end
-    local saved, err = Access.set(mode)
-    if not saved then
-        Notify.error("web console: cannot save the access mode: " .. one_line(err))
-        return
-    end
-    M.report_access(saved)
-end
-
 --- External base URL the daemon advertises, when known.
 --- @param info? table decoded `daemon.json`
 --- @return string|nil
-function M.public_url(info)
-    local public = info and info.publicUrl
-    if type(public) ~= "string" or public == "" then
-        public = web_config().public_url
+--- One-line summary of a pairing report, for hosts with no UI to draw in.
+--- @param report { url: string, code: string }
+--- @return string
+function M.pairing_line(report)
+    return ("web console: pair a device at %s (code %s)"):format(report.url, report.code)
+end
+
+--- Normalise a pairing mint response into a render-ready report.
+---
+--- `payload` is either the decoded `POST /api/v1/pair` body or its JSON text.
+--- Returns `nil` for anything unusable (no URL/code, a matrix with a non-`1`/`0`
+--- character, a mis-sized grid), so callers fail with one message instead of
+--- drawing garbage.
+--- @param payload table|string|nil
+--- @return { url: string, code: string, expires_at: number|nil, version: number|nil, size: integer, rows: string[], bases: table[] }|nil
+function M.pairing_report(payload)
+    local decoded = payload
+    if type(payload) == "string" then
+        local text = vim.trim(payload)
+        if text == "" then
+            return nil
+        end
+        local ok, value = pcall(vim.json.decode, text)
+        if not ok or type(value) ~= "table" then
+            return nil
+        end
+        decoded = value
     end
-    if type(public) ~= "string" or public == "" then
+    if type(decoded) ~= "table" then
         return nil
     end
-    return (public:gsub("/+$", ""))
+    local url, code = decoded.url, decoded.code
+    if type(url) ~= "string" or url == "" or type(code) ~= "string" or code == "" then
+        return nil
+    end
+    local qr = decoded.qr
+    if type(qr) ~= "table" or type(qr.rows) ~= "table" then
+        return nil
+    end
+    local size = tonumber(qr.size)
+    local rows = {}
+    for _, row in ipairs(qr.rows) do
+        if type(row) ~= "string" or row == "" or row:find("[^01]") then
+            return nil
+        end
+        if size and #row ~= size then
+            return nil
+        end
+        rows[#rows + 1] = row
+    end
+    if #rows == 0 then
+        return nil
+    end
+    size = size or #rows
+    if #rows ~= size then
+        return nil
+    end
+    return {
+        url = url,
+        code = code,
+        expires_at = tonumber(decoded.expiresAt),
+        version = tonumber(qr.version),
+        size = size,
+        rows = rows,
+        --- Every address a phone could use, as reported by the mint response.
+        bases = type(decoded.bases) == "table" and decoded.bases or {},
+    }
 end
 
---- Render the `pi2 pairing` output (URL + code) into one line.
---- @param stdout string
---- @return string
-function M.render_pairing(stdout)
-    local text = stdout or ""
-    local url = text:match("url%s+(%S+)")
-    local code = text:match("code%s+(%S+)")
-    if url and code then
-        return ("web console: pair a device at %s (code %s)"):format(url, code)
-    end
-    if url then
-        return ("web console: pair a device at %s"):format(url)
-    end
-    local fallback = one_line(text)
-    if fallback == "" then
-        return "web console: pairing returned no code"
-    end
-    return "web console: " .. fallback
-end
+--- HTTP budget for the mint round-trip; the daemon answers immediately.
+M.MINT_TIMEOUT_MS = 5000
 
---- `:PiWebPair`
-function M.pair()
-    local ok, Runtime = pcall(require, "pi.web.runtime")
+--- POST `/api/v1/pair` and hand back a render-ready report.
+---
+--- The daemon owns the URL, the QR matrix and the base list (ADR 0001): this
+--- module only asks for them, so the symbol and the link always agree. The CLI
+--- token travels through curl's stdin config, so it never appears in `ps`.
+---
+--- @param base string|nil pin the link to one of the advertised bases
+--- @param on_done fun(report: table|nil, err: string|nil)
+--- @param opts? { port?: integer, token?: string, system?: fun(argv: string[], opts: table, on_exit: fun(res: table)): any, timeout?: integer }
+function M.mint_pair(base, on_done, opts)
+    opts = opts or {}
+    local ok_runtime, Runtime = pcall(require, "pi.web.runtime")
+    if not ok_runtime then
+        on_done(nil, "web console unavailable: " .. one_line(Runtime))
+        return
+    end
+    local daemon = Runtime.read_daemon_json() or {}
+    local port = tonumber(opts.port) or tonumber(daemon.port)
+    if not port or port <= 0 then
+        on_done(nil, "no daemon port — is `pi2 daemon` running?")
+        return
+    end
+    local token = opts.token or Runtime.read_text(Runtime.cli_token_path())
+    if type(token) ~= "string" or token == "" then
+        on_done(nil, "no CLI token in the runtime dir — restart `pi2 daemon`")
+        return
+    end
+
+    local body = "{}"
+    if type(base) == "string" and base ~= "" then
+        body = vim.json.encode({ base = base })
+    end
+    local argv = {
+        "curl",
+        "-sS",
+        "-X",
+        "POST",
+        "-H",
+        "@-",
+        "-H",
+        "Content-Type: application/json",
+        "--data",
+        body,
+        "-w",
+        "\n%{http_code}",
+        ("http://127.0.0.1:%d/api/v1/pair"):format(port),
+    }
+
+    local system = opts.system or vim.system
+    local timeout = opts.timeout or M.MINT_TIMEOUT_MS
+    local done = false
+    --- @type table|nil
+    local result = nil
+    local ok, err = pcall(
+        system,
+        argv,
+        { text = true, stdin = "Authorization: Bearer " .. token .. "\n" },
+        function(res)
+            result = res
+            done = true
+        end
+    )
     if not ok then
-        Notify.error("web console unavailable: " .. one_line(Runtime))
+        on_done(nil, "cannot run curl: " .. one_line(err))
         return
     end
-    local resolved = Runtime.resolve_daemon()
-    if not resolved then
-        Notify.warn("pi2 daemon not found — run :PiWebInstall to install it")
+    if not done then
+        vim.wait(timeout, function()
+            return done
+        end, 20)
+    end
+    if not done or type(result) ~= "table" then
+        on_done(nil, ("pairing mint timed out after %d ms"):format(timeout))
         return
     end
-    if not Runtime.read_daemon_json() then
-        Notify.warn("web console: no running pi2 daemon — run :PiWeb first")
+    if tonumber(result.code) ~= 0 then
+        local detail = type(result.stderr) == "string" and vim.trim(result.stderr) or ""
+        on_done(nil, "curl failed: " .. (detail ~= "" and one_line(detail) or ("exit " .. tostring(result.code))))
         return
     end
-    local extra = {}
-    local public = M.public_url(Runtime.read_daemon_json())
-    if public then
-        extra = { "--public-url", public }
+
+    local stdout = type(result.stdout) == "string" and result.stdout or ""
+    local raw, status = stdout:match("^(.-)\n(%d%d%d)%s*$")
+    if not status then
+        on_done(nil, "unexpected response from the daemon")
+        return
     end
-    M.run(M.cli_argv(resolved, "pairing", extra), function(res)
-        if tonumber(res.code) ~= 0 then
-            Notify.error(
-                "web console pairing failed: "
-                    .. detail(res.stderr ~= "" and res.stderr or res.stdout, "exit " .. tostring(res.code))
+    local status_code = tonumber(status)
+    if status_code ~= 200 then
+        local ok_decode, payload = pcall(vim.json.decode, raw or "")
+        local reason = ok_decode and type(payload) == "table"
+                and tostring(payload.message or payload.code or "")
+            or ""
+        on_done(
+            nil,
+            ("pairing mint refused: HTTP %d%s"):format(status_code, reason ~= "" and (" — " .. reason) or "")
+        )
+        return
+    end
+    local ok_decode, payload = pcall(vim.json.decode, raw or "")
+    if not ok_decode or type(payload) ~= "table" then
+        on_done(nil, "pairing mint returned unreadable JSON")
+        return
+    end
+    local report = M.pairing_report(payload)
+    if not report then
+        on_done(nil, "pairing mint returned no usable QR payload")
+        return
+    end
+    on_done(report, nil)
+end
+
+--- Base URL of a pairing link (`…/pair/<CODE>` → `…`).
+--- @param url string
+--- @return string
+function M.pairing_base(url)
+    return (tostring(url or ""):gsub("/pair/[^/]+$", ""))
+end
+
+--- Short picker label for one `bases[]` entry of the mint response.
+--- @param base table
+--- @return string
+function M.base_label(base)
+    local kind = ({ public = "public", lan = "LAN", other = "routed", tailscale = "tailscale" })[base.kind] or "?"
+    if base.kind == "public" then
+        return ("public URL  %s"):format(tostring(base.url))
+    end
+    return ("%-10s %-16s %-9s %s"):format(
+        tostring(base.name or "?"),
+        tostring(base.address or "?"),
+        kind,
+        tostring(base.url or "?")
+    )
+end
+
+--- Ask which address a phone should use. Exactly one usable base skips the menu.
+--- @param bases table[]|nil
+--- @param on_choice fun(base: table|nil) `nil` when the user cancels
+function M.choose_base(bases, on_choice)
+    local usable = {}
+    for _, base in ipairs(bases or {}) do
+        if type(base) == "table" and type(base.url) == "string" and base.url ~= "" then
+            usable[#usable + 1] = base
+        end
+    end
+    if #usable <= 1 then
+        on_choice(usable[1])
+        return
+    end
+    vim.ui.select(usable, {
+        prompt = "π │ web console: which address should a phone use?",
+        format_item = M.base_label,
+    }, function(choice)
+        on_choice(choice)
+    end)
+end
+
+--- Split a base URL into the host/port a TCP probe should dial.
+--- @param url string|nil
+--- @return string|nil host, integer|nil port
+function M.probe_target(url)
+    local scheme, rest = tostring(url or ""):match("^(%a[%w+.-]*)://(.+)$")
+    if not scheme then
+        return nil, nil
+    end
+    rest = rest:gsub("/.*$", "")
+    local host, port = rest:match("^(%[[^%]]+%]):(%d+)$")
+    if not host then
+        host, port = rest:match("^([^:]+):(%d+)$")
+    end
+    if not host then
+        host = rest
+        port = scheme == "https" and 443 or 80
+    end
+    return host, tonumber(port)
+end
+
+--- `true` when something listens on that address — which is exactly what a
+--- phone would find. Unprobeable URLs are treated as reachable (fail open).
+--- @param url string
+--- @param on_done fun(ok: boolean, detail: string)
+--- @param timeout? integer milliseconds
+function M.reachable(url, on_done, timeout)
+    local host, port = M.probe_target(url)
+    local uv = vim.uv or vim.loop
+    local tcp = host ~= nil and port ~= nil and uv.new_tcp() or nil
+    if not tcp then
+        on_done(true, "not probed")
+        return
+    end
+    local finished = false
+    local timer = uv.new_timer()
+    local function finish(ok, detail)
+        if finished then
+            return
+        end
+        finished = true
+        if timer then
+            pcall(function()
+                timer:stop()
+                timer:close()
+            end)
+        end
+        pcall(function()
+            tcp:close()
+        end)
+        vim.schedule(function()
+            on_done(ok, detail)
+        end)
+    end
+    timer:start(timeout or 2000, 0, function()
+        finish(false, "timed out")
+    end)
+    tcp:connect(host, port, function(err)
+        if err ~= nil then
+            finish(false, tostring(err))
+        else
+            finish(true, "connected")
+        end
+    end)
+end
+
+--- Draw a pairing report: refuse loopback, probe the address, then float or text.
+--- @param report { url: string, code: string, rows: string[], expires_at?: number }
+function M.show_pairing(report)
+    local base = M.pairing_base(report.url)
+    local host = M.probe_target(base)
+    if type(host) == "string" and (host == "localhost" or host == "[::1]" or host:match("^127%.") ~= nil) then
+        Notify.warn(
+            (
+                "web console: %s only works on this machine — the daemon only listens on 127.0.0.1; "
+                .. 'set `web.host = "0.0.0.0"` (or PI2_HOST) and restart it'
+            ):format(report.url)
+        )
+        return
+    end
+    M.reachable(base, function(ok, reason)
+        if not ok then
+            Notify.warn(
+                ("web console: %s is not reachable (%s) — check `web.host`/PI2_HOST and the firewall"):format(
+                    base,
+                    reason
+                )
             )
             return
         end
-        Notify.info(M.render_pairing(res.stdout or ""))
+        local ok_qr, Qr = pcall(require, "pi.web.qr")
+        if not ok_qr or #vim.api.nvim_list_uis() == 0 then
+            Notify.info(M.pairing_line(report))
+            return
+        end
+        local shown = pcall(Qr.open, {
+            rows = report.rows,
+            url = report.url,
+            code = report.code,
+            expires_at = report.expires_at,
+            refresh = M.pair,
+        })
+        if not shown then
+            Notify.info(M.pairing_line(report))
+        end
+    end)
+end
+
+--- `:PiWebPair`: pick the address a phone should use, mint a code for it, draw
+--- the QR code (or one notify line when there is no UI to draw in).
+---
+--- Guessing the address is what produced unscannable `127.0.0.1` links, so the
+--- command asks: the mint response carries every base (interface name + IPv4 +
+--- URL) and the picker shows them. The chosen base is then probed with a TCP
+--- connect before anything is drawn — a code nobody can reach is a bug, not a
+--- fallback.
+---
+--- `opts` is forwarded to `mint_pair`, which is where tests inject `system`/
+--- `port`/`token`; production passes nothing.
+--- @param opts? table
+function M.pair(opts)
+    local info = M.ensure_running()
+    if not info then
+        return
+    end
+
+    local function mint(base, on_report)
+        M.mint_pair(base, function(report, err)
+            if not report then
+                Notify.error("web console pairing failed: " .. tostring(err))
+                return
+            end
+            on_report(report)
+        end, opts)
+    end
+
+    mint(nil, function(report)
+        local default_base = M.pairing_base(report.url)
+        M.choose_base(report.bases, function(chosen)
+            if chosen == nil then
+                if #(report.bases or {}) == 0 then
+                    -- A host with no usable interface: fall back to the base the
+                    -- daemon picked (show_pairing refuses loopback explicitly).
+                    M.show_pairing(report)
+                    return
+                end
+                Notify.info("web console: pairing cancelled")
+                return
+            end
+            if chosen.url == default_base then
+                M.show_pairing(report)
+                return
+            end
+            -- A different address needs a code minted on that base; the first
+            -- code simply expires unused.
+            mint(chosen.url, function(rerun)
+                M.show_pairing(rerun)
+            end)
+        end)
     end)
 end
 
