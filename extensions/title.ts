@@ -305,9 +305,13 @@ export default function autoTitle(pi: ExtensionAPI): void {
 				// Clear only after the name is persisted (or generation failed):
 				// the spinner stays while the new name is on its way.
 				if (started) {
-					ctx.ui.setStatus(STATUS_KEY, undefined);
+					try {
+						ctx.ui.setStatus(STATUS_KEY, undefined);
+					} catch {
+						// Stale ctx after session replacement or reload; ignore.
+					}
 				}
-			})();
+			})().catch(() => {});
 		});
 	});
 }
