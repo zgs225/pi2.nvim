@@ -250,9 +250,12 @@ function reconstruct(ctx: ExtensionContext): void {
 		const data = entry.data as { todos?: unknown } | undefined;
 		if (data && isValidTodos(data.todos)) {
 			todos = data.todos.map((item) => ({ ...item }));
-			break;
+			lastWriteTurn = turnCount;
+			return;
 		}
 	}
+	// Neither source provided a list: start fresh (new session or empty branch).
+	todos = [];
 	lastWriteTurn = turnCount;
 }
 

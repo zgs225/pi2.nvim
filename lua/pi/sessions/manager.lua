@@ -249,6 +249,20 @@ local function prune_todo_state(session)
     end
 end
 
+--- Reset the todo panel's per-session state when a session's conversation was
+--- replaced (`new_session` or `load_session`). Detached-but-alive semantics do
+--- not apply here: the conversation was replaced, so stale todos must be
+--- dropped. Nil-safe and pcall'd like the other todo hooks.
+---@param session pi.Session
+local function reset_todo_state(session)
+    local ok, err = pcall(function()
+        require("pi.todo").on_conversation_replaced(session)
+    end)
+    if not ok then
+        Notify.warn("todo panel reset failed: " .. tostring(err))
+    end
+end
+
 --- Bind a tab's chat UI to a session process. Detaches any prior bindings on
 --- either side without stopping RPC processes.
 ---@param session pi.Session
@@ -1484,6 +1498,7 @@ local function start_new_session(session)
                 require("pi.ui.sessions").invalidate(session)
                 require("pi.ui.sessions").clear_flags(session)
                 require("pi.ui.sessions").request_refresh()
+                reset_todo_state(session)
                 session.startup_announcements = {}
                 session.system_errors = {}
                 session.changed_files = {}
@@ -1898,6 +1913,7 @@ function load_session(session, session_path, opts, callback)
         require("pi.ui.sessions").invalidate(session)
         require("pi.ui.sessions").clear_flags(session)
         require("pi.ui.sessions").request_refresh()
+        reset_todo_state(session)
         -- The resumed session's model was restored from its session file by
         -- core; adopt it as this tab's pin.
         refresh_state_and_pin(session)

@@ -523,6 +523,34 @@ function M.on_session_closed(session)
     end)
 end
 
+--- The session object survived but its conversation was replaced (`new_session`,
+--- or loading/resuming a different session file into the same tab session), so
+--- the todo mirror must be dropped; detached-but-alive semantics of
+--- on_session_closed do NOT apply here. The session's pending auto-open marker
+--- is also cleared so a stale marker cannot pop a panel for the next
+--- conversation. A refresh is scheduled using the same coalescing pattern as
+--- on_session_closed so any panel rendering the replaced session converges
+--- (auto-opened panels close under hide_when_empty, while manually opened
+--- panels render the placeholder).
+---@param session pi.Session
+function M.on_conversation_replaced(session)
+    if type(session) == "table" then
+        state[session] = nil
+        local tab = session.attached_tab or session.tab
+        if tab then
+            auto_open_pending[tab] = nil
+        end
+    end
+    if refresh_scheduled then
+        return
+    end
+    refresh_scheduled = true
+    vim.schedule(function()
+        refresh_scheduled = false
+        M.refresh()
+    end)
+end
+
 --- Update the mirror from parsed tool-result details and refresh/open panels.
 --- Called from sessions/manager.lua on tool_execution_end (live and replay)
 --- for todo tools, keyed to the ROUTING SESSION — including detached sessions,
