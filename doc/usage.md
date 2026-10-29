@@ -277,6 +277,8 @@ An id can also migrate after a session was already announced. The plugin then em
 ### Snapshots, seq and reconnects
 
 - A `snapshot` replaces the client's cache: `payload.state` plus `payload.entries`, the newest entries that fit the caps (**≤ 50 entries, ≤ 256 KB** encoded). Anything older is paginated through `workspace.query{kind="entries", before = <entryId>, limit = N}`.
+- `payload.state.name` is seeded from the session itself, so a snapshot of a session named before the client subscribed still carries the title instead of `name: null` (a lazily created reducer never saw the earlier `session_info_changed`).
+- A **live** session whose JSONL does not exist yet is a fresh session (`pi` writes the file with its first entry): `workspace.query{kind="entries"}` answers an empty page (`{entries: [], cursor: {hasMore: false}}`) instead of an error. A live session with no session file at all is a resume still in flight and still answers `E_BAD_REQUEST`, so a real history is never hidden behind an empty page.
 - The plugin's reducer keeps at most **500 entries** per session. `seq` and `epoch` come from the instance, never from the reducer.
 - `seq` is strictly increasing on the wire, per session. Streaming deltas and tool updates are coalesced and get their seq **at flush time**, so a coalesced frame can never overtake a newer one.
 - A WS `subscribe` may carry `since: {sessionId, epoch, seq}`. The daemon answers with the cached snapshot while the pair is valid and sends `resync_required` when the epoch changed or the seq is ahead of what it has.

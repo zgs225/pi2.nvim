@@ -131,6 +131,19 @@ renderers drift.
   still accepted).
 - `subagent.dispatch` takes `{items, wait, cancel_siblings_on_fail}` (a flat single-task shorthand is accepted);
   `task.output {taskId}` was added; `subagent.steer`/`subagent.read` are implemented too.
+- `workspace.query{kind="sessions"}` rows carry `tab` (the owning tabpage **handle**, creation order) **and**
+  `tabRank` (its 1-based visual position in `nvim_list_tabpages()`): `:PiSessions` ranks by the tabline, and handles
+  diverge from it after `:tabmove` or a mid-tabline `:tabnew`, so a client must sort on `tabRank`. The rank map is
+  built once per query, not per row.
+- `workspace.query{kind="entries"}` on a **live** session whose JSONL is not written yet answers an empty page
+  (`pi.web.history.empty_page()`) rather than `E_NOT_FOUND`: a fresh session's file appears with its first entry, and
+  an error there made the console report "history failed to load" for every brand-new session. A live session with no
+  session file at all (resume in flight) still errors — an empty page would hide its real history.
+- Snapshots seed `state.name` from `session.name` (`instance.state_for()`), because the lazily created reducer never
+  saw the `session_info_changed` that named the session; without it every snapshot said `name: null`.
+- `bridge:stop()` writes one framed `bye` (`payload.reason = "stopped"`) before closing a live pipe, so the daemon
+  records a deliberate disconnect (`plugin said bye`) instead of a generic socket close. Idempotent, and skipped
+  when the bridge was never connected.
 - Idempotency by `clientRequestId` is **not** implemented in the plugin: the daemon dedupes for 5 minutes
   (`pi2d/docs/protocol.md` §3.2). The plugin just ignores the field.
 
