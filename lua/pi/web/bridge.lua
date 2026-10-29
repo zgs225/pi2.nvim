@@ -11,6 +11,7 @@
 ---@field on_unsubscribe? fun(session_id: string|nil, record: table) Daemon unsubscribed
 ---@field on_shutdown? fun(payload: table|nil, record: table) Daemon asked the instance to shut down
 ---@field on_query? fun(payload: table|nil, ctx: pi.web.CmdContext) `workspace.query`
+---@field on_fatal? fun(message: string) Permanent failure (e.g. protocol mismatch); the bridge stops itself
 ---@field socket_path? string Override the daemon socket (default: `pi.web.runtime.socket_path()`)
 ---@field token? string Override the handshake token (default: read the token file)
 ---@field seq_provider? fun(session_id: string|nil): integer Provider for `ack` seq numbers (default: per-bridge counter)
@@ -150,6 +151,8 @@ function Bridge.new(opts)
     self._daemon_id = nil
     self._limits = { maxFrameBytes = DEFAULTS.max_frame_bytes }
     self._policy = nil
+    -- set when the connection failed permanently (protocol mismatch)
+    self._fatal = nil
 
     -- inbound JSONL framing
     self._in_parts = {}
@@ -502,6 +505,13 @@ end
 
 --- @param record table
 function Bridge:_dispatch(record)
+    -- The envelope version is the compatibility contract (protocol §1). A
+    -- mismatch cannot heal by retrying, so it is fatal for this connection.
+    if not Protocol.is_compatible(record.v) then
+        self:_protocol_mismatch(record.v)
+        return
+    end
+
     local kind = record.type
     if kind == Protocol.IN.HELLO_ACK then
         self._daemon_id = record.daemonId
@@ -550,6 +560,22 @@ function Bridge:_context(record, method)
 end
 
 --- Run a `cmd` handler and answer with `ack` or `error`.
+--- Stop the bridge for good and tell the user why (protocol mismatch).
+---
+--- Reconnecting would just fail again — the daemon's wire version is a
+--- property of the installed binary — so the bridge reports once and stops.
+--- @param version any
+function Bridge:_protocol_mismatch(version)
+    if self._fatal then
+        return
+    end
+    local message = Protocol.mismatch_message(version)
+    self._fatal = message
+    self:_log("error", message)
+    self:_emit("on_fatal", message)
+    self:stop()
+end
+
 --- @param record table
 function Bridge:_handle_cmd(record)
     local payload = type(record.payload) == "table" and record.payload or {}
@@ -1020,6 +1046,7 @@ function Bridge.status(self)
         dropped = self._dropped_total,
         connects = self._connects,
         attempts = self._attempts,
+        fatal = self._fatal,
     }
 end
 

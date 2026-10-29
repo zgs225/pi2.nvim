@@ -314,6 +314,12 @@ function M.start()
         on_query = function(payload, ctx)
             M.handle_query(payload, ctx)
         end,
+        on_fatal = function(message)
+            -- A protocol mismatch cannot heal by retrying: say it once, loudly,
+            -- with the upgrade command the daemon's version implies.
+            M.log("error", message)
+            Notify.error("web console: " .. tostring(message))
+        end,
     }
 
     if explicit_token then

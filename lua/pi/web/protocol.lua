@@ -89,6 +89,31 @@ function M.decode(line)
     return decoded, nil
 end
 
+--- Is a record's `v` acceptable to this plugin?
+---
+--- Every record carries `v` (protocol §1) and the plugin speaks exactly
+--- `M.VERSION`. A missing field is tolerated (older/looser producers); anything
+--- else must match. A mismatch is permanent, so the bridge stops instead of
+--- retrying forever against an incompatible daemon.
+--- @param value any
+--- @return boolean
+function M.is_compatible(value)
+    if value == nil then
+        return true
+    end
+    return tonumber(value) == M.VERSION
+end
+
+--- One-line reason for a version mismatch (notify + log).
+--- @param value any
+--- @return string
+function M.mismatch_message(value)
+    return (
+        "daemon speaks pi2 protocol v%s, this plugin speaks v%d — upgrade pi2d "
+        .. "(`npm i -g @yuez/pi2d`, or your package manager) or pi2.nvim"
+    ):format(tostring(value), M.VERSION)
+end
+
 --- Build an outbound envelope with the protocol version filled in.
 --- @param kind string
 --- @param fields table|nil
