@@ -1,17 +1,21 @@
 -- Web console entry point: bridge lifecycle, daemon bootstrap, `:PiWeb*`
--- commands support and the headless/host switches.
+-- command support and the headless/host switches.
 --
 -- Design (`.agents/docs/web-integration.md` §2/§6):
 --   * the bridge is a singleton per Neovim process and never blocks the editor;
---   * the daemon is started lazily (detached `jobstart`) only when the socket is
---     missing and `web.auto_start` is on — a daemon that spawned us (headless
---     host) already has its socket, so `pi.host` never spawns a second one;
+--   * `pi.web.ops` owns everything about the daemon process: resolution of the
+--     `pi2` executable, the user service (`pi2 service …`), the detached spawn
+--     (with its log at `$PI2_STATE_DIR/daemon.log`) and the attach-first
+--     `ensure()` ladder. This module only orchestrates the bridge around it;
+--   * a daemon that spawned us (headless host) already published
+--     `daemon.json`, so `pi.host` never spawns a second one;
 --   * `pi.host` flips `host_mode`, which makes `instance.shutdown` quit the
 --     headless process after stopping its sessions.
 
 local M = {}
 
 local Bridge = require("pi.web.bridge")
+local Ops = require("pi.web.ops")
 local Runtime = require("pi.web.runtime")
 local Protocol = require("pi.web.protocol")
 local Notify = require("pi.notify")
@@ -76,64 +80,28 @@ function M.log(level, msg)
     pcall(uv.fs_close, fd)
 end
 
+--- True when a daemon published `<runtime>/daemon.json` — the single liveness
+--- criterion shared with `:PiWeb`, `:PiWebStatus` and `pi.web.ops`.
 --- @return boolean
 function M.daemon_present()
-    return uv.fs_stat(Runtime.socket_path()) ~= nil
+    return Ops.running() ~= nil
 end
 
---- Spawn the daemon detached when no socket is present. Never blocks and never
---- raises: the bridge retries (with backoff) until the daemon is up.
+--- Start the daemon when nothing runs and `web.autostart` allows it.
 ---
---- The executable comes from `pi.web.runtime.resolve_daemon()` (config → PATH →
---- plugin data → checkout → npx). `npx` runs through the pinned package
---- (`npx -y @yuez/pi2d@latest daemon`); every other source runs `<bin> daemon`.
+--- Never blocks and never raises: the bridge retries (with backoff) until the
+--- daemon is up. `pi.web.ops` owns the argv, the environment and the daemon log;
+--- the full attach → service → spawn ladder lives in `pi.web.ops.ensure()` and
+--- is what `:PiWeb` uses.
 --- @return boolean started, string|nil err
 function M.start_daemon()
-    local cfg = config()
-    if cfg.auto_start == false then
-        return false, "web.auto_start is disabled"
-    end
     if M.daemon_present() then
         return true
     end
-
-    local resolved = Runtime.resolve_daemon()
-    if not resolved then
-        return false, "daemon not found: " .. tostring(cfg.daemon or "pi2")
+    if Ops.autostart_mode(config()) == false then
+        return false, "web.autostart is disabled"
     end
-
-    -- The daemon is a subcommand of the CLI: `pi2 daemon [args...]`.
-    local argv
-    if resolved.source == "npx" then
-        argv = { "npx", "-y", "@yuez/pi2d@latest", "daemon" }
-    else
-        argv = { resolved.bin, "daemon" }
-    end
-    for _, extra in ipairs(cfg.daemon_args or {}) do
-        argv[#argv + 1] = tostring(extra)
-    end
-
-    --- @type table
-    local job_opts = { detach = true }
-    local env = {}
-    if type(cfg.host) == "string" and cfg.host ~= "" then
-        env.PI2_HOST = cfg.host
-    end
-    if type(cfg.public_url) == "string" and cfg.public_url ~= "" then
-        env.PI2_PUBLIC_URL = cfg.public_url
-    end
-    if type(cfg.workspace_roots) == "table" and #cfg.workspace_roots > 0 then
-        env.PI2_WORKSPACE_ROOTS = table.concat(cfg.workspace_roots, ",")
-    end
-    if next(env) ~= nil then
-        job_opts.env = env
-    end
-    local ok, pid = pcall(vim.fn.jobstart, argv, job_opts)
-    if not ok or type(pid) ~= "number" or pid <= 0 then
-        return false, "failed to spawn " .. argv[1]
-    end
-    M.log("info", ("spawned daemon %s (%s, pid %d)"):format(argv[1], resolved.source, pid))
-    return true
+    return Ops.spawn()
 end
 
 --- Answer a daemon `workspace.query` record (the bridge routes these outside
@@ -377,6 +345,12 @@ function M.stop()
     return true
 end
 
+--- @class pi.web.StatusExtras
+--- @field service? pi.web.ServiceStatus result of `pi2 service status --json`
+--- @field version? string `pi2 --version` (or `pi2 config --json`'s version)
+--- @field install_shape? string "bundled" / "node"
+
+--- Status snapshot for `:PiWebStatus` and `:PiWebDoctor`.
 --- @return table status
 function M.status()
     local current = bridge
@@ -385,12 +359,93 @@ function M.status()
     status.host = host_mode
     status.daemon_socket = Runtime.socket_path()
     status.daemon_present = M.daemon_present()
+    local mode = Ops.autostart_mode(config())
+    status.autostart = mode
+    local info = Ops.daemon_info()
+    status.daemon_port = info and tonumber(info.port) or nil
+    status.daemon_url = Ops.daemon_url(info)
+    local resolved = Runtime.resolve_daemon()
+    status.daemon_source = resolved and resolved.source or nil
+    status.daemon_bin = resolved and resolved.bin or nil
     if instance then
         status.workspace_id = instance.workspace_id
         status.instance_id = current and current:status().instance_id or status.instance_id
         status.sessions = instance:session_count()
     end
     return status
+end
+
+--- One line for a `pi.web.ServiceStatus` (`service: …`).
+--- @param service pi.web.ServiceStatus|nil
+--- @return string
+local function service_line(service)
+    if not service then
+        return "service: not probed (re-run :PiWebStatus or :PiWebDoctor)"
+    end
+    if service.manager == "none" then
+        return ("service: no manager (%s)"):format(service.error or "systemd/launchd unavailable")
+    end
+    local flag = function(value)
+        if value == nil then
+            return "unknown"
+        end
+        return value and "yes" or "no"
+    end
+    local unit = service.unit
+    local name = unit and unit.path or (service.manager == "systemd" and "pi2.service" or "com.pi2.daemon.plist")
+    local installed = unit and unit.installed and "installed" or "missing"
+    local line = ("service: %s %s [%s] enabled=%s active=%s"):format(
+        service.manager,
+        name,
+        installed,
+        flag(service.enabled),
+        flag(service.active)
+    )
+    if service.linger ~= nil then
+        line = line .. " linger=" .. flag(service.linger)
+    end
+    if not (unit and unit.installed) then
+        line = line .. " — install with :PiWebService install"
+    end
+    return line
+end
+
+--- Human-readable one-liner list for `:PiWebStatus`.
+---
+--- `extra` carries what only an async probe can know (the service state, the
+--- `pi2` version/install shape); the commands layer re-renders once those land.
+--- @param extra? pi.web.StatusExtras
+--- @return string[]
+function M.status_lines(extra)
+    extra = extra or {}
+    local status = M.status()
+    local lines = {
+        ("web: %s"):format(status.enabled and "enabled" or "disabled"),
+        ("autostart: %s"):format(Ops.autostart_label(status.autostart)),
+    }
+    if status.daemon_bin then
+        lines[#lines + 1] = ("daemon: %s (%s)"):format(status.daemon_bin, status.daemon_source)
+    else
+        lines[#lines + 1] = "daemon: not found — install pi2 (npm i -g @yuez/pi2d) or run :PiWebInstall"
+    end
+    if status.daemon_url then
+        lines[#lines + 1] = ("daemon: running at %s (socket %s)"):format(status.daemon_url, status.daemon_socket)
+    else
+        lines[#lines + 1] = ("daemon: not running (socket %s)"):format(status.daemon_socket)
+    end
+    lines[#lines + 1] = service_line(extra.service)
+    if extra.version then
+        local shape = extra.install_shape and (" (" .. extra.install_shape .. ")") or ""
+        lines[#lines + 1] = ("pi2: %s%s"):format(extra.version, shape)
+    end
+    lines[#lines + 1] = ("bridge: %s"):format(
+        status.started and (status.ready and "ready" or "connecting") or "stopped"
+    )
+    lines[#lines + 1] = ("workspace: %s"):format(tostring(status.workspace_id))
+    lines[#lines + 1] = ("instance: %s"):format(tostring(status.instance_id))
+    lines[#lines + 1] = ("sessions: %s"):format(tostring(status.sessions or 0))
+    lines[#lines + 1] = ("host: %s"):format(status.host and "yes" or "no")
+    return lines
 end
 
 --- Configure + optionally start the web console. `pi.setup()` calls this when
@@ -407,22 +462,6 @@ function M.setup(opts)
         return bridge
     end
     return M.start()
-end
-
---- Human-readable one-liner list for `:PiWebStatus`.
---- @return string[]
-function M.status_lines()
-    local status = M.status()
-    local lines = {
-        ("web: %s"):format(status.enabled and "enabled" or "disabled"),
-        ("bridge: %s"):format(status.started and (status.ready and "ready" or "connecting") or "stopped"),
-        ("socket: %s%s"):format(status.daemon_socket, status.daemon_present and "" or " (missing)"),
-        ("workspace: %s"):format(tostring(status.workspace_id)),
-        ("instance: %s"):format(tostring(status.instance_id)),
-        ("sessions: %s"):format(tostring(status.sessions or 0)),
-        ("host: %s"):format(status.host and "yes" or "no"),
-    }
-    return lines
 end
 
 return M
