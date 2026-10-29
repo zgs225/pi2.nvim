@@ -312,7 +312,7 @@ The remaining methods are `subagent.stop {targets}`, `subagent.steer {target, me
 | Field | Notes |
 | --- | --- |
 | `sessionId`, `sessionFile`, `name`, `timestamp`, `modified`, `firstMessage` | Disk projection |
-| `cwd`, `tab`, `live` | Live projection (`tab` is the owning tabpage) |
+| `cwd`, `tab`, `tabRank`, `live` | Live projection. `tab` is the owning tabpage **handle**, which encodes creation order; `tabRank` is that tab's 1-based visual position in `nvim_list_tabpages()` — the order `:PiSessions` ranks its root rows by. Sort on `tabRank`, not `tab`: the two diverge after `:tabmove` and after a tab inserted mid-tabline (`:tabnew` from tab 1, so handles can be e.g. `1, 2, 4, 3`). Both are set together and absent on a row that is not attached to a tab. |
 | `status` | Live status when `live` and the web instance is up (`busy`, `compacting`, `idle`, `exited`); otherwise the sub-session manifest status: `dormant`, `done` (completed), `error` (failed), `interrupted`, `exited` (manifest says active but nothing runs). Absent on a non-live root row. |
 | `model` | Per-session model pin |
 | `visible` | Default `:PiSessions` visibility (see below); always present, always `true` for roots |

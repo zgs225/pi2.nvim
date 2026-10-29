@@ -96,6 +96,25 @@ local function spy(module, name, replacement)
     end
 end
 
+--- Close every tab except the first one, leaving it current.
+---
+--- The tab-rank specs open real tabs to get a tabline whose visual order
+--- differs from tabpage-handle order; this keeps one from leaking into the next
+--- test (the whole file runs in a single headless instance).
+local function close_extra_tabs()
+    local tabs = vim.api.nvim_list_tabpages()
+    for i = #tabs, 2, -1 do
+        if vim.api.nvim_tabpage_is_valid(tabs[i]) then
+            vim.api.nvim_set_current_tabpage(tabs[i])
+            vim.cmd("tabclose!")
+        end
+    end
+    local first = vim.api.nvim_list_tabpages()[1]
+    if first and vim.api.nvim_tabpage_is_valid(first) then
+        vim.api.nvim_set_current_tabpage(first)
+    end
+end
+
 describe("pi.web.commands", function()
     local restores
 
@@ -115,6 +134,7 @@ describe("pi.web.commands", function()
         Tasks._reset()
         Commands._reset_caches()
         Commands._id_wait_ms = 5000
+        close_extra_tabs()
     end)
 
     --- @param module table
@@ -495,6 +515,110 @@ describe("pi.web.commands", function()
         assert.equals("disk-1", result.sessions[1].sessionId)
         assert.equals("live-1", result.sessions[2].sessionId)
         assert.is_true(result.sessions[2].live)
+    end)
+
+    it("ranks live session rows by the tabline, not by tabpage handle", function()
+        local History = require("pi.sessions.history")
+        stub(History, "list", function()
+            return {}
+        end)
+
+        Sessions._bind_shim_for_test(fake_session({ id = "s-1" }), vim.api.nvim_get_current_tabpage())
+        vim.cmd("tabnew")
+        Sessions._bind_shim_for_test(fake_session({ id = "s-2" }), vim.api.nvim_get_current_tabpage())
+        -- A tab created from tab 1 lands between tabs 1 and 2: `s-3` gets the
+        -- largest handle but the second visual position.
+        vim.cmd("tabfirst")
+        vim.cmd("tabnew")
+        Sessions._bind_shim_for_test(fake_session({ id = "s-3" }), vim.api.nvim_get_current_tabpage())
+
+        local visual = vim.api.nvim_list_tabpages()
+        assert.equals(3, #visual)
+        -- Precondition: handle order must diverge from the tabline here, or the
+        -- assertions below would pass on `tab` alone.
+        local by_handle = { unpack(visual) }
+        table.sort(by_handle)
+        assert.are_not.same(by_handle, visual)
+
+        local ok, result = Commands.dispatch("workspace.query", { kind = "sessions" }, {})
+        assert.is_true(ok)
+        assert.equals(3, #result.sessions)
+
+        local rows = {}
+        for _, row in ipairs(result.sessions) do
+            rows[row.sessionId] = row
+        end
+        assert.equals(visual[1], rows["s-1"].tab)
+        assert.equals(visual[2], rows["s-3"].tab)
+        assert.equals(visual[3], rows["s-2"].tab)
+        assert.equals(1, rows["s-1"].tabRank)
+        assert.equals(2, rows["s-3"].tabRank)
+        assert.equals(3, rows["s-2"].tabRank)
+
+        -- Sorting the rows on `tabRank` reproduces the :PiSessions order.
+        local ordered = vim.list_slice(result.sessions)
+        table.sort(ordered, function(a, b)
+            return a.tabRank < b.tabRank
+        end)
+        local ids = {}
+        for _, row in ipairs(ordered) do
+            ids[#ids + 1] = row.sessionId
+        end
+        assert.are.same({ "s-1", "s-3", "s-2" }, ids)
+    end)
+
+    it("keeps the tab rank on a row that is both on disk and live", function()
+        local tab = vim.api.nvim_get_current_tabpage()
+        Sessions._bind_shim_for_test(fake_session({ id = "both-1" }), tab)
+        local History = require("pi.sessions.history")
+        stub(History, "list", function()
+            return {
+                {
+                    id = "both-1",
+                    path = "/tmp/both-1.jsonl",
+                    timestamp = "2026-01-01T00:00:00Z",
+                    modified = 1,
+                    first_message = "hi",
+                    name = "Both",
+                },
+            }
+        end)
+
+        local ok, result = Commands.dispatch("workspace.query", { kind = "sessions" }, {})
+        assert.is_true(ok)
+        assert.equals(1, #result.sessions)
+        local row = result.sessions[1]
+        -- Merged into the disk row, which keeps the disk projection…
+        assert.equals("both-1", row.sessionId)
+        assert.equals("Both", row.name)
+        -- …and gains the live tab projection, rank included.
+        assert.equals(tab, row.tab)
+        assert.equals(1, row.tabRank)
+        assert.is_true(row.live)
+    end)
+
+    it("leaves tabRank off rows that have no tab", function()
+        Sessions._register_for_test(fake_session({ id = "detached-1" }))
+        local History = require("pi.sessions.history")
+        stub(History, "list", function()
+            return {
+                {
+                    id = "disk-only-1",
+                    path = "/tmp/disk-only-1.jsonl",
+                    timestamp = "2026-01-01T00:00:00Z",
+                    modified = 1,
+                    first_message = "hi",
+                },
+            }
+        end)
+
+        local ok, result = Commands.dispatch("workspace.query", { kind = "sessions" }, {})
+        assert.is_true(ok)
+        assert.equals(2, #result.sessions)
+        for _, row in ipairs(result.sessions) do
+            assert.is_nil(row.tab, row.sessionId)
+            assert.is_nil(row.tabRank, row.sessionId)
+        end
     end)
 
     it("answers workspace.query entries with a paginated history page", function()

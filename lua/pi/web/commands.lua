@@ -961,7 +961,11 @@ end
 --- @field modified? integer
 --- @field firstMessage? string
 --- @field cwd? string
---- @field tab? integer
+--- @field tab? integer Owning tabpage handle. A handle encodes *creation* order, not the tabline.
+--- @field tabRank? integer 1-based visual position of the row's tab in `nvim_list_tabpages()`.
+---   Set whenever `tab` is. `:PiSessions` ranks its root rows by the tabline, so a client
+---   reproducing that order sorts on `tabRank`: `tab` diverges from it after `:tabmove` and
+---   after a mid-tabline insertion (`:tabnew` from tab 1, so handles can be e.g. 1, 2, 4, 3).
 --- @field live? boolean
 --- @field status? string Live status when the row is live, manifest status otherwise.
 --- @field model? pi.ModelRef
@@ -974,15 +978,37 @@ end
 --- @field createdAt? number Epoch ms.
 --- @field lastActiveAt? number Epoch ms.
 
+--- Visual position of every tabpage, keyed by handle.
+---
+--- The same map `Sessions.list()` builds to order `:PiSessions`: tabpage handles
+--- reflect creation order, not position, so it is the position that has to
+--- travel to the client for it to reproduce the list order.
+--- @return table<integer, integer>|nil nil when the tabpage list is unavailable.
+local function tab_rank_map()
+    local ok, tabs = pcall(vim.api.nvim_list_tabpages)
+    if not ok or type(tabs) ~= "table" then
+        return nil
+    end
+    --- @type table<integer, integer>
+    local rank = {}
+    for i, tab in ipairs(tabs) do
+        rank[tab] = i
+    end
+    return rank
+end
+
 --- @param session pi.Session
 --- @param instance pi.web.Instance|nil
+--- @param rank table<integer, integer>|nil Tab visual position per handle (`tab_rank_map()`).
 --- @return pi.web.SessionListRow
-local function live_session_row(session, instance)
+local function live_session_row(session, instance, rank)
+    local tab = session.attached_tab
     local row = {
         sessionId = session.id,
         sessionFile = session.session_file,
         cwd = session.cwd,
-        tab = session.attached_tab,
+        tab = tab,
+        tabRank = tab and rank and rank[tab] or nil,
         live = session.rpc and session.rpc:is_running() or false,
     }
     if instance then
@@ -1106,6 +1132,9 @@ local function workspace_query(params, ctx)
         --- @type pi.web.SessionListRow[]
         local sessions = {}
         local seen = {}
+        -- Computed once per query, not per row: the tabline position every live
+        -- row is annotated with (see `pi.web.SessionListRow.tabRank`).
+        local rank = tab_rank_map()
         local ok, History = pcall(require, "pi.sessions.history")
         if ok and type(History.list) == "function" then
             for _, info in ipairs(History.list()) do
@@ -1121,13 +1150,14 @@ local function workspace_query(params, ctx)
             end
         end
         for _, session in ipairs(Sessions().list_all()) do
-            local row = live_session_row(session, instance)
+            local row = live_session_row(session, instance, rank)
             if seen[session.id] then
                 for _, disk in ipairs(sessions) do
                     if disk.sessionId == session.id then
                         disk.live = row.live
                         disk.status = row.status
                         disk.tab = row.tab
+                        disk.tabRank = row.tabRank
                         disk.sessionFile = disk.sessionFile or row.sessionFile
                         disk.model = row.model
                     end
