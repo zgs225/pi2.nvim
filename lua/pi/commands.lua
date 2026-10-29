@@ -287,7 +287,7 @@ function M.setup()
         end
     end
 
-    local complete_flags_pi_web = complete_from({ "--global" })
+    local complete_flags_pi_web = complete_from({ "--check", "--force", "--global" })
 
     vim.api.nvim_create_user_command("PiWeb", function()
         pi_web("open_console")
@@ -298,7 +298,7 @@ function M.setup()
     end, {
         nargs = "*",
         complete = complete_flags_pi_web,
-        desc = "Install the latest @yuez/pi2d into <web.install_dir> (--global: global npm; optional <version> pins it)",
+        desc = "Install pi2 on its own channel: `pi2 update` for a standalone binary, npm into <web.install_dir> otherwise",
     })
 
     vim.api.nvim_create_user_command("PiWebUpdate", function(cmd)
@@ -306,7 +306,7 @@ function M.setup()
     end, {
         nargs = "*",
         complete = complete_flags_pi_web,
-        desc = "Update @yuez/pi2d (latest by default; restart the daemon afterwards)",
+        desc = "Update pi2 on its channel (--check reports only; --global is npm-only; a <version> pins it)",
     })
 
     vim.api.nvim_create_user_command("PiWebDoctor", function()

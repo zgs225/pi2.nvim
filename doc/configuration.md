@@ -388,7 +388,9 @@ require("pi").setup({
         -- "https://myhost.tail1234.ts.net" (no trailing slash). Advertised to
         -- :PiWebPair as the first choice, e.g. behind `tailscale serve`.
         public_url = nil,
-        -- Where :PiWebInstall puts the daemon npm package; the executable is
+        -- Where the npm channel of :PiWebInstall puts the package (the
+        -- standalone channel ignores it: `pi2 update` owns that layout, see
+        -- docs/install.md). The executable is
         -- then resolved as <install_dir>/node_modules/.bin/pi2. Install is
         -- explicit and confirmed: `@yuez/pi2d@latest`, or a pinned <version>.
         install_dir = vim.fn.stdpath("data") .. "/pi2d",

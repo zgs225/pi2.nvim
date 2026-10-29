@@ -256,34 +256,218 @@ function M.npm_install(global, kind, version)
     return true
 end
 
---- Parse `:PiWebInstall`/`:PiWebUpdate` args: `[--global] [<version>]`.
+--- Parse JSON emitted on stdout, or `nil` when it is not a JSON object.
+--- @param text any
+--- @return table|nil
+local function decode_json(text)
+    local trimmed = type(text) == "string" and vim.trim(text) or ""
+    if trimmed == "" then
+        return nil
+    end
+    local ok, decoded = pcall(vim.json.decode, trimmed)
+    if ok and type(decoded) == "table" then
+        return decoded
+    end
+    return nil
+end
+
+--- Ask the resolved pi2 how it was installed: `bundled` (compiled binary) or
+--- `node` (npm / dev checkout). `nil` when no pi2 answers `config --json`.
+--- @param resolved pi.web.DaemonCandidate
+--- @param on_done fun(shape: string|nil)
+function M.install_shape(resolved, on_done)
+    M.run(M.cli_argv(resolved, "config", { "--json" }), function(res)
+        local shape
+        if tonumber(res.code) == 0 then
+            local decoded = decode_json(res.stdout)
+            if decoded and type(decoded.installShape) == "string" then
+                shape = decoded.installShape
+            end
+        end
+        on_done(shape)
+    end)
+end
+
+--- argv for `pi2 update`, in the plugin's own flag vocabulary.
+---
+--- The CLI owns verification, the versioned layout and the channel refusal, so
+--- the plugin only maps: `<version>` pins (and implies `--force`, because the
+--- user named an exact version), `--check` asks without downloading.
+--- @param resolved pi.web.DaemonCandidate
+--- @param opts? { version?: string, check?: boolean, force?: boolean }
+--- @return string[]
+function M.update_argv(resolved, opts)
+    opts = opts or {}
+    local extra = { "--json" }
+    if opts.check then
+        extra[#extra + 1] = "--check"
+    end
+    if opts.force then
+        extra[#extra + 1] = "--force"
+    end
+    local pinned = type(opts.version) == "string" and vim.trim(opts.version) or ""
+    pinned = pinned:gsub("^@yuez/pi2d@", ""):gsub("^v", "")
+    if pinned ~= "" and pinned ~= "latest" then
+        extra[#extra + 1] = "--version"
+        extra[#extra + 1] = pinned
+    end
+    return M.cli_argv(resolved, "update", extra)
+end
+
+--- One notify line for a `pi2 update --json` payload.
+--- @param payload table|nil
+--- @return string
+function M.update_report(payload)
+    if type(payload) ~= "table" then
+        return "web console: pi2 update finished"
+    end
+    local current = tostring(payload.current or "?")
+    local latest = tostring(payload.latest or "?")
+    if payload.action == "up-to-date" then
+        return ("web console: pi2 %s is up to date (latest %s)"):format(current, latest)
+    end
+    if payload.action == "checked" then
+        return ("web console: pi2 %s — latest %s"):format(current, latest)
+    end
+    local line = ("web console: pi2 %s → %s installed"):format(current, latest)
+    local restart = type(payload.restart) == "string" and vim.trim(payload.restart) or ""
+    if restart ~= "" then
+        line = line .. " — restart the daemon to use it: " .. restart
+    end
+    return line
+end
+
+--- `pi2 update` for a compiled (standalone/curl-installed) pi2.
+---
+--- The CLI refuses npm, Homebrew and the AUR installs with the command that owns
+--- them; that message is surfaced verbatim instead of being re-implemented here.
+--- @param resolved pi.web.DaemonCandidate
+--- @param opts { version?: string, check?: boolean, force?: boolean }
+function M.cli_update(resolved, opts)
+    opts = opts or {}
+    local function failed(res, prefix)
+        local text = res.stderr ~= "" and res.stderr or res.stdout
+        Notify.error(prefix .. detail(text, "pi2 update exited " .. tostring(res.code)))
+    end
+
+    -- A pinned version needs no pre-check: confirm and go (the pin implies
+    -- --force, so a deliberate downgrade works too).
+    if type(opts.version) == "string" and opts.version ~= "" then
+        local argv = M.update_argv(resolved, { version = opts.version, force = true })
+        if not M.confirm(("Install pi2 %s? (%s)"):format(opts.version, table.concat(argv, " "))) then
+            Notify.info("web console: update cancelled")
+            return
+        end
+        M.run(argv, function(res)
+            if tonumber(res.code) ~= 0 then
+                failed(res, "web console update failed: ")
+                return
+            end
+            Notify.info(M.update_report(decode_json(res.stdout)))
+        end)
+        return
+    end
+
+    M.run(M.update_argv(resolved, { check = true }), function(res)
+        local probe = decode_json(res.stdout)
+        if tonumber(res.code) ~= 0 or not probe then
+            failed(res, "web console update unavailable: ")
+            return
+        end
+        if opts.check or probe.updatable ~= true then
+            Notify.info(M.update_report(probe))
+            return
+        end
+        local argv = M.update_argv(resolved, { force = opts.force })
+        local question = ("Update pi2 %s → %s? (%s)"):format(
+            tostring(probe.current),
+            tostring(probe.latest),
+            table.concat(argv, " ")
+        )
+        if not M.confirm(question) then
+            Notify.info("web console: update cancelled")
+            return
+        end
+        M.run(argv, function(out)
+            if tonumber(out.code) ~= 0 then
+                failed(out, "web console update failed: ")
+                return
+            end
+            Notify.info(M.update_report(decode_json(out.stdout)))
+        end)
+    end)
+end
+
+--- Install/update following the channel the installed pi2 reports.
+---
+--- * no resolvable `pi2` → npm (the only channel the plugin can bootstrap)
+--- * `installShape == "node"` (npm, dev checkout) → npm
+--- * `installShape == "bundled"` (curl installer, Homebrew, AUR) → `pi2 update`,
+---   which refuses the package-manager channels with the right command
+--- @param kind "install"|"update"
 --- @param args? string[]
---- @return boolean global, string|nil version
+function M.install_or_update(kind, args)
+    local global, version, check, force = M.parse_install_args(args)
+    local ok_runtime, Runtime = pcall(require, "pi.web.runtime")
+    local resolved = ok_runtime and Runtime.resolve_daemon() or nil
+
+    if not resolved then
+        if check then
+            Notify.warn(
+                "web console: no pi2 to check — install one (`npm i -g @yuez/pi2d`, the curl installer, or brew)"
+            )
+            return
+        end
+        M.npm_install(global, kind, version)
+        return
+    end
+
+    M.install_shape(resolved, function(shape)
+        if shape == "bundled" then
+            if global then
+                Notify.warn("web console: --global is npm-only — a standalone pi2 updates through `pi2 update`")
+            end
+            M.cli_update(resolved, { version = version, check = check, force = force })
+            return
+        end
+        if shape ~= "node" then
+            Notify.warn("web console: could not tell how this pi2 was installed — falling back to npm")
+        end
+        M.npm_install(global, kind, version)
+    end)
+end
+
+--- Parse `:PiWebInstall`/`:PiWebUpdate` args:
+--- `[--global] [--check] [--force] [<version>]`.
+--- @param args? string[]
+--- @return boolean global, string|nil version, boolean check, boolean force
 function M.parse_install_args(args)
-    local global, version = false, nil
+    local global, version, check, force = false, nil, false, false
     for _, arg in ipairs(args or {}) do
         local value = tostring(arg)
         if value == "--global" or value == "-g" then
             global = true
+        elseif value == "--check" then
+            check = true
+        elseif value == "--force" then
+            force = true
         elseif value ~= "" then
             version = value
         end
     end
-    return global, version
+    return global, version, check, force
 end
 
---- `:PiWebInstall [--global] [<version>]`
+--- `:PiWebInstall [--global] [--check] [--force] [<version>]`
 --- @param args? string[]
 function M.install(args)
-    local global, version = M.parse_install_args(args)
-    M.npm_install(global, "install", version)
+    M.install_or_update("install", args)
 end
 
---- `:PiWebUpdate [--global] [<version>]`
+--- `:PiWebUpdate [--global] [--check] [--force] [<version>]`
 --- @param args? string[]
 function M.update(args)
-    local global, version = M.parse_install_args(args)
-    M.npm_install(global, "update", version)
+    M.install_or_update("update", args)
 end
 
 --- Render a `pi2 doctor --json` payload as `name status detail` lines.
