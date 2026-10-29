@@ -158,7 +158,7 @@ Daemon resolution and the local login handshake are separate modules, so extensi
 ```lua
 local runtime = require("pi.web.runtime")
 
-runtime.resolve_daemon(opts?) -- { bin, source = "config"|"path"|"plugin-data"|"checkout"|"npx" } | nil
+runtime.resolve_daemon(opts?) -- { bin, source = "config"|"env"|"path"|"plugin-data"|"checkout" } | nil
 runtime.read_daemon_json(dir?) -- decoded <runtime>/daemon.json or nil (pure, never throws)
 
 local login = require("pi.web.login")

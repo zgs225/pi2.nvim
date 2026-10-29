@@ -181,14 +181,16 @@ Whenever a task reaches a terminal state — completed, failed, or stopped — t
 
 | Command | Action |
 | --- | --- |
-| `:PiWeb` | The whole flow: resolves and starts the daemon, waits up to 10 s for `<runtime>/daemon.json`, then signs a local browser in (`web.open = false` only reports the URL) |
-| `:PiWebInstall [--global]` | `npm i --prefix <web.install_dir> @yuez/pi2d@latest` (`--global`: `npm i -g @yuez/pi2d@latest`), then reports which executable the resolution ladder picked |
-| `:PiWebUpdate [--global]` | Same install as `:PiWebInstall` plus a reminder that a running daemon must be restarted (`pi2 daemon --force`) |
+| `:PiWeb` | The whole flow: attaches to a running daemon, else starts the installed user service (`pi2 service start`), else spawns `pi2 daemon` detached, then waits up to 10 s for `<runtime>/daemon.json` and signs a local browser in (`web.open = false` only reports the URL) |
+| `:PiWebInstall [--global] [<version>]` | Asks first, then `npm i --prefix <web.install_dir> @yuez/pi2d@latest` (`--global`: `npm i -g`; a `<version>` such as `0.1.6` pins it), and reports which executable the resolution ladder picked |
+| `:PiWebUpdate [--global] [<version>]` | Same install as `:PiWebInstall` plus a reminder that the running daemon must be restarted (`pi2 service stop && pi2 service start`, or `pi2 stop`) |
 | `:PiWebDoctor` | Runs `<pi2> doctor --json` and shows the `name status detail` lines |
 | `:PiWebPair` | Mints a pairing code (the daemon picks the base) and draws it as a **scannable QR code** in a floating window, together with the link, the code and the expiry — point a phone camera at it and the console opens on the connect page with the code already filled in. `q`/`<Esc>` close, `r` mints a fresh code, `y` copies the link. The picker chooses which host goes into the link, so the code is reachable from the phone; an unreachable address is refused with what to change. Hosts without a UI get the URL + code as a notify instead |
-| `:PiWebStart` | Start the bridge; spawns `pi2 daemon` detached if `<runtime>/d.sock` is missing |
-| `:PiWebStop` | Stop the bridge (sessions and the daemon keep running) |
-| `:PiWebStatus` | Show bridge/socket/workspace/instance/session counts |
+| `:PiWebService [status\|install\|enable\|disable\|start\|stop]` | The user service, driven through `pi2 service …` (the CLI owns `systemctl`/`launchd`, the plugin never calls it directly). `status` reports manager, unit path, installed/enabled/active and linger; `install` confirms, then runs `pi2 install-service --write` |
+| `:PiWebLog [count]` | The service manager's log (`journalctl --user -u pi2` / the LaunchAgent's log files) or `<state dir>/daemon.log` for a plugin-spawned daemon, in a scratch buffer |
+| `:PiWebStart` | Attach the bridge (spawns `pi2 daemon` detached when nothing runs and `web.autostart` allows it) |
+| `:PiWebStop` | Stop the bridge only — the daemon keeps running (and a browser tab stays signed in). Stop the daemon with `pi2 service stop` or `pi2 stop` |
+| `:PiWebStatus` | Bridge, daemon source/URL, service state and the async `pi2 config --json` version/install shape |
 
 ### Scanning the code
 
@@ -207,17 +209,33 @@ Loopback links are never drawn: a code pointing at `127.0.0.1` cannot be opened 
 
 ### How `:PiWeb` finds the daemon
 
-`pi.web.runtime.resolve_daemon()` walks a fixed ladder and returns `{ bin, source }`; every candidate must exist **and** be executable:
+`pi.web.runtime.resolve_daemon()` walks a fixed ladder and returns `{ bin, source }`; every candidate must exist **and** be executable, and there is no `npx` path (pi2d ADR 0002 rejects it — resolution is a lookup, never an install):
 
 | # | source | candidate |
 | --- | --- | --- |
-| 1 | `config` | `web.daemon` (an absolute path is used as-is, a bare name goes through `exepath`) |
-| 2 | `path` | `exepath("pi2")` |
-| 3 | `plugin-data` | `<web.install_dir>/node_modules/.bin/pi2` (default `<stdpath("data")>/pi2d/...`) |
-| 4 | `checkout` | `node_modules/.bin/pi2` walked up from the cwd (daemon development) |
-| 5 | `npx` | `npx -y @yuez/pi2d@latest daemon …`, only when `npx` is on `PATH` |
+| 1 | `config` | `web.binary` (absolute path used as-is, bare name via `exepath`); the deprecated `web.daemon` is its alias |
+| 2 | `env` | `$PI2_DAEMON_BIN`, same treatment |
+| 3 | `path` | `exepath("pi2")` |
+| 4 | `plugin-data` | `<web.install_dir>/node_modules/.bin/pi2` (default `<stdpath("data")>/pi2d/...`) |
+| 5 | `checkout` | `node_modules/.bin/pi2` walked up from the cwd (daemon development) |
 
-Nothing is ever auto-installed: when no candidate qualifies, `:PiWeb` tells you to run `:PiWebInstall`.
+Nothing is ever auto-installed, and a missing binary is reported with the install commands (`npm i -g @yuez/pi2d`, the curl installer, brew) plus `:PiWebInstall` as the explicit fallback.
+
+### Autostart and the user service
+
+`web.autostart` decides what `:PiWeb` may do (`"auto"` is the default):
+
+| Value | Behaviour |
+| --- | --- |
+| `"auto"` | Attach to a running daemon (`daemon.json`) — if nothing runs, start the installed user service with `pi2 service start` — if no unit exists, spawn `pi2 daemon` detached |
+| `"spawn"` | Skip the service probe and always spawn a detached daemon |
+| `false` | Never start anything: `:PiWeb` only attaches, and reports how to start the daemon |
+
+The deprecated `web.auto_start` boolean still works (`false` → `false`, `true` → `"spawn"`).
+
+A plugin-spawned daemon is a foreground `pi2 daemon` process attached to a log file: `$PI2_STATE_DIR/daemon.log` (`~/.local/state/pi2/daemon.log` on Linux, `~/Library/Logs/pi2/daemon.log` on macOS), which is what `:PiWebLog` reads when no service unit is installed. The daemon never daemonizes itself — Neovim's `jobstart(..., { detach = true })` is what makes it outlive the editor.
+
+Service-managed daemons are controlled through the CLI only: `pi2 service status|start|stop|enable|disable`. `:PiWebService` wraps that, and `:PiWebStop` deliberately stops just the bridge so a service-managed daemon is never signalled behind `Restart=on-failure`/`KeepAlive`.
 
 ### Binding and reachability
 
@@ -227,7 +245,7 @@ Loopback is always accepted, so `:PiWeb` keeps signing the local browser in (`PO
 
 The login handshake reads the real port from `<runtime>/daemon.json` and the local admin token from `<runtime>/cli.token`, `POST`s `/api/v1/console/session` (loopback only, 5 s bounded `vim.system` call) and hands the returned URL to `vim.ui.open` (`xdg-open`/`open` as fallback). The token travels on stdin, is never printed or logged, and the URL is only passed to the opener — use `pi2 open --print` if you need it in a terminal.
 
-The bridge only starts automatically when [`web.enabled = true`](configuration.md) is set before `require("pi").setup()`. `:PiWebStart` works without that flag. The daemon must be installed (`pi2` on `PATH`, which provides the `daemon` subcommand, or an absolute [`web.daemon`](configuration.md) path) and serves the browser UI on its own port; `web.log = true` writes bridge diagnostics to `stdpath("log")/pi2-web.log` — stdout/stderr are never used, because a headless instance may share them with nothing useful and must never print.
+The bridge only starts automatically when [`web.enabled = true`](configuration.md) is set before `require("pi").setup()`. `:PiWebStart` works without that flag. The daemon must be installed (`pi2` on `PATH` — the recommended CLI install — via `$PI2_DAEMON_BIN`, or an absolute [`web.binary`](configuration.md) path) and serves the browser UI on its own port; `web.log = true` writes bridge diagnostics to `stdpath("log")/pi2-web.log` — stdout/stderr are never used, because a headless instance may share them with nothing useful and must never print.
 
 ### Headless instance and `--remote-ui`
 

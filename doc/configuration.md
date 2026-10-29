@@ -354,16 +354,23 @@ require("pi").setup({
     -- Web console bridge (`pi2 daemon` + browser UI). Off by default. See
     -- doc/usage.md#web-console.
     web = {
-        -- Start the bridge together with pi.setup() (lazily starting the
-        -- daemon when its socket is missing). :PiWebStart starts it explicitly.
+        -- Start the bridge together with pi.setup() (`:PiWebStart` starts it
+        -- explicitly). `:PiWeb` attaches to a running daemon, else starts the
+        -- user service, else spawns one, as `autostart` allows.
         enabled = false,
-        -- Spawn `daemon` detached when <runtime>/d.sock does not exist. A
-        -- daemon that already started this Neovim (headless host) is reused.
-        auto_start = true,
+        -- What :PiWeb may start: "auto" (attach → `pi2 service start` when a unit
+        -- is installed → spawn `pi2 daemon` detached), "spawn" (skip the service
+        -- probe, always spawn), or false (connect only, never start anything).
+        autostart = "auto",
+        -- Deprecated alias of `autostart`: false → autostart = false,
+        -- true → autostart = "spawn". Normalised by pi.web.ops.
+        auto_start = nil,
         -- Daemon executable: a bare name resolved with exepath(), or an
-        -- absolute path. The bridge always appends the `daemon` subcommand
-        -- (`pi2 daemon ...`).
-        daemon = "pi2",
+        -- absolute path. Unset falls through to $PI2_DAEMON_BIN, `pi2` on PATH,
+        -- the plugin-data install, then a checkout walk-up.
+        binary = nil,
+        -- Deprecated alias of `binary`.
+        daemon = nil,
         -- Extra arguments appended after the `daemon` subcommand on lazy start.
         daemon_args = {},
         -- Workspace roots advertised to the daemon (PI2_WORKSPACE_ROOTS).
@@ -382,7 +389,8 @@ require("pi").setup({
         -- :PiWebPair as the first choice, e.g. behind `tailscale serve`.
         public_url = nil,
         -- Where :PiWebInstall puts the daemon npm package; the executable is
-        -- then resolved as <install_dir>/node_modules/.bin/pi2.
+        -- then resolved as <install_dir>/node_modules/.bin/pi2. Install is
+        -- explicit and confirmed: `@yuez/pi2d@latest`, or a pinned <version>.
         install_dir = vim.fn.stdpath("data") .. "/pi2d",
         -- Open the browser from :PiWeb (true) or only report the console URL.
         open = true,

@@ -28,15 +28,39 @@ headless bootstrap shipped as **`lua/pi/host.lua`** (module `pi.host`), not `lua
 ```
 lua/pi/web/
   protocol.lua   (done)   constants, JSONL helpers
-  runtime.lua    (W9)     hex ids, runtime dirs, token
+  runtime.lua    (done)   hex ids, runtime dirs, token, daemon log dir,
+                          resolve_daemon() ladder (config → env → PATH → plugin
+                          data → checkout; no npx)
+  ops.lua        (done)   daemon process + user service: attach → `pi2 service
+                          start` → spawn `<bin> daemon` (log redirect), `pi2
+                          service status|start|stop|enable|disable`, log lines
   bridge.lua     (W4)     socket transport, framing, reconnect, throttle
   state.lua      (W5)     authoritative reducer per session (MAX_ENTRIES = 500)
   instance.lua   (W9)     instance identity, bridge wiring, event fanout, snapshots
   commands.lua   (W9)     cmd method table (manager/attention/tasks/subsessions)
   history.lua    (W6)     jsonl pagination + line-offset index
   init.lua       (W9)     setup(), start/stop, status, :PiWeb* commands
+  ctl.lua        (done)   :PiWeb* entry points (install/service/log/pair/doctor)
+  login.lua      (done)   loopback console-session handshake
+  qr.lua         (done)   pairing QR renderer
 lua/pi/host.lua  (W9)     headless bootstrap (`nvim --headless --listen …`)
 ```
+
+### Daemon lifecycle ownership (pi2d ADR 0002)
+
+- `runtime.resolve_daemon()` is a **lookup**. `npx` is gone; a miss is reported
+  with the install commands, never bootstrapped.
+- `ops.ensure()` is the only start path: **attach** (a published `daemon.json`
+  is sufficient — a service-managed daemon must be usable even when no `pi2`
+  is resolvable) → **service** (`pi2 service status` to see whether a unit is
+  installed, then `pi2 service start`) → **spawn** (`<bin> daemon` detached,
+  stdout/stderr appended to `$PI2_STATE_DIR/daemon.log`). `web.autostart`
+  (`"auto"` | `"spawn"` | `false`, deprecated alias `web.auto_start`) gates it.
+- `pi2 service …` is the only thing that talks to systemd/launchd. `:PiWebStop`
+  stops the bridge only; stopping the daemon is `pi2 service stop` / `pi2 stop`.
+- `:checkhealth pi` has a web section: binary source, daemon port, autostart,
+  unit installed/enabled/active — file probes only (no subprocesses).
+
 
 ## 2. Where to hook (minimal edits to existing files)
 
