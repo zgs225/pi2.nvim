@@ -60,6 +60,13 @@ lua/pi/host.lua  (W9)     headless bootstrap (`nvim --headless --listen …`)
   stops the bridge only; stopping the daemon is `pi2 service stop` / `pi2 stop`.
 - `:checkhealth pi` has a web section: binary source, daemon port, autostart,
   unit installed/enabled/active — file probes only (no subprocesses).
+- Login and pairing are CLI calls, not HTTP from Lua: `pi2 open --print` for the
+  loopback sign-in URL (`pi.web.login`), `pi2 pairing --json` for the mint payload
+  (`pi.web.ctl.mint_pair`). The plugin never touches `cli.token`, and no `curl`
+  is required for the editor.
+- Wire compatibility: every record carries `v` (protocol §1). `Protocol.is_compatible()`
+  gates `Bridge:_dispatch()`; a mismatch emits `on_fatal` once and stops the bridge
+  (retrying cannot fix an installed daemon's version).
 
 
 ## 2. Where to hook (minimal edits to existing files)

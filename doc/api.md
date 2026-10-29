@@ -163,11 +163,18 @@ runtime.read_daemon_json(dir?) -- decoded <runtime>/daemon.json or nil (pure, ne
 
 local login = require("pi.web.login")
 
-login.url(opts?)  -- POST /api/v1/console/session; signed-in URL or nil + reason
+login.url(opts?)  -- `pi2 open --print`; signed-in URL or nil + reason
 login.open(opts?) -- login.url() + the platform opener; returns url, opener_err?
 ```
 
-`opts` exists for tests and custom openers: `runtime_dir`, `timeout` (ms, default 5000), `system` (a `vim.system` replacement), `opener` (a `fun(url): boolean, err?`) and `config`. `login.open()` is the loopback sign-in path that `:PiWeb` uses; other devices pair via `:PiWebPair` instead of being signed in. The CLI token from `<runtime>/cli.token` is sent on stdin and never printed, logged, or placed in argv.
+`opts` exists for tests and custom openers: `timeout` (ms, default 5000), `system` (a `vim.system` replacement), `opener` (a `fun(url): boolean, err?`), `resolve` (a `fun(): pi.web.DaemonCandidate|nil`) and `config`. `login.open()` is the loopback sign-in path that `:PiWeb` uses; other devices pair via `:PiWebPair` (which runs `pi2 pairing --json`), so no token is ever handled by the plugin.
+
+```lua
+local ctl = require("pi.web.ctl")
+
+ctl.mint_pair(base?, on_done, opts?) -- `pi2 pairing --json` -> render-ready report
+ctl.pairing_report(payload)          -- validate/normalise url+code+qr+bases
+```
 
 The daemon-side entry point is `require("pi.host").start(workspace?)`, which the daemon (`pi2 daemon`) calls from a headless Neovim (`--headless --listen <sock> -c 'lua require("pi.host").start()'`). See [Web console](usage.md#web-console).
 

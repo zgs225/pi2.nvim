@@ -237,13 +237,15 @@ A plugin-spawned daemon is a foreground `pi2 daemon` process attached to a log f
 
 Service-managed daemons are controlled through the CLI only: `pi2 service status|start|stop|enable|disable`. `:PiWebService` wraps that, and `:PiWebStop` deliberately stops just the bridge so a service-managed daemon is never signalled behind `Restart=on-failure`/`KeepAlive`.
 
+The bridge refuses an incompatible wire version: every record carries `v` (protocol §1), and a mismatch is permanent, so it reports once (`daemon speaks pi2 protocol v2, this plugin speaks v1 — upgrade pi2d …`) and stops instead of retrying forever.
+
 ### Binding and reachability
 
 `pi2 daemon` binds `0.0.0.0` by default, so the console is reachable from the LAN (or a tailnet) as soon as it runs. [`web.host`](configuration.md) is passed to the daemon as `PI2_HOST` when the plugin spawns it; `PI2_HOST=127.0.0.1` restricts the daemon to this machine (set the same value in `web.host` so a restart keeps it).
 
 Loopback is always accepted, so `:PiWeb` keeps signing the local browser in (`POST /api/v1/console/session` → `#t=<token>`) whatever the bind address is. Signing in from another device is a pairing, not a login: `:PiWebPair` mints a code, the picker chooses which host goes into the link/QR code (so the phone gets an address it can actually reach), and the chosen base is probed before the symbol is drawn. `web.public_url` (passed as `PI2_PUBLIC_URL`) advertises an external base, e.g. a [`tailscale serve`](https://tailscale.com/kb/1242/tailscale-serve) URL, and is what the pairing picker offers first.
 
-The login handshake reads the real port from `<runtime>/daemon.json` and the local admin token from `<runtime>/cli.token`, `POST`s `/api/v1/console/session` (loopback only, 5 s bounded `vim.system` call) and hands the returned URL to `vim.ui.open` (`xdg-open`/`open` as fallback). The token travels on stdin, is never printed or logged, and the URL is only passed to the opener — use `pi2 open --print` if you need it in a terminal.
+The login handshake is the CLI's: the plugin runs `pi2 open --print` (a 5 s bounded `vim.system` call) and hands the printed URL to `vim.ui.open` (`web.browser`, then `xdg-open`/`open` as fallbacks). The CLI reads `<runtime>/daemon.json` + `<runtime>/cli.token`, `POST`s `/api/v1/console/session` loopback-only, and prints exactly the signed-in URL — the token never reaches argv, a log line or this plugin. Pairing works the same way: `:PiWebPair` runs `pi2 pairing --json` and draws the QR matrix the CLI returns.
 
 The bridge only starts automatically when [`web.enabled = true`](configuration.md) is set before `require("pi").setup()`. `:PiWebStart` works without that flag. The daemon must be installed (`pi2` on `PATH` — the recommended CLI install — via `$PI2_DAEMON_BIN`, or an absolute [`web.binary`](configuration.md) path) and serves the browser UI on its own port; `web.log = true` writes bridge diagnostics to `stdpath("log")/pi2-web.log` — stdout/stderr are never used, because a headless instance may share them with nothing useful and must never print.
 
