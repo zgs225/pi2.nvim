@@ -14,12 +14,19 @@ describe("pi.host", function()
         Host._reset()
         saved.socket = vim.env.PI2_SOCKET
         saved.daemon = vim.env.PI2_DAEMON_SOCKET
+        saved.runtime = vim.env.PI2_RUNTIME_DIR
+        -- Hermetic runtime dir: `daemon_present` reads `<runtime>/daemon.json`, so
+        -- the spec must not see the daemon of the machine running it.
+        local runtime = vim.fn.tempname()
+        vim.fn.mkdir(runtime, "p")
+        vim.env.PI2_RUNTIME_DIR = runtime
     end)
 
     after_each(function()
         Host._reset()
         vim.env.PI2_SOCKET = saved.socket
         vim.env.PI2_DAEMON_SOCKET = saved.daemon
+        vim.env.PI2_RUNTIME_DIR = saved.runtime
     end)
 
     it("adopts PI2_DAEMON_SOCKET unless PI2_SOCKET is set explicitly", function()
@@ -47,12 +54,12 @@ describe("pi.host", function()
         vim.fn.mkdir(dir, "p")
 
         local prev_socket = vim.env.PI2_SOCKET
-        local prev_auto = Config.options.web.auto_start
-        local prev_daemon = Config.options.web.daemon
+        local prev_autostart = Config.options.web.autostart
+        local prev_binary = Config.options.web.binary
         local prev_enabled = Config.options.web.enabled
         vim.env.PI2_SOCKET = dir .. "/d.sock"
-        Config.options.web.auto_start = false
-        Config.options.web.daemon = dir .. "/missing-pi2-daemon"
+        Config.options.web.autostart = false
+        Config.options.web.binary = dir .. "/missing-pi2-daemon"
 
         local bridge = Web.start()
         assert.is_true(bridge ~= nil)
@@ -66,10 +73,33 @@ describe("pi.host", function()
         assert.is_true(Instance.instance() == nil)
         assert.is_false(Web.status().enabled)
 
-        Config.options.web.auto_start = prev_auto
-        Config.options.web.daemon = prev_daemon
+        Config.options.web.autostart = prev_autostart
+        Config.options.web.binary = prev_binary
         Config.options.web.enabled = prev_enabled
         vim.env.PI2_SOCKET = prev_socket
+    end)
+
+    it('defaults to autostart = "auto" and keeps the deprecated web keys', function()
+        local Config = require("pi.config")
+        local web = Config.options.web
+        -- New keys: `autostart` defaults to "auto", `binary` is unset so the
+        -- resolution ladder (PATH → plugin data → checkout) decides.
+        assert.equals("auto", web.autostart)
+        assert.is_nil(web.binary)
+        -- Deprecated aliases stay typed and unset by default; their normalisation
+        -- lives in `pi.web.ops.autostart_mode()`, not in `pi.config`.
+        assert.is_nil(web.daemon)
+        assert.is_nil(web.auto_start)
+
+        local prev_binary, prev_daemon, prev_auto = web.binary, web.daemon, web.auto_start
+        web.binary = "/opt/pi2/bin/pi2"
+        web.daemon = "/opt/pi2/bin/pi2-legacy"
+        web.auto_start = false
+        assert.equals("/opt/pi2/bin/pi2", Config.options.web.binary)
+        assert.equals("/opt/pi2/bin/pi2-legacy", Config.options.web.daemon)
+        assert.is_false(Config.options.web.auto_start)
+
+        web.binary, web.daemon, web.auto_start = prev_binary, prev_daemon, prev_auto
     end)
 
     it("boots headless, keeps the process alive, and exits on stop without printing", function()

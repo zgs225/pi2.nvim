@@ -1,24 +1,39 @@
 ---@class pi.web.Runtime
---- Platform paths shared with `pi2d` (`pi2d/src/core/paths.ts`).
+--- Platform paths and daemon resolution shared with `pi2d`
+--- (`pi2d/src/core/paths.ts`).
 ---
 --- The plugin and the daemon must agree on where the daemon socket, its token
---- file and the per-instance sockets live, otherwise the bridge either cannot
---- dial or the daemon refuses the handshake. This module is the single source
---- of truth for those paths.
+--- file, the per-instance sockets and the daemon log live, otherwise the bridge
+--- either cannot dial or the daemon refuses the handshake. This module is the
+--- single source of truth for those paths, and it owns the ladder that finds the
+--- `pi2` executable (`resolve_daemon`). There is no `npx` path (pi2d ADR 0002):
+--- a missing executable is reported, never bootstrapped.
 ---
 --- Every function here is **main-loop only** (it may touch `vim.env`, `vim.fs`
 --- and `vim.fn`), never call it from a `vim.uv` callback.
 local M = {}
 
+--- Read one entry from an injected environment table, treating a missing value,
+--- a non-string and `""` as unset.
+--- @param source table<string, string|nil>|nil
+--- @param name string
+--- @return string|nil
+local function env_value(source, name)
+    if type(source) ~= "table" then
+        return nil
+    end
+    local value = source[name]
+    if type(value) ~= "string" or value == "" then
+        return nil
+    end
+    return value
+end
+
 --- Read an environment override, treating "" as unset.
 --- @param name string
 --- @return string|nil
 local function env(name)
-    local value = vim.env[name]
-    if value == nil or value == "" then
-        return nil
-    end
-    return value
+    return env_value(vim.env, name)
 end
 
 --- @return boolean
@@ -137,6 +152,29 @@ function M.data_dir()
     local base = env("XDG_DATA_HOME")
     if not base then
         base = join(home(), ".local", "share")
+    end
+    return join(base, "pi2")
+end
+
+--- Directory for daemon-owned state: logs and generated host inits. Mirrors
+--- `stateDir()` in `pi2d/src/core/paths.ts`: `$PI2_STATE_DIR` →
+--- `~/Library/Logs/pi2` (macOS) → `$XDG_STATE_HOME/pi2` → `~/.local/state/pi2`.
+---
+--- This is the daemon-log directory: `pi2 daemon` appends `daemon.log` here (and
+--- `instances/<instanceId>.log` per managed Neovim), which is what `:PiWebLog`
+--- and `:checkhealth pi` point at. Resolution only — nothing is created here.
+--- @return string
+function M.state_dir()
+    local override = env("PI2_STATE_DIR")
+    if override then
+        return override
+    end
+    if M.is_mac() then
+        return join(home(), "Library", "Logs", "pi2")
+    end
+    local base = env("XDG_STATE_HOME")
+    if not base then
+        base = join(home(), ".local", "state")
     end
     return join(base, "pi2")
 end
@@ -491,16 +529,17 @@ end
 -- ---------------------------------------------------------------------------
 
 --- Where a resolved `pi2` executable came from (ladder order).
----@alias pi.web.DaemonSource "config"|"path"|"plugin-data"|"checkout"|"npx"
+---@alias pi.web.DaemonSource "config"|"env"|"path"|"plugin-data"|"checkout"
 
 ---@class pi.web.DaemonCandidate
----@field bin string executable to spawn (`npx` for the last-resort candidate)
+---@field bin string executable to spawn: `<bin> daemon [web.daemon_args…]`
 ---@field source pi.web.DaemonSource
 
 ---@class pi.web.ResolveOpts
----@field config? pi.WebConfig daemon settings (defaults to `pi.config`)
+---@field config? pi.WebConfig daemon settings (defaults to `pi.config.options.web`)
 ---@field cwd? string start of the checkout walk-up (defaults to the process cwd)
 ---@field data_dir? string plugin-data root (defaults to `stdpath("data")`)
+---@field env? table<string, string|nil> environment read for `$PI2_DAEMON_BIN` (defaults to `vim.env`)
 ---@field exepath? fun(name: string): string
 ---@field executable? fun(path: string): boolean
 
@@ -539,11 +578,34 @@ local function ancestors(dir)
     return out
 end
 
+--- Turn a configured/exported value into a runnable path: an absolute (or
+--- path-like) value is used as-is, a bare name goes through `exepath`. Returns
+--- `nil` when nothing exists and is executable there.
+--- @param value string|nil
+--- @param exepath fun(name: string): string
+--- @param executable fun(path: string): boolean
+--- @return string|nil
+local function runnable_bin(value, exepath, executable)
+    if type(value) ~= "string" or value == "" then
+        return nil
+    end
+    local bin = value
+    if not bin:find("[/\\]") then
+        local ok_exe, resolved = pcall(exepath, value)
+        bin = (ok_exe and type(resolved) == "string") and resolved or ""
+    end
+    if is_runnable(bin, executable) then
+        return bin
+    end
+    return nil
+end
+
 --- @param opts pi.web.ResolveOpts
 --- @return pi.web.DaemonCandidate|nil
 local function do_resolve(opts)
     local ok_cfg, config = pcall(require, "pi.config")
     local cfg = opts.config or (ok_cfg and config.options.web) or {}
+    local env_source = opts.env or vim.env
     local exepath = opts.exepath or function(name)
         return vim.fn.exepath(name)
     end
@@ -561,25 +623,30 @@ local function do_resolve(opts)
         return ""
     end
 
-    -- 1. config: an absolute path is used as-is, a bare name goes through exepath.
-    local configured = cfg.daemon
-    if type(configured) == "string" and configured ~= "" then
-        local bin = configured
-        if not bin:find("[/\\]") then
-            bin = call(exepath, configured)
-        end
-        if is_runnable(bin, executable) then
-            return { bin = bin, source = "config" }
-        end
+    -- 1. config: `web.binary`, falling back to the deprecated `web.daemon`
+    --    alias. An absolute path is used as-is, a bare name goes through exepath.
+    local configured = cfg.binary
+    if type(configured) ~= "string" or configured == "" then
+        configured = cfg.daemon
+    end
+    local bin = runnable_bin(configured, exepath, executable)
+    if bin then
+        return { bin = bin, source = "config" }
     end
 
-    -- 2. PATH
+    -- 2. env: $PI2_DAEMON_BIN, same treatment as the config value.
+    bin = runnable_bin(env_value(env_source, "PI2_DAEMON_BIN"), exepath, executable)
+    if bin then
+        return { bin = bin, source = "env" }
+    end
+
+    -- 3. PATH
     local on_path = call(exepath, "pi2")
     if is_runnable(on_path, executable) then
         return { bin = on_path, source = "path" }
     end
 
-    -- 3. plugin data: the npm package `:PiWebInstall` maintains.
+    -- 4. plugin data: the npm package `:PiWebInstall` maintains.
     local data_root = opts.data_dir or vim.fn.stdpath("data")
     local dir = cfg.install_dir
     if type(dir) ~= "string" or dir == "" then
@@ -590,7 +657,7 @@ local function do_resolve(opts)
         return { bin = plugin_data, source = "plugin-data" }
     end
 
-    -- 4. checkout: `node_modules/.bin/pi2` walked up from the cwd (daemon devs).
+    -- 5. checkout: `node_modules/.bin/pi2` walked up from the cwd (daemon devs).
     for _, base in ipairs(ancestors(opts.cwd or vim.fn.getcwd())) do
         local candidate = join(base, "node_modules", ".bin", "pi2")
         if is_runnable(candidate, executable) then
@@ -598,20 +665,22 @@ local function do_resolve(opts)
         end
     end
 
-    -- 5. npx, only when it is actually installed.
-    local npx = call(exepath, "npx")
-    if npx ~= "" then
-        return { bin = "npx", source = "npx" }
-    end
-
+    -- Nothing runnable: no `npx` fallback (pi2d ADR 0002), the caller reports
+    -- the install command instead.
     return nil
 end
 
---- Resolve the `pi2` daemon executable through the fixed ladder
---- (`config` → `path` → `plugin-data` → `checkout` → `npx`). Every candidate is
---- checked for existence + executability; `npx` is the last resort and is only
---- used when it is on `PATH`. Never throws: an undetectable executable yields
---- `nil`.
+--- Resolve the `pi2` daemon executable through the fixed ladder:
+---
+--- 1. `web.binary` (or the deprecated `web.daemon`) — `config`
+--- 2. `$PI2_DAEMON_BIN` — `env`
+--- 3. `pi2` on `PATH` — `path`
+--- 4. `<web.install_dir>/node_modules/.bin/pi2` — `plugin-data`
+--- 5. `node_modules/.bin/pi2` walked up from the cwd — `checkout`
+---
+--- Every candidate must exist *and* be executable; the first match wins and
+--- nothing else (no `npx`) is used as a fallback. Never throws: an undetectable
+--- executable yields `nil`.
 --- @param opts? pi.web.ResolveOpts
 --- @return pi.web.DaemonCandidate|nil
 function M.resolve_daemon(opts)

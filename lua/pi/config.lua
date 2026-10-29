@@ -335,8 +335,9 @@
 
 ---@class pi.WebConfig
 ---@field enabled? boolean Start the headless web bridge when `pi.setup()` runs (default false)
----@field auto_start? boolean Spawn the web-console daemon (`pi2 daemon`) when its socket is missing (default true)
----@field daemon? string Daemon executable (default "pi2"); absolute path or `exepath` name. The bridge appends the `daemon` subcommand.
+---@field autostart? "auto"|"spawn"|false How `:PiWeb` may start the daemon: "auto" attaches/spawns when nothing runs (default), "spawn" always spawns detached, false connects only and never spawns
+---@field binary? string Daemon executable override: absolute path or `exepath` name (resolved first by `pi.web.runtime.resolve_daemon()`; unset → `$PI2_DAEMON_BIN` → PATH → plugin data → checkout)
+---@field daemon? string Deprecated alias of `binary`, kept for existing configs; prefer `binary`
 ---@field daemon_args? string[] Extra arguments appended after `daemon` on lazy start
 ---@field workspace_roots? string[] Workspace roots advertised to the daemon via `PI2_WORKSPACE_ROOTS`
 ---@field log? boolean|string Write bridge diagnostics to `stdpath("log")/pi2-web.log` (true) or to this path
@@ -345,6 +346,7 @@
 ---@field install_dir? string Where `:PiWebInstall` puts the pi2d npm package (default `<stdpath("data")>/pi2d`)
 ---@field open? boolean Open the browser from `:PiWeb` (default true)
 ---@field browser? string Opener command override for `:PiWeb` (default: `vim.ui.open`, then `xdg-open`/`open`)
+---@field auto_start? boolean Deprecated alias of `autostart`: `false` → `autostart = false`, `true` → `autostart = "spawn"`. Normalised by `pi.web.ops.autostart_mode()`, not by `pi.config`.
 
 ---@class pi.Options
 ---@field cli pi.CliConfig
@@ -587,8 +589,20 @@ local defaults = {
     },
     web = {
         enabled = false,
-        auto_start = true,
-        daemon = "pi2",
+        -- How :PiWeb may start the daemon: "auto" (attach if running, otherwise
+        -- spawn detached), "spawn" (always detached), false (connect only).
+        autostart = "auto",
+        -- Daemon executable override (step 1 of
+        -- `pi.web.runtime.resolve_daemon()`): an absolute path or an `exepath`
+        -- name. Unset → $PI2_DAEMON_BIN → `pi2` on PATH →
+        -- <install_dir>/node_modules/.bin/pi2 → a checkout walk-up from the cwd.
+        binary = nil,
+        -- Deprecated alias of `binary`; only used when `binary` is unset.
+        daemon = nil,
+        -- Deprecated alias of `autostart`: false → autostart = false,
+        -- true → autostart = "spawn". Normalised by
+        -- `pi.web.ops.autostart_mode()`, so `pi.config` keeps it verbatim.
+        auto_start = nil,
         daemon_args = {},
         workspace_roots = nil,
         log = false,
