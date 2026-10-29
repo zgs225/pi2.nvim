@@ -237,6 +237,11 @@ function M.setup()
         require("pi.todo").toggle()
     end, { desc = "Toggle the todo sidebar panel" })
 
+    --- Forward declaration: the wrapper below is defined once for the whole
+    --- web block, and `:PiWebStatus` is registered before it.
+    --- @type fun(name: string, ...: any)
+    local pi_web
+
     vim.api.nvim_create_user_command("PiWebStart", function()
         local ok, err = pcall(require("pi.web").start)
         if not ok then
@@ -250,16 +255,18 @@ function M.setup()
 
     vim.api.nvim_create_user_command("PiWebStop", function()
         require("pi.web").stop()
-        require("pi.notify").info("Web console stopped")
-    end, { desc = "Stop the π² web console bridge" })
+        require("pi.notify").info(
+            "Web console bridge stopped (the daemon keeps running; use `pi2 service stop` or `pi2 stop` to stop it)"
+        )
+    end, { desc = "Stop the π² web console bridge (the daemon keeps running)" })
 
     vim.api.nvim_create_user_command("PiWebStatus", function()
-        require("pi.notify").info(table.concat(require("pi.web").status_lines(), "\n"))
-    end, { desc = "Show π² web console bridge status" })
+        pi_web("status")
+    end, { desc = "Show the π² web console status (bridge, daemon, service)" })
 
     -- One-command console surface. Every entry point is wrapped so a broken
     -- install degrades to a one-line notify instead of a stack trace.
-    local function pi_web(name, ...)
+    pi_web = function(name, ...)
         local ok, Ctl = pcall(require, "pi.web.ctl")
         if not ok then
             require("pi.notify").error("web console unavailable: " .. tostring(Ctl))
@@ -284,14 +291,14 @@ function M.setup()
 
     vim.api.nvim_create_user_command("PiWeb", function()
         pi_web("open_console")
-    end, { desc = "Open the π² web console (installs/starts the daemon as needed)" })
+    end, { desc = "Open the π² web console (attaches to or starts the daemon)" })
 
     vim.api.nvim_create_user_command("PiWebInstall", function(cmd)
         pi_web("install", vim.split(cmd.args, "%s+", { trimempty = true }))
     end, {
         nargs = "*",
         complete = complete_flags_pi_web,
-        desc = "Install pi2d (npm i --prefix <web.install_dir>); --global installs it globally",
+        desc = "Install the latest @yuez/pi2d into <web.install_dir> (--global: global npm; optional <version> pins it)",
     })
 
     vim.api.nvim_create_user_command("PiWebUpdate", function(cmd)
@@ -299,7 +306,7 @@ function M.setup()
     end, {
         nargs = "*",
         complete = complete_flags_pi_web,
-        desc = "Update @yuez/pi2d@latest (restart the daemon afterwards)",
+        desc = "Update @yuez/pi2d (latest by default; restart the daemon afterwards)",
     })
 
     vim.api.nvim_create_user_command("PiWebDoctor", function()
@@ -309,6 +316,23 @@ function M.setup()
     vim.api.nvim_create_user_command("PiWebPair", function()
         pi_web("pair")
     end, { desc = "Mint a pairing code and show the URL + code" })
+
+    local complete_service_actions = complete_from({ "status", "install", "enable", "disable", "start", "stop" })
+
+    vim.api.nvim_create_user_command("PiWebService", function(cmd)
+        pi_web("service", vim.split(cmd.args, "%s+", { trimempty = true }))
+    end, {
+        nargs = "*",
+        complete = complete_service_actions,
+        desc = "Control the pi2 user service (status|install|enable|disable|start|stop)",
+    })
+
+    vim.api.nvim_create_user_command("PiWebLog", function(cmd)
+        pi_web("log", vim.split(cmd.args, "%s+", { trimempty = true }))
+    end, {
+        nargs = "?",
+        desc = "Show the daemon log (service manager log, or the spawn log)",
+    })
 end
 
 return M

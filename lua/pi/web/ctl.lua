@@ -1,10 +1,9 @@
 -- `:PiWeb*` command implementations (the user-facing control surface).
 --
 -- This module is the only place that shells out for the console workflows:
--- install/update (npm), doctor, pairing + the QR view and the one-command
--- `:PiWeb` flow (resolve daemon → start the bridge → wait for
--- `<runtime>/daemon.json` → sign in a local browser) and the `:PiWebPair`
--- QR view.
+-- install/update (npm), doctor, the user service (`:PiWebService`) and its log
+-- (`:PiWebLog`), pairing + the QR view, and the one-command `:PiWeb` flow
+-- (attach → service → spawn through `pi.web.ops`, then sign a local browser in).
 --
 -- Rules:
 --   * never throw at the user — `call()` wraps every entry point and degrades to
@@ -12,11 +11,24 @@
 --   * never block longer than the contract allows (`:PiWeb` polls `daemon.json`
 --     for at most 10 s, everything else is async);
 --   * never print the CLI token: only `pi2 open --print`-style flows return the
---     signed-in URL, and this module never renders it.
+--     signed-in URL, and this module never renders it;
+--   * there is no `npx` path: a missing `pi2` is reported with the install
+--     commands (pi2d `docs/adr/0002-install-and-run.md`).
 
 local M = {}
 
 local Notify = require("pi.notify")
+
+--- `pi.web.ops`, loaded lazily so a broken/missing module degrades to a notify
+--- (and so specs can stub `package.loaded["pi.web.ops"]`).
+--- @return pi.web.Ops|nil
+local function ops()
+    local ok, module = pcall(require, "pi.web.ops")
+    if not ok or type(module) ~= "table" then
+        return nil
+    end
+    return module
+end
 
 --- `:PiWeb` waits this long for the daemon to publish `daemon.json`.
 M.START_TIMEOUT_MS = 10000
@@ -66,19 +78,13 @@ function M.install_dir(cfg)
     return vim.fs.joinpath(vim.fn.stdpath("data"), "pi2d")
 end
 
---- Build the argv for a CLI subcommand, honouring the resolved source.
---- `npx` always runs the pinned package: `npx -y @yuez/pi2d@latest <sub> …`.
+--- Build the argv for a CLI subcommand of the resolved `pi2` executable.
 --- @param resolved pi.web.DaemonCandidate
 --- @param sub string
 --- @param extra? string[]
 --- @return string[]
 function M.cli_argv(resolved, sub, extra)
-    local argv
-    if resolved.source == "npx" then
-        argv = { "npx", "-y", "@yuez/pi2d@latest", sub }
-    else
-        argv = { resolved.bin, sub }
-    end
+    local argv = { resolved.bin, sub }
     for _, arg in ipairs(extra or {}) do
         argv[#argv + 1] = tostring(arg)
     end
@@ -103,33 +109,23 @@ function M.run(argv, on_done)
     return obj ~= nil
 end
 
---- Wait (bounded) for `<runtime>/daemon.json`.
+--- Wait (bounded) for `<runtime>/daemon.json` (`pi.web.ops` owns the poll).
 --- @param timeout? integer milliseconds (default 10000)
 --- @return table|nil info
 function M.wait_for_daemon(timeout)
-    local ok, Runtime = pcall(require, "pi.web.runtime")
-    if not ok then
+    local Ops = ops()
+    if not Ops then
         return nil
     end
-    local info = Runtime.read_daemon_json()
-    if info then
-        return info
-    end
-    vim.wait(timeout or M.START_TIMEOUT_MS, function()
-        info = Runtime.read_daemon_json()
-        return info ~= nil
-    end, M.POLL_MS)
-    return info
+    return Ops.wait_for_daemon(timeout, M.POLL_MS)
 end
 
---- `true` when a daemon looks alive (it published `daemon.json`).
+--- `true` when a daemon published `daemon.json` — the plugin's single liveness
+--- criterion (a running service needs no resolvable binary to be usable).
 --- @return boolean
 function M.daemon_running()
-    local ok, Runtime = pcall(require, "pi.web.runtime")
-    if not ok then
-        return false
-    end
-    return Runtime.read_daemon_json() ~= nil
+    local Ops = ops()
+    return Ops ~= nil and Ops.running() ~= nil
 end
 
 --- `:PiWeb`: the whole one-command flow.
@@ -137,39 +133,22 @@ function M.open_console()
     M.launch()
 end
 
---- Resolve the daemon binary, spawn it when nothing publishes `daemon.json`, and
---- wait (bounded) for it. Notifies the reason and returns `nil` on failure.
+--- Resolve how to reach a daemon — attach if one is running, else start the
+--- installed user service, else spawn `pi2 daemon` detached (`pi.web.ops`).
+--- Notifies the failing step and returns `nil`.
 --- @return table|nil info decoded `daemon.json`
 function M.ensure_running()
-    local ok, Runtime = pcall(require, "pi.web.runtime")
-    if not ok then
-        Notify.error("web console unavailable: " .. one_line(Runtime))
+    local Ops = ops()
+    if not Ops then
+        Notify.error("web console unavailable: pi.web.ops is missing")
         return nil
     end
-    if not Runtime.resolve_daemon() then
-        -- Never run npm behind the user's back: point at the explicit command.
-        Notify.warn("pi2 daemon not found — run :PiWebInstall to install it")
-        return nil
-    end
-    local info = Runtime.read_daemon_json()
-    if info then
-        return info
-    end
-
-    local Web = require("pi.web")
-    local valid, start_err = Web.start_daemon()
-    if not valid and start_err and start_err:find("auto_start", 1, true) then
-        Notify.error("web console: " .. one_line(start_err) .. " — start it with `pi2 daemon`")
-        return nil
-    end
-    pcall(Web.start)
-
-    info = M.wait_for_daemon(M.START_TIMEOUT_MS)
+    local info, err = Ops.ensure({ wait_ms = M.START_TIMEOUT_MS, poll_ms = M.POLL_MS })
     if not info then
-        local hint = start_err and (" (" .. one_line(start_err) .. ")") or ""
-        Notify.error("web console: pi2 daemon did not start" .. hint .. " — run :PiWebDoctor")
+        Notify.error("web console: " .. detail(err, "no daemon") .. " — run :PiWebDoctor")
         return nil
     end
+    pcall(require("pi.web").start)
     return info
 end
 
@@ -203,18 +182,51 @@ function M.launch()
     Notify.info(("web console: opened http://127.0.0.1:%s in your browser"):format(tostring(port or "?")))
 end
 
---- npm install of `@yuez/pi2d@latest`, then report the newly resolved source.
+--- Package spec for `:PiWebInstall`/`:PiWebUpdate`: `latest` unless a version
+--- argument pins one (pi2d publishes exact versions such as `0.1.6`).
+--- @param version string|nil
+--- @return string
+function M.package_spec(version)
+    local pinned = type(version) == "string" and vim.trim(version) or ""
+    pinned = pinned:gsub("^@yuez/pi2d@", "")
+    if pinned == "" or pinned == "latest" then
+        return "@yuez/pi2d@latest"
+    end
+    return "@yuez/pi2d@" .. pinned
+end
+
+--- Ask before running npm. `M.confirm` is a field so specs never prompt.
+--- @param question string
+--- @return boolean
+function M.confirm(question)
+    if #vim.api.nvim_list_uis() == 0 then
+        Notify.info("web console: " .. question .. " - running non-interactively")
+        return true
+    end
+    local ok, choice = pcall(vim.fn.confirm, question, "&Yes\n&No", 2)
+    return ok and choice == 1
+end
+
+--- npm install of `@yuez/pi2d` (`latest` by default), then report which
+--- executable the resolution ladder picked.
 --- @param global boolean
 --- @param kind "install"|"update"
-function M.npm_install(global, kind)
+--- @param version? string
+function M.npm_install(global, kind, version)
     local cfg = web_config()
+    local spec = M.package_spec(version)
     local argv, target
     if global then
-        argv = { "npm", "i", "-g", "@yuez/pi2d@latest" }
-        target = "@yuez/pi2d@latest (global)"
+        argv = { "npm", "i", "-g", spec }
+        target = spec .. " (global)"
     else
         target = M.install_dir(cfg)
-        argv = { "npm", "i", "--prefix", target, "@yuez/pi2d@latest" }
+        argv = { "npm", "i", "--prefix", target, spec }
+    end
+    local verb = kind == "update" and "Update" or "Install"
+    if not M.confirm(("%s %s? (%s)"):format(verb, target, table.concat(argv, " "))) then
+        Notify.info("web console: " .. kind .. " cancelled")
+        return false
     end
     Notify.info("web console: installing " .. target .. "…")
     M.run(argv, function(res)
@@ -236,33 +248,42 @@ function M.npm_install(global, kind)
             )
         )
         if kind == "update" then
-            Notify.info("web console: restart the daemon to use the update (`pi2 daemon --force`)")
+            Notify.info(
+                "web console: restart the daemon to use the update (`pi2 service stop && pi2 service start`, or `pi2 stop`)"
+            )
         end
     end)
+    return true
 end
 
---- `:PiWebInstall [--global]`
+--- Parse `:PiWebInstall`/`:PiWebUpdate` args: `[--global] [<version>]`.
+--- @param args? string[]
+--- @return boolean global, string|nil version
+function M.parse_install_args(args)
+    local global, version = false, nil
+    for _, arg in ipairs(args or {}) do
+        local value = tostring(arg)
+        if value == "--global" or value == "-g" then
+            global = true
+        elseif value ~= "" then
+            version = value
+        end
+    end
+    return global, version
+end
+
+--- `:PiWebInstall [--global] [<version>]`
 --- @param args? string[]
 function M.install(args)
-    local global = false
-    for _, arg in ipairs(args or {}) do
-        if arg == "--global" or arg == "-g" then
-            global = true
-        end
-    end
-    M.npm_install(global, "install")
+    local global, version = M.parse_install_args(args)
+    M.npm_install(global, "install", version)
 end
 
---- `:PiWebUpdate [--global]`
+--- `:PiWebUpdate [--global] [<version>]`
 --- @param args? string[]
 function M.update(args)
-    local global = false
-    for _, arg in ipairs(args or {}) do
-        if arg == "--global" or arg == "-g" then
-            global = true
-        end
-    end
-    M.npm_install(global, "update")
+    local global, version = M.parse_install_args(args)
+    M.npm_install(global, "update", version)
 end
 
 --- Render a `pi2 doctor --json` payload as `name status detail` lines.
@@ -305,7 +326,9 @@ function M.doctor()
     end
     local resolved = Runtime.resolve_daemon()
     if not resolved then
-        Notify.warn("pi2 daemon not found — run :PiWebInstall to install it")
+        Notify.warn(
+            "pi2 not found — install the CLI (`npm i -g @yuez/pi2d`, the curl installer or brew) or run :PiWebInstall"
+        )
         return
     end
     M.run(M.cli_argv(resolved, "doctor", { "--json" }), function(res)
@@ -323,9 +346,6 @@ function M.doctor()
     end)
 end
 
---- External base URL the daemon advertises, when known.
---- @param info? table decoded `daemon.json`
---- @return string|nil
 --- One-line summary of a pairing report, for hosts with no UI to draw in.
 --- @param report { url: string, code: string }
 --- @return string
@@ -406,7 +426,7 @@ M.MINT_TIMEOUT_MS = 5000
 ---
 --- @param base string|nil pin the link to one of the advertised bases
 --- @param on_done fun(report: table|nil, err: string|nil)
---- @param opts? { port?: integer, token?: string, system?: fun(argv: string[], opts: table, on_exit: fun(res: table)): any, timeout?: integer }
+--- @param opts? { port?: integer, token?: string, system?: function, timeout?: integer }
 function M.mint_pair(base, on_done, opts)
     opts = opts or {}
     local ok_runtime, Runtime = pcall(require, "pi.web.runtime")
@@ -488,9 +508,7 @@ function M.mint_pair(base, on_done, opts)
     local status_code = tonumber(status)
     if status_code ~= 200 then
         local ok_decode, payload = pcall(vim.json.decode, raw or "")
-        local reason = ok_decode and type(payload) == "table"
-                and tostring(payload.message or payload.code or "")
-            or ""
+        local reason = ok_decode and type(payload) == "table" and tostring(payload.message or payload.code or "") or ""
         on_done(
             nil,
             ("pairing mint refused: HTTP %d%s"):format(status_code, reason ~= "" and (" — " .. reason) or "")
@@ -713,6 +731,221 @@ function M.pair(opts)
                 M.show_pairing(rerun)
             end)
         end)
+    end)
+end
+
+--- `true`/`false`/`unknown` for a tri-state service flag.
+--- @param value boolean|nil
+--- @return string
+local function tri(value)
+    if value == nil then
+        return "unknown"
+    end
+    return value and "yes" or "no"
+end
+
+--- Render a `pi2 service status` report as lines for `:PiWebService`.
+--- @param status pi.web.ServiceStatus
+--- @return string[]
+function M.service_lines(status)
+    local lines = { ("service: %s"):format(tostring(status.manager)) }
+    if status.unit then
+        lines[#lines + 1] = ("unit: %s%s"):format(
+            status.unit.path,
+            status.unit.installed and " (installed)" or " (missing)"
+        )
+    end
+    lines[#lines + 1] = ("enabled: %s   active: %s"):format(tri(status.enabled), tri(status.active))
+    if status.linger ~= nil then
+        lines[#lines + 1] = "linger: " .. tri(status.linger)
+    end
+    if status.error then
+        lines[#lines + 1] = "error: " .. status.error
+    end
+    if not (status.unit and status.unit.installed) then
+        lines[#lines + 1] = "next: :PiWebService install (then `:PiWebService enable`)"
+    elseif status.enabled ~= true or status.active ~= true then
+        lines[#lines + 1] = "next: :PiWebService enable"
+    end
+    return lines
+end
+
+--- `:PiWebStatus`: bridge/daemon lines synchronously, then the async probes
+--- (`pi2 config --json` for the version/install shape, `pi2 service status
+--- --json`) as one enriched block.
+function M.status()
+    local ok_web, Web = pcall(require, "pi.web")
+    if not ok_web then
+        Notify.error("web console unavailable: " .. one_line(Web))
+        return
+    end
+    local Ops = ops()
+    if not Ops then
+        Notify.error("web console unavailable: pi.web.ops is missing")
+        return
+    end
+
+    Notify.info(table.concat(Web.status_lines(), "\n"))
+
+    local ok_runtime, Runtime = pcall(require, "pi.web.runtime")
+    local resolved = ok_runtime and Runtime.resolve_daemon() or nil
+    local extra = {}
+
+    local function emit()
+        Notify.info(table.concat(Web.status_lines(extra), "\n"))
+    end
+
+    if not resolved then
+        Ops.service_status(function(status)
+            extra.service = status
+            emit()
+        end)
+        return
+    end
+
+    local service_state --- @type pi.web.ServiceStatus|false|nil
+    local config_done = false
+    local function maybe_emit()
+        if config_done and service_state ~= nil then
+            emit()
+        end
+    end
+    Ops.service_status(function(status)
+        service_state = status or false
+        maybe_emit()
+    end)
+    M.run(M.cli_argv(resolved, "config", { "--json" }), function(res)
+        local ok, decoded = pcall(vim.json.decode, vim.trim(res.stdout or ""))
+        if ok and type(decoded) == "table" then
+            extra.version = type(decoded.version) == "string" and decoded.version or nil
+            extra.install_shape = type(decoded.installShape) == "string" and decoded.installShape or nil
+        end
+        config_done = true
+        maybe_emit()
+    end)
+end
+
+--- `:PiWebService install`: write the user unit, then say how to enable it.
+function M.install_service()
+    local ok, Runtime = pcall(require, "pi.web.runtime")
+    if not ok then
+        Notify.error("web console unavailable: " .. one_line(Runtime))
+        return
+    end
+    local resolved = Runtime.resolve_daemon()
+    if not resolved then
+        Notify.warn(
+            "pi2 not found — install the CLI (`npm i -g @yuez/pi2d`, the curl installer or brew) or run :PiWebInstall"
+        )
+        return
+    end
+    if
+        not M.confirm("Write the user service unit for " .. resolved.bin .. "?" .. " (`pi2 install-service --write`)")
+    then
+        Notify.info("web console: service install cancelled")
+        return
+    end
+    M.run(M.cli_argv(resolved, "install-service", { "--write" }), function(res)
+        local text = tostring(res.stdout or "") .. tostring(res.stderr or "")
+        if tonumber(res.code) ~= 0 then
+            Notify.error("web console: install-service failed: " .. detail(text, "exit " .. tostring(res.code)))
+            return
+        end
+        Notify.info("web console: " .. detail(text, "service unit written") .. "\nnext: `:PiWebService enable`")
+    end)
+end
+
+--- `:PiWebService [status|install|enable|disable|start|stop]`
+---
+--- The unit is the one `pi2 install-service` renders; control goes through the
+--- CLI (`pi2 service …`) so the plugin never talks to systemd/launchd itself.
+--- @param args? string[]
+function M.service(args)
+    local action = "status"
+    for _, arg in ipairs(args or {}) do
+        local value = tostring(arg)
+        if value ~= "" then
+            action = value
+            break
+        end
+    end
+    local Ops = ops()
+    if not Ops then
+        Notify.error("web console unavailable: pi.web.ops is missing")
+        return
+    end
+
+    if action == "install" or action == "install-service" then
+        M.install_service()
+        return
+    end
+
+    if action == "status" then
+        Ops.service_status(function(status, err)
+            if not status then
+                Notify.warn("web console service: " .. tostring(err))
+                return
+            end
+            Notify.info(table.concat(M.service_lines(status), "\n"))
+        end)
+        return
+    end
+
+    if not vim.tbl_contains(Ops.SERVICE_ACTIONS or {}, action) then
+        Notify.error(
+            ("web console: unknown :PiWebService action `%s` (status|install|enable|disable|start|stop)"):format(action)
+        )
+        return
+    end
+
+    Ops.service(action, function(res, err)
+        if not res then
+            Notify.error("web console service: " .. tostring(err))
+            return
+        end
+        if tonumber(res.code) ~= 0 then
+            Notify.error(
+                ("web console service %s failed: %s"):format(
+                    action,
+                    detail(res.stderr ~= "" and res.stderr or res.stdout, "exit " .. tostring(res.code))
+                )
+            )
+            return
+        end
+        Notify.info(("web console service %s done"):format(action))
+    end)
+end
+
+--- Show log lines in a scratch buffer (`:PiWebLog`), or notify when headless.
+--- @param lines string[]|nil
+function M.show_log(lines)
+    lines = lines or {}
+    if #vim.api.nvim_list_uis() == 0 then
+        Notify.info(table.concat(lines, "\n"))
+        return
+    end
+    local buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    vim.bo[buf].buftype = "nofile"
+    vim.bo[buf].bufhidden = "wipe"
+    vim.bo[buf].filetype = "log"
+    vim.bo[buf].modifiable = false
+    pcall(vim.api.nvim_buf_set_name, buf, "pi2 log")
+    pcall(vim.api.nvim_win_set_buf, 0, buf)
+end
+
+--- `:PiWebLog [count]`: the service manager's log, or the spawn log.
+--- @param args? string[]
+function M.log(args)
+    local Ops = ops()
+    if not Ops then
+        Notify.error("web console unavailable: pi.web.ops is missing")
+        return
+    end
+    local count = tonumber((args or {})[1]) or Ops.LOG_LINES or 200
+    count = math.max(1, math.min(5000, math.floor(count)))
+    Ops.log_lines(count, function(lines)
+        M.show_log(lines)
     end)
 end
 
