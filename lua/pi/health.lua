@@ -365,6 +365,83 @@ M.check = function()
             vim.health.info("no image compression tool found (sips/magick/ffmpeg); images will be sent uncompressed")
         end
     end
+    -- ── Web console (pi2d) ──────────────────────────────────────────
+    -- File probes only: `:checkhealth` must never spawn a process. The live
+    -- checks are `:PiWebStatus` / `:PiWebDoctor` (`pi2 service status --json`).
+    -- `M._web` lets the specs inject every probe.
+    local web_cfg = Config.options.web or {}
+    local web = M._web or {}
+    local ok_runtime, Runtime = pcall(require, "pi.web.runtime")
+    local ok_ops, Ops = pcall(require, "pi.web.ops")
+    local resolve = web.resolve or function()
+        return ok_runtime and Runtime.resolve_daemon() or nil
+    end
+    local read_daemon_json = web.daemon_json
+        or function()
+            return ok_runtime and Runtime.read_daemon_json() or nil
+        end
+    local autostart_mode = web.autostart_mode
+        or function(cfg)
+            return ok_ops and Ops.autostart_mode(cfg) or "auto"
+        end
+    local service_status = web.service_status
+    local exists = web.exists or function(path)
+        return vim.uv.fs_stat(path) ~= nil
+    end
+
+    local daemon = resolve()
+    if daemon then
+        vim.health.ok(("pi2 found via %s: `%s`"):format(tostring(daemon.source), tostring(daemon.bin)))
+    else
+        vim.health.warn("pi2 (the web-console daemon) was not found", {
+            "Install the CLI: `npm i -g @yuez/pi2d`, the curl installer, or `brew install zgs225/tap/pi2d`",
+            "Or run :PiWebInstall to install the latest @yuez/pi2d into <web.install_dir>",
+            "Set `web.binary` (or `$PI2_DAEMON_BIN`) to an explicit executable",
+        })
+    end
+
+    local info = read_daemon_json()
+    if info then
+        vim.health.ok(("daemon running on http://127.0.0.1:%s"):format(tostring(info.port)))
+    else
+        local socket = ok_runtime and Runtime.socket_path() or "?"
+        vim.health.info(("no running daemon (socket %s); `:PiWeb` starts one per web.autostart"):format(socket))
+    end
+
+    vim.health.info(("autostart: %s"):format(tostring(autostart_mode(web_cfg))))
+
+    if service_status then
+        local status = service_status()
+        if status and status.unit then
+            if status.unit.installed then
+                local state = ("%s unit installed (%s), enabled=%s active=%s"):format(
+                    tostring(status.manager),
+                    status.unit.path,
+                    tostring(status.enabled),
+                    tostring(status.active)
+                )
+                vim.health.ok(state)
+            else
+                vim.health.info(
+                    ("no %s unit (%s); run :PiWebService install"):format(tostring(status.manager), status.unit.path)
+                )
+            end
+        elseif status then
+            vim.health.info("no service manager available (foreground/spawn mode only)")
+        end
+    else
+        local unit = web.unit_path
+        if unit and exists(unit) then
+            vim.health.ok("user service unit present: " .. unit)
+        else
+            vim.health.info("user service not probed (run :PiWebService status for unit state)")
+        end
+    end
+
+    if type(web_cfg.log) ~= "nil" and web_cfg.log then
+        local path = type(web_cfg.log) == "string" and web_cfg.log or (vim.fn.stdpath("log") .. "/pi2-web.log")
+        vim.health.info("bridge log: " .. path)
+    end
 end
 
 return M
