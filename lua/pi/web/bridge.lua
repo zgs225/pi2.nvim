@@ -394,6 +394,7 @@ function Bridge:stop()
     if self._stopped then
         return
     end
+    local was_connected = self._connected
     self._stopped = true
     self._connected = false
     self._ready = false
@@ -418,8 +419,26 @@ function Bridge:stop()
     self._inbox = {}
     self._in_parts = {}
     self._in_len = 0
-    if self._pipe then
-        self:_close_pipe(self._pipe)
+    local pipe = self._pipe
+    if pipe then
+        if was_connected and not pipe:is_closing() then
+            local bye = Protocol.envelope(Protocol.OUT.BYE, {
+                payload = { reason = "stopped" },
+            })
+            local ok, frame = pcall(vim.json.encode, bye)
+            if ok and type(frame) == "string" then
+                local written = pcall(pipe.write, pipe, frame .. "\n", function()
+                    self:_close_pipe(pipe)
+                end)
+                if not written then
+                    self:_close_pipe(pipe)
+                end
+            else
+                self:_close_pipe(pipe)
+            end
+        else
+            self:_close_pipe(pipe)
+        end
     end
     self:_log("info", "bridge stopped")
 end

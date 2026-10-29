@@ -615,6 +615,47 @@ describe("pi.web.bridge", function()
         assert.equals(1, #env.srv:records_of("hello"))
     end)
 
+    it("sends a single framed bye record before closing the pipe on stop", function()
+        local bridge = started_bridge(env)
+        assert.equals(1, #env.srv:records_of("hello"))
+
+        bridge:stop()
+        bridge:stop() -- idempotent; must not write a second bye
+
+        assert.is_true(
+            wait(function()
+                return #env.srv:records_of(Protocol.OUT.BYE) == 1
+            end),
+            "peer never received bye record"
+        )
+        assert.is_true(
+            wait(function()
+                local client = env.srv:last_client()
+                return client and not client.open
+            end),
+            "client socket remained open after bye"
+        )
+
+        -- Peer read hello then exactly one bye line; no session/ack/event frames
+        local records = env.srv:records()
+        assert.equals(2, #records)
+        assert.equals(Protocol.OUT.HELLO, records[1].type)
+        assert.equals(Protocol.OUT.BYE, records[2].type)
+        assert.equals(Protocol.VERSION, records[2].v)
+        assert.same({ reason = "stopped" }, records[2].payload)
+
+        assert.equals(0, #env.srv:records_of(Protocol.OUT.EVENT))
+        assert.equals(0, #env.srv:records_of(Protocol.OUT.ACK))
+        assert.equals(0, #env.srv:records_of(Protocol.OUT.SNAPSHOT))
+
+        -- Even after a grace period, exactly one bye was written
+        wait(function()
+            return false
+        end, 100)
+        assert.equals(1, #env.srv:records_of(Protocol.OUT.BYE))
+        assert.equals(2, #env.srv:records())
+    end)
+
     it("never throws when the daemon socket is missing", function()
         env.srv:stop()
         local bridge = new_bridge(env, { backoff_initial = 10, backoff_max = 20 })
