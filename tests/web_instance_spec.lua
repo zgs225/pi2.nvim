@@ -178,6 +178,25 @@ describe("pi.web.instance", function()
         assert.is_truthy(state.name == vim.NIL)
     end)
 
+    it("seeds the snapshot's name from the session (lazy State misses session_info_changed)", function()
+        local bridge = fake_bridge()
+        local instance = Instance.setup({ workspace_id = "ws-test", cwd = "/repo", bridge = bridge })
+        local session = fake_session({ id = "s-named" })
+        Sessions._register_for_test(session)
+        -- The backend named the session before the first web subscribe. Drive the
+        -- real event path (`handle_event` stores it on the session) instead of
+        -- assigning the field: the lazily created State must not report
+        -- `name: null` and the web must not fall back to `(unnamed)`.
+        require("pi.sessions.manager").handle_event(session, {
+            type = "session_info_changed",
+            name = "Refactor auth",
+        })
+        instance:on_subscribe("s-named")
+
+        assert.equals(1, #bridge.snapshots)
+        assert.equals("Refactor auth", bridge.snapshots[1].state.name)
+    end)
+
     it("reduces pi events into the snapshot (entries, usage, status)", function()
         local bridge = fake_bridge()
         local instance = Instance.setup({ workspace_id = "ws-test", cwd = "/repo", bridge = bridge })

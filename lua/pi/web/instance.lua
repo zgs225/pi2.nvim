@@ -194,6 +194,11 @@ function Instance:state_for(session)
             session_id = id or "",
             workspace_id = self.workspace_id,
             cwd = session.cwd or self.cwd,
+            -- Seed the name the session already has (the title extension sets
+            -- it via `session_info_changed`, which a lazily created State never
+            -- saw): without it every snapshot reports `name: null` for a
+            -- named session and the web falls back to `(unnamed)`.
+            name = session.name,
             status = self:live_status(session, "starting"),
             model = pin.model,
             thinking = pin.thinking_level,

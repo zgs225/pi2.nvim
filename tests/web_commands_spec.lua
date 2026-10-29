@@ -656,6 +656,33 @@ describe("pi.web.commands", function()
         assert.equals(Protocol.ERR.BAD_REQUEST, err.code)
     end)
 
+    it("answers an empty page for a live session whose file is not written yet", function()
+        local session = fake_session({ id = "fresh-1" })
+        -- `pi` creates the JSONL with the first entry: until then the path the
+        -- backend reported does not exist on disk.
+        session.session_file = vim.fn.tempname() .. "/not-yet.jsonl"
+        Sessions._register_for_test(session)
+
+        local ok, page = Commands.dispatch("workspace.query", { kind = "entries", limit = 10 }, ctx_for(session))
+        assert.is_true(ok)
+        assert.same({}, page.entries)
+        assert.is_false(page.cursor.hasMore)
+        assert.is_nil(page.cursor.before)
+        assert.same(0, page.bytes)
+
+        -- The same live session answers through the file when it exists.
+        local path = vim.fn.tempname()
+        vim.fn.writefile({
+            vim.json.encode({ type = "session", id = "s-1", cwd = "/repo" }),
+            vim.json.encode({ type = "message", id = "m1", message = { role = "user", content = "hi" } }),
+        }, path)
+        session.session_file = path
+        local ok2, written = Commands.dispatch("workspace.query", { kind = "entries", limit = 10 }, ctx_for(session))
+        assert.is_true(ok2)
+        assert.equals(1, #written.entries)
+        assert.equals("m1", written.entries[1].id)
+    end)
+
     it("rejects unknown workspace query kinds", function()
         local ok, err = Commands.dispatch("workspace.query", { kind = "nope" }, {})
         assert.is_nil(ok)

@@ -21,6 +21,7 @@
 
 ---@class pi.Session
 ---@field id string Session id from backend (`sessionId`) or JSONL header; temporary ids use the `tmp-` prefix until the backend reports the real id.
+---@field name? string Display name the backend reported (`session_info_changed`, e.g. the bundled title extension). `:PiSessions` labels and web snapshots read it; nil until a name arrives.
 ---@field attached_tab? pi.TabId Tab currently displaying this session (`nil` when detached or running in the background).
 ---@field tab? pi.TabId Alias for `attached_tab` (backward compatibility).
 ---@field rpc pi.Rpc
@@ -1045,6 +1046,14 @@ local function handle_event_impl(session, msg)
             Extension.handle(session, msg)
         end)
     elseif t == "session_info_changed" then
+        -- The backend's name is the one every surface labels the session with
+        -- (`:PiSessions`, the sub-session pickers, web snapshots). Keep it on
+        -- the session itself: the ui/sessions name cache is keyed by session and
+        -- invisible to `pi.web.instance`, so a web snapshot of a session named
+        -- before the browser subscribed would otherwise say `name: null`.
+        if type(msg.name) == "string" and msg.name ~= "" then
+            session.name = msg.name
+        end
         -- A child names itself after its first turn (bundled title.ts →
         -- pi.setSessionName). Adopt that title as the child's manifest name so
         -- :PiSessions / the sub-session pickers show it instead of the task

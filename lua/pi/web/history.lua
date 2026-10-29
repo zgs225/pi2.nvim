@@ -618,6 +618,16 @@ local function page_from(acc, newest_first, limit, want)
     return entries, has_more
 end
 
+--- A page for a session that has no JSONL yet.
+---
+--- A fresh session gets its file when `pi` persists the first entry, so "no
+--- file" is an empty history, not a read failure. The page carries no cursor:
+--- there is nothing older to page to.
+--- @return pi.web.HistoryPage
+function M.empty_page()
+    return { entries = {}, cursor = { hasMore = false }, bytes = 0, duration_ms = 0, skipped = 0 }
+end
+
 --- The newest `limit` entries, read backwards from EOF without the index.
 --- @param limit integer|nil
 --- @return pi.web.HistoryPage

@@ -1171,20 +1171,30 @@ local function workspace_query(params, ctx)
     end
 
     if kind == "entries" then
+        local session = ctx and ctx.session_id and Sessions().get_by_id(ctx.session_id) or nil
         local path = params.sessionFile
-        if not path then
-            local session = ctx.session_id and Sessions().get_by_id(ctx.session_id) or nil
-            path = session and session.session_file or nil
-        end
-        if type(path) ~= "string" or path == "" then
-            return bad_request("sessionFile is required")
+        if not path and session then
+            path = session.session_file
         end
         local ok, History = pcall(require, "pi.web.history")
         if not ok then
             return failure(Protocol.ERR.UNSUPPORTED, "session history is not available")
         end
+        -- A session that is still live but whose file has not been written yet is
+        -- a *fresh* session: `pi` creates the JSONL with its first entry. That is
+        -- an empty history, not a read failure — answering an error here made the
+        -- web console show "history failed to load" on every brand-new session.
+        -- A session with no path at all is not covered: that is a resume still in
+        -- flight, and an empty page there would hide its real history.
+        local live = session ~= nil and session.rpc ~= nil and session.rpc:is_running()
+        if type(path) ~= "string" or path == "" then
+            return bad_request("sessionFile is required")
+        end
         local reader, open_err = History.open(path)
         if not reader then
+            if live and not (vim.uv or vim.loop).fs_stat(path) then
+                return true, History.empty_page()
+            end
             return failure(Protocol.ERR.NOT_FOUND, open_err or "cannot read session file")
         end
         local page
