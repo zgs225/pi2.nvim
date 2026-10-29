@@ -361,7 +361,7 @@ describe("pi.web.ctl.pair", function()
 end)
 
 describe("pi.web.ctl.mint_pair", function()
-    --- Capture the curl invocation and answer with a canned HTTP reply.
+    --- `vim.system` stub: records the argv and answers with a canned CLI result.
     local function fake_system(reply, captured)
         return function(argv, opts, on_exit)
             captured.argv = argv
@@ -371,13 +371,11 @@ describe("pi.web.ctl.mint_pair", function()
         end
     end
 
-    local function data_arg(argv)
-        for index, value in ipairs(argv) do
-            if value == "--data" then
-                return argv[index + 1]
-            end
+    --- A resolvable `pi2` (never executed).
+    local function resolves(bin)
+        return function()
+            return { bin = bin or "/usr/bin/pi2", source = "path" }
         end
-        return nil
     end
 
     local function body(overrides)
@@ -394,86 +392,95 @@ describe("pi.web.ctl.mint_pair", function()
         return vim.json.encode(payload)
     end
 
-    it("POSTs /api/v1/pair with the CLI token on stdin and decodes the report", function()
-        local captured = { reply = { code = 0, stderr = "", stdout = body() .. "\n200" } }
+    it("runs `pi2 pairing --json` and decodes the report", function()
+        local captured = { reply = { code = 0, stderr = "", stdout = body() } }
         local report, err
         Ctl.mint_pair(nil, function(value, failure)
             report, err = value, failure
-        end, { port = 7676, token = "cli-token", system = fake_system(captured.reply, captured), timeout = 100 })
+        end, { resolve = resolves(), system = fake_system(captured.reply, captured), timeout = 100 })
 
         assert.is_nil(err)
         assert.is_truthy(report)
         assert.equals("ABCD2345", report.code)
         assert.equals(21, #report.rows)
-        assert.equals("http://127.0.0.1:7676/api/v1/pair", captured.argv[#captured.argv])
-        assert.equals("Authorization: Bearer cli-token\n", captured.opts.stdin)
-        -- No base: the daemon picks, so the body stays empty.
-        assert.equals("{}", data_arg(captured.argv))
+        -- No HTTP and no token handling here: the CLI owns the exchange.
+        assert.same({ "/usr/bin/pi2", "pairing", "--json" }, captured.argv)
+        assert.is_true(captured.opts.text)
+        assert.is_nil(captured.opts.stdin)
     end)
 
-    it("pins the chosen base in the request body", function()
-        local captured = { reply = { code = 0, stderr = "", stdout = body() .. "\n200" } }
+    it("pins the chosen base with --base", function()
+        local captured = { reply = { code = 0, stderr = "", stdout = body() } }
         Ctl.mint_pair("http://100.64.0.14:7676", function() end, {
-            port = 7676,
-            token = "cli-token",
+            resolve = resolves(),
             system = fake_system(captured.reply, captured),
             timeout = 100,
         })
-        local sent = vim.json.decode(data_arg(captured.argv))
-        assert.equals("http://100.64.0.14:7676", sent.base)
+        assert.same({ "/usr/bin/pi2", "pairing", "--json", "--base", "http://100.64.0.14:7676" }, captured.argv)
     end)
 
-    it("surfaces a daemon error status and its message", function()
-        local reply = {
-            code = 0,
-            stderr = "",
-            stdout = vim.json.encode({ code = "E_BAD_REQUEST", message = "base must be one of: …" }) .. "\n400",
+    it("surfaces the CLI failure as one line", function()
+        local captured = {
+            reply = { code = 1, stderr = "pi2: pairing refused: base must be one of: …\nmore", stdout = "" },
         }
-        local captured = { reply = reply }
         local report, err
         Ctl.mint_pair("http://evil.example:9999", function(value, failure)
             report, err = value, failure
-        end, { port = 7676, token = "cli-token", system = fake_system(captured.reply, captured), timeout = 100 })
+        end, { resolve = resolves(), system = fake_system(captured.reply, captured), timeout = 100 })
 
         assert.is_nil(report)
-        assert.is_truthy(err:find("HTTP 400", 1, true))
+        assert.is_truthy(err:find("pairing failed", 1, true))
         assert.is_truthy(err:find("base must be one of", 1, true))
+        assert.is_nil(err:find("\n", 1, true))
     end)
 
     it("rejects an unreadable body instead of drawing garbage", function()
-        local captured = { reply = { code = 0, stderr = "", stdout = "not json\n200" } }
+        local captured = { reply = { code = 0, stderr = "", stdout = "not json" } }
         local report, err
         Ctl.mint_pair(nil, function(value, failure)
             report, err = value, failure
-        end, { port = 7676, token = "cli-token", system = fake_system(captured.reply, captured), timeout = 100 })
+        end, { resolve = resolves(), system = fake_system(captured.reply, captured), timeout = 100 })
 
         assert.is_nil(report)
         assert.is_truthy(err:find("unreadable JSON", 1, true))
     end)
 
-    it("fails fast when the daemon has published no port or token", function()
+    it("fails fast when pi2 cannot be resolved", function()
         local calls = 0
         local function system()
             calls = calls + 1
             return {}
         end
 
-        local no_port_report, no_port_err
-        Ctl.mint_pair(nil, function(value, failure)
-            no_port_report, no_port_err = value, failure
-        end, { port = 0, token = "cli-token", system = system, timeout = 100 })
-        assert.is_nil(no_port_report)
-        assert.is_truthy(no_port_err:find("daemon port", 1, true))
-
         local report, err
         Ctl.mint_pair(nil, function(value, failure)
             report, err = value, failure
-        end, { port = 7676, token = "", system = system, timeout = 100 })
+        end, {
+            resolve = function()
+                return nil
+            end,
+            system = system,
+            timeout = 100,
+        })
         assert.is_nil(report)
-        assert.is_truthy(err:find("CLI token", 1, true))
-
-        -- Neither failure shells out.
+        assert.is_truthy(err:find("npm i -g @yuez/pi2d", 1, true))
+        -- Nothing is shelled out without a binary.
         assert.equals(0, calls)
+    end)
+
+    it("times out instead of blocking forever", function()
+        local report, err
+        Ctl.mint_pair(nil, function(value, failure)
+            report, err = value, failure
+        end, {
+            resolve = resolves(),
+            timeout = 30,
+            system = function()
+                return {}
+            end,
+        })
+        assert.is_nil(report)
+        assert.is_truthy(err:find("timed out", 1, true))
     end)
 end)
 

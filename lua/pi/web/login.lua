@@ -1,37 +1,35 @@
--- Local-browser login handshake (`POST /api/v1/console/session`).
+-- Local-browser login handshake for `:PiWeb`.
 --
--- `:PiWeb` must land in an *already signed in* browser: the daemon mints
--- (rotates) the local-browser device token and returns a `#t=<token>` handoff
--- URL. The credentials for that call live next to the daemon: `<runtime>/daemon.json` (actual bound port) and `<runtime>/cli.token`
--- (local admin token, 0600).
+-- The daemon mints (rotates) the local-browser device token and returns a
+-- `#t=<token>` handoff URL over `POST /api/v1/console/session`. That exchange is
+-- already owned by the CLI — `pi2 open --print` reads `<runtime>/daemon.json`
+-- and `<runtime>/cli.token`, keeps the token out of argv and prints exactly the
+-- signed-in URL — so the plugin runs it instead of re-implementing the HTTP
+-- call. One code path, and no `curl` dependency for the editor.
 --
--- The token never appears in argv (world-readable through `ps`): curl reads the
--- Authorization header from stdin (`-H @-`). It is never printed or logged
--- either — the returned URL contains it by design and is only handed to the
--- opener (and to callers for `--print`-style display).
+-- The URL contains the token by design; it is only handed to the opener (and to
+-- callers for `--print`-style display), never logged.
 --
--- The HTTP round-trip is a bounded `vim.system` call (`text = true`, 5 s
--- timeout), so the editor is never blocked indefinitely.
+-- The round-trip is a bounded `vim.system` call (`text = true`, 5 s), so the
+-- editor is never blocked indefinitely.
 
 local M = {}
 
 local Runtime = require("pi.web.runtime")
 
-local uv = vim.uv or vim.loop
-
---- Default round-trip budget for the console-session request.
+--- Default budget for `pi2 open --print`.
 M.TIMEOUT_MS = 5000
---- Bodies in error messages are flattened and truncated to this many chars.
+--- Error details are flattened and truncated to this many chars.
 M.BODY_LIMIT = 200
 
 ---@class pi.web.LoginOpts
----@field runtime_dir? string read `daemon.json`/`cli.token` from here (tests)
----@field timeout? integer milliseconds to wait for the request (default 5000)
+---@field timeout? integer milliseconds to wait for the CLI (default 5000)
 ---@field system? fun(cmd: string[], opts: table, on_exit: fun(res: table)): any injectable `vim.system`
 ---@field opener? fun(url: string): boolean, string|nil injectable opener
 ---@field config? pi.WebConfig defaults to `pi.config`
+---@field resolve? fun(): pi.web.DaemonCandidate|nil injectable daemon resolution (tests)
 
---- Flatten to a single trimmed line of at most `BODY_LIMIT` chars.
+--- Flatten to a single trimmed line of at most `M.BODY_LIMIT` chars.
 --- @param text any
 --- @return string
 local function one_line(text)
@@ -43,84 +41,17 @@ local function one_line(text)
     return line
 end
 
---- @param dir? string
---- @return integer|nil port, string|nil err
-local function daemon_port(dir)
-    local path = Runtime.daemon_json_path(dir)
-    local raw = Runtime.read_text(path)
-    if not raw then
-        return nil, "no running pi2 daemon (" .. path .. " missing)"
-    end
-    local ok, decoded = pcall(vim.json.decode, raw)
-    if not ok or type(decoded) ~= "table" then
-        return nil, "malformed " .. path
-    end
-    local port = tonumber(decoded.port)
-    if not port or port <= 0 then
-        return nil, path .. " has no port"
-    end
-    return math.floor(port), nil
-end
-
---- POST the console-session request. Returns the HTTP status and body.
---- @param port integer
---- @param token string
---- @param opts pi.web.LoginOpts
---- @return integer|nil status, string body, string|nil err
-local function post_session(port, token, opts)
-    local system = opts.system or vim.system
-    local timeout = opts.timeout or M.TIMEOUT_MS
-    local argv = {
-        "curl",
-        "-sS",
-        "-X",
-        "POST",
-        "-H",
-        "@-",
-        "-H",
-        "Content-Type: application/json",
-        "--data",
-        "{}",
-        "-w",
-        "\n%{http_code}",
-        ("http://127.0.0.1:%d/api/v1/console/session"):format(port),
-    }
-    local done = false
-    --- @type table|nil
-    local result = nil
-    local ok, err = pcall(
-        system,
-        argv,
-        { text = true, stdin = "Authorization: Bearer " .. token .. "\n" },
-        function(res)
-            result = res
-            done = true
+--- First non-empty line of a block of text, flattened.
+--- @param text any
+--- @return string
+local function first_line(text)
+    for line in tostring(text or ""):gmatch("[^\r\n]+") do
+        local trimmed = vim.trim(line)
+        if trimmed ~= "" then
+            return one_line(trimmed)
         end
-    )
-    if not ok then
-        return nil, "", "cannot run curl: " .. one_line(err)
     end
-    if not done then
-        vim.wait(timeout, function()
-            return done
-        end, 20)
-    end
-    if not done or type(result) ~= "table" then
-        return nil, "", ("console session request timed out after %d ms"):format(timeout)
-    end
-    if tonumber(result.code) ~= 0 then
-        local detail = result.stderr
-        if type(detail) ~= "string" or vim.trim(detail) == "" then
-            detail = "exit " .. tostring(result.code)
-        end
-        return nil, "", "curl failed: " .. one_line(detail)
-    end
-    local stdout = type(result.stdout) == "string" and result.stdout or ""
-    local body, status = stdout:match("^(.-)\n(%d%d%d)%s*$")
-    if not status then
-        return nil, stdout, "unexpected response from the daemon"
-    end
-    return tonumber(status), body or "", nil
+    return ""
 end
 
 --- @param opts? pi.web.LoginOpts
@@ -128,11 +59,11 @@ end
 local function normalize(opts)
     opts = opts or {}
     local normalized = {
-        runtime_dir = opts.runtime_dir,
         timeout = opts.timeout,
         system = opts.system,
         opener = opts.opener,
         config = opts.config,
+        resolve = opts.resolve,
     }
     if not normalized.config then
         local ok, config = pcall(require, "pi.config")
@@ -141,34 +72,65 @@ local function normalize(opts)
     return normalized
 end
 
---- Request a signed-in console URL from the local daemon.
+--- Request a signed-in console URL through `pi2 open --print`.
 --- @param opts? pi.web.LoginOpts
 --- @return string|nil url, string|nil err
 function M.url(opts)
     local o = normalize(opts)
-    local port, port_err = daemon_port(o.runtime_dir)
-    if not port then
-        return nil, port_err
+    local resolved
+    if type(o.resolve) == "function" then
+        local ok, value = pcall(o.resolve)
+        resolved = ok and value or nil
+    else
+        local ok, value = pcall(Runtime.resolve_daemon)
+        resolved = ok and value or nil
     end
-    local token_path = Runtime.cli_token_path(o.runtime_dir)
-    local token = Runtime.read_text(token_path)
-    if not token then
-        return nil, "missing " .. token_path
+    if not resolved then
+        return nil,
+            "pi2 not found — install the CLI (`npm i -g @yuez/pi2d`, the curl installer or brew) or run :PiWebInstall"
     end
-    local status, body, err = post_session(port, token, o)
-    if not status then
-        return nil, err
+
+    local argv = { resolved.bin, "open", "--print" }
+    local system = o.system or vim.system
+    local timeout = o.timeout or M.TIMEOUT_MS
+    local done, result = false, nil
+    local ok, err = pcall(system, argv, { text = true }, function(res)
+        result = res
+        done = true
+    end)
+    if not ok then
+        return nil, "cannot run `" .. table.concat(argv, " ") .. "`: " .. one_line(err)
     end
-    if status ~= 200 then
-        return nil, ("%s %s"):format(tostring(status), one_line(body))
+    if not done then
+        vim.wait(timeout, function()
+            return done
+        end, 20)
     end
-    local ok, decoded = pcall(vim.json.decode, body or "")
-    if not ok or type(decoded) ~= "table" then
-        return nil, "console session response is not JSON"
+    if not done or type(result) ~= "table" then
+        return nil, ("`pi2 open --print` timed out after %d ms"):format(timeout)
     end
-    local url = decoded.url
-    if type(url) ~= "string" or url == "" then
-        return nil, "console session response has no url"
+    if tonumber(result.code) ~= 0 then
+        local detail = first_line(result.stderr)
+        if detail == "" then
+            detail = first_line(result.stdout)
+        end
+        if detail == "" then
+            detail = "exit " .. tostring(result.code)
+        end
+        return nil, "pi2 open failed: " .. detail
+    end
+
+    -- `pi2 open --print` prints the URL on one line; take the last URL-shaped
+    -- line so a stray warning on stdout cannot become the handoff target.
+    local url
+    for line in tostring(result.stdout or ""):gmatch("[^\r\n]+") do
+        local trimmed = vim.trim(line)
+        if trimmed:match("^https?://%S+$") then
+            url = trimmed
+        end
+    end
+    if not url then
+        return nil, "`pi2 open --print` printed no URL"
     end
     return url, nil
 end
@@ -213,7 +175,7 @@ function M.open_url(url, opts)
             return false, one_line(open_err)
         end
     end
-    if (uv.os_uname().sysname or "") == "Darwin" then
+    if ((vim.uv or vim.loop).os_uname().sysname or "") == "Darwin" then
         return M.spawn({ "open", url }, o)
     end
     return M.spawn({ "xdg-open", url }, o)

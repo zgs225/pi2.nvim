@@ -418,15 +418,17 @@ end
 --- HTTP budget for the mint round-trip; the daemon answers immediately.
 M.MINT_TIMEOUT_MS = 5000
 
---- POST `/api/v1/pair` and hand back a render-ready report.
+--- Mint a pairing code through `pi2 pairing --json` and hand back a
+--- render-ready report.
 ---
---- The daemon owns the URL, the QR matrix and the base list (ADR 0001): this
---- module only asks for them, so the symbol and the link always agree. The CLI
---- token travels through curl's stdin config, so it never appears in `ps`.
+--- The daemon owns the URL, the QR matrix and the base list (ADR 0001), and the
+--- CLI already normalises that payload — so the plugin only asks for it. No HTTP
+--- request, no CLI-token handling and no curl dependency live here any more; the
+--- symbol and the link still always agree.
 ---
 --- @param base string|nil pin the link to one of the advertised bases
 --- @param on_done fun(report: table|nil, err: string|nil)
---- @param opts? { port?: integer, token?: string, system?: function, timeout?: integer }
+--- @param opts? { timeout?: integer, system?: function, resolve?: function }
 function M.mint_pair(base, on_done, opts)
     opts = opts or {}
     local ok_runtime, Runtime = pcall(require, "pi.web.runtime")
@@ -434,54 +436,40 @@ function M.mint_pair(base, on_done, opts)
         on_done(nil, "web console unavailable: " .. one_line(Runtime))
         return
     end
-    local daemon = Runtime.read_daemon_json() or {}
-    local port = tonumber(opts.port) or tonumber(daemon.port)
-    if not port or port <= 0 then
-        on_done(nil, "no daemon port — is `pi2 daemon` running?")
-        return
+
+    local resolved
+    if type(opts.resolve) == "function" then
+        local ok, value = pcall(opts.resolve)
+        resolved = ok and value or nil
+    else
+        local ok, value = pcall(Runtime.resolve_daemon)
+        resolved = ok and value or nil
     end
-    local token = opts.token or Runtime.read_text(Runtime.cli_token_path())
-    if type(token) ~= "string" or token == "" then
-        on_done(nil, "no CLI token in the runtime dir — restart `pi2 daemon`")
+    if not resolved then
+        on_done(
+            nil,
+            "pi2 not found — install it (`npm i -g @yuez/pi2d`, the curl installer or brew) or run :PiWebInstall"
+        )
         return
     end
 
-    local body = "{}"
+    local extra = { "--json" }
     if type(base) == "string" and base ~= "" then
-        body = vim.json.encode({ base = base })
+        extra = { "--json", "--base", base }
     end
-    local argv = {
-        "curl",
-        "-sS",
-        "-X",
-        "POST",
-        "-H",
-        "@-",
-        "-H",
-        "Content-Type: application/json",
-        "--data",
-        body,
-        "-w",
-        "\n%{http_code}",
-        ("http://127.0.0.1:%d/api/v1/pair"):format(port),
-    }
+    local argv = M.cli_argv(resolved, "pairing", extra)
 
     local system = opts.system or vim.system
     local timeout = opts.timeout or M.MINT_TIMEOUT_MS
     local done = false
     --- @type table|nil
     local result = nil
-    local ok, err = pcall(
-        system,
-        argv,
-        { text = true, stdin = "Authorization: Bearer " .. token .. "\n" },
-        function(res)
-            result = res
-            done = true
-        end
-    )
+    local ok, err = pcall(system, argv, { text = true }, function(res)
+        result = res
+        done = true
+    end)
     if not ok then
-        on_done(nil, "cannot run curl: " .. one_line(err))
+        on_done(nil, "cannot run `" .. table.concat(argv, " ") .. "`: " .. one_line(err))
         return
     end
     if not done then
@@ -494,30 +482,16 @@ function M.mint_pair(base, on_done, opts)
         return
     end
     if tonumber(result.code) ~= 0 then
-        local detail = type(result.stderr) == "string" and vim.trim(result.stderr) or ""
-        on_done(nil, "curl failed: " .. (detail ~= "" and one_line(detail) or ("exit " .. tostring(result.code))))
+        local text = tostring(result.stderr or "")
+        if vim.trim(text) == "" then
+            text = tostring(result.stdout or "")
+        end
+        on_done(nil, "pairing failed: " .. detail(text, "exit " .. tostring(result.code)))
         return
     end
-
-    local stdout = type(result.stdout) == "string" and result.stdout or ""
-    local raw, status = stdout:match("^(.-)\n(%d%d%d)%s*$")
-    if not status then
-        on_done(nil, "unexpected response from the daemon")
-        return
-    end
-    local status_code = tonumber(status)
-    if status_code ~= 200 then
-        local ok_decode, payload = pcall(vim.json.decode, raw or "")
-        local reason = ok_decode and type(payload) == "table" and tostring(payload.message or payload.code or "") or ""
-        on_done(
-            nil,
-            ("pairing mint refused: HTTP %d%s"):format(status_code, reason ~= "" and (" — " .. reason) or "")
-        )
-        return
-    end
-    local ok_decode, payload = pcall(vim.json.decode, raw or "")
+    local ok_decode, payload = pcall(vim.json.decode, tostring(result.stdout or ""))
     if not ok_decode or type(payload) ~= "table" then
-        on_done(nil, "pairing mint returned unreadable JSON")
+        on_done(nil, "`pi2 pairing --json` returned unreadable JSON")
         return
     end
     local report = M.pairing_report(payload)
