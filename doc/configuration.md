@@ -388,11 +388,11 @@ require("pi").setup({
         -- "https://myhost.tail1234.ts.net" (no trailing slash). Advertised to
         -- :PiWebPair as the first choice, e.g. behind `tailscale serve`.
         public_url = nil,
-        -- Where the npm channel of :PiWebInstall puts the package (the
-        -- standalone channel ignores it: `pi2 update` owns that layout, see
-        -- docs/install.md). The executable is
-        -- then resolved as <install_dir>/node_modules/.bin/pi2. Install is
-        -- explicit and confirmed: `@yuez/pi2d@latest`, or a pinned <version>.
+        -- Deprecated: the plugin no longer installs (ADR 0004). The value is
+        -- still read by the resolution ladder as a read-only fallback for an
+        -- existing npm copy at <install_dir>/node_modules/.bin/pi2, so nothing
+        -- breaks, but nothing writes there either. Install via the standalone
+        -- installer (docs/install.md) or your package manager.
         install_dir = vim.fn.stdpath("data") .. "/pi2d",
         -- Open the browser from :PiWeb (true) or only report the console URL.
         open = true,

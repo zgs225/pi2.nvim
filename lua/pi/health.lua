@@ -395,7 +395,7 @@ M.check = function()
     else
         vim.health.warn("pi2 (the web-console daemon) was not found", {
             "Install the CLI: `npm i -g @yuez/pi2d`, the curl installer, or `brew install zgs225/tap/pi2d`",
-            "Or run :PiWebInstall — it follows the install channel (npm into <web.install_dir> when no pi2 is resolvable)",
+            "Or run :PiWebInstall to print them (standalone first; the plugin does not install pi2)",
             "Set `web.binary` (or `$PI2_DAEMON_BIN`) to an explicit executable",
         })
     end

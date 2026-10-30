@@ -107,76 +107,6 @@ describe(":PiWeb command surface", function()
     end)
 end)
 
-describe(":PiWebInstall planning", function()
-    local saved
-
-    before_each(function()
-        saved = { confirm = Ctl.confirm, run = Ctl.run, install_dir = Ctl.install_dir }
-        -- No resolvable pi2: the npm channel is the only one the plugin can bootstrap.
-        local Runtime = require("pi.web.runtime")
-        saved.resolve = Runtime.resolve_daemon
-        Runtime.resolve_daemon = function()
-            return nil
-        end
-    end)
-
-    after_each(function()
-        Ctl.confirm = saved.confirm
-        Ctl.run = saved.run
-        Ctl.install_dir = saved.install_dir
-        require("pi.web.runtime").resolve_daemon = saved.resolve
-    end)
-
-    it("defaults to @yuez/pi2d@latest and can be pinned by a version argument", function()
-        assert.equals("@yuez/pi2d@latest", Ctl.package_spec(nil))
-        assert.equals("@yuez/pi2d@latest", Ctl.package_spec("latest"))
-        assert.equals("@yuez/pi2d@0.1.6", Ctl.package_spec("0.1.6"))
-        assert.equals("@yuez/pi2d@0.1.6", Ctl.package_spec("@yuez/pi2d@0.1.6"))
-    end)
-
-    it("parses --global and an optional version", function()
-        local global, version = Ctl.parse_install_args({ "--global", "0.1.6" })
-        assert.is_true(global)
-        assert.equals("0.1.6", version)
-        local global2, version2 = Ctl.parse_install_args({})
-        assert.is_false(global2)
-        assert.is_nil(version2)
-    end)
-
-    it("asks before running npm and runs it only on confirmation", function()
-        local ran = {}
-        Ctl.run = function(argv)
-            ran[#ran + 1] = argv
-            return true
-        end
-        Ctl.install_dir = function()
-            return "/tmp/pi2d"
-        end
-
-        Ctl.confirm = function()
-            return false
-        end
-        local cancelled = capture_notify(function()
-            Ctl.install({})
-        end)
-        assert.equals(0, #ran)
-        assert.is_truthy(table.concat(cancelled, "\n"):find("cancelled", 1, true))
-
-        Ctl.confirm = function()
-            return true
-        end
-        capture_notify(function()
-            Ctl.install({})
-        end)
-        assert.same({ "npm", "i", "--prefix", "/tmp/pi2d", "@yuez/pi2d@latest" }, ran[1])
-
-        capture_notify(function()
-            Ctl.install({ "--global", "0.1.6" })
-        end)
-        assert.same({ "npm", "i", "-g", "@yuez/pi2d@0.1.6" }, ran[2])
-    end)
-end)
-
 describe(":PiWebService actions", function()
     local saved
 
@@ -288,15 +218,70 @@ describe(":PiWeb degradation", function()
     end)
 end)
 
-describe(":PiWebInstall / :PiWebUpdate channel dispatch", function()
+describe(":PiWebInstall / :PiWebUpdate planning", function()
+    local resolved = { bin = "/usr/local/bin/pi2", source = "path" }
+
+    it("maps the plugin flags onto `pi2 update`", function()
+        assert.same({ "/usr/local/bin/pi2", "update", "--json" }, Ctl.update_argv(resolved))
+        assert.same(
+            { "/usr/local/bin/pi2", "update", "--json", "--check" },
+            Ctl.update_argv(resolved, { check = true })
+        )
+        assert.same(
+            { "/usr/local/bin/pi2", "update", "--json", "--version", "0.1.6" },
+            Ctl.update_argv(resolved, { version = "@yuez/pi2d@0.1.6" })
+        )
+        assert.same(
+            { "/usr/local/bin/pi2", "update", "--json", "--force", "--version", "0.1.7" },
+            Ctl.update_argv(resolved, { version = "v0.1.7", force = true })
+        )
+        assert.same({ "/usr/local/bin/pi2", "update", "--json" }, Ctl.update_argv(resolved, { version = "latest" }))
+    end)
+
+    it("parses --check and --force alongside the version", function()
+        local global, version, check, force = Ctl.parse_install_args({ "--check", "0.1.6" })
+        assert.is_false(global)
+        assert.equals("0.1.6", version)
+        assert.is_true(check)
+        assert.is_false(force)
+
+        local _, _, check2, force2 = Ctl.parse_install_args({ "--force" })
+        assert.is_false(check2)
+        assert.is_true(force2)
+    end)
+
+    it("renders update payloads as one line", function()
+        assert.equals(
+            "web console: pi2 0.1.7 is up to date (latest 0.1.7)",
+            Ctl.update_report({ action = "up-to-date", current = "0.1.7", latest = "0.1.7" })
+        )
+        assert.equals(
+            "web console: pi2 0.1.6 — latest 0.1.7",
+            Ctl.update_report({ action = "checked", current = "0.1.6", latest = "0.1.7" })
+        )
+        local installed = Ctl.update_report({
+            action = "installed",
+            current = "0.1.6",
+            latest = "0.1.7",
+            restart = "pi2 service stop && pi2 service start",
+        })
+        assert.is_truthy(installed:find("0.1.6 → 0.1.7 installed", 1, true))
+        assert.is_truthy(installed:find("pi2 service stop", 1, true))
+    end)
+
+    it("offers the standalone installer first", function()
+        local commands = Ctl.install_commands()
+        assert.is_truthy(commands[1]:find("scripts/install.sh", 1, true))
+        assert.is_truthy(commands[2]:find("npm i -g @yuez/pi2d", 1, true))
+    end)
+end)
+
+describe(":PiWebUpdate / :PiWebInstall — resolve, delegate, print", function()
     local Runtime = require("pi.web.runtime")
     local saved
 
-    --- Stub `Ctl.run` with a pi2 that reports `shape`, and answer the update
-    --- probes with `replies` ({ check = payload, update = payload }).
-    --- @param shape string|nil
-    --- @param replies? table
-    --- @return table[] argv log
+    --- Stub `Ctl.run` with a pi2 that reports `shape`, answering the update
+    --- probes from `replies`; returns every argv that was executed.
     local function fake_run(shape, replies)
         replies = replies or {}
         local ran = {}
@@ -333,13 +318,9 @@ describe(":PiWebInstall / :PiWebUpdate channel dispatch", function()
     end
 
     before_each(function()
-        saved =
-            { resolve = Runtime.resolve_daemon, run = Ctl.run, confirm = Ctl.confirm, install_dir = Ctl.install_dir }
+        saved = { resolve = Runtime.resolve_daemon, run = Ctl.run, confirm = Ctl.confirm }
         Runtime.resolve_daemon = function()
             return { bin = "/usr/local/bin/pi2", source = "path" }
-        end
-        Ctl.install_dir = function()
-            return "/tmp/pi2d"
         end
         Ctl.confirm = function()
             return true
@@ -350,67 +331,65 @@ describe(":PiWebInstall / :PiWebUpdate channel dispatch", function()
         Runtime.resolve_daemon = saved.resolve
         Ctl.run = saved.run
         Ctl.confirm = saved.confirm
-        Ctl.install_dir = saved.install_dir
     end)
 
-    it("maps the plugin flags onto `pi2 update`", function()
-        local resolved = { bin = "/usr/local/bin/pi2", source = "path" }
-        assert.same({ "/usr/local/bin/pi2", "update", "--json" }, Ctl.update_argv(resolved))
-        assert.same(
-            { "/usr/local/bin/pi2", "update", "--json", "--check" },
-            Ctl.update_argv(resolved, { check = true })
-        )
-        assert.same(
-            { "/usr/local/bin/pi2", "update", "--json", "--version", "0.1.6" },
-            Ctl.update_argv(resolved, { version = "@yuez/pi2d@0.1.6" })
-        )
-        assert.same(
-            { "/usr/local/bin/pi2", "update", "--json", "--force", "--version", "0.1.7" },
-            Ctl.update_argv(resolved, { version = "v0.1.7", force = true })
-        )
-        -- `latest` is not a pin.
-        assert.same({ "/usr/local/bin/pi2", "update", "--json" }, Ctl.update_argv(resolved, { version = "latest" }))
+    it("prints the install commands and executes nothing when there is no pi2", function()
+        Runtime.resolve_daemon = function()
+            return nil
+        end
+        local ran = {}
+        Ctl.run = function(argv)
+            ran[#ran + 1] = argv
+            return true
+        end
+        local notes = capture_notify(function()
+            Ctl.install({})
+        end)
+        local text = table.concat(notes, "\n")
+        assert.equals(0, #ran)
+        assert.is_truthy(text:find("pi2 is not installed", 1, true))
+        assert.is_truthy(text:find("scripts/install.sh", 1, true))
+        assert.is_truthy(text:find(":PiWebUpdate", 1, true))
     end)
 
-    it("parses --check and --force alongside the version", function()
-        local global, version, check, force = Ctl.parse_install_args({ "--global", "--check", "0.1.6" })
-        assert.is_true(global)
-        assert.equals("0.1.6", version)
-        assert.is_true(check)
-        assert.is_false(force)
-
-        local _, _, _, forced = Ctl.parse_install_args({ "--force" })
-        assert.is_true(forced)
-    end)
-
-    it("renders update payloads as one line", function()
-        assert.equals(
-            "web console: pi2 0.1.7 is up to date (latest 0.1.7)",
-            Ctl.update_report({ action = "up-to-date", current = "0.1.7", latest = "0.1.7" })
-        )
-        assert.equals(
-            "web console: pi2 0.1.6 — latest 0.1.7",
-            Ctl.update_report({ action = "checked", current = "0.1.6", latest = "0.1.7" })
-        )
-        local installed = Ctl.update_report({
-            action = "installed",
-            current = "0.1.6",
-            latest = "0.1.7",
-            restart = "pi2 service stop && pi2 service start",
-        })
-        assert.is_truthy(installed:find("0.1.6 → 0.1.7 installed", 1, true))
-        assert.is_truthy(installed:find("pi2 service stop", 1, true))
-    end)
-
-    it("uses npm for an npm-installed (node) pi2", function()
-        local ran = fake_run("node")
-        capture_notify(function()
+    it("says there is nothing to update when there is no pi2", function()
+        Runtime.resolve_daemon = function()
+            return nil
+        end
+        local ran = {}
+        Ctl.run = function(argv)
+            ran[#ran + 1] = argv
+            return true
+        end
+        local notes = capture_notify(function()
             Ctl.update({})
         end)
-        assert.same({ "npm", "i", "--prefix", "/tmp/pi2d", "@yuez/pi2d@latest" }, ran[2])
+        assert.equals(0, #ran)
+        assert.is_truthy(table.concat(notes, "\n"):find("nothing to update", 1, true))
     end)
 
-    it("drives `pi2 update` for a standalone (bundled) pi2, asking first", function()
+    it("prints the package-manager command for an npm-installed pi2, running nothing", function()
+        local ran = fake_run("node")
+        local notes = capture_notify(function()
+            Ctl.update({})
+        end)
+        local text = table.concat(notes, "\n")
+        assert.equals(1, #ran) -- only the shape probe
+        assert.equals("config", ran[1][2])
+        assert.is_truthy(text:find("npm i -g @yuez/pi2d@latest", 1, true))
+        assert.is_truthy(text:find("owns the upgrade", 1, true))
+    end)
+
+    it("--check on an npm install points at npm instead of pi2 update", function()
+        local ran = fake_run("node")
+        local notes = capture_notify(function()
+            Ctl.update({ "--check" })
+        end)
+        assert.equals(1, #ran)
+        assert.is_truthy(table.concat(notes, "\n"):find("npm view @yuez/pi2d version", 1, true))
+    end)
+
+    it("drives `pi2 update` for a standalone pi2, asking first", function()
         local ran = fake_run("bundled", {
             check = { action = "checked", current = "0.1.6", latest = "0.1.7", updatable = true },
             update = {
@@ -430,7 +409,7 @@ describe(":PiWebInstall / :PiWebUpdate channel dispatch", function()
         assert.same({ "/usr/local/bin/pi2", "update", "--json", "--check" }, ran[2])
         assert.same({ "/usr/local/bin/pi2", "update", "--json" }, ran[3])
         for _, argv in ipairs(ran) do
-            assert.is_true(argv[1] ~= "npm", "the standalone channel must not shell out to npm")
+            assert.is_true(argv[1] ~= "npm", "the plugin must never shell out to npm")
         end
         assert.is_truthy(text:find("0.1.6 → 0.1.7 installed", 1, true))
         assert.is_truthy(text:find("restart the daemon", 1, true))
@@ -479,7 +458,7 @@ describe(":PiWebInstall / :PiWebUpdate channel dispatch", function()
         assert.same({ "/usr/local/bin/pi2", "update", "--json", "--force", "--version", "0.1.6" }, ran[2])
     end)
 
-    it("surfaces the CLI's channel refusal instead of running npm", function()
+    it("surfaces the CLI's channel refusal instead of doing anything else", function()
         local ran = fake_run("bundled", {
             check_code = 1,
             check_stderr = "pi2: pi2 was installed by brew; let it upgrade itself: brew upgrade pi2d",
@@ -508,34 +487,22 @@ describe(":PiWebInstall / :PiWebUpdate channel dispatch", function()
         assert.is_truthy(table.concat(notes, "\n"):find("update cancelled", 1, true))
     end)
 
-    it("warns that --global is npm-only on the standalone channel", function()
+    it("`:PiWebInstall` on a standalone pi2 reports it and never updates", function()
+        local ran = fake_run("bundled")
+        local notes = capture_notify(function()
+            Ctl.install({})
+        end)
+        local text = table.concat(notes, "\n")
+        assert.equals(1, #ran) -- only the shape probe
+        assert.is_truthy(text:find("Self-updating channel", 1, true))
+        assert.is_truthy(text:find(":PiWebUpdate", 1, true))
+    end)
+
+    it("warns that --global is gone", function()
         fake_run("bundled", { check = { action = "up-to-date", current = "0.1.7", latest = "0.1.7" } })
         local notes = capture_notify(function()
             Ctl.update({ "--global" })
         end)
-        local text = table.concat(notes, "\n")
-        assert.is_truthy(text:find("--global is npm-only", 1, true))
-        assert.is_truthy(text:find("is up to date", 1, true))
-    end)
-
-    it("falls back to npm when the install shape is unknown", function()
-        local ran = fake_run(nil)
-        local notes = capture_notify(function()
-            Ctl.update({})
-        end)
-        assert.same({ "npm", "i", "--prefix", "/tmp/pi2d", "@yuez/pi2d@latest" }, ran[2])
-        assert.is_truthy(table.concat(notes, "\n"):find("could not tell how this pi2 was installed", 1, true))
-    end)
-
-    it("`install` shares the dispatch (a standalone pi2 reinstalls via pi2 update)", function()
-        local ran = fake_run("bundled", {
-            check = { action = "checked", current = "0.1.6", latest = "0.1.7", updatable = true },
-            update = { action = "installed", current = "0.1.6", latest = "0.1.7" },
-        })
-        capture_notify(function()
-            Ctl.install({})
-        end)
-        assert.equals("config", ran[1][2])
-        assert.equals("update", ran[2][2])
+        assert.is_truthy(table.concat(notes, "\n"):find("--global is gone", 1, true))
     end)
 end)

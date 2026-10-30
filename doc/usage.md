@@ -182,8 +182,8 @@ Whenever a task reaches a terminal state — completed, failed, or stopped — t
 | Command | Action |
 | --- | --- |
 | `:PiWeb` | The whole flow: attaches to a running daemon, else starts the installed user service (`pi2 service start`), else spawns `pi2 daemon` detached, then waits up to 10 s for `<runtime>/daemon.json` and signs a local browser in (`web.open = false` only reports the URL) |
-| `:PiWebInstall [--global] [--check] [--force] [<version>]` | Installs pi2 **on the channel the resolved binary reports** (`pi2 config --json` → `installShape`). A compiled binary goes through `pi2 update` (which refuses npm/Homebrew/AUR with the command that owns them); an npm/dev pi2 gets `npm i --prefix <web.install_dir> @yuez/pi2d@latest` (`--global`: `npm i -g`; a `<version>` such as `0.1.6` pins it). With no pi2 at all it falls back to npm, the only channel the plugin can bootstrap |
-| `:PiWebUpdate [--global] [--check] [--force] [<version>]` | Same dispatch. On the standalone channel the plugin runs `pi2 update --check --json` first, asks `pi2 0.1.6 → 0.1.7?`, then `pi2 update --json` (SHA256 + SLSA provenance verified, `current` switched) and prints the restart command the CLI reports. `--check` only reports; a pinned `<version>` implies `--force`; `--global` is npm-only and warns on the standalone channel |
+| `:PiWebInstall` | **Prints** how to install pi2 — the plugin never installs anything ([ADR 0004](https://github.com/zgs225/pi2d/blob/main/docs/adr/0004-one-self-updating-channel.md)). With no resolvable `pi2` it lists the commands (standalone `curl` installer first, then npm/Homebrew/AUR); with a `pi2` it reports where it lives, which rung of the resolution ladder found it, and which channel owns its upgrade |
+| `:PiWebUpdate [--check] [--force] [<version>]` | On the standalone channel it drives `pi2 update`: a `--check --json` probe first, a confirm showing `pi2 0.1.6 → 0.1.7`, then `pi2 update --json` (SHA256 + SLSA provenance verified, `current` switched) and the restart command the CLI reports. `--check` only reports; a pinned `<version>` implies `--force`. On npm/Homebrew/AUR the CLI refuses and the plugin prints that command instead of running anything |
 | `:PiWebDoctor` | Runs `<pi2> doctor --json` and shows the `name status detail` lines |
 | `:PiWebPair` | Mints a pairing code (the daemon picks the base) and draws it as a **scannable QR code** in a floating window, together with the link, the code and the expiry — point a phone camera at it and the console opens on the connect page with the code already filled in. `q`/`<Esc>` close, `r` mints a fresh code, `y` copies the link. The picker chooses which host goes into the link, so the code is reachable from the phone; an unreachable address is refused with what to change. Hosts without a UI get the URL + code as a notify instead |
 | `:PiWebService [status\|install\|enable\|disable\|start\|stop]` | The user service, driven through `pi2 service …` (the CLI owns `systemctl`/`launchd`, the plugin never calls it directly). `status` reports manager, unit path, installed/enabled/active and linger; `install` confirms, then runs `pi2 install-service --write` |
@@ -219,7 +219,7 @@ Loopback links are never drawn: a code pointing at `127.0.0.1` cannot be opened 
 | 4 | `plugin-data` | `<web.install_dir>/node_modules/.bin/pi2` (default `<stdpath("data")>/pi2d/...`) |
 | 5 | `checkout` | `node_modules/.bin/pi2` walked up from the cwd (daemon development) |
 
-Nothing is ever auto-installed, and a missing binary is reported with the install commands (`npm i -g @yuez/pi2d`, the curl installer, brew) plus `:PiWebInstall` as the explicit fallback.
+Nothing is ever auto-installed: the plugin resolves a `pi2`, uses it, and prints the install commands (standalone installer first, then npm/brew/AUR) when there is none. `:PiWebInstall` shows those commands.
 
 ### Autostart and the user service
 

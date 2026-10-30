@@ -287,7 +287,7 @@ function M.setup()
         end
     end
 
-    local complete_flags_pi_web = complete_from({ "--check", "--force", "--global" })
+    local complete_flags_pi_web = complete_from({ "--check", "--force" })
 
     vim.api.nvim_create_user_command("PiWeb", function()
         pi_web("open_console")
@@ -298,7 +298,7 @@ function M.setup()
     end, {
         nargs = "*",
         complete = complete_flags_pi_web,
-        desc = "Install pi2 on its own channel: `pi2 update` for a standalone binary, npm into <web.install_dir> otherwise",
+        desc = "Show how to install pi2 (standalone first; the plugin never installs anything)",
     })
 
     vim.api.nvim_create_user_command("PiWebUpdate", function(cmd)
@@ -306,7 +306,7 @@ function M.setup()
     end, {
         nargs = "*",
         complete = complete_flags_pi_web,
-        desc = "Update pi2 on its channel (--check reports only; --global is npm-only; a <version> pins it)",
+        desc = "Update pi2 via `pi2 update` on the standalone channel, else print the package manager's command (--check reports only; a <version> pins it)",
     })
 
     vim.api.nvim_create_user_command("PiWebDoctor", function()

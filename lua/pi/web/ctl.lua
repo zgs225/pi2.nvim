@@ -67,17 +67,6 @@ local function detail(text, fallback)
     return line
 end
 
---- Where `:PiWebInstall` puts the npm package.
---- @param cfg? pi.WebConfig
---- @return string
-function M.install_dir(cfg)
-    cfg = cfg or web_config()
-    if type(cfg.install_dir) == "string" and cfg.install_dir ~= "" then
-        return cfg.install_dir
-    end
-    return vim.fs.joinpath(vim.fn.stdpath("data"), "pi2d")
-end
-
 --- Build the argv for a CLI subcommand of the resolved `pi2` executable.
 --- @param resolved pi.web.DaemonCandidate
 --- @param sub string
@@ -182,20 +171,8 @@ function M.launch()
     Notify.info(("web console: opened http://127.0.0.1:%s in your browser"):format(tostring(port or "?")))
 end
 
---- Package spec for `:PiWebInstall`/`:PiWebUpdate`: `latest` unless a version
---- argument pins one (pi2d publishes exact versions such as `0.1.6`).
---- @param version string|nil
---- @return string
-function M.package_spec(version)
-    local pinned = type(version) == "string" and vim.trim(version) or ""
-    pinned = pinned:gsub("^@yuez/pi2d@", "")
-    if pinned == "" or pinned == "latest" then
-        return "@yuez/pi2d@latest"
-    end
-    return "@yuez/pi2d@" .. pinned
-end
-
---- Ask before running npm. `M.confirm` is a field so specs never prompt.
+--- Ask before running anything that mutates the install. `M.confirm` is a
+--- field so specs never prompt.
 --- @param question string
 --- @return boolean
 function M.confirm(question)
@@ -205,55 +182,6 @@ function M.confirm(question)
     end
     local ok, choice = pcall(vim.fn.confirm, question, "&Yes\n&No", 2)
     return ok and choice == 1
-end
-
---- npm install of `@yuez/pi2d` (`latest` by default), then report which
---- executable the resolution ladder picked.
---- @param global boolean
---- @param kind "install"|"update"
---- @param version? string
-function M.npm_install(global, kind, version)
-    local cfg = web_config()
-    local spec = M.package_spec(version)
-    local argv, target
-    if global then
-        argv = { "npm", "i", "-g", spec }
-        target = spec .. " (global)"
-    else
-        target = M.install_dir(cfg)
-        argv = { "npm", "i", "--prefix", target, spec }
-    end
-    local verb = kind == "update" and "Update" or "Install"
-    if not M.confirm(("%s %s? (%s)"):format(verb, target, table.concat(argv, " "))) then
-        Notify.info("web console: " .. kind .. " cancelled")
-        return false
-    end
-    Notify.info("web console: installing " .. target .. "…")
-    M.run(argv, function(res)
-        if tonumber(res.code) ~= 0 then
-            Notify.error(
-                "web console install failed: "
-                    .. detail(res.stderr ~= "" and res.stderr or res.stdout, "npm exited " .. tostring(res.code))
-            )
-            return
-        end
-        local ok, Runtime = pcall(require, "pi.web.runtime")
-        local resolved = ok and Runtime.resolve_daemon() or nil
-        local source = resolved and (resolved.source .. " (" .. resolved.bin .. ")") or "not found"
-        Notify.info(
-            ("web console: %s %s — daemon source: %s"):format(
-                kind == "update" and "updated" or "installed",
-                target,
-                source
-            )
-        )
-        if kind == "update" then
-            Notify.info(
-                "web console: restart the daemon to use the update (`pi2 service stop && pi2 service start`, or `pi2 stop`)"
-            )
-        end
-    end)
-    return true
 end
 
 --- Parse JSON emitted on stdout, or `nil` when it is not a JSON object.
@@ -398,42 +326,84 @@ function M.cli_update(resolved, opts)
     end)
 end
 
---- Install/update following the channel the installed pi2 reports.
+--- The install commands, standalone first (ADR 0004: the standalone artifact is
+--- the one self-updating channel; npm, Homebrew and the AUR own their upgrades).
+--- @return string[]
+function M.install_commands()
+    return {
+        "curl -fsSL https://raw.githubusercontent.com/zgs225/pi2d/main/scripts/install.sh | sh",
+        "npm i -g @yuez/pi2d            (or pnpm add -g / bun add -g / mise use -g npm:@yuez/pi2d)",
+        "brew install zgs225/tap/pi2d   (macOS; the formula then owns the upgrade)",
+    }
+end
+
+--- Hand the install commands to the user. The plugin never installs anything:
+--- whoever wrote the files owns the upgrade (ADR 0004).
+--- @param kind "install"|"update"
+function M.report_install_commands(kind)
+    local lines_out = {
+        kind == "update" and "web console: pi2 is not installed, so there is nothing to update."
+            or "web console: pi2 is not installed.",
+        "Install the standalone channel (self-contained, self-updating, no Node needed):",
+    }
+    for _, command in ipairs(M.install_commands()) do
+        lines_out[#lines_out + 1] = "  " .. command
+    end
+    lines_out[#lines_out + 1] = "Then `:PiWeb` starts it; `:PiWebUpdate` drives `pi2 update`."
+    Notify.info(table.concat(lines_out, "\n"))
+end
+
+--- Report how the resolved pi2 was installed, and who owns its upgrade.
+--- @param resolved pi.web.DaemonCandidate
+--- @param shape string|nil
+function M.report_install(resolved, shape)
+    local where = ("web console: pi2 at %s (%s, %s)"):format(
+        tostring(resolved.bin),
+        tostring(resolved.source),
+        tostring(shape or "install shape unknown")
+    )
+    if shape == "bundled" then
+        Notify.info(where .. "\nSelf-updating channel: `:PiWebUpdate` (or `pi2 update`).")
+        return
+    end
+    Notify.info(
+        where
+            .. "\nThe package manager that installed it owns the upgrade: `npm i -g @yuez/pi2d@latest` (or pnpm/bun/mise)."
+    )
+end
+
+--- `:PiWebInstall` / `:PiWebUpdate`: resolve, delegate, or print — the plugin
+--- never installs anything (ADR 0004).
 ---
---- * no resolvable `pi2` → npm (the only channel the plugin can bootstrap)
---- * `installShape == "node"` (npm, dev checkout) → npm
---- * `installShape == "bundled"` (curl installer, Homebrew, AUR) → `pi2 update`,
----   which refuses the package-manager channels with the right command
+--- * no resolvable `pi2` → print the install commands, change nothing
+--- * `bundled` (standalone installer) → `pi2 update`, the one self-updating
+---   channel; the npm/brew/AUR refusals come from the CLI and are surfaced verbatim
+--- * `node` (npm / dev checkout) → print the command the package manager owns
 --- @param kind "install"|"update"
 --- @param args? string[]
 function M.install_or_update(kind, args)
     local global, version, check, force = M.parse_install_args(args)
+    if global then
+        Notify.warn("web console: --global is gone — the plugin no longer installs packages")
+    end
     local ok_runtime, Runtime = pcall(require, "pi.web.runtime")
     local resolved = ok_runtime and Runtime.resolve_daemon() or nil
-
     if not resolved then
-        if check then
-            Notify.warn(
-                "web console: no pi2 to check — install one (`npm i -g @yuez/pi2d`, the curl installer, or brew)"
-            )
-            return
-        end
-        M.npm_install(global, kind, version)
+        M.report_install_commands(kind)
         return
     end
-
     M.install_shape(resolved, function(shape)
-        if shape == "bundled" then
-            if global then
-                Notify.warn("web console: --global is npm-only — a standalone pi2 updates through `pi2 update`")
-            end
+        if shape == "bundled" and kind == "update" then
             M.cli_update(resolved, { version = version, check = check, force = force })
             return
         end
-        if shape ~= "node" then
-            Notify.warn("web console: could not tell how this pi2 was installed — falling back to npm")
+        if shape ~= "bundled" and kind == "update" and check then
+            Notify.info(
+                "web console: an npm-installed pi2 has no `pi2 update` — check with `npm view @yuez/pi2d version`"
+            )
+            return
         end
-        M.npm_install(global, kind, version)
+        M.report_install(resolved, shape)
     end)
 end
 
