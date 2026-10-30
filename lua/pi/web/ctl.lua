@@ -1,7 +1,7 @@
 -- `:PiWeb*` command implementations (the user-facing control surface).
 --
 -- This module is the only place that shells out for the console workflows:
--- install/update (npm), doctor, the user service (`:PiWebService`) and its log
+-- doctor, the user-service report and the daemon log
 -- (`:PiWebLog`), pairing + the QR view, and the one-command `:PiWeb` flow
 -- (attach → service → spawn through `pi.web.ops`, then sign a local browser in).
 --
@@ -171,275 +171,6 @@ function M.launch()
     Notify.info(("web console: opened http://127.0.0.1:%s in your browser"):format(tostring(port or "?")))
 end
 
---- Ask before running anything that mutates the install. `M.confirm` is a
---- field so specs never prompt.
---- @param question string
---- @return boolean
-function M.confirm(question)
-    if #vim.api.nvim_list_uis() == 0 then
-        Notify.info("web console: " .. question .. " - running non-interactively")
-        return true
-    end
-    local ok, choice = pcall(vim.fn.confirm, question, "&Yes\n&No", 2)
-    return ok and choice == 1
-end
-
---- Parse JSON emitted on stdout, or `nil` when it is not a JSON object.
---- @param text any
---- @return table|nil
-local function decode_json(text)
-    local trimmed = type(text) == "string" and vim.trim(text) or ""
-    if trimmed == "" then
-        return nil
-    end
-    local ok, decoded = pcall(vim.json.decode, trimmed)
-    if ok and type(decoded) == "table" then
-        return decoded
-    end
-    return nil
-end
-
---- Ask the resolved pi2 how it was installed: `bundled` (compiled binary) or
---- `node` (npm / dev checkout). `nil` when no pi2 answers `config --json`.
---- @param resolved pi.web.DaemonCandidate
---- @param on_done fun(shape: string|nil)
-function M.install_shape(resolved, on_done)
-    M.run(M.cli_argv(resolved, "config", { "--json" }), function(res)
-        local shape
-        if tonumber(res.code) == 0 then
-            local decoded = decode_json(res.stdout)
-            if decoded and type(decoded.installShape) == "string" then
-                shape = decoded.installShape
-            end
-        end
-        on_done(shape)
-    end)
-end
-
---- argv for `pi2 update`, in the plugin's own flag vocabulary.
----
---- The CLI owns verification, the versioned layout and the channel refusal, so
---- the plugin only maps: `<version>` pins (and implies `--force`, because the
---- user named an exact version), `--check` asks without downloading.
---- @param resolved pi.web.DaemonCandidate
---- @param opts? { version?: string, check?: boolean, force?: boolean }
---- @return string[]
-function M.update_argv(resolved, opts)
-    opts = opts or {}
-    local extra = { "--json" }
-    if opts.check then
-        extra[#extra + 1] = "--check"
-    end
-    if opts.force then
-        extra[#extra + 1] = "--force"
-    end
-    local pinned = type(opts.version) == "string" and vim.trim(opts.version) or ""
-    pinned = pinned:gsub("^@yuez/pi2d@", ""):gsub("^v", "")
-    if pinned ~= "" and pinned ~= "latest" then
-        extra[#extra + 1] = "--version"
-        extra[#extra + 1] = pinned
-    end
-    return M.cli_argv(resolved, "update", extra)
-end
-
---- One notify line for a `pi2 update --json` payload.
---- @param payload table|nil
---- @return string
-function M.update_report(payload)
-    if type(payload) ~= "table" then
-        return "web console: pi2 update finished"
-    end
-    local current = tostring(payload.current or "?")
-    local latest = tostring(payload.latest or "?")
-    if payload.action == "up-to-date" then
-        return ("web console: pi2 %s is up to date (latest %s)"):format(current, latest)
-    end
-    if payload.action == "checked" then
-        return ("web console: pi2 %s — latest %s"):format(current, latest)
-    end
-    local line = ("web console: pi2 %s → %s installed"):format(current, latest)
-    local restart = type(payload.restart) == "string" and vim.trim(payload.restart) or ""
-    if restart ~= "" then
-        line = line .. " — restart the daemon to use it: " .. restart
-    end
-    return line
-end
-
---- `pi2 update` for a compiled (standalone/curl-installed) pi2.
----
---- The CLI refuses npm, Homebrew and the AUR installs with the command that owns
---- them; that message is surfaced verbatim instead of being re-implemented here.
---- @param resolved pi.web.DaemonCandidate
---- @param opts { version?: string, check?: boolean, force?: boolean }
-function M.cli_update(resolved, opts)
-    opts = opts or {}
-    local function failed(res, prefix)
-        local text = res.stderr ~= "" and res.stderr or res.stdout
-        Notify.error(prefix .. detail(text, "pi2 update exited " .. tostring(res.code)))
-    end
-
-    -- A pinned version needs no pre-check: confirm and go (the pin implies
-    -- --force, so a deliberate downgrade works too).
-    if type(opts.version) == "string" and opts.version ~= "" then
-        local argv = M.update_argv(resolved, { version = opts.version, force = true })
-        if not M.confirm(("Install pi2 %s? (%s)"):format(opts.version, table.concat(argv, " "))) then
-            Notify.info("web console: update cancelled")
-            return
-        end
-        M.run(argv, function(res)
-            if tonumber(res.code) ~= 0 then
-                failed(res, "web console update failed: ")
-                return
-            end
-            Notify.info(M.update_report(decode_json(res.stdout)))
-        end)
-        return
-    end
-
-    M.run(M.update_argv(resolved, { check = true }), function(res)
-        local probe = decode_json(res.stdout)
-        if tonumber(res.code) ~= 0 or not probe then
-            failed(res, "web console update unavailable: ")
-            return
-        end
-        if opts.check or probe.updatable ~= true then
-            Notify.info(M.update_report(probe))
-            return
-        end
-        local argv = M.update_argv(resolved, { force = opts.force })
-        local question = ("Update pi2 %s → %s? (%s)"):format(
-            tostring(probe.current),
-            tostring(probe.latest),
-            table.concat(argv, " ")
-        )
-        if not M.confirm(question) then
-            Notify.info("web console: update cancelled")
-            return
-        end
-        M.run(argv, function(out)
-            if tonumber(out.code) ~= 0 then
-                failed(out, "web console update failed: ")
-                return
-            end
-            Notify.info(M.update_report(decode_json(out.stdout)))
-        end)
-    end)
-end
-
---- The install commands, standalone first (ADR 0004: the standalone artifact is
---- the one self-updating channel; npm, Homebrew and the AUR own their upgrades).
---- @return string[]
-function M.install_commands()
-    return {
-        "curl -fsSL https://raw.githubusercontent.com/zgs225/pi2d/main/scripts/install.sh | sh",
-        "npm i -g @yuez/pi2d            (or pnpm add -g / bun add -g / mise use -g npm:@yuez/pi2d)",
-        "brew install zgs225/tap/pi2d   (macOS; the formula then owns the upgrade)",
-    }
-end
-
---- Hand the install commands to the user. The plugin never installs anything:
---- whoever wrote the files owns the upgrade (ADR 0004).
---- @param kind "install"|"update"
-function M.report_install_commands(kind)
-    local lines_out = {
-        kind == "update" and "web console: pi2 is not installed, so there is nothing to update."
-            or "web console: pi2 is not installed.",
-        "Install the standalone channel (self-contained, self-updating, no Node needed):",
-    }
-    for _, command in ipairs(M.install_commands()) do
-        lines_out[#lines_out + 1] = "  " .. command
-    end
-    lines_out[#lines_out + 1] = "Then `:PiWeb` starts it; `:PiWebUpdate` drives `pi2 update`."
-    Notify.info(table.concat(lines_out, "\n"))
-end
-
---- Report how the resolved pi2 was installed, and who owns its upgrade.
---- @param resolved pi.web.DaemonCandidate
---- @param shape string|nil
-function M.report_install(resolved, shape)
-    local where = ("web console: pi2 at %s (%s, %s)"):format(
-        tostring(resolved.bin),
-        tostring(resolved.source),
-        tostring(shape or "install shape unknown")
-    )
-    if shape == "bundled" then
-        Notify.info(where .. "\nSelf-updating channel: `:PiWebUpdate` (or `pi2 update`).")
-        return
-    end
-    Notify.info(
-        where
-            .. "\nThe package manager that installed it owns the upgrade: `npm i -g @yuez/pi2d@latest` (or pnpm/bun/mise)."
-    )
-end
-
---- `:PiWebInstall` / `:PiWebUpdate`: resolve, delegate, or print — the plugin
---- never installs anything (ADR 0004).
----
---- * no resolvable `pi2` → print the install commands, change nothing
---- * `bundled` (standalone installer) → `pi2 update`, the one self-updating
----   channel; the npm/brew/AUR refusals come from the CLI and are surfaced verbatim
---- * `node` (npm / dev checkout) → print the command the package manager owns
---- @param kind "install"|"update"
---- @param args? string[]
-function M.install_or_update(kind, args)
-    local global, version, check, force = M.parse_install_args(args)
-    if global then
-        Notify.warn("web console: --global is gone — the plugin no longer installs packages")
-    end
-    local ok_runtime, Runtime = pcall(require, "pi.web.runtime")
-    local resolved = ok_runtime and Runtime.resolve_daemon() or nil
-    if not resolved then
-        M.report_install_commands(kind)
-        return
-    end
-    M.install_shape(resolved, function(shape)
-        if shape == "bundled" and kind == "update" then
-            M.cli_update(resolved, { version = version, check = check, force = force })
-            return
-        end
-        if shape ~= "bundled" and kind == "update" and check then
-            Notify.info(
-                "web console: an npm-installed pi2 has no `pi2 update` — check with `npm view @yuez/pi2d version`"
-            )
-            return
-        end
-        M.report_install(resolved, shape)
-    end)
-end
-
---- Parse `:PiWebInstall`/`:PiWebUpdate` args:
---- `[--global] [--check] [--force] [<version>]`.
---- @param args? string[]
---- @return boolean global, string|nil version, boolean check, boolean force
-function M.parse_install_args(args)
-    local global, version, check, force = false, nil, false, false
-    for _, arg in ipairs(args or {}) do
-        local value = tostring(arg)
-        if value == "--global" or value == "-g" then
-            global = true
-        elseif value == "--check" then
-            check = true
-        elseif value == "--force" then
-            force = true
-        elseif value ~= "" then
-            version = value
-        end
-    end
-    return global, version, check, force
-end
-
---- `:PiWebInstall [--global] [--check] [--force] [<version>]`
---- @param args? string[]
-function M.install(args)
-    M.install_or_update("install", args)
-end
-
---- `:PiWebUpdate [--global] [--check] [--force] [<version>]`
---- @param args? string[]
-function M.update(args)
-    M.install_or_update("update", args)
-end
-
 --- Render a `pi2 doctor --json` payload as `name status detail` lines.
 --- Falls back to the plain-text report when the payload is not JSON.
 --- @param stdout string
@@ -481,7 +212,7 @@ function M.doctor()
     local resolved = Runtime.resolve_daemon()
     if not resolved then
         Notify.warn(
-            "pi2 not found — install the CLI (`npm i -g @yuez/pi2d`, the curl installer or brew) or run :PiWebInstall"
+            "pi2 not found — install the CLI (the curl installer or `brew install zgs225/tap/pi2d`, or `npm i -g @yuez/pi2d`)"
         )
         return
     end
@@ -602,7 +333,7 @@ function M.mint_pair(base, on_done, opts)
     if not resolved then
         on_done(
             nil,
-            "pi2 not found — install it (`npm i -g @yuez/pi2d`, the curl installer or brew) or run :PiWebInstall"
+            "pi2 not found — install it (the curl installer or `brew install zgs225/tap/pi2d`, or `npm i -g @yuez/pi2d`)"
         )
         return
     end
@@ -872,7 +603,7 @@ local function tri(value)
     return value and "yes" or "no"
 end
 
---- Render a `pi2 service status` report as lines for `:PiWebService`.
+--- Render a `pi2 service status` report as lines for `:PiWebStatus`.
 --- @param status pi.web.ServiceStatus
 --- @return string[]
 function M.service_lines(status)
@@ -891,9 +622,9 @@ function M.service_lines(status)
         lines[#lines + 1] = "error: " .. status.error
     end
     if not (status.unit and status.unit.installed) then
-        lines[#lines + 1] = "next: :PiWebService install (then `:PiWebService enable`)"
+        lines[#lines + 1] = "next: `pi2 install-service --write` (then `systemctl --user enable --now pi2.service`)"
     elseif status.enabled ~= true or status.active ~= true then
-        lines[#lines + 1] = "next: :PiWebService enable"
+        lines[#lines + 1] = "next: `systemctl --user enable --now pi2.service`"
     end
     return lines
 end
@@ -950,97 +681,6 @@ function M.status()
         end
         config_done = true
         maybe_emit()
-    end)
-end
-
---- `:PiWebService install`: write the user unit, then say how to enable it.
-function M.install_service()
-    local ok, Runtime = pcall(require, "pi.web.runtime")
-    if not ok then
-        Notify.error("web console unavailable: " .. one_line(Runtime))
-        return
-    end
-    local resolved = Runtime.resolve_daemon()
-    if not resolved then
-        Notify.warn(
-            "pi2 not found — install the CLI (`npm i -g @yuez/pi2d`, the curl installer or brew) or run :PiWebInstall"
-        )
-        return
-    end
-    if
-        not M.confirm("Write the user service unit for " .. resolved.bin .. "?" .. " (`pi2 install-service --write`)")
-    then
-        Notify.info("web console: service install cancelled")
-        return
-    end
-    M.run(M.cli_argv(resolved, "install-service", { "--write" }), function(res)
-        local text = tostring(res.stdout or "") .. tostring(res.stderr or "")
-        if tonumber(res.code) ~= 0 then
-            Notify.error("web console: install-service failed: " .. detail(text, "exit " .. tostring(res.code)))
-            return
-        end
-        Notify.info("web console: " .. detail(text, "service unit written") .. "\nnext: `:PiWebService enable`")
-    end)
-end
-
---- `:PiWebService [status|install|enable|disable|start|stop]`
----
---- The unit is the one `pi2 install-service` renders; control goes through the
---- CLI (`pi2 service …`) so the plugin never talks to systemd/launchd itself.
---- @param args? string[]
-function M.service(args)
-    local action = "status"
-    for _, arg in ipairs(args or {}) do
-        local value = tostring(arg)
-        if value ~= "" then
-            action = value
-            break
-        end
-    end
-    local Ops = ops()
-    if not Ops then
-        Notify.error("web console unavailable: pi.web.ops is missing")
-        return
-    end
-
-    if action == "install" or action == "install-service" then
-        M.install_service()
-        return
-    end
-
-    if action == "status" then
-        Ops.service_status(function(status, err)
-            if not status then
-                Notify.warn("web console service: " .. tostring(err))
-                return
-            end
-            Notify.info(table.concat(M.service_lines(status), "\n"))
-        end)
-        return
-    end
-
-    if not vim.tbl_contains(Ops.SERVICE_ACTIONS or {}, action) then
-        Notify.error(
-            ("web console: unknown :PiWebService action `%s` (status|install|enable|disable|start|stop)"):format(action)
-        )
-        return
-    end
-
-    Ops.service(action, function(res, err)
-        if not res then
-            Notify.error("web console service: " .. tostring(err))
-            return
-        end
-        if tonumber(res.code) ~= 0 then
-            Notify.error(
-                ("web console service %s failed: %s"):format(
-                    action,
-                    detail(res.stderr ~= "" and res.stderr or res.stdout, "exit " .. tostring(res.code))
-                )
-            )
-            return
-        end
-        Notify.info(("web console service %s done"):format(action))
     end)
 end
 

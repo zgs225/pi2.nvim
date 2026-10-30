@@ -58,7 +58,6 @@ M.SERVICE_WAIT_MS = 5000
 --- How long a spawned daemon gets to publish `daemon.json`.
 M.SPAWN_WAIT_MS = 10000
 --- Every action `pi2 service` accepts (completion + validation).
-M.SERVICE_ACTIONS = { "status", "start", "stop", "enable", "disable" }
 
 --- The injectable process runner. Tests replace it with a fake that never
 --- spawns anything; production uses `vim.system`.
@@ -272,7 +271,7 @@ function M.spawn()
     local resolved = Runtime.resolve_daemon()
     if not resolved then
         return false,
-            "pi2 not found — install it (`npm i -g @yuez/pi2d`, the curl installer or brew) or run :PiWebInstall"
+            "pi2 not found — install the standalone channel (curl installer, see docs/install.md) or `npm i -g @yuez/pi2d`"
     end
 
     local argv = M.daemon_argv(resolved, cfg)
@@ -394,7 +393,8 @@ function M.service_status_sync(opts)
     opts = opts or {}
     local resolved = Runtime.resolve_daemon()
     if not resolved then
-        return nil, "pi2 not found — install it (`npm i -g @yuez/pi2d`) or run :PiWebInstall"
+        return nil,
+            "pi2 not found — install the standalone channel (curl installer, see docs/install.md) or `npm i -g @yuez/pi2d`"
     end
     local argv = M.service_argv(resolved, "status")
     local res, err = M.run_sync(argv, opts.timeout or M.SERVICE_WAIT_MS)
@@ -414,54 +414,33 @@ function M.service_status_sync(opts)
     return status, nil
 end
 
---- Run one service action asynchronously; `on_done(res|nil, err|nil)`, where
---- `res` is `{ code, stdout, stderr, argv }`.
---- @param action string
---- @param on_done fun(res: table|nil, err: string|nil)
-function M.service(action, on_done)
+--- Async `pi2 service status`; `on_done(status|nil, err|nil)`.
+--- @param on_done fun(status: pi.web.ServiceStatus|nil, err: string|nil)
+function M.service_status(on_done)
     on_done = on_done or function() end
     local resolved = Runtime.resolve_daemon()
     if not resolved then
         on_done(
             nil,
-            "pi2 not found — install it (`npm i -g @yuez/pi2d`, the curl installer or brew) or run :PiWebInstall"
+            "pi2 not found — install the standalone channel (curl installer, see docs/install.md) or `npm i -g @yuez/pi2d`"
         )
         return
     end
-    local argv = M.service_argv(resolved, action)
-    local done = false
-    local ok, handle = pcall(M.system, argv, { text = true }, function(res)
-        if done then
+    local argv = M.service_argv(resolved, "status")
+    local delivered = false
+    local function deliver(status, err)
+        if delivered then
             return
         end
-        done = true
+        delivered = true
         vim.schedule(function()
-            on_done({
-                code = res and res.code or 1,
-                stdout = res and res.stdout or "",
-                stderr = res and res.stderr or "",
-                argv = argv,
-            }, nil)
-        end)
-    end)
-    if not ok or handle == nil then
-        vim.schedule(function()
-            on_done(nil, "cannot run `" .. table.concat(argv, " ") .. "`: " .. M.one_line(handle))
+            on_done(status, err)
         end)
     end
-end
 
---- Async `pi2 service status`; `on_done(status|nil, err|nil)`.
---- @param on_done fun(status: pi.web.ServiceStatus|nil, err: string|nil)
-function M.service_status(on_done)
-    on_done = on_done or function() end
-    M.service("status", function(res, err)
-        if not res then
-            on_done(nil, err)
-            return
-        end
+    local ok, handle = pcall(M.system, argv, { text = true }, function(res)
         if tonumber(res.code) ~= 0 then
-            on_done(
+            deliver(
                 nil,
                 M.first_line(res.stderr) ~= "" and M.first_line(res.stderr)
                     or ("pi2 service status exited " .. tostring(res.code))
@@ -470,11 +449,14 @@ function M.service_status(on_done)
         end
         local status = M.decode_service_status(res.stdout)
         if not status then
-            on_done(nil, "pi2 service status returned unreadable output")
+            deliver(nil, "pi2 service status returned unreadable output")
             return
         end
-        on_done(status, nil)
+        deliver(status, nil)
     end)
+    if not ok or handle == nil then
+        deliver(nil, "cannot run " .. tostring(argv[1]) .. ": " .. M.one_line(handle))
+    end
 end
 
 -- ---------------------------------------------------------------------------
@@ -592,7 +574,8 @@ function M.start_service(opts)
     end
     local resolved = Runtime.resolve_daemon()
     if not resolved then
-        return false, "pi2 not found — install it (`npm i -g @yuez/pi2d`) or run :PiWebInstall"
+        return false,
+            "pi2 not found — install the standalone channel (curl installer, see docs/install.md) or `npm i -g @yuez/pi2d`"
     end
     local argv = M.service_argv(resolved, "start")
     local res, err = M.run_sync(argv, opts.timeout or M.SERVICE_WAIT_MS)
@@ -629,7 +612,7 @@ function M.ensure(opts)
     local mode = M.autostart_mode(cfg)
     if mode == false then
         return nil,
-            "web.autostart is disabled — start the daemon with `pi2 daemon` (or enable the user service with :PiWebService install)"
+            "web.autostart is disabled — start the daemon with `pi2 daemon` (or install the user service with `pi2 install-service --write`)"
     end
 
     local errors = {}

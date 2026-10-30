@@ -275,39 +275,9 @@ function M.setup()
         Ctl.call(name, ...)
     end
 
-    --- Fixed candidate list as a completion function (`complete` only takes a
-    --- function or a string).
-    --- @param items string[]
-    --- @return fun(lead: string): string[]
-    local function complete_from(items)
-        return function(lead)
-            return vim.tbl_filter(function(item)
-                return vim.startswith(item, lead or "")
-            end, items)
-        end
-    end
-
-    local complete_flags_pi_web = complete_from({ "--check", "--force" })
-
     vim.api.nvim_create_user_command("PiWeb", function()
         pi_web("open_console")
     end, { desc = "Open the π² web console (attaches to or starts the daemon)" })
-
-    vim.api.nvim_create_user_command("PiWebInstall", function(cmd)
-        pi_web("install", vim.split(cmd.args, "%s+", { trimempty = true }))
-    end, {
-        nargs = "*",
-        complete = complete_flags_pi_web,
-        desc = "Show how to install pi2 (standalone first; the plugin never installs anything)",
-    })
-
-    vim.api.nvim_create_user_command("PiWebUpdate", function(cmd)
-        pi_web("update", vim.split(cmd.args, "%s+", { trimempty = true }))
-    end, {
-        nargs = "*",
-        complete = complete_flags_pi_web,
-        desc = "Update pi2 via `pi2 update` on the standalone channel, else print the package manager's command (--check reports only; a <version> pins it)",
-    })
 
     vim.api.nvim_create_user_command("PiWebDoctor", function()
         pi_web("doctor")
@@ -316,16 +286,6 @@ function M.setup()
     vim.api.nvim_create_user_command("PiWebPair", function()
         pi_web("pair")
     end, { desc = "Mint a pairing code and show the URL + code" })
-
-    local complete_service_actions = complete_from({ "status", "install", "enable", "disable", "start", "stop" })
-
-    vim.api.nvim_create_user_command("PiWebService", function(cmd)
-        pi_web("service", vim.split(cmd.args, "%s+", { trimempty = true }))
-    end, {
-        nargs = "*",
-        complete = complete_service_actions,
-        desc = "Control the pi2 user service (status|install|enable|disable|start|stop)",
-    })
 
     vim.api.nvim_create_user_command("PiWebLog", function(cmd)
         pi_web("log", vim.split(cmd.args, "%s+", { trimempty = true }))

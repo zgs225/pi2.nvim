@@ -182,11 +182,8 @@ Whenever a task reaches a terminal state — completed, failed, or stopped — t
 | Command | Action |
 | --- | --- |
 | `:PiWeb` | The whole flow: attaches to a running daemon, else starts the installed user service (`pi2 service start`), else spawns `pi2 daemon` detached, then waits up to 10 s for `<runtime>/daemon.json` and signs a local browser in (`web.open = false` only reports the URL) |
-| `:PiWebInstall` | **Prints** how to install pi2 — the plugin never installs anything ([ADR 0004](https://github.com/zgs225/pi2d/blob/main/docs/adr/0004-one-self-updating-channel.md)). With no resolvable `pi2` it lists the commands (standalone `curl` installer first, then npm/Homebrew/AUR); with a `pi2` it reports where it lives, which rung of the resolution ladder found it, and which channel owns its upgrade |
-| `:PiWebUpdate [--check] [--force] [<version>]` | On the standalone channel it drives `pi2 update`: a `--check --json` probe first, a confirm showing `pi2 0.1.6 → 0.1.7`, then `pi2 update --json` (SHA256 + SLSA provenance verified, `current` switched) and the restart command the CLI reports. `--check` only reports; a pinned `<version>` implies `--force`. On npm/Homebrew/AUR the CLI refuses and the plugin prints that command instead of running anything |
 | `:PiWebDoctor` | Runs `<pi2> doctor --json` and shows the `name status detail` lines |
 | `:PiWebPair` | Mints a pairing code (the daemon picks the base) and draws it as a **scannable QR code** in a floating window, together with the link, the code and the expiry — point a phone camera at it and the console opens on the connect page with the code already filled in. `q`/`<Esc>` close, `r` mints a fresh code, `y` copies the link. The picker chooses which host goes into the link, so the code is reachable from the phone; an unreachable address is refused with what to change. Hosts without a UI get the URL + code as a notify instead |
-| `:PiWebService [status\|install\|enable\|disable\|start\|stop]` | The user service, driven through `pi2 service …` (the CLI owns `systemctl`/`launchd`, the plugin never calls it directly). `status` reports manager, unit path, installed/enabled/active and linger; `install` confirms, then runs `pi2 install-service --write` |
 | `:PiWebLog [count]` | The service manager's log (`journalctl --user -u pi2` / the LaunchAgent's log files) or `<state dir>/daemon.log` for a plugin-spawned daemon, in a scratch buffer |
 | `:PiWebStart` | Attach the bridge (spawns `pi2 daemon` detached when nothing runs and `web.autostart` allows it) |
 | `:PiWebStop` | Stop the bridge only — the daemon keeps running (and a browser tab stays signed in). Stop the daemon with `pi2 service stop` or `pi2 stop` |
@@ -219,7 +216,7 @@ Loopback links are never drawn: a code pointing at `127.0.0.1` cannot be opened 
 | 4 | `plugin-data` | `<web.install_dir>/node_modules/.bin/pi2` (default `<stdpath("data")>/pi2d/...`) |
 | 5 | `checkout` | `node_modules/.bin/pi2` walked up from the cwd (daemon development) |
 
-Nothing is ever auto-installed: the plugin resolves a `pi2`, uses it, and prints the install commands (standalone installer first, then npm/brew/AUR) when there is none. `:PiWebInstall` shows those commands.
+Nothing is ever auto-installed and nothing is installed from the editor: the plugin resolves a `pi2`, uses it, and reports the install commands (standalone installer first, then npm/brew/AUR) when there is none. Install and upgrade are `pi2`'s job — `curl …/install.sh | sh` once, then `pi2 update`.
 
 ### Autostart and the user service
 
@@ -235,7 +232,7 @@ The deprecated `web.auto_start` boolean still works (`false` → `false`, `true`
 
 A plugin-spawned daemon is a foreground `pi2 daemon` process attached to a log file: `$PI2_STATE_DIR/daemon.log` (`~/.local/state/pi2/daemon.log` on Linux, `~/Library/Logs/pi2/daemon.log` on macOS), which is what `:PiWebLog` reads when no service unit is installed. The daemon never daemonizes itself — Neovim's `jobstart(..., { detach = true })` is what makes it outlive the editor.
 
-Service-managed daemons are controlled through the CLI only: `pi2 service status|start|stop|enable|disable`. `:PiWebService` wraps that, and `:PiWebStop` deliberately stops just the bridge so a service-managed daemon is never signalled behind `Restart=on-failure`/`KeepAlive`.
+Service-managed daemons are controlled through the CLI only: `pi2 service status|start|stop|enable|disable`, with `pi2 install-service --write` rendering the unit. `:PiWebStatus` and `:checkhealth pi` report the unit and print those commands, and `:PiWebStop` deliberately stops just the bridge so a service-managed daemon is never signalled behind `Restart=on-failure`/`KeepAlive`.
 
 The bridge refuses an incompatible wire version: every record carries `v` (protocol §1), and a mismatch is permanent, so it reports once (`daemon speaks pi2 protocol v2, this plugin speaks v1 — upgrade pi2d …`) and stops instead of retrying forever.
 

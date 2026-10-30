@@ -343,7 +343,7 @@
 ---@field log? boolean|string Write bridge diagnostics to `stdpath("log")/pi2-web.log` (true) or to this path
 ---@field host? string Bind address for `pi2 daemon` (PI2_HOST); nil → the daemon default 0.0.0.0, set "127.0.0.1" for loopback-only
 ---@field public_url? string External base URL advertised to the daemon (PI2_PUBLIC_URL), e.g. "https://myhost.tail1234.ts.net"
----@field install_dir? string Where `:PiWebInstall` puts the pi2d npm package (default `<stdpath("data")>/pi2d`)
+---@field install_dir? string Deprecated read-only fallback: where an older npm copy lives (default `<stdpath("data")>/pi2d`)
 ---@field open? boolean Open the browser from `:PiWeb` (default true)
 ---@field browser? string Opener command override for `:PiWeb` (default: `vim.ui.open`, then `xdg-open`/`open`)
 ---@field auto_start? boolean Deprecated alias of `autostart`: `false` → `autostart = false`, `true` → `autostart = "spawn"`. Normalised by `pi.web.ops.autostart_mode()`, not by `pi.config`.
@@ -614,8 +614,9 @@ local defaults = {
         -- External base URL advertised to the daemon (PI2_PUBLIC_URL), e.g.
         -- "https://myhost.tail1234.ts.net" (no trailing slash).
         public_url = nil,
-        -- Where :PiWebInstall puts the pi2d npm package (resolved as
-        -- <install_dir>/node_modules/.bin/pi2).
+        -- Deprecated: nothing writes here any more (the plugin does not install,
+        -- see ADR 0004). Still read by the ladder as <install_dir>/node_modules/.bin/pi2
+        -- so an existing npm copy keeps resolving.
         install_dir = vim.fn.stdpath("data") .. "/pi2d",
         -- Open the browser from `:PiWeb` (true) or just report the console URL.
         open = true,

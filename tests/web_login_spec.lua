@@ -72,7 +72,7 @@ describe("pi.web.login", function()
         })
         assert.is_nil(url)
         assert.is_truthy(err:find("npm i -g @yuez/pi2d", 1, true))
-        assert.is_truthy(err:find(":PiWebInstall", 1, true))
+        assert.is_truthy(err:find("curl installer", 1, true))
         assert.is_false(called)
     end)
 

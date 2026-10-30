@@ -646,7 +646,7 @@ local function do_resolve(opts)
         return { bin = on_path, source = "path" }
     end
 
-    -- 4. plugin data: the npm package `:PiWebInstall` maintains.
+    -- 4. plugin data: a legacy npm copy (nothing writes here any more; ADR 0004).
     local data_root = opts.data_dir or vim.fn.stdpath("data")
     local dir = cfg.install_dir
     if type(dir) ~= "string" or dir == "" then

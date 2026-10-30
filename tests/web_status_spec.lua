@@ -1,5 +1,5 @@
 -- `:PiWebStatus` rendering: `pi.web.status_lines(extra)` (init.lua) plus the
--- `:PiWebService status` formatter (ctl.lua). Both are pure string builders —
+-- The `:PiWebStatus` service formatter (ctl.lua). Both are pure string builders —
 -- no daemon, no service manager, no subprocess — so the specs only stub the
 -- probes that feed them.
 
@@ -81,7 +81,7 @@ describe("pi.web.status_lines", function()
         })
 
         local text = table.concat(Web.status_lines(), "\n")
-        assert.is_truthy(text:find("install pi2 (npm i -g @yuez/pi2d)", 1, true))
+        assert.is_truthy(text:find("install the curl installer", 1, true))
         assert.is_truthy(text:find("daemon: not running", 1, true))
         assert.is_truthy(text:find("service: not probed", 1, true))
     end)
@@ -120,7 +120,7 @@ describe("pi.web.ctl service_lines", function()
         assert.is_truthy(text:find("(installed)", 1, true))
         assert.is_truthy(text:find("enabled: yes   active: no", 1, true))
         assert.is_nil(text:find("linger", 1, true))
-        assert.is_truthy(text:find("next: :PiWebService enable", 1, true))
+        assert.is_truthy(text:find("next: `systemctl --user enable --now pi2.service`", 1, true))
     end)
 
     it("suggests install when the unit is missing", function()
@@ -135,7 +135,7 @@ describe("pi.web.ctl service_lines", function()
             }),
             "\n"
         )
-        assert.is_truthy(text:find("next: :PiWebService install", 1, true))
+        assert.is_truthy(text:find("next: `pi2 install-service --write`", 1, true))
         assert.is_truthy(text:find("linger: yes", 1, true))
     end)
 end)

@@ -411,7 +411,7 @@ local function service_line(service)
         line = line .. " linger=" .. flag(service.linger)
     end
     if not (unit and unit.installed) then
-        line = line .. " — install with :PiWebService install"
+        line = line .. " — install with `pi2 install-service --write`"
     end
     return line
 end
@@ -432,7 +432,8 @@ function M.status_lines(extra)
     if status.daemon_bin then
         lines[#lines + 1] = ("daemon: %s (%s)"):format(status.daemon_bin, status.daemon_source)
     else
-        lines[#lines + 1] = "daemon: not found — install pi2 (npm i -g @yuez/pi2d) or run :PiWebInstall"
+        lines[#lines + 1] =
+            "daemon: not found — install the curl installer (docs/install.md) or `npm i -g @yuez/pi2d`"
     end
     if status.daemon_url then
         lines[#lines + 1] = ("daemon: running at %s (socket %s)"):format(status.daemon_url, status.daemon_socket)

@@ -87,7 +87,7 @@ function M.url(opts)
     end
     if not resolved then
         return nil,
-            "pi2 not found — install the CLI (`npm i -g @yuez/pi2d`, the curl installer or brew) or run :PiWebInstall"
+            "pi2 not found — install the standalone channel (curl installer, see docs/install.md) or `npm i -g @yuez/pi2d`"
     end
 
     local argv = { resolved.bin, "open", "--print" }

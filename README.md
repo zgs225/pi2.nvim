@@ -274,7 +274,7 @@ require("pi").setup({
 | `:PiSubView` | View a child sub-session in a read-only float viewer with real-time streaming |
 | `:PiTodo` | Toggle the todo side panel: the current session's `todo_write` checklist (see [doc/usage.md](doc/usage.md#todo-list)) |
 | `:PiWebStart` / `:PiWebStop` / `:PiWebStatus` | Attach, detach, or inspect the web-console bridge (`:PiWebStop` leaves the daemon running; see [doc/usage.md](doc/usage.md#web-console)) |
-| `:PiWeb` / `:PiWebService` / `:PiWebLog` | Open the console signed in; control the `pi2` user service (`status\|install\|enable\|disable\|start\|stop`); show the daemon log |
+| `:PiWeb` / `:PiWebStatus` / `:PiWebLog` | Open the console signed in; report the bridge, daemon, unit state and the `pi2 service …` / `pi2 install-service --write` commands; show the daemon log |
 | `:PiWebPair` | Mint a pairing code and draw it as a scannable QR code (LAN/Tailscale reachability) |
 | `:PiDiff` | Review the git diff of every file changed by the current session in one panel: file list + diff, grouped per git work tree |
 | `:PiToggleStartupDetails` | Toggle the startup block between compact and expanded |

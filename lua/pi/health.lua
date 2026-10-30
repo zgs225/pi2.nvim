@@ -395,7 +395,6 @@ M.check = function()
     else
         vim.health.warn("pi2 (the web-console daemon) was not found", {
             "Install the CLI: `npm i -g @yuez/pi2d`, the curl installer, or `brew install zgs225/tap/pi2d`",
-            "Or run :PiWebInstall to print them (standalone first; the plugin does not install pi2)",
             "Set `web.binary` (or `$PI2_DAEMON_BIN`) to an explicit executable",
         })
     end
@@ -423,7 +422,10 @@ M.check = function()
                 vim.health.ok(state)
             else
                 vim.health.info(
-                    ("no %s unit (%s); run :PiWebService install"):format(tostring(status.manager), status.unit.path)
+                    ("no %s unit (%s); run `pi2 install-service --write`"):format(
+                        tostring(status.manager),
+                        status.unit.path
+                    )
                 )
             end
         elseif status then
@@ -434,7 +436,7 @@ M.check = function()
         if unit and exists(unit) then
             vim.health.ok("user service unit present: " .. unit)
         else
-            vim.health.info("user service not probed (run :PiWebService status for unit state)")
+            vim.health.info("user service not probed (run `pi2 service status` for unit state)")
         end
     end
 
