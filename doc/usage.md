@@ -805,8 +805,8 @@ Built-in thresholds:
 | `list_subagents` | — | — | Always inline |
 | `read_subagent` | — | — | Always inline |
 | `list_batches` | — | — | Always inline |
-| `poll_subagents` | — | — | Always inline |
-| `wait_subagents` | — | — | Always inline |
+| `poll_subagents` | — | — | Always inline — the batch is named by its item labels (`auth-review, schema-fix, docs-sweep, +2`, from the persisted batch record) rather than its id, and the header status adds the failed/cancelled items (`5/5 partial · ✗ schema-fix, ✗ docs-sweep`) |
+| `wait_subagents` | — | — | Always inline — same row as `poll_subagents`, plus the wait window when one was passed (`… (timeout 300s)`) |
 | `stop_subagents` | — | — | Always inline |
 | `todo_write` | — | unlimited | Session todo checklist — no input line; the full ✓/◐/○ checklist (progress header plus one row per item) is always rendered and the block never auto-collapses (no fold to toggle, no window-width elision either). See [Todo list](#todo-list) |
 | (unknown) | 1 | 1 | Default renderer picks the first string argument as summary |

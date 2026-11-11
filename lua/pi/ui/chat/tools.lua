@@ -1718,13 +1718,10 @@ local renderers = {
             return SubToolUi.display_name("poll_subagents")
         end,
         inline_text = function(_, args)
-            if not args or type(args.batch_id) ~= "string" then
-                return nil
-            end
-            return "batch " .. (SubToolUi.short_id(args.batch_id) or args.batch_id)
+            return SubToolUi.batch_items_text(args and args.batch_id)
         end,
         inline_status = function(result)
-            return SubToolUi.batch_status_text(SubToolUi.result_details(result))
+            return SubToolUi.batch_outcome_text(SubToolUi.result_details(result))
         end,
     },
     wait_subagents = {
@@ -1733,13 +1730,14 @@ local renderers = {
             return SubToolUi.display_name("wait_subagents")
         end,
         inline_text = function(_, args)
-            if not args or type(args.batch_id) ~= "string" then
-                return nil
+            local text = SubToolUi.batch_items_text(args and args.batch_id)
+            if text and type(args.timeout_ms) == "number" and args.timeout_ms > 0 then
+                text = string.format("%s (timeout %ds)", text, math.floor(args.timeout_ms / 1000))
             end
-            return "batch " .. (SubToolUi.short_id(args.batch_id) or args.batch_id)
+            return text
         end,
         inline_status = function(result)
-            return SubToolUi.batch_status_text(SubToolUi.result_details(result))
+            return SubToolUi.batch_outcome_text(SubToolUi.result_details(result))
         end,
     },
     list_batches = {
