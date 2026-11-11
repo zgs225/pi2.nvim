@@ -4,6 +4,7 @@
 -- tool itself only ever executes inside pi.
 
 local History = require("pi.ui.chat.history")
+local Tasks = require("pi.tasks")
 local Tools = require("pi.ui.chat.tools")
 
 local TAB = 903
@@ -44,6 +45,55 @@ local function read_extension()
     return text
 end
 
+--- Every inline virt_text chunk on the block header, in buffer order.
+---@param h pi.ChatHistory
+---@return string[]
+local function header_virt(h)
+    local out = {}
+    for _, em in ipairs(vim.api.nvim_buf_get_extmarks(h:buf(), h:ns(), 0, -1, { details = true })) do
+        local vt = (em[4] or {}).virt_text
+        if vt then
+            for _, chunk in ipairs(vt) do
+                if type(chunk[1]) == "string" then
+                    out[#out + 1] = chunk[1]
+                end
+            end
+        end
+    end
+    return out
+end
+
+--- Whether any header virt text equals `want` (trimmed) — the status badge.
+---@param h pi.ChatHistory
+---@param want string
+---@return boolean
+local function has_badge(h, want)
+    for _, chunk in ipairs(header_virt(h)) do
+        if vim.trim(chunk) == want then
+            return true
+        end
+    end
+    return false
+end
+
+--- Register a background task the way the extension's `started` event does.
+---@param id string
+---@param command string
+local function register_task(id, command)
+    Tasks.upsert({
+        id = id,
+        command = command,
+        status = "running",
+        start_time = vim.uv.now(),
+        session_id = "s1",
+        tab = TAB,
+    })
+end
+
+local function delete(h)
+    pcall(vim.api.nvim_buf_delete, h:buf(), { force = true })
+end
+
 describe("wait_task renderer", function()
     it("has a dedicated hourglass icon instead of the generic tool fallback", function()
         -- Blocks are read by their glyph: a generic dot makes a wait look like
@@ -78,6 +128,98 @@ describe("wait_task renderer", function()
         local buf = h:buf()
         assert.is_true(#rows_with(buf, "b3f2a1") == 1)
         assert.is_true(#rows_with(buf, "timeout") == 0)
+    end)
+
+    it("leads with the command the task runs, not just its id", function()
+        Tasks._reset()
+        register_task("b3f2a1", "npm run dev")
+        local h = History.new(TAB)
+        h:on_tool_start("wait_task", "wt4", { task_id = "b3f2a1", timeout_ms = 30000 })
+        pump(50)
+        local buf = h:buf()
+        -- The id alone says nothing about what is being waited on; the command
+        -- comes from the registry the extension's `started` event populates.
+        assert.is_true(#rows_with(buf, "npm run dev · b3f2a1 (timeout 30s)") == 1, table.concat(lines_of(buf), "\n"))
+        delete(h)
+        Tasks._reset()
+    end)
+
+    it("flattens and truncates an over-long command", function()
+        Tasks._reset()
+        register_task("b3f2a1", "echo one\necho " .. string.rep("x", 200))
+        local h = History.new(TAB)
+        h:on_tool_start("wait_task", "wt5", { task_id = "b3f2a1" })
+        pump(50)
+        local buf = h:buf()
+        local row = rows_with(buf, "echo one")[1]
+        assert.is_not_nil(row, "expected the command row")
+        local line = lines_of(buf)[row + 1]
+        assert.is_truthy(line:find("…", 1, true), "expected the command to be elided")
+        assert.is_true(vim.fn.strdisplaywidth(line) <= 80 + #" · b3f2a1", line)
+        delete(h)
+        Tasks._reset()
+    end)
+
+    it("badges a deadline hit as still running, not as an error", function()
+        local h = History.new(TAB)
+        h:on_tool_start("wait_task", "wt6", { task_id = "b3f2a1", timeout_ms = 3000 })
+        pump(50)
+        h:on_tool_end("wait_task", "wt6", {
+            content = { { type = "text", text = "[still running] Task b3f2a1 has not exited after 3.0s." } },
+            details = { taskId = "b3f2a1", status = "still_running", wallTimeSeconds = 3.0 },
+        }, false)
+        pump(60)
+        assert.is_true(has_badge(h, "still running"), table.concat(header_virt(h), "|"))
+        delete(h)
+    end)
+
+    it("stays silent on a clean exit and badges a failure", function()
+        local h = History.new(TAB)
+        h:on_tool_start("wait_task", "wt7", { task_id = "b3f2a1" })
+        pump(50)
+        h:on_tool_end("wait_task", "wt7", {
+            content = { { type = "text", text = "Task b3f2a1 exited with code 0 after 6.0s." } },
+            details = { taskId = "b3f2a1", status = "exited", exitCode = 0, wallTimeSeconds = 6.0 },
+        }, false)
+        pump(60)
+        assert.is_false(has_badge(h, "still running"))
+        assert.is_false(has_badge(h, "exit 0"))
+        delete(h)
+
+        local h2 = History.new(TAB)
+        h2:on_tool_start("wait_task", "wt8", { task_id = "b3f2a1" })
+        pump(50)
+        h2:on_tool_end("wait_task", "wt8", {
+            content = { { type = "text", text = "Task b3f2a1 exited with code 2 after 1.0s." } },
+            details = { taskId = "b3f2a1", status = "exited", exitCode = 2, wallTimeSeconds = 1.0 },
+        }, true)
+        pump(60)
+        assert.is_true(has_badge(h2, "exit 2"), table.concat(header_virt(h2), "|"))
+        delete(h2)
+    end)
+
+    it("badges a signal and a cancelled wait", function()
+        local h = History.new(TAB)
+        h:on_tool_start("wait_task", "wt9", { task_id = "b3f2a1" })
+        pump(50)
+        h:on_tool_end("wait_task", "wt9", {
+            content = { { type = "text", text = "Task b3f2a1 was killed by SIGTERM." } },
+            details = { taskId = "b3f2a1", status = "exited", signal = "SIGTERM", wallTimeSeconds = 1.0 },
+        }, true)
+        pump(60)
+        assert.is_true(has_badge(h, "signal SIGTERM"), table.concat(header_virt(h), "|"))
+        delete(h)
+
+        local h2 = History.new(TAB)
+        h2:on_tool_start("wait_task", "wt10", { task_id = "b3f2a1" })
+        pump(50)
+        h2:on_tool_end("wait_task", "wt10", {
+            content = { { type = "text", text = "[cancelled] stopped waiting for task b3f2a1" } },
+            details = { taskId = "b3f2a1", status = "cancelled", wallTimeSeconds = 1.0 },
+        }, true)
+        pump(60)
+        assert.is_true(has_badge(h2, "wait cancelled"), table.concat(header_virt(h2), "|"))
+        delete(h2)
     end)
 
     it("renders the waited task's output as the result body", function()
