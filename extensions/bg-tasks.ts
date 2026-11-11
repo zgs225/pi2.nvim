@@ -26,8 +26,33 @@
  *
  *  - the tool result of a call that was attached when the process exited
  *    (a foreground call that finished inside its window, or `wait_task`), or
- *  - the wake report — a `pi2_bg_task` custom message with
- *    `{ triggerTurn: true }` sent when the process exits with nobody attached.
+ *  - the wake report — a `pi2_bg_task` custom message carrying the exit status,
+ *    sent when the process exits with nobody attached.
+ *
+ * Delivery ladder (why it is four stages instead of one `sendMessage`). A
+ * steering message is discarded when the run is aborted, so a report sent that
+ * way can vanish with no trace; a `delivered` flag set at send time then hides
+ * the loss from the fallback. Instead a report walks through
+ * `none -> sent -> confirmed`, and only `confirmed` stops further delivery:
+ *
+ *  1. idle at exit -> `sendMessage(..., { triggerTurn: true })` starts a turn
+ *     immediately (the completion is the only thing left to do);
+ *  2. a run is active -> the next actionable boundary (`turn_end`, then
+ *     `agent_before_settle`) appends ONE aggregated `custom_message` entry and
+ *     asks for `continue: true`, so the model acts on it in this run. Entries
+ *     are committed even when the turn ends in an abort (verified), unlike a
+ *     steering queue, and `continue` is suppressed for an aborted turn so an
+ *     abort still ends the run;
+ *  3. `context` is the ground-truth receipt and the last resort: the exact text
+ *     handed over is searched for in the message list about to be sent, which
+ *     confirms it, and anything still missing is injected before that request.
+ *     This is what makes an aborted run cost nothing — the report survives in
+ *     the transcript (stage 2) and is injected on the next turn (stage 3);
+ *  4. `agent_settled` (with `aborted !== true`) flushes reports that finished
+ *     after the last boundary, because nothing else would wake the agent.
+ *
+ * An `agent_settled` for an aborted run deliberately wakes nothing (the user
+ * asked for the run to stop); the report waits for stage 3.
  *
  * The wake report is why `sleep` must never be the model's waiting primitive:
  * it is delivered mid-run at the next turn boundary, so a model that has other
@@ -100,6 +125,18 @@ const COUNT_LINES_UP_TO_BYTES = 8 * 1024 * 1024;
 /** Bound on the output tail inlined in a wake report. */
 const WAKE_TAIL_LINES = 40;
 const WAKE_TAIL_BYTES = 4 * 1024;
+/**
+ * Grace window for an idle wake: a message sent this recently may still be on
+ * its way into context, so the `context` fallback waits one boundary before
+ * concluding it was dropped. Only applies to the `wake` channel — boundary
+ * entries are durable and are read from context on the very next request.
+ */
+const IDLE_WAKE_GRACE_MS = 5_000;
+
+/** How far a completion report has got on its way into model context. */
+type DeliveryState = "none" | "sent" | "confirmed";
+/** Channel that carried a report's text. */
+type DeliveryChannel = "boundary" | "wake" | "fallback" | "tool-result";
 
 /** Payload of the display:false custom messages the frontend (pi.nvim) receives. */
 interface BgTaskDetails {
@@ -125,8 +162,6 @@ interface BgTaskState {
 	exitCode: number | null;
 	signal: string | null;
 	spawnError?: string;
-	/** Wake report handed to the session stream (or context injector). */
-	delivered: boolean;
 	/** Whether a "started" event was pushed to the frontend panel. */
 	panelStarted: boolean;
 	/**
@@ -135,6 +170,20 @@ interface BgTaskState {
 	 * and the result is delivered by the attached call instead.
 	 */
 	observers: number;
+	/**
+	 * Report delivery progress. `none` = never handed to a channel, `sent` =
+	 * handed over but not observed in model context yet, `confirmed` = seen in
+	 * a `context` message list (or carried by a tool result). Only `none` tasks
+	 * are candidates for a new channel, so a report is never delivered twice
+	 * while its first attempt may still land.
+	 */
+	delivery: DeliveryState;
+	/** Exact text handed to the channel, matched against `context` messages. */
+	sentText?: string;
+	/** When `sentText` was handed over (ms), for the idle-wake grace window. */
+	sentAt?: number;
+	/** Which channel carried `sentText`. */
+	sentVia?: DeliveryChannel;
 	/** Resolves exactly once, when the process closes or spawn fails. */
 	exited: Promise<void>;
 	resolveExited: () => void;
@@ -144,6 +193,12 @@ const tasks = new Map<string, BgTaskState>();
 /** Background process groups to kill best-effort when the pi process exits. */
 const trackedPids = new Set<number>();
 let exitHookInstalled = false;
+/**
+ * Whether an agent run is active. `turn_end` / `agent_before_settle` fire while
+ * it is true, so a completion only needs the idle wake when it is false. Kept
+ * here (not read from a ctx) because the exit callbacks run outside any event.
+ */
+let busy = false;
 
 /** Kill a detached process group, falling back to the pid alone. */
 function killProcessGroup(pid: number): void {
@@ -202,6 +257,51 @@ function buildWakeNote(task: BgTaskState): string {
 		return `${head}\nThis is an automated task notification, not a message from the user. Nothing was waiting on it, so no tool result carried the output: read the file above (or call wait_task on the task id) if you need more than this summary.`;
 	}
 	return `${head}\nThis is an automated task notification, not a message from the user. Output tail:\n\n${tail.text}`;
+}
+
+/**
+ * One report for every task that finished since the last flush.
+ *
+ * A single task keeps the full wake note (status + output tail). Several tasks
+ * share ONE message with the status lines only: a burst of completions must not
+ * push N × 4 KB of tails into context, and the model can read the files (or
+ * call `wait_task` on any id) when it actually needs the output. This mirrors
+ * what the other frontends do — push a signal, let the reader pull the detail.
+ */
+function buildBatchNote(batch: BgTaskState[]): string {
+	if (batch.length === 1) {
+		return buildWakeNote(batch[0]);
+	}
+	const lines = batch.map((task) => {
+		const elapsed = formatSeconds((task.endedAt ?? Date.now()) - task.startedAt);
+		return `- ${task.taskId} ("${task.command}") ${describeExit(task)} after ${elapsed}. Output: ${task.outputFile}`;
+	});
+	return (
+		`[SYSTEM NOTIFICATION - NOT USER INPUT]\n[Background tasks: ${batch.length} finished]\n${lines.join("\n")}\n` +
+		"This is an automated task notification, not a message from the user. Output tails are omitted for a batched report: read the files above (or call wait_task on a task id) if you need the output."
+	);
+}
+
+/**
+ * Plain text of a message in a `context` payload, for receipt matching. Custom
+ * messages map to a user-role message whose content is the string that was
+ * sent; user/tool messages carry a content-part array.
+ */
+function messageText(message: unknown): string | undefined {
+	const content = (message as { content?: unknown } | null | undefined)?.content;
+	if (typeof content === "string") {
+		return content;
+	}
+	if (Array.isArray(content)) {
+		return content
+			.map((part) =>
+				part !== null && typeof part === "object" && (part as { type?: string }).type === "text"
+					? String((part as { text?: unknown }).text ?? "")
+					: "",
+			)
+			.join("");
+	}
+	return undefined;
 }
 
 /**
@@ -432,22 +532,92 @@ function attachWait(task: BgTaskState, options: AttachOptions): Promise<WaitOutc
 
 export default function bgTasks(pi: ExtensionAPI) {
 	// ------------------------------------------------------------------
-	// Context fallback injector: registered ONCE at module load. Before
-	// every LLM call, inject wake reports that never made it into the
-	// session stream (sendMessage threw, e.g. stale ctx). Tasks whose
-	// report was delivered are skipped, so the two paths never duplicate.
-	// event.messages is a deep copy; nothing here is persisted.
+	// Delivery receipt + last-resort injector. `context` is the exact message
+	// list about to be sent to the model, so it settles delivery truthfully:
+	// the text we handed over earlier is either in there (confirmed) or it is
+	// not (dropped by an abort, a discarded steering queue, or a stale extension
+	// ctx — inject it now). Nothing is ever injected twice, because a task stops
+	// being a candidate as soon as its text is observed. `event.messages` is a
+	// deep copy; nothing here is persisted.
 	// ------------------------------------------------------------------
 	pi.on("context", (event) => {
-		const pending = [...tasks.values()].filter((task) => task.completed && !task.delivered);
-		if (pending.length === 0) {
+		const outstanding = pendingReports();
+		if (outstanding.length === 0) {
 			return undefined;
 		}
-		for (const task of pending) {
-			event.messages.push({ role: "user", content: buildWakeNote(task), timestamp: Date.now() });
-			task.delivered = true;
+		const texts = new Set<string>();
+		for (const message of event.messages) {
+			const text = messageText(message);
+			if (text !== undefined) {
+				texts.add(text);
+			}
+		}
+		const missing: BgTaskState[] = [];
+		for (const task of outstanding) {
+			if (task.sentText !== undefined && texts.has(task.sentText)) {
+				markConfirmed(task);
+				continue;
+			}
+			if (task.observers > 0) {
+				// An attached tool call is about to return this terminal state
+				// itself; injecting now would deliver it twice.
+				continue;
+			}
+			if (
+				task.delivery === "sent" &&
+				task.sentVia === "wake" &&
+				task.sentAt !== undefined &&
+				Date.now() - task.sentAt < IDLE_WAKE_GRACE_MS
+			) {
+				// A wake sent a moment ago may still be landing; give it one
+				// boundary before concluding it was dropped.
+				continue;
+			}
+			missing.push(task);
+		}
+		if (missing.length === 0) {
+			return undefined;
+		}
+		const text = buildBatchNote(missing);
+		event.messages.push({ role: "user", content: text, timestamp: Date.now() });
+		for (const task of missing) {
+			// Injected into THIS request: the text is by definition delivered.
+			markSent(task, "fallback", text);
+			markConfirmed(task);
 		}
 		return { messages: event.messages };
+	});
+
+	// ------------------------------------------------------------------
+	// Run state + actionable boundaries. `turn_end` is the earliest point a
+	// report can join the conversation (after the turn's tool calls, before the
+	// next provider request) and the only one that fires for an aborted turn;
+	// `agent_before_settle` is the final chance of a normal run. Both append ONE
+	// aggregated `custom_message` entry — durable, unlike a steering message —
+	// and ask for one continuation so the model can act on it in this run.
+	// ------------------------------------------------------------------
+	pi.on("agent_start", () => {
+		busy = true;
+		return undefined;
+	});
+
+	pi.on("turn_end", (event) => deliverAtBoundary(event));
+
+	pi.on("agent_before_settle", (event) => deliverAtBoundary(event));
+
+	pi.on("agent_settled", (event) => {
+		busy = false;
+		if (event.aborted) {
+			// The user asked for the run to stop: keep the report (it is already
+			// committed for an aborted turn, or stays pending) and let the next
+			// `context` deliver it. Waking here would fight the abort.
+			return undefined;
+		}
+		// Reports that finished after the last boundary: nothing else would
+		// wake the agent, and a run requested from a settled handler starts
+		// after every settled handler completes.
+		flushPending({ wake: true });
+		return undefined;
 	});
 
 	// ------------------------------------------------------------------
@@ -505,7 +675,7 @@ export default function bgTasks(pi: ExtensionAPI) {
 			completed: false,
 			exitCode: null,
 			signal: null,
-			delivered: false,
+			delivery: "none",
 			panelStarted: false,
 			observers: 0,
 			exited,
@@ -591,13 +761,113 @@ export default function bgTasks(pi: ExtensionAPI) {
 			reportPanel(task);
 		}
 		if (task.observers > 0) {
-			// An attached call is about to return this terminal state, so the
-			// model already sees it: consume the wake, deliver nothing.
-			task.delivered = true;
+			// An attached call will return this terminal state itself and mark the
+			// report confirmed. Leave it pending rather than "consumed": a call
+			// that is aborted before it returns then still gets the report through
+			// the `context` fallback instead of losing it.
+		} else if (busy) {
+			// A run is active: the next actionable boundary carries the report.
 		} else {
-			reportWake(task);
+			flushPending({ wake: true });
 		}
 		task.resolveExited();
+	}
+
+	/** Outstanding reports: completed and not yet confirmed in model context. */
+	function pendingReports(): BgTaskState[] {
+		return [...tasks.values()].filter((task) => task.completed && task.delivery !== "confirmed");
+	}
+
+	/** Record that a channel now carries this report (not yet observed). */
+	function markSent(task: BgTaskState, via: DeliveryChannel, text: string): void {
+		task.delivery = "sent";
+		task.sentVia = via;
+		task.sentText = text;
+		task.sentAt = Date.now();
+	}
+
+	/**
+	 * Stop delivering this report. Set when the text was observed in a `context`
+	 * payload, injected there, or carried by a tool result — never at send time.
+	 */
+	function markConfirmed(task: BgTaskState): void {
+		task.delivery = "confirmed";
+	}
+
+	/**
+	 * Append the outstanding reports to a boundary proposal.
+	 *
+	 * `continue: true` guarantees one follow-up provider request, so a model that
+	 * ended its turn while a task was still running does not go quiet holding the
+	 * result. A turn that is ending because it was aborted keeps the entry (it is
+	 * committed with the turn — verified) but asks for no continuation, so the
+	 * abort still stops the run; the report is read on the next turn instead.
+	 */
+	function deliverAtBoundary(event: {
+		entries: unknown[];
+		outcome?: string;
+	}): { entries: unknown[]; continue?: boolean } | undefined {
+		const pending = pendingReports().filter((task) => task.delivery === "none" && task.observers === 0);
+		if (pending.length === 0) {
+			return undefined;
+		}
+		const text = buildBatchNote(pending);
+		for (const task of pending) {
+			markSent(task, "boundary", text);
+		}
+		const aborted = event.outcome === "aborted";
+		return {
+			entries: [
+				...event.entries,
+				{
+					type: "custom_message",
+					customType: CUSTOM_TYPE,
+					content: text,
+					display: false,
+					// A batched report covers several tasks: omit `details` so the
+					// frontend does not upsert a phantom task row for the batch. The
+					// per-task `reportPanel` messages are what drive the panel.
+					...batchDetails(pending),
+				},
+			],
+			...(aborted ? {} : { continue: true }),
+		};
+	}
+
+	/**
+	 * Hand every undelivered report to the session as ONE custom message.
+	 *
+	 * `wake` asks for a turn (only used when the session is otherwise idle, i.e.
+	 * the completion is the only thing left to do). The message is a plain
+	 * `pi2_bg_task` custom message without `deliverAs`, so core appends it at once
+	 * when idle and at the next turn boundary while streaming. Delivery is not
+	 * assumed: the text is checked for in the next `context` payload, and a
+	 * message that never got there is injected by the fallback.
+	 */
+	function flushPending(options: { wake: boolean }): void {
+		const pending = pendingReports().filter((task) => task.delivery === "none" && task.observers === 0);
+		if (pending.length === 0) {
+			return;
+		}
+		const text = buildBatchNote(pending);
+		try {
+			pi.sendMessage(
+				{
+					customType: CUSTOM_TYPE,
+					content: text,
+					display: false,
+					...batchDetails(pending),
+				},
+				options.wake ? { triggerTurn: true } : undefined,
+			);
+		} catch {
+			// Stale ctx after reload etc.: leave the reports pending; the `context`
+			// handler injects them before the next LLM call instead.
+			return;
+		}
+		for (const task of pending) {
+			markSent(task, "wake", text);
+		}
 	}
 
 	/**
@@ -639,46 +909,33 @@ export default function bgTasks(pi: ExtensionAPI) {
 	}
 
 	/**
-	 * Wake report: `{ triggerTurn: true }` without `deliverAs` steers the
-	 * active run so the report is delivered mid-run at the next turn boundary
-	 * instead of waiting for the whole run to settle; an idle agent wakes
-	 * immediately. `task.delivered` guards both this path and the load-time
-	 * context fallback, so a report is never injected twice.
+	 * `details` for a report message. Only a single-task report carries them: the
+	 * frontend task registry keys on `details.taskId`, so a batched message with
+	 * one representative id would fabricate a task row. Panel state always comes
+	 * from the per-task `reportPanel` messages, so omitting them loses nothing.
 	 */
-	function reportWake(task: BgTaskState): void {
-		if (task.delivered) {
-			return;
+	function batchDetails(batch: BgTaskState[]): { details?: BgTaskDetails } {
+		if (batch.length !== 1) {
+			return {};
 		}
-		const details = {
-			kind: task.spawnError
-				? "failed"
-				: task.signal !== null
-					? "stopped"
-					: task.exitCode === 0
-						? "completed"
-						: "failed",
-			taskId: task.taskId,
-			command: task.command,
-			pid: task.pid,
-			outputFile: task.outputFile,
-			exitCode: task.exitCode,
-			signal: task.signal,
-		} satisfies BgTaskDetails;
-		try {
-			pi.sendMessage(
-				{
-					customType: CUSTOM_TYPE,
-					content: buildWakeNote(task),
-					display: false,
-					details,
-				},
-				{ triggerTurn: true },
-			);
-			task.delivered = true;
-		} catch {
-			// Stale ctx after reload etc.: leave undelivered; the context
-			// handler injects the report before the next LLM call instead.
-		}
+		const task = batch[0];
+		return {
+			details: {
+				kind: task.spawnError
+					? "failed"
+					: task.signal !== null
+						? "stopped"
+						: task.exitCode === 0
+							? "completed"
+							: "failed",
+				taskId: task.taskId,
+				command: task.command,
+				pid: task.pid,
+				outputFile: task.outputFile,
+				exitCode: task.exitCode,
+				signal: task.signal,
+			} satisfies BgTaskDetails,
+		};
 	}
 
 	// ------------------------------------------------------------------
@@ -783,9 +1040,9 @@ export default function bgTasks(pi: ExtensionAPI) {
 					killProcessGroup(task.pid);
 				}
 				// The kill lands as a "stopped" exit a moment later. The model
-				// already got the cancellation in this result, so consume the
-				// wake instead of reporting the kill back as a fresh event.
-				task.delivered = true;
+				// already got the cancellation in this result, so confirm the report
+				// instead of sending the kill back as a fresh event.
+				markConfirmed(task);
 				const partial = readOutputTail(task.outputFile, MAX_OUTPUT_BYTES, MAX_OUTPUT_LINES).text;
 				return {
 					content: [
@@ -809,6 +1066,8 @@ export default function bgTasks(pi: ExtensionAPI) {
 			const exitCode = task.spawnError ? 1 : (task.exitCode ?? 1);
 
 			if (outcome === "exited") {
+				// This result carries the terminal state: the report is delivered.
+				markConfirmed(task);
 				// Foreground command that finished inside its window: the log is
 				// scratch space now (unless the footer points at it), so keep
 				// /tmp proportional to *running* tasks instead of to every call.
@@ -952,6 +1211,8 @@ export default function bgTasks(pi: ExtensionAPI) {
 			const elapsed = formatSeconds((task.endedAt ?? Date.now()) - task.startedAt);
 
 			if (outcome === "exited") {
+				// This result carries the terminal state: the report is delivered.
+				markConfirmed(task);
 				const head = `Task ${task.taskId} ${describeExit(task)} after ${elapsed}.`;
 				return {
 					content: [{ type: "text" as const, text: tail.text ? `${head}\n\n${tail.text}` : head }],
