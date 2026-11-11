@@ -1139,6 +1139,31 @@ local renderers = {
     -- lua/pi/codemode/tool_ui.lua. The first on_end row MUST be the empty
     -- separator: extract_tool_sections() treats it as render_output()'s blank
     -- line and uses it to split input from output.
+    -- wait_task blocks on a background bash task and returns that task's
+    -- output, so it renders like a bash block with the task id instead of a
+    -- command: the result body is the only place a backgrounded command's
+    -- output reaches the chat, so it must never be hidden on a single line.
+    wait_task = {
+        input_visible = 1,
+        output_visible = 6,
+        on_start = function(history, args)
+            if not (args and type(args.task_id) == "string") then
+                return
+            end
+            local line = args.task_id
+            if type(args.timeout_ms) == "number" and args.timeout_ms > 0 then
+                line = string.format("%s (timeout %ds)", line, math.floor(args.timeout_ms / 1000))
+            end
+            render_body_line(history, line)
+        end,
+        on_end = function(history, _, result, _, insert_at)
+            local text = extract_result_text(result)
+            if text and text ~= "" then
+                insert_at = render_output(history, text, insert_at)
+            end
+            return insert_at
+        end,
+    },
     codemode = {
         input_visible = 1,
         output_visible = 3,

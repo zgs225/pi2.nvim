@@ -136,13 +136,15 @@ Long-running shell commands — dev servers, watchers, long builds, slow test su
 
 ### From the agent
 
-The extension overrides the built-in `bash` tool with one extra optional parameter, `run_in_background`. When the agent passes `run_in_background: true` (the intended use: dev servers, file watchers, long builds, test suites that take minutes), the command spawns detached instead of blocking the turn:
+The extension overrides the built-in `bash` tool with one extra optional parameter, `run_in_background`, and registers a companion `wait_task` tool. Every command — background or not — spawns detached with stdout/stderr streamed into `pi-bash-<taskId>.log` in the system temp directory (the same naming convention pi uses for its truncated-output spill files); only the *attach window* differs.
 
-- The tool returns immediately with a task id and the output file path.
-- stdout/stderr stream into a log file in the system temp directory: `pi-bash-<taskId>.log` (the same naming convention pi uses for its truncated-output spill files).
-- The model is told **not** to poll the output file — when the task finishes (or fails, or is stopped), the extension wakes the agent with a completion report (task id, command, exit code or signal, output path) injected into its context.
+**Foreground (default)** stays attached for `timeout` — default 2 minutes, clamped to 1s…10min — so a quick command behaves exactly like stock bash: its output comes back as the tool result with pi's usual 50 KiB / 2000-line truncation, and a non-zero exit as `Command exited with code N`. A command that **outlives its window is not killed**: it keeps running as a background task and the tool returns `[still running]` with the task id and the output so far. Abort (Esc) still kills the process group and returns `[cancelled]`. The log of a command that finished inside its window is removed unless the truncation footer points at it.
 
-The `timeout` parameter does not apply to background tasks, and the model is instructed not to append `&` itself. Foreground `bash` calls are byte-for-byte the built-in behavior — streaming, truncation, timeout kill, and abort handling are unchanged.
+**Background (`run_in_background: true`)** — the intended use: dev servers, file watchers, long builds, test suites that take minutes — returns immediately with a task id and the output file path; `timeout` does not apply. The row appears in `:PiTasks` at that moment.
+
+**Waiting.** `wait_task(task_id, timeout_ms?)` — default 120 s, max 30 min — blocks until the process exits and returns its output. It is event-driven, so a task that finishes in 3 seconds returns in 3 seconds; its deadline does **not** kill the process, and the `[still running]` result says explicitly that this is not a failure. The three outcomes the agent is taught instead of `sleep`: if it has other work, do that; if this result is all that is left, **end its turn** (that is called out as the correct move, not as giving up — the wake report starts a new turn); if it truly must block, call `wait_task`. A completion is delivered exactly once: a call attached at exit consumes it, so a waited-on task produces no duplicate wake.
+
+**Wake report.** When a task exits with nobody attached, the extension reports completion with a status message for the panel plus a wake message that reaches the agent's context and persists in the transcript — task id, command, exit code or signal, output path, and the last 40 lines of output, prefixed `[SYSTEM NOTIFICATION - NOT USER INPUT]` (custom messages arrive as user-role text, and without the banner models read them as human input).
 
 ### From the prompt
 
@@ -172,7 +174,7 @@ From the panel (all buffer-local, only inside the tasks list):
 
 Output views are read-only (`pi-task-output` filetype, `q` closes) and tail-read large outputs: files over 256 KB are read from the end, capped at 10000 lines. The `p` preview opens a live float for the task under the cursor: a header shows the full command (`$ …`) over a dimmed metadata block — id, status (with exit code/signal once terminal), pid, a `running for mm:ss` clock that becomes `ran for mm:ss · ended … ago`, and the output path — followed by the output tail (up to 1000 lines). While the task runs the tail is re-read every 500 ms and the view follows the newest line (the cursor sticks to the bottom only when it was already there, or the float is unfocused); a terminal status updates the header one last time and then the preview freezes. Stopping a task sends SIGTERM to the recorded pid; the authoritative `stopped` state arrives from the backend's own event, so the row updates even if you stop it elsewhere. Task state lives in memory only — it is not persisted, so tasks from past sessions don't survive a Neovim restart.
 
-Whenever a task reaches a terminal state — completed, failed, or stopped — the extension wakes the agent, which reports the outcome in the chat; the panel row updates in place at the same moment. Panel placement and sizing are configured under [`tasks_panel`](configuration.md); the colors are the [`PiTasksList*`](highlight-groups.md#background-tasks-panel) highlight groups.
+Whenever a task reaches a terminal state — completed, failed, or stopped — the extension wakes the agent, which reports the outcome in the chat; the panel row updates in place at the same moment. If the agent was itself blocked on that task (`wait_task`, or a foreground call that outlived its window), the output arrives as that tool result instead of a wake, so nothing is reported twice. Panel placement and sizing are configured under [`tasks_panel`](configuration.md); the colors are the [`PiTasksList*`](highlight-groups.md#background-tasks-panel) highlight groups.
 
 ## Prompt history
 
@@ -754,7 +756,7 @@ Successful tool calls end silently (a blank breathing line); only errors print a
 Tools come in two rendering styles:
 
 - **Inline tools** render as a single line. `read` is the canonical example — it shows `read tools.lua (42 lines)` and stays on one line even when the file is huge, because inlining the content would just be noise. Consecutive inline tool calls are grouped without blank lines between them.
-- **Full-block tools** get the multi-line indented block shown above. `bash`, `edit`, `write`, the built-in read-only search tools (`grep`, `find`, `ls`), the four [pi-web-access](https://github.com/nicobailon/pi-web-access) tools (`web_search`, `fetch_content`, `source_check`, `get_search_content`), [`codemode`](#code-mode-codemode), and any tool pi2.nvim doesn't have a dedicated renderer for fall into this category.
+- **Full-block tools** get the multi-line indented block shown above. `bash`, `wait_task`, `edit`, `write`, the built-in read-only search tools (`grep`, `find`, `ls`), the four [pi-web-access](https://github.com/nicobailon/pi-web-access) tools (`web_search`, `fetch_content`, `source_check`, `get_search_content`), [`codemode`](#code-mode-codemode), and any tool pi2.nvim doesn't have a dedicated renderer for fall into this category.
 
 ### Path display
 
@@ -787,6 +789,7 @@ Built-in thresholds:
 | Tool | `input_visible` | `output_visible` | Notes |
 | --- | --- | --- | --- |
 | `bash` | 1 | 1 | Shows first line of command + first line of output when collapsed |
+| `wait_task` | 1 | 6 | Background-task wait — the task id and attach window are the input; the waited task's output is the body, which is the only place a backgrounded command's output reaches the chat |
 | `read` | — | — | Always inline |
 | `edit` | unlimited | 0 | Renders the proposed diff as input; no separate output section |
 | `write` | unlimited | 0 | Same shape as `edit` for a whole-file write |
