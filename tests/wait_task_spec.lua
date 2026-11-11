@@ -45,6 +45,13 @@ local function read_extension()
 end
 
 describe("wait_task renderer", function()
+    it("has a dedicated hourglass icon instead of the generic tool fallback", function()
+        -- Blocks are read by their glyph: a generic dot makes a wait look like
+        -- an unrecognized tool. nf-md-timer_sand, distinct from bash's terminal
+        -- and from the sub-agent clock glyphs.
+        assert.are.equal(vim.fn.nr2char(0xF051F, 1), Tools.get_tool_icon("wait_task"))
+    end)
+
     it("renders as a block, not an inline one-liner", function()
         local renderer = Tools.get_renderer("wait_task")
         assert.is_table(renderer)

@@ -27,6 +27,7 @@ end
 ---@type table<string, string>
 local TOOL_ICONS = {
     bash = nf(0xE795), -- nf-dev-terminal
+    wait_task = nf(0xF051F), -- nf-md-timer_sand (blocking wait on a bash task)
     codemode = nf(0xF031E), -- nf-md-language_javascript
     read = nf(0xF0219), -- nf-md-file-document
     edit = nf(0xF03EB), -- nf-md-pencil
