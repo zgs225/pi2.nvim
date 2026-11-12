@@ -535,13 +535,80 @@ function M.list_batches_status(details)
     return ("(%d batches, %d running)"):format(#details.batches, running)
 end
 
+--- Status values a worker report may close with. Anything else is not a
+--- marker (see M.split_report_status).
+---@type table<string, boolean>
+local REPORT_STATUSES = {
+    ok = true,
+    blocked = true,
+    failed = true,
+}
+
+--- Split a worker's trailing status marker off its report.
+---
+--- Children are told to close with a single STATUS line
+--- (extensions/subagent-child.ts WORKER_NOTE). Only the last non-empty line is
+--- inspected, and only a legal value counts: no marker, an unknown word, or a
+--- marker with nothing before it all return nil plus the report untouched, so a
+--- missing marker never fabricates a status.
+---@param report string
+---@return "ok"|"blocked"|"failed"|nil status
+---@return string body
+function M.split_report_status(report)
+    if type(report) ~= "string" or report == "" then
+        return nil, report
+    end
+
+    -- Offsets of the last line that has non-whitespace content.
+    local last_text, last_start = nil, nil
+    local pos = 1
+    while pos <= #report do
+        local nl = report:find("\n", pos, true)
+        local line_end = nl and (nl - 1) or #report
+        local line = report:sub(pos, line_end)
+        if line:match("%S") then
+            last_text, last_start = line, pos
+        end
+        if not nl then
+            break
+        end
+        pos = nl + 1
+    end
+
+    -- STATUS is matched case-insensitively (the line is lowercased first; only
+    -- the marker word is ever needed from it).
+    local status = last_text and last_text:lower():match("^%s*status:%s*(%w+)%s*$")
+    if not status or not REPORT_STATUSES[status] then
+        return nil, report
+    end
+
+    local body = report:sub(1, last_start - 1):gsub("%s+$", "")
+    if body == "" then
+        -- Marker only, no report to attach it to.
+        return nil, report
+    end
+    return status, body
+end
+
 --- Completion report injected into the parent chat (user-spawned children).
+---
+--- The header only changes when the worker actually closed with a status marker
+--- (M.split_report_status): a report without one keeps this wording byte for
+--- byte, so children that never learned the marker render exactly as before and
+--- no status is invented for them.
 ---@param name string
 ---@param report string
 ---@return string
 function M.completion_report(name, report)
+    local status, body = M.split_report_status(report)
     if M.resolve_lang() == "zh" then
+        if status then
+            return ("[子会话「%s」已完成：%s] %s"):format(name, status, body)
+        end
         return ("[子会话「%s」已完成] %s"):format(name, report)
+    end
+    if status then
+        return ('[Sub-session "%s" completed: %s] %s'):format(name, status, body)
     end
     return ('[Sub-session "%s" completed] %s'):format(name, report)
 end
