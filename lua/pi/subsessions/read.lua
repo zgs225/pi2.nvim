@@ -111,39 +111,59 @@ function M.entries_at(path, indices)
     return lines
 end
 
+---@class pi.LastTurn
+---@field text string Last assistant text ("" when the turn produced none)
+---@field stop_reason? string e.g. "stop", "toolUse", "error", "aborted", "length"
+---@field error_message? string Provider/runtime error carried by a failed turn
+
+--- Trailing state of a run in one pass over the session file: the last
+--- assistant message's text, its stop reason, and the error message pi recorded
+--- when that turn failed.
+---
+--- One read instead of three: the settle path needs all of them, and a
+--- re-read per fact walks the whole JSONL again (sessions grow to megabytes).
 ---@param path string
----@return string? last assistant text
-function M.last_assistant_message(path)
+---@return pi.LastTurn? turn nil when the file has no assistant message.
+function M.last_turn(path)
     local entries = read_jsonl(path)
     for i = #entries, 1, -1 do
         local entry = entries[i]
-        if entry.type == "message" and type(entry.message) == "table" and entry.message.role == "assistant" then
-            return truncate_content(entry.message.content, 100000)
+        local message = entry.message
+        if entry.type == "message" and type(message) == "table" and message.role == "assistant" then
+            local error_message = message.errorMessage
+            return {
+                text = truncate_content(message.content, 100000),
+                stop_reason = type(message.stopReason) == "string" and message.stopReason or nil,
+                error_message = type(error_message) == "string" and error_message ~= "" and error_message or nil,
+            }
         end
     end
     return nil
+end
+
+---@param path string
+---@return string? last assistant text
+function M.last_assistant_message(path)
+    local turn = M.last_turn(path)
+    return turn and turn.text or nil
 end
 
 --- Stop reason of the last assistant message in a session file.
 ---@param path string
 ---@return string? stop_reason e.g. "aborted", "stop", "error"
 function M.last_stop_reason(path)
-    local entries = read_jsonl(path)
-    for i = #entries, 1, -1 do
-        local entry = entries[i]
-        if entry.type == "message" and type(entry.message) == "table" and entry.message.role == "assistant" then
-            if type(entry.message.stopReason) == "string" then
-                return entry.message.stopReason
-            end
-            return nil
-        end
-    end
-    return nil
+    local turn = M.last_turn(path)
+    return turn and turn.stop_reason or nil
 end
 
 --- Infer a child's run status from the last meaningful JSONL entry.
+---
+--- The stop reason is authoritative for a completed turn: a provider/runtime
+--- failure is persisted as an assistant message with `stopReason: "error"`
+--- (content usually empty), so a bare "last message is an assistant message"
+--- test would book a dead run as `completed`.
 ---@param path string
----@return "completed"|"interrupted"|nil
+---@return "completed"|"interrupted"|"failed"|nil
 function M.infer_run_status(path)
     local entries = read_jsonl(path)
     for i = #entries, 1, -1 do
@@ -152,6 +172,12 @@ function M.infer_run_status(path)
         local msg = entry.message
         if t == "message" and type(msg) == "table" then
             if msg.role == "assistant" then
+                if msg.stopReason == "error" then
+                    return "failed"
+                end
+                if msg.stopReason == "aborted" then
+                    return "interrupted"
+                end
                 return "completed"
             end
             if msg.role == "toolUse" or msg.role == "toolResult" then

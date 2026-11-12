@@ -172,7 +172,14 @@ function projectTail(path: string, tail: number): string[] {
 					typeof entry.message.content === "string"
 						? entry.message.content.slice(0, 500)
 						: JSON.stringify(entry.message.content).slice(0, 500);
-				return `[${i + 1}] ${entry.message.role}: ${text}`;
+				// A failed turn persists an assistant message with empty content and
+				// the reason in `errorMessage`; projecting the content alone renders
+				// it as a bare `role: []` and hides why the run died.
+				const error =
+					typeof entry.message.errorMessage === "string" && entry.message.errorMessage !== ""
+						? ` (error: ${entry.message.errorMessage.slice(0, 200)})`
+						: "";
+				return `[${i + 1}] ${entry.message.role}: ${text}${error}`;
 			}
 		} catch {
 			/* skip */
@@ -256,7 +263,7 @@ export default function subagentBridge(pi: ExtensionAPI) {
 		label: "List Sub-agents",
 		promptSnippet: "List sub-agent sessions owned by this session (including dormant ones)",
 		description:
-			"List sub-agents owned by the current parent session, including dormant, completed, failed and interrupted children. Call this before dispatch_subagents when continuing prior work. Returns { subagents: [{ id, name, status, model, thinking_level, parent_epoch, last_active_at }] } — empty when the session id is not known yet. `status` is one of 'active', 'completed', 'failed', 'interrupted', 'dormant'. Use `id` (UUID) as the target — not the display name. Closed (dormant) children remain reusable.",
+			"List sub-agents owned by the current parent session, including dormant, completed, failed and interrupted children. Call this before dispatch_subagents when continuing prior work. Returns { subagents: [{ id, name, status, model, thinking_level, parent_epoch, last_active_at, error? }] } — empty when the session id is not known yet. `status` is one of 'active', 'completed', 'failed', 'interrupted', 'dormant'; `error` is present on a child whose last run failed and carries the provider/runtime reason (e.g. a quota or auth error). Use `id` (UUID) as the target — not the display name. Closed (dormant) children remain reusable.",
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			const parent = parentSessionId(ctx);
@@ -273,6 +280,9 @@ export default function subagentBridge(pi: ExtensionAPI) {
 					model: e.config?.model,
 					thinking_level: e.config?.thinking_level,
 					last_active_at: e.last_active_at,
+					// Only set for a failed last run; JSON.stringify drops undefined, so
+					// a healthy row keeps the documented shape.
+					error: e.last_error,
 				}));
 			return toolResult({ subagents });
 		},
@@ -283,7 +293,7 @@ export default function subagentBridge(pi: ExtensionAPI) {
 		label: "Read Sub-agent",
 		promptSnippet: "Read the projected tail of a sub-agent's session log",
 		description:
-			"Read the projected tail of a sub-agent session log (observation only, no host round-trip). Use it to inspect what a child is doing or how it finished without dispatching new work. Returns { lines: string[] }, one line per non-empty JSONL line in the returned window (the last `tail` of them), each prefixed with its 1-based position in that window. A line renders as `[n] <role>: <content>` only when it parses as a JSON object with type 'message' and a message.role; `content` is then cut at 500 characters, so tool calls and tool results appear as truncated compact JSON rather than their full text. Every other line collapses to `[n] (entry)` — that includes thinking records and any line that does not parse as JSON. Unknown ids return { error: 'session file not found' }.",
+			"Read the projected tail of a sub-agent session log (observation only, no host round-trip). Use it to inspect what a child is doing or how it finished without dispatching new work. Returns { lines: string[] }, one line per non-empty JSONL line in the returned window (the last `tail` of them), each prefixed with its 1-based position in that window. A line renders as `[n] <role>: <content>` only when it parses as a JSON object with type 'message' and a message.role; `content` is then cut at 500 characters, so tool calls and tool results appear as truncated compact JSON rather than their full text, and a failed assistant turn appends ` (error: <errorMessage>)` so the reason survives its empty content. Every other line collapses to `[n] (entry)` — that includes thinking records and any line that does not parse as JSON. Unknown ids return { error: 'session file not found' }.",
 		parameters: Type.Object({
 			target: Type.String({ description: "Sub-agent session id (UUID) from list_subagents." }),
 			tail: Type.Optional(

@@ -4,6 +4,7 @@
 #   make e2e     — run headless end-to-end scripts (tests/*_e2e.lua)
 #   make e2e-reaper — real-pi e2e: subagent idle reaper + max_children cap (needs pi binary + provider; not CI)
 #   make e2e-bg-delivery — real-pi e2e: background bash completion delivery into agent context (needs pi + provider; not CI)
+#   make e2e-subagent-failure — real-pi e2e: a failed child run reaches the parent as a failed item (needs pi; not CI)
 #   make smoke   — headless end-to-end smoke check (loads the user config, opens the chat)
 #   make format  — reformat lua/ and tests/ in place with stylua
 #   make style   — check formatting only (stylua --check); non-zero exit on drift, for CI/hooks
@@ -19,7 +20,7 @@ MIN_INIT := tests/minimal_init.lua
 STYLUA_BIN ?= stylua
 LUA_LS_BIN ?= lua-language-server
 
-.PHONY: test smoke format style lint docs-links e2e e2e-reaper e2e-bg-delivery
+.PHONY: test smoke format style lint docs-links e2e e2e-reaper e2e-bg-delivery e2e-subagent-failure
 
 test:
 	PLENARY_PATH=$(PLENARY_PATH) $(NVIM_BIN) --headless -u $(MIN_INIT) \
@@ -42,6 +43,12 @@ e2e-reaper:
 # stays out of CI and `make test`.
 e2e-bg-delivery:
 	$(NVIM_BIN) --headless -u $(MIN_INIT) -l scripts/e2e/bg_tasks_delivery.lua
+
+# Real-pi e2e for a failed child run (quota/auth/network error) surfacing as a
+# failed batch item with the provider reason instead of an empty `ok`. Uses a
+# local fake provider, so it needs the pi binary but no account/quota.
+e2e-subagent-failure:
+	$(NVIM_BIN) --headless -u $(MIN_INIT) -l scripts/e2e/subagent_failure.lua
 
 smoke:
 	$(NVIM_BIN) --headless -u $(HOME)/.config/nvim/init.lua -l scripts/smoke.lua

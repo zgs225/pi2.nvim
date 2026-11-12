@@ -613,6 +613,23 @@ function M.completion_report(name, report)
     return ('[Sub-session "%s" completed] %s'):format(name, report)
 end
 
+--- Failure notice injected into the parent chat (user-spawned children).
+---
+--- A failed run has no report to quote, so the notice carries the reason the
+--- backend recorded instead. It is deliberately distinct from
+--- M.completion_report: "completed: failed" would read as a self-declared
+--- outcome, while this line says the child never got to report anything.
+---@param name string
+---@param reason string Provider/runtime error text, e.g. `429: {"…insufficient_quota"}`
+---@return string
+function M.failure_report(name, reason)
+    local detail = type(reason) == "string" and reason ~= "" and reason or "unknown error"
+    if M.resolve_lang() == "zh" then
+        return ("[子会话「%s」失败] %s"):format(name, detail)
+    end
+    return ('[Sub-session "%s" failed] %s'):format(name, detail)
+end
+
 --- dispatch uses inline rendering only for a single item with wait:true.
 ---@param args? table
 ---@return boolean

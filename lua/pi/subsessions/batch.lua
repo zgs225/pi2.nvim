@@ -343,6 +343,9 @@ function M.complete_item(batch_id, ref, ok, opts)
         patch_item(batch, ref, {
             status = "failed",
             error = opts.error or "failed",
+            -- A run that failed after producing text keeps it: the parent can
+            -- still tell how far the child got, and the error says why it stopped.
+            output = opts.output,
         })
         maybe_cancel_siblings(batch, ref)
     end
@@ -352,9 +355,24 @@ function M.complete_item(batch_id, ref, ok, opts)
     require("pi.ui.sessions").request_refresh()
 end
 
+--- Outcome of a settled child run, as decided by the settle handler
+--- (subsessions/init.lua), which is the only place that can tell an aborted run
+--- from a failed one (`stopReason: "error"` plus the provider's `errorMessage`).
+---@class pi.SubsessionItemOutcome
+---@field ok boolean False when the run itself failed.
+---@field error? string Provider/runtime error text for a failed run.
+---@field output? string Text the run produced (kept on failure when non-empty).
+
+--- Settle the running items that this child's finished run owns.
+---
+--- `outcome` is authoritative when given. Without it the manifest's `failed`
+--- status is the fallback — that is the unexpected-exit path, where the manager
+--- patches `failed` before settling because a crashed child leaves no assistant
+--- turn to read.
 ---@param child_id string
+---@param outcome? pi.SubsessionItemOutcome
 ---@return boolean claimed True when this settle completed a running batch item.
-function M.on_child_settled(child_id)
+function M.on_child_settled(child_id, outcome)
     local entry = Manifest.load()[child_id]
     if not entry then
         return false
@@ -363,10 +381,25 @@ function M.on_child_settled(child_id)
     if type(gen) ~= "number" then
         return false
     end
+    local claimed_outcome = type(outcome) == "table" and type(outcome.ok) == "boolean" and outcome or nil
+    if not claimed_outcome then
+        local failed = entry.status == "failed"
+        claimed_outcome = {
+            ok = not failed,
+            error = failed and (entry.last_error or "sub-session failed") or nil,
+        }
+    end
+    local output = claimed_outcome.output
+    if claimed_outcome.ok and type(output) ~= "string" then
+        local path = Read.find_path(child_id)
+        output = path and Read.last_assistant_message(path) or ""
+    end
+    -- A failed run usually produced no text at all (quota/auth/network errors
+    -- arrive before any content); keep a partial report when it did.
+    if not claimed_outcome.ok and (type(output) ~= "string" or output == "") then
+        output = nil
+    end
     local batches = M.load()
-    local path = Read.find_path(child_id)
-    local output = path and Read.last_assistant_message(path) or ""
-    local failed = entry.status == "failed"
     local claimed = false
     for batch_id, batch in pairs(batches) do
         if batch.status == "running" or batch.status == "pending" then
@@ -376,9 +409,9 @@ function M.on_child_settled(child_id)
                     and item.generation == gen
                     and (item.status == "running" or item.status == "spawning")
                 then
-                    M.complete_item(batch_id, item.ref, not failed, {
-                        output = failed and nil or output,
-                        error = failed and "sub-session failed" or nil,
+                    M.complete_item(batch_id, item.ref, claimed_outcome.ok, {
+                        output = output,
+                        error = claimed_outcome.ok and nil or (claimed_outcome.error or "sub-agent run failed"),
                     })
                     claimed = true
                 end
@@ -570,7 +603,13 @@ local function run_batch(batch, parent)
             persist(b)
             child.rpc:send({ type = "prompt", message = item.message }, function(res)
                 if not res.success then
-                    M.complete_item(batch.id, item.ref, false, { error = "prompt failed" })
+                    -- Carry the backend's reason (e.g. "No API key found for …")
+                    -- instead of an opaque "prompt failed": the parent can act
+                    -- on the former and only guess at the latter.
+                    local reason = type(res.error) == "string" and res.error ~= "" and res.error or nil
+                    M.complete_item(batch.id, item.ref, false, {
+                        error = reason and ("prompt failed: " .. reason) or "prompt failed",
+                    })
                 end
             end)
         end
@@ -1054,7 +1093,11 @@ function M.rebuild()
                         changed = true
                     elseif entry and entry.run_generation == item.generation and entry.status == "failed" then
                         item.status = "failed"
-                        item.error = "sub-session failed"
+                        -- The settle recorded why (provider error, process exit);
+                        -- a manifest written before that field existed falls back
+                        -- to the generic text.
+                        item.error = type(entry.last_error) == "string" and entry.last_error ~= "" and entry.last_error
+                            or "sub-session failed"
                         changed = true
                     end
                 end

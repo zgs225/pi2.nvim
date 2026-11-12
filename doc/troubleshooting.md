@@ -57,6 +57,16 @@ When filing an issue, attaching the relevant section of `rpc.log` is by far the 
 
 `wait_subagents` / `dispatch_subagents({ wait = true })` blocks the parent pi process on a host `select` until Neovim replies with `extension_ui_response`. The tunneled sub-agent tools forward the tool `AbortSignal` to that select, so `:PiAbort` interrupts a pending wait immediately instead of hanging until `subagent.batch_timeout_ms`. If a reply is dropped (encode/send failure), the parent may still stay busy even though the child row looks idle and `.pi2-sub-batches.json` already says `completed` — abort the parent (`:PiAbort`) and retry the wait. With `debug = true` or `:PiToggleDebug`, `rpc.log` should show the `extension_ui_response` (or `Failed to encode RPC command` / `Failed to send RPC command`).
 
+## Sub-agent failed: quota, auth or network error
+
+When a child's model call is rejected — exhausted quota, invalid API key, rate limit, dead network — the run ends with an assistant turn carrying `stopReason: "error"` and the reason in `errorMessage`, and no content. pi2.nvim reports that as a **failure**, not as an empty success:
+
+- The batch item comes back `status = "failed"` with the provider message in `error` (e.g. `429: {"message":"You exceeded your current quota…","type":"insufficient_quota"}`), and the batch status is `failed`, or `partial` when siblings finished.
+- `list_subagents` shows `status = "failed"` plus `error`, and `read_subagent` renders the failed turn as `[n] assistant: [] (error: …)`.
+- A user-spawned child injects `[Sub-session "x" failed] …` / `[子会话「x」失败] …` into the parent chat.
+
+Nothing is broken and nothing needs closing: the child process stays alive and reusable. Fix the cause (top up the quota, `/login` or set the provider key) and reuse the child with `dispatch_subagents({ items = { { target = "<id>", message = "…" } } })`, or dispatch again with a different `model`. The same report appears when the prompt itself is rejected (`failed to send task to sub-session: No API key found for …`) and when the child process dies unexpectedly (`sub-agent process exited`).
+
 ## Process lifecycle
 
 Each π session owns an underlying `pi --mode rpc` subprocess. One tab = one session = one process. The lifecycle is:

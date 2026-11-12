@@ -224,7 +224,7 @@ function M.sweep()
             local mtime = path ~= nil and vim.fn.getftime(path) or -1
             local idle = mtime > 0 and (os.time() - mtime) >= minutes * 60
             if
-                (inferred == "completed" or inferred == "interrupted")
+                (inferred == "completed" or inferred == "interrupted" or inferred == "failed")
                 and idle
                 and alive
                 and not is_viewed_child(id)
