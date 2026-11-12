@@ -3040,10 +3040,10 @@ function show_resume_picker(items, opts)
     vim.ui.select(rows, {
         prompt = "Resume session",
         kind = "pi-resume-session",
-        -- Pass rows whose session carries a `file` field so backends like
-        -- snacks.nvim can preview the raw session file when preview is enabled.
-        -- Other vim.ui.select implementations ignore extra fields and render via
-        -- `format_item`. Same row rendering as the telescope picker above.
+        -- Rows carry their session item (with `file`) so a backend that
+        -- previews raw session files can find one; other vim.ui.select
+        -- implementations ignore extra fields and render via `format_item`.
+        -- Same row rendering as the telescope picker above.
         format_item = function(row)
             if row.kind == "session" then
                 return format_resume_item(row.item.session)

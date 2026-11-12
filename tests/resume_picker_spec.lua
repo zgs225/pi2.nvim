@@ -663,6 +663,62 @@ describe("pi resume picker", function()
             assert.equals(T_TARGET, find_after(0, "switch_session").sessionPath)
         end)
 
+        it("re-filters per prompt, keeping a matched session under its title", function()
+            local cfg = picker_with_worktree()
+
+            -- "worktree session" matches only the worktree row's text, not the
+            -- main checkout's; the fix-auth group must survive because its
+            -- session does, even though the title itself does not match.
+            local rows = cfg.finder.fn("worktree session")
+            assert.are.same(
+                { "group", "session" },
+                vim.tbl_map(function(row)
+                    return row.kind
+                end, rows)
+            )
+            assert.equals(T_OTHER, rows[2].item.file)
+            -- R3: a session row never repeats its checkout context.
+            assert.is_nil(rows[2].text:find("fix-auth", 1, true))
+            assert.is_nil(rows[2].text:find("󰙅", 1, true))
+
+            -- A query with no match yields no rows (and therefore no titles).
+            assert.equals(0, #cfg.finder.fn("zzz-no-match"))
+
+            -- The empty prompt restores both partitions, main first (its
+            -- session is newer).
+            assert.are.same(
+                { "group", "session", "group", "session" },
+                vim.tbl_map(function(row)
+                    return row.kind
+                end, cfg.finder.fn(""))
+            )
+        end)
+
+        it("deletes only session rows when a title row is multi-selected", function()
+            local cfg = picker_with_worktree()
+            cfg.attach_mappings(13, function(_modes, lhs, fn)
+                tele.maps[lhs] = fn
+            end)
+            local rows = picker_rows(cfg)
+            tele.multi = { { value = rows[1] }, { value = rows[2] } }
+
+            local removed = {}
+            local real_remove = os.remove
+            os.remove = function(path)
+                removed[#removed + 1] = path
+                return true
+            end
+            local orig_confirm = vim.fn.confirm
+            vim.fn.confirm = function()
+                return 1 -- Yes
+            end
+            tele.maps["<C-x>"]()
+            vim.fn.confirm = orig_confirm
+            os.remove = real_remove
+
+            assert.are.same({ T_TARGET }, removed, "the title row is not a deletion target")
+        end)
+
         it("keeps group rows out of the <C-x> selection", function()
             local cfg = picker_with_worktree()
             cfg.attach_mappings(12, function(_modes, lhs, fn)
