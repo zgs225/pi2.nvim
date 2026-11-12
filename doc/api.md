@@ -177,7 +177,7 @@ The git layer is a separate module, `require("pi.worktree")`, which is what `pi.
 | `Worktree.diff(info, cb, opts?)` | `cb(patch, err)` — `base_sha` → now (untracked files included), or `opts.from` → now for an incremental capture (a reused checkout's new work only). Capture is all-or-nothing: it errors (rather than returning a partial patch) when the worktree has more than 20 000 untracked files or an untracked path a patch cannot represent (a directory holding its own repository). |
 | `Worktree.snapshot(info, cb)` | `cb(path, err)` — writes that patch under `<git common dir>/pi2-worktree-snapshots/<name>/`, with the same all-or-nothing capture rules, so a failed snapshot never yields a truncated patch. A `<patch>.json` sidecar (`WorktreeSnapshotMeta`: name, path, repo_root, base_sha, head, created_at) keeps the snapshot self-describing after the checkout is gone. |
 | `Worktree.latest_snapshot(repo_root, name)` | `{ path, meta? }` — newest snapshot of a worktree (used to restore a missing checkout on resume). |
-| `Worktree.probe(target_dir, patch, cb)` | `cb("clean"\|"already"\|"conflict", err)` — `git apply --check`, then `--reverse --check`; nothing is written. The idempotency check behind automatic integration and retention. |
+| `Worktree.probe(target_dir, patch, cb)` | `cb("clean"\|"already"\|"conflict", err)` — `git apply --check`, then `--reverse --check`; nothing is written. Backs `:PiWorktreeApply`'s checked apply. |
 | `Worktree.apply_patch(target_dir, patch, cb)` | `cb(ok, err)` — `git apply` into `target_dir`'s **working tree only** (no index, no 3-way, no commit). Atomic: a conflicting hunk aborts the whole patch. |
 | `Worktree.branch(info, branch, cb)` | Attaches `branch` (creating it, or checking out the existing one). |
 | `Worktree.release(info, cb)` | `cb(removed, err)` — removes the checkout **only** when clean and not ahead of base. |
@@ -185,25 +185,6 @@ The git layer is a separate module, `require("pi.worktree")`, which is what `pi.
 | `Worktree.bind(info, fields)` | Synchronous; publishes `{ session_id, session_file }` onto the worktree metadata. |
 
 `WorktreeInfo` is the table every one of these accepts and returns (`kind`, `name`, `path`, `repo_root`, `git_dir`, `common_dir?`, `base_sha?`, `mode?`, `session_id?`, `session_file?`) — persist it (it is JSON-encodable) and hand it back to `status` / `diff` / `remove` later. `validate_name(name)` returns `ok, err` for the directory-name rules; `pi.worktree` also exposes `_reset` / `_set_runner` test hooks. Full guide: [Worktrees](worktrees.md).
-
-### Automatic integration (`pi.worktree_integration`)
-
-**Retained but dormant:** a spawned sub-session no longer gets a checkout of its own (see [Worktrees → Sub-sessions](worktrees.md#sub-sessions)), so the engine no longer triggers on a dispatch. Its API is documented here because the module still ships.
-
-
-The rules — capture, snapshot, safe window, conflict handling, retention — are documented in [Worktrees → Automatic integration](worktrees.md#automatic-integration). The module itself is driven by the sub-session layer and is safe to call directly:
-
-| Function | Contract |
-| --- | --- |
-| `Integration.on_child_settled(child, entry, manifest_cwd, done?)` | Integrate a settled child's checkout. `done(outcome, record)` fires once on the main loop when the integration finished **or** was parked (`queued`); outcomes: `applied`, `applied_kept`, `applying`, `resolving`, `queued`, `needs_attention`, `skipped`, `disabled`, `no_child`, `no_entry`, `no_worktree`, `worktree_missing`, `error`. |
-| `Integration.on_parent_ready(parent)` | A safe window opened (wait started/ended, turn finished, session resumed): drains the target's queue, re-enqueues `queued` rows, promotes retryable `needs_attention` rows (`modified_buffer`, `parent_busy`, `other_session`, `parent_dirty`, `parent_gone`, `no_target`, `probe_unavailable`) and returns how many were promoted. |
-| `Integration.reconcile(done?)` | Startup recovery across every manifest on disk: `applying` → probe (`applied` / `queued` / `needs_attention`), `queued` → enqueue, `resolving` with a dead child → `needs_attention`. `done(summary)` reports `{ checked, applied, queued, needs_attention, skipped }`. |
-| `Integration.enforce_retention(cwd?, done?)` | The soft cap (`worktree.integration.keep_count`). `done(summary)` reports `{ managed, removable, removed, protected, kept }`; only verified `applied` checkouts are candidates. |
-| `Integration.is_waiting(parent)` | Whether the parent is blocked in `wait_subagents` (the preferred apply window). |
-| `Integration.patch_files(patch)` | Repo-relative paths a unified patch touches (both sides of a rename). |
-| `Integration._decide(facts)` | Pure decision function: `apply` / `mark_applied` / `queue` / `resolve` / `needs_attention` / `skip` from a facts table — the whole matrix in one testable place. |
-
-The persisted record lives on the child's manifest row as `entry.integration` (`state`, `patch_sha`, `base_sha`, `head_sha`, `parent_head`, `snapshot_path`, `files`, `attempts`, `applied_at`, `reason`, `error`, `kept_reason`, `pinned`, `archived`, `worktree_removed`, `run_generation`); it is written **before** the first write, which is what makes a crashed Neovim recoverable.
 
 ## Queue modes
 

@@ -36,7 +36,6 @@
 ---@field _worktree_same_cwd boolean session cwd equals Neovim's cwd
 ---@field _worktree_status? { dirty?: boolean, ahead?: integer } async `git status` summary for the badge
 ---@field _worktree_timer? uv.uv_timer_t debounced badge refresh (tool completion)
----@field _worktree_records pi.ChatWorktreeRecord[] persistent integration records (oldest first)
 local Chat = {}
 Chat.__index = Chat
 
@@ -107,7 +106,6 @@ function Chat.new(tab, mode, agent)
     self._worktree_same_cwd = true
     self._worktree_status = nil
     self._worktree_timer = nil
-    self._worktree_records = {}
     self._last_applied_prompt = nil
     self._bash_running = false
     self._bash_req_id = nil
@@ -141,14 +139,6 @@ end
 --- a turn can finish many tools, and one `git status` per quiet period is
 --- enough to keep the dirty/ahead marker current.
 local WORKTREE_REFRESH_DEBOUNCE_MS = 300
-
---- Bounded history of automatic worktree integration records per chat: old
---- events scroll away, but the newest are never dropped by a burst.
-local MAX_WORKTREE_RECORDS = 20
-
----@class pi.ChatWorktreeRecord
----@field text string the Integration module's sentence, verbatim
----@field rendered boolean already written into the history buffer
 
 --- The worktree module when available. `detect` is synchronous and
 --- filesystem-only; dirty/ahead comes from an async `status` call, so nothing
@@ -188,72 +178,6 @@ function Chat.worktree_badge(info, same_cwd, status)
     end
     local marked = status ~= nil and (status.dirty == true or (type(status.ahead) == "number" and status.ahead > 0))
     return { { glyph .. name .. (marked and "*" or ""), "PiChatHistoryWorktree" } }
-end
-
---- Build the history lines for one integration record: the worktree glyph plus
---- the Integration module's own text, continuation lines indented so a
---- multi-line message stays one record.
----@param text string
----@return pi.CustomBlockLine[]
-local function worktree_record_lines(text)
-    local content = {}
-    for i, line in ipairs(vim.split(text, "\n", { plain = true })) do
-        content[#content + 1] = {
-            { i == 1 and "󰙅 " or "  ", "PiWorktreeIntegrationIcon" },
-            { line, "PiWorktreeIntegration" },
-        }
-    end
-    return content
-end
-
---- Record one automatic worktree integration event in the history, as a
---- persistent visible line — never only a transient notification. The history
---- buffer exists for the chat's whole lifetime, so the record is written even
---- while the chat has no window and is still there on the next show; if the
---- buffer cannot take it yet, the record stays pending and is replayed then.
----
---- The text comes from `pi.worktree_integration` (`queued` / `applying` /
---- `resolving` / `applied` / `needs_attention`, and `removed` as part of an
---- applied sentence).
----@param text string
-function Chat:show_worktree_integration(text)
-    if type(text) ~= "string" then
-        return
-    end
-    local trimmed = vim.trim(text)
-    if trimmed == "" then
-        return
-    end
-    self._worktree_records = self._worktree_records or {}
-    self._worktree_records[#self._worktree_records + 1] = { text = trimmed, rendered = false }
-    while #self._worktree_records > MAX_WORKTREE_RECORDS do
-        table.remove(self._worktree_records, 1)
-    end
-    self:_render_worktree_records()
-end
-
---- Write every not-yet-rendered integration record into the history buffer.
---- Records that cannot be written yet (no usable buffer) stay pending, so the
---- next show retries them.
-function Chat:_render_worktree_records()
-    local records = self._worktree_records
-    if not records or #records == 0 then
-        return
-    end
-    local buf = self._history:buf()
-    if not buf or not vim.api.nvim_buf_is_valid(buf) then
-        return
-    end
-    for _, record in ipairs(records) do
-        if not record.rendered then
-            self:append_custom_block({
-                target = "history",
-                block = "custom",
-                content = worktree_record_lines(record.text),
-            })
-            record.rendered = true
-        end
-    end
 end
 
 --- Show a breadcrumb when viewing a sub-session (`◂ 父：…`).
@@ -616,8 +540,6 @@ function Chat:show(opts)
         return
     end
     self:_set_keymaps()
-    -- A record that could not be written yet (no usable buffer) lands now.
-    self:_render_worktree_records()
     -- Window creation resets the winbar / float title: re-apply it and re-read
     -- the worktree state (files may have changed while the chat was hidden),
     -- rather than replaying a cached badge.
@@ -2183,10 +2105,6 @@ function Chat:clear()
     self._done_verb = nil
     self._last_turn_stop_reason = nil
     self._history:clear()
-    -- The buffer was wiped for a different conversation: its integration
-    -- records belong to the old one. (A hidden chat keeps them: clear() is the
-    -- conversation boundary, not hide().)
-    self._worktree_records = {}
     self._prompt:statusline():reset_usage()
 end
 

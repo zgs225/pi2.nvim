@@ -51,7 +51,6 @@ local show_hidden_children = false
 ---@field worktree? string worktree name shown on a group header / sub-session row
 ---@field worktree_path? string display path of a worktree group header
 ---@field forked_from? string display name of the session this one was forked from
----@field integration_state? string automatic worktree integration state of a sub-session row
 
 ---@type integer? shared list buffer
 local buf = nil
@@ -275,20 +274,6 @@ end
 --- Worktree glyph shared by the group header and the sub-session row suffix.
 local WORKTREE_GLYPH = "󰙅"
 
---- Compact status for a manifest child's automatic worktree integration: one
---- glyph appended to the row body, so the existing name / subtitle columns keep
---- their alignment and a long integration error can never widen the list.
---- `applied` also covers a checkout removed after a successful apply
---- (`worktree_removed`), whose state stays `applied`.
----@type table<string, { glyph: string, hl: string }>
-local INTEGRATION_STATUS = {
-    queued = { glyph = "⧗", hl = "PiSessionsListIntegrationQueued" },
-    applying = { glyph = "…", hl = "PiSessionsListIntegrationRunning" },
-    resolving = { glyph = "…", hl = "PiSessionsListIntegrationRunning" },
-    applied = { glyph = "✓", hl = "PiSessionsListIntegrationApplied" },
-    needs_attention = { glyph = "!", hl = "PiSessionsListIntegrationAttention" },
-}
-
 ---@class pi.SessionsListWorktree
 ---@field kind "main"|"linked"
 ---@field name string worktree directory name
@@ -500,13 +485,6 @@ function M.format_line(row, tick)
     end
     local subtitle = #extra > 0 and (" · " .. table.concat(extra, " · ")) or ""
     local forked = row.forked_from and (" ↳ forked from " .. row.forked_from) or ""
-    local integration_status = row.integration_state and INTEGRATION_STATUS[row.integration_state] or nil
-    local integration = ""
-    local integration_hl = nil
-    if integration_status then
-        integration = " " .. integration_status.glyph
-        integration_hl = integration_status.hl
-    end
     local provisional = pending or name == "(unnamed)"
     local spinner = row.title_generating and provisional and M.spinner_frame(tick)
 
@@ -523,15 +501,7 @@ function M.format_line(row, tick)
         prefix = "  "
     end
 
-    local line = prefix
-        .. dot
-        .. " "
-        .. (spinner and spinner .. " " or "")
-        .. name
-        .. forked
-        .. subtitle
-        .. integration
-        .. count
+    local line = prefix .. dot .. " " .. (spinner and spinner .. " " or "") .. name .. forked .. subtitle .. count
     local dot_start = #prefix
     local name_start = dot_start + #dot + 1 + (spinner and #spinner + 1 or 0)
     local chunks = {
@@ -540,11 +510,6 @@ function M.format_line(row, tick)
     }
     if #forked > 0 then
         chunks[#chunks + 1] = { name_start + #name, name_start + #name + #forked, "PiSessionsListDotDim" }
-    end
-    if integration ~= "" and integration_hl then
-        -- Skip the separating space: only the glyph carries the status color.
-        local start = name_start + #name + #forked + #subtitle + 1
-        chunks[#chunks + 1] = { start, start + #integration - 1, integration_hl }
     end
     if spinner then
         table.insert(chunks, 2, { name_start - #spinner - 1, name_start - 1, "PiSessionsListSpinner" })
@@ -638,9 +603,6 @@ local function append_child_row(out, entry, tab, opts)
         -- surfaced in the parent chat instead. `child_completion_seen` only controls list visibility.
         done = false,
         error = entry.status == "failed",
-        -- One-glyph status of the child's automatic worktree integration; an
-        -- unknown/absent state renders nothing (row stays byte-identical).
-        integration_state = type(entry.integration) == "table" and entry.integration.state or nil,
         name = entry.name,
         title_generating = false,
         subtitle = subtitle,

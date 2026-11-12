@@ -222,27 +222,6 @@ require("pi").setup({
         -- included) before :PiWorktreeRemove / Worktree.remove deletes it.
         -- When false, the confirmation warns that the work is lost.
         snapshot_before_remove = true,
-        -- Retained but DORMANT: a spawned sub-session no longer gets a
-        -- checkout of its own, so there is nothing to integrate. The engine
-        -- (pi.worktree_integration) and its knobs stay for checkouts recorded
-        -- by earlier versions; see doc/worktrees.md#automatic-integration.
-        integration = {
-            -- Apply automatically at all (default true). false = only
-            -- :PiWorktreeApply moves work out of a checkout.
-            auto = true,
-            -- On a conflict / stale base, ask the still-running child to
-            -- rebase and resolve inside its own checkout once, then retry
-            -- (default true; max_attempts = 0 disables it).
-            auto_resolve = true,
-            -- Resolving rounds a child gets before the integration stops in
-            -- needs_attention (default 1).
-            max_attempts = 1,
-            -- Soft cap on applied child checkouts kept on disk: only
-            -- `applied` + verified + inactive + unpinned checkouts are
-            -- removed, oldest first; anything unintegrated, parked or in
-            -- needs_attention is never removed for quota (default 15).
-            keep_count = 15,
-        },
     },
 
     -- Sub-sessions (子会话). When enabled (default), injects extensions/subagent.ts

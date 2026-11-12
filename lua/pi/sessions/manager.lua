@@ -334,43 +334,6 @@ local function release_session_worktree(session)
     end)
 end
 
---- Optional worktree-integration module (lazy, tolerant): the integration
---- engine owns the queue, the sessions manager only signals idle moments.
----@return table?
-local function integration_module()
-    local ok, mod = pcall(require, "pi.worktree_integration")
-    if ok and type(mod) == "table" then
-        return mod
-    end
-    ok, mod = pcall(require, "pi.integration")
-    if ok and type(mod) == "table" then
-        return mod
-    end
-    ok, mod = pcall(require, "pi.worktree.integration")
-    if ok and type(mod) == "table" then
-        return mod
-    end
-    return nil
-end
-
---- Tell the integration queue that a *parent* session is idle so it can drain
---- queued work (e.g. applying/merging finished child work). Children are
---- handled by `pi.subsessions`; ordinary sessions have no queue.
----@param session pi.Session
-local function notify_parent_ready(session)
-    if session.parent_id then
-        return
-    end
-    local Integration = integration_module()
-    if not Integration or type(Integration.on_parent_ready) ~= "function" then
-        return
-    end
-    local ok, err = pcall(Integration.on_parent_ready, session)
-    if not ok then
-        Notify.warn("worktree integration drain failed: " .. tostring(err))
-    end
-end
-
 --- Keep `pinned_model` in sync with `pinned_config.model` for callers not yet migrated.
 ---@param session pi.Session
 ---@param opts { model?: pi.ModelRef, thinking_level?: string }
@@ -1104,9 +1067,6 @@ function M.handle_event(session, msg)
             -- `aborted` is authoritative on pi >= 1.1.0; older pi omits it, so
             -- the child settle path falls back to the session file's stop reason.
             require("pi.subsessions").on_child_settled(session, msg.aborted == true)
-        else
-            -- A parent is idle again: let the integration queue drain.
-            notify_parent_ready(session)
         end
         if chat then
             chat:set_status(nil)
@@ -2262,11 +2222,6 @@ function load_session(session, session_path, opts, callback)
         -- core; adopt it as this tab's pin.
         refresh_state_and_pin(session)
         done(true)
-        -- A resumed parent is idle: drain queued integrations after the view
-        -- rebuild is scheduled, never inside the RPC response callback.
-        vim.schedule(function()
-            notify_parent_ready(session)
-        end)
 
         -- Revive (and other headless loads) switch the file before the chat is
         -- bound; the caller rebuilds via reattach_view. Sending get_messages

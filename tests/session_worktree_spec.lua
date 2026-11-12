@@ -33,7 +33,6 @@ local real = {
     list = History.list,
     on_parent_resumed = Subsessions.on_parent_resumed,
     on_child_settled = Subsessions.on_child_settled,
-    worktree_integration = package.loaded["pi.worktree_integration"],
     get = Sessions.get,
     get_or_create = Sessions.get_or_create,
     worktree = package.loaded["pi.worktree"],
@@ -106,13 +105,6 @@ end
 --- Install Rpc stubs; returns a table collecting start opts.
 ---@return { starts: table[], commands: table[], responded: fun(cmd: table, cb?: fun(res: table)) }
 local function install_rpc_stub()
-    -- Keep the real integration queue out of the specs: manager idle hooks may
-    -- otherwise drain leftover real manifest rows and emit notifications.
-    package.loaded["pi.worktree_integration"] = {
-        on_parent_ready = function()
-            return 0
-        end,
-    }
     local state = { starts = {}, commands = {} }
     Rpc.start = function(self, opts)
         state.starts[#state.starts + 1] = vim.deepcopy(opts or {})
@@ -153,7 +145,6 @@ local function restore()
     vim.ui.select = real.select
     Subsessions.on_parent_resumed = real.on_parent_resumed
     Subsessions.on_child_settled = real.on_child_settled
-    package.loaded["pi.worktree_integration"] = real.worktree_integration
     package.loaded["pi.worktree"] = real.worktree
     require("pi.quickfix").on_tool_end = real.quickfix_tool_end
     require("pi.reload").on_file_changed = real.reload_file_changed
@@ -806,24 +797,6 @@ describe("cross-worktree resume", function()
         assert.equals(starts_before, #rpc_state.starts)
         assert.equals(session, Sessions.get())
         assert.equals(wt, session.worktree)
-    end)
-
-    it("notifies the integration engine when a parent settles", function()
-        local calls = {}
-        package.loaded["pi.worktree_integration"] = {
-            on_parent_ready = function(session)
-                calls[#calls + 1] = session
-            end,
-        }
-        local parent = fake_session({ id = "parent-ready" })
-        Sessions.handle_event(parent, { type = "agent_settled" })
-        assert.equals(1, #calls)
-        assert.equals(parent, calls[1])
-
-        Subsessions.on_child_settled = function() end
-        local child = fake_session({ id = "child-ready", parent_id = "parent-ready" })
-        Sessions.handle_event(child, { type = "agent_settled" })
-        assert.equals(1, #calls)
     end)
 end)
 

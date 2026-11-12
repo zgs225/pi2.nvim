@@ -27,7 +27,7 @@ local Reaper = require("pi.subsessions.reaper")
 local Subsessions = require("pi.subsessions")
 local Sessions = require("pi.sessions.manager")
 
-Config.setup({ worktree = { integration = { auto = false } } })
+Config.setup({})
 
 ---@param dir string
 ---@return string
@@ -97,7 +97,6 @@ describe("sub-session workspace consistency", function()
         Config.setup({
             agent_dir = agent_dir,
             subagent = { enabled = true, max_children = 5 },
-            worktree = { integration = { auto = false } },
         })
         vim.cmd("cd " .. vim.fn.fnameescape(other_cwd))
         Manifest._reset()
@@ -165,7 +164,7 @@ describe("sub-session workspace consistency", function()
         Sessions._reset()
         Manifest._reset()
         Batch._reset()
-        Config.setup({ worktree = { integration = { auto = false } } })
+        Config.setup({})
         vim.cmd("cd " .. vim.fn.fnameescape(original_cwd))
         for _, dir in ipairs({ agent_dir, parent_cwd, other_cwd }) do
             pcall(vim.fn.delete, dir, "rf")
@@ -327,7 +326,6 @@ describe("sub-session revive workspace handling", function()
         Config.setup({
             agent_dir = agent_dir,
             subagent = { enabled = true, max_children = 5 },
-            worktree = { integration = { auto = false } },
         })
         vim.cmd("cd " .. vim.fn.fnameescape(other_cwd))
         Manifest._reset()
@@ -363,7 +361,7 @@ describe("sub-session revive workspace handling", function()
         Sessions._reset()
         Manifest._reset()
         Batch._reset()
-        Config.setup({ worktree = { integration = { auto = false } } })
+        Config.setup({})
         vim.cmd("cd " .. vim.fn.fnameescape(original_cwd))
         for _, dir in ipairs({ agent_dir, parent_cwd, other_cwd }) do
             pcall(vim.fn.delete, dir, "rf")
@@ -501,7 +499,7 @@ describe("sub-session reaper and rebuild across workspaces", function()
         Sessions._reset()
         Manifest._reset()
         Batch._reset()
-        Config.setup({ worktree = { integration = { auto = false } } })
+        Config.setup({})
         vim.cmd("cd " .. vim.fn.fnameescape(original_cwd))
         for _, dir in ipairs({ agent_dir, parent_cwd, other_cwd }) do
             pcall(vim.fn.delete, dir, "rf")

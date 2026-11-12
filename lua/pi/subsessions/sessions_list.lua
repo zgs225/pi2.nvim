@@ -4,21 +4,6 @@ local Config = require("pi.config")
 
 local M = {}
 
---- Integration states that keep a child visible no matter how its completion was
---- acknowledged: the row is the only place the `⧗` / `…` / `!` badge lives, so
---- hiding it (completion already read, `show_completed = "none"`, dormant…) would
---- hide work that still owes the parent a result.
----@param entry pi.SubsessionManifestEntry
----@return boolean
-local function integration_pending(entry)
-    local Manifest = require("pi.subsessions.manifest")
-    local state = Manifest.integration_state(entry)
-    if state == nil then
-        return false
-    end
-    return state == "needs_attention" or Manifest.INTEGRATION_BUSY[state] == true
-end
-
 ---@class pi.SessionsListChildFilterCtx
 ---@field completion_seen? fun(child_id: string): boolean
 ---@field process_alive? fun(child_id: string): boolean
@@ -48,12 +33,6 @@ function M.child_visible(entry, ctx)
     end
 
     if type(child_id) == "string" and running(child_id) then
-        return true
-    end
-
-    -- An un-integrated / attention-needing child stays visible even when its
-    -- completion was already read: the badge must not disappear with the row.
-    if integration_pending(entry) then
         return true
     end
 

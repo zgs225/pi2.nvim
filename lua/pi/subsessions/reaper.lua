@@ -18,10 +18,11 @@
 --- Closing goes through `Subsessions.close`: manifest turns `dormant`, the
 --- session JSONL is retained and the child stays revivable via dispatch.
 ---
---- The same module also owns the worktree backstop (`release_orphaned_worktrees`,
---- run at the top of every sweep): closing a child releases its worktree, but a
---- child that died without a close/settle (Neovim restarted, RPC exit raced the
---- manifest) still owns a checkout on disk.
+--- The same module also owns the leftover-checkout backstop
+--- (`release_orphaned_worktrees`, run at the top of every sweep): closing a
+--- child releases its worktree, but a child that died without a close/settle
+--- (Neovim restarted, RPC exit raced the manifest) still owns a checkout on
+--- disk. The sweep releases exactly those rows no live session owns.
 
 local M = {}
 
@@ -97,13 +98,6 @@ local function can_reap(child_id, cwd)
         entry = Manifest.locate(child_id, cwd)
     end
     if type(entry) ~= "table" or not settled_status[entry.status] then
-        return false
-    end
-
-    -- (d) the integration engine owns the checkout while it is queued /
-    -- resolving / applying — closing the process would pull the directory out
-    -- from under it.
-    if Manifest.integration_busy(entry) then
         return false
     end
 
@@ -201,18 +195,10 @@ local function release_orphans_in(manifest)
         -- owned by the manifest module, this is just the backstop consumer.
         local row = entry --[[@as table]]
         if Manifest.is_entry_id(id) and type(row) == "table" and Sessions.get_by_id(id) == nil then
-            -- Rows the integration engine has a record for are the engine's
-            -- business, not this backstop's: `queued`/`resolving`/`applying` are
-            -- mid-flight, and an `applied`/`needs_attention` checkout may still
-            -- hold changes the engine has not finished with. Direct
-            -- `Worktree.release` would also refuse a dirty checkout forever.
-            -- Engine-driven cleanup is `Integration.enforce_retention`.
-            local engine_owned = Manifest.integration_state(row) ~= nil
             local info = row.worktree
             local path = type(info) == "table" and info.path or nil
             if
-                not engine_owned
-                and type(path) == "string"
+                type(path) == "string"
                 and path ~= ""
                 and vim.fn.isdirectory(path) == 1
                 and require("pi.subsessions").release_worktree(id)

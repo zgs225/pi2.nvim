@@ -160,11 +160,6 @@ local function set_defaults()
     -- worktree is badged; a session whose cwd differs from Neovim's renders
     -- the badge in PiStatusLineWarning instead (no separate group).
     vim.api.nvim_set_hl(0, "PiChatHistoryWorktree", { default = true, fg = title.fg, bold = true, italic = true })
-    -- Persistent worktree-integration record in the parent chat's history: the
-    -- worktree glyph plus the Integration module's own sentence (never only a
-    -- transient notification).
-    vim.api.nvim_set_hl(0, "PiWorktreeIntegrationIcon", { default = true, fg = title.fg, bold = true })
-    vim.api.nvim_set_hl(0, "PiWorktreeIntegration", { default = true, fg = normal.fg })
     vim.api.nvim_set_hl(0, "PiChatPromptWinbar", { default = true, bg = normal.bg })
     vim.api.nvim_set_hl(0, "PiChatPromptWinbarTitle", { default = true, fg = comment.fg, bg = normal.bg, bold = true })
     vim.api.nvim_set_hl(
@@ -246,12 +241,6 @@ local function set_defaults()
     -- Worktree group header (`󰙅 name · ~/path`) in :PiSessions; rows under a
     -- group name their worktree in the row body.
     vim.api.nvim_set_hl(0, "PiSessionsListWorktree", { default = true, fg = title.fg, bold = true, italic = true })
-    -- Automatic worktree integration status of a sub-session row: one glyph,
-    -- so the row's columns keep their alignment whatever the integration text.
-    vim.api.nvim_set_hl(0, "PiSessionsListIntegrationQueued", { default = true, fg = comment.fg })
-    vim.api.nvim_set_hl(0, "PiSessionsListIntegrationRunning", { default = true, fg = special.fg, bold = true })
-    vim.api.nvim_set_hl(0, "PiSessionsListIntegrationApplied", { default = true, link = "DiagnosticOk" })
-    vim.api.nvim_set_hl(0, "PiSessionsListIntegrationAttention", { default = true, fg = warning.fg, bold = true })
 
     -- Background tasks panel (:PiTasks): running spins in the info hue,
     -- terminal states map to ok/error/warn, and the current-row marker uses

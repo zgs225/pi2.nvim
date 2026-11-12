@@ -12,8 +12,8 @@ local Sessions = require("pi.sessions.manager")
 local Reaper = require("pi.subsessions.reaper")
 
 --- Run generation of a brand-new child row. Every new run on an existing row
---- (revive) increments it; the integration engine records the generation it
---- captured so a late apply/cleanup can be rejected when the child moved on.
+--- (revive) increments it, so a settle that belongs to a superseded run can be
+--- told apart from the current one.
 local FIRST_RUN_GENERATION = 1
 
 --- Abort epochs per lineage: interactive spawns capture the epoch at start and
@@ -313,111 +313,18 @@ local function send_task(session, task, callback)
     end
 end
 
---- Worktree integration engine, loaded lazily and optional.
----
---- The engine owns the child-checkout → parent-changes state machine
---- (`queued` → `resolving` → `applying` → `applied` / `needs_attention`). Same
---- rationale as `worktree_mod`: the sub-session layer keeps working — and specs
---- keep running — when the module is absent or a stub stands in for it.
----@return table?
-local function integration_mod()
-    local ok, mod = pcall(require, "pi.worktree_integration")
-    if ok and type(mod) == "table" then
-        return mod
-    end
-    return nil
-end
-
---- True when automatic worktree integration is enabled (`worktree.integration.auto`,
---- default true).
----
---- Read here as well as in the engine so a disabled engine never costs a settle
---- an event-loop tick: without it, `done` is only reached through the engine's
---- own scheduled callback.
----@return boolean
-local function integration_auto()
-    local wt = Config.options.worktree --[[@as table?]]
-    local integration = type(wt) == "table" and wt.integration or nil
-    if type(integration) ~= "table" then
-        return true
-    end
-    return integration.auto ~= false
-end
-
---- Integration **states** the engine persists on a manifest row (its other
---- outcome codes — "disabled", "no_worktree", "skipped", "no_entry" — are
---- results, not states, and must not leave a record behind).
----@type table<string, boolean>
-local integration_states = {
-    applied = true,
-    queued = true,
-    applying = true,
-    resolving = true,
-    needs_attention = true,
-}
-
---- Normalize the engine's `done(state, record)` callback into the record the
---- sub-session layer stores and reports (`state` plus `files`, `error`, ...).
----
---- The engine reports outcome codes that are not persisted states ("disabled",
---- "no_entry", "no_worktree", ...); those yield `nil` — no integration record,
---- exactly like a run with nothing to integrate.
----@param state string? engine outcome or state name
----@param record table? persisted integration record
----@return table?
-local function integration_outcome(state, record)
-    local rec = record --[[@as table]]
-    local name = type(rec) == "table" and rec.state or nil
-    if type(name) ~= "string" then
-        name = type(state) == "string" and state or nil
-    end
-    if not name or not integration_states[name] then
-        return nil
-    end
-    local outcome = {}
-    if type(rec) == "table" then
-        for k, v in pairs(rec) do
-            outcome[k] = v
-        end
-    end
-    outcome.state = name
-    return outcome
-end
-
---- Call `fn` on the engine when it exists and exposes that function.
---- Never lets an engine error break sub-session bookkeeping.
----@param name string engine function name
----@param ... any arguments
----@return boolean called
-local function integration_call(name, ...)
-    local mod = integration_mod()
-    if not mod or type(mod[name]) ~= "function" then
-        return false
-    end
-    local ok, err = pcall(mod[name], ...)
-    if not ok then
-        Notify.warn(("worktree integration %s failed: %s"):format(name, tostring(err)))
-        return false
-    end
-    return true
-end
-
 --- Mark `parent` as blocked waiting on sub-sessions.
 ---
 --- The marker is a depth counter — one tab/handler can wait while another wait
 --- is already open — and it is always cleared by `end_parent_wait` (settle,
 --- timeout and synchronous completion all run through the same callback).
---- `Integration.on_parent_ready` is what drives the engine's queue: while the
---- parent is waiting, an applied result belongs to that waiting call.
 ---@param parent pi.Session
 local function begin_parent_wait(parent)
     local session = parent --[[@as table]]
     session.waiting_subagents = (tonumber(session.waiting_subagents) or 0) + 1
-    integration_call("on_parent_ready", parent)
 end
 
---- Clear one wait on `parent`; the marker disappears entirely at depth 0 and the
---- engine is told the parent is ready again.
+--- Clear one wait on `parent`; the marker disappears entirely at depth 0.
 ---@param parent pi.Session
 local function end_parent_wait(parent)
     local session = parent --[[@as table]]
@@ -428,7 +335,6 @@ local function end_parent_wait(parent)
     end
     -- Cleared, not zeroed: "no marker" is the resting state every caller tests.
     session.waiting_subagents = nil
-    integration_call("on_parent_ready", parent)
 end
 
 --- True when `parent` is currently blocked in a sub-session wait.
@@ -606,13 +512,6 @@ function M.release_worktree(child_id)
     if type(entry) ~= "table" then
         entry = Manifest.locate(child_id)
     end
-    -- A row the integration engine has a record for is engine-owned: mid-flight
-    -- states (queued/resolving/applying) must not be pulled out from under it,
-    -- and an `applied`/`needs_attention` checkout may still hold its changes.
-    -- Engine-driven cleanup is `Integration.enforce_retention`.
-    if Manifest.integration_state(entry) ~= nil then
-        return false
-    end
     local info = entry_worktree(entry)
     local path = type(info) == "table" and info.path or nil
     if type(path) ~= "string" or path == "" then
@@ -746,8 +645,8 @@ function M.spawn(parent, opts, callback)
             -- workspace manifest — the same directory the child runs in.
             child.manifest_cwd = cwd
             -- First run on a brand-new row. Every later run (revive / reuse)
-            -- bumps it, which is what lets the integration engine reject a late
-            -- apply or cleanup that belongs to a superseded run.
+            -- bumps it, so a settle that belongs to a superseded run is
+            -- recognisable.
             child.run_generation = FIRST_RUN_GENERATION
 
             local config = resolve_child_config(parent, opts)
@@ -1024,16 +923,7 @@ end
 function M.close(child_id, callback)
     local stopped = false
     local child = resolve_child(child_id)
-    -- The integration engine owns the child's checkout while it is queued /
-    -- resolving / applying: closing the process or dropping the row now would
-    -- race it (and the manager would release the directory under its feet).
-    local entry, workspace = Manifest.locate(child_id, Manifest.workspace(child))
-    if Manifest.integration_busy(entry) then
-        if callback then
-            callback(false)
-        end
-        return false
-    end
+    local _, workspace = Manifest.locate(child_id, Manifest.workspace(child))
     if child and child.rpc:is_running() then
         Sessions.close_session(child)
         stopped = true
@@ -1173,7 +1063,7 @@ function M.revive(child_id, callback)
     child.parent_id = entry.parent_id
     -- Record the transcript this run uses. The row's `worktree` only stays while
     -- the child really runs in that leftover checkout: a gone one is dropped, so
-    -- neither the reaper nor the integration engine acts on a missing directory.
+    -- the reaper never acts on a missing directory.
     Manifest.patch(child_id, {
         session_file = path,
         worktree = keeps_checkout and recorded or Manifest.REMOVE,
@@ -1181,10 +1071,6 @@ function M.revive(child_id, callback)
     }, manifest_cwd)
     Sessions.load_session_path(child, path, function(ok)
         if ok then
-            -- `integration` is deliberately not in this patch: a resume keeps
-            -- the recorded integration outcome (applied / queued / needs
-            -- attention) so the parent can still report what happened to that
-            -- checkout, and the engine can reconcile it.
             Manifest.patch(child_id, {
                 status = "active",
                 last_active_at = Manifest.iso_now(),
@@ -1324,30 +1210,10 @@ function M.on_child_settled(child, aborted)
     local parent = Sessions.find_by_lineage(entry.parent_id)
 
     --- Finish the settle: batch accounting, manifest status, parent report.
-    ---
-    --- Runs **after** the integration engine reported (see the dispatch at the
-    --- end of this function), so the batch item the parent observes already
-    --- carries `integration` and a waiting call returns an applied / queued /
-    --- needs_attention result instead of a bare "ok".
-    ---@param integration table? engine outcome
-    local function finish_settle(integration)
-        if type(integration) == "table" and type(integration.state) ~= "string" then
-            -- The parent tool result must always be able to name a state.
-            integration.state = "needs_attention"
-        end
+    local function finish_settle()
         -- A failed run stays failed: the later patches below must not flip a
         -- crashed/failed child's row to `completed`.
         local final_status = run_failed and "failed" or "completed"
-
-        --- Row patch that also records the integration outcome (when there is one).
-        ---@param patch table
-        ---@return table
-        local function with_integration(patch)
-            if type(integration) == "table" then
-                patch.integration = integration
-            end
-            return patch
-        end
 
         if was_aborted then
             -- Settle the aborted run's own items (waking a parent blocked in
@@ -1355,16 +1221,14 @@ function M.on_child_settled(child, aborted)
             -- abort watermark over the manifest generation, which the parent may
             -- already have bumped by reusing this child.
             --
-            -- An aborted run is never integrated automatically: the user
-            -- cancelled the work, so its items report `skipped` and its worktree
-            -- is left exactly as it was (the row keeps no integration record).
+            -- An aborted run is never folded back into the parent: the user
+            -- cancelled the work, so the leftover checkout is left as it was.
             local watermark = M.aborted_generation(child.id)
             local current = type(entry.run_generation) == "number" and entry.run_generation or nil
             Batch.interrupt_items_for_child(child.id, {
                 generation = watermark or current,
                 reason = "cancelled: aborted by user",
                 cwd = manifest_cwd,
-                integration = { state = "skipped", reason = "aborted" },
             })
             -- When the child was already reused for a newer run this settle belongs
             -- to the aborted run only: leave the live run's manifest status alone.
@@ -1383,30 +1247,21 @@ function M.on_child_settled(child, aborted)
             ok = not run_failed,
             error = failure_reason,
             output = report,
-        }, manifest_cwd, integration)
+        }, manifest_cwd)
 
         -- Agent tool path or a running batch item: skip parent prompt injection.
         if entry.agent_spawned or claimed then
-            Manifest.patch(
-                child.id,
-                with_integration({
-                    status = final_status,
-                    last_report = report,
-                    last_error = run_failed and failure_reason or Manifest.REMOVE,
-                    last_active_at = Manifest.iso_now(),
-                }),
-                manifest_cwd
-            )
+            Manifest.patch(child.id, {
+                status = final_status,
+                last_report = report,
+                last_error = run_failed and failure_reason or Manifest.REMOVE,
+                last_active_at = Manifest.iso_now(),
+            }, manifest_cwd)
             after_completed(parent)
             return
         end
 
         if entry.reported then
-            -- Already reported by an earlier settle: still record a (late)
-            -- integration outcome instead of dropping it on the floor.
-            if type(integration) == "table" then
-                Manifest.patch(child.id, with_integration({}), manifest_cwd)
-            end
             after_completed(parent)
             return
         end
@@ -1415,12 +1270,12 @@ function M.on_child_settled(child, aborted)
         -- error: a user-spawned child that died on a quota, auth or network
         -- failure must not disappear into a silent manifest row.
         if run_failed then
-            local patch = with_integration({
+            local patch = {
                 status = "failed",
                 last_report = report,
                 last_error = failure_reason,
                 last_active_at = Manifest.iso_now(),
-            })
+            }
             if not parent or not parent.rpc:is_running() then
                 Manifest.patch(child.id, patch, manifest_cwd)
                 after_completed(parent)
@@ -1443,29 +1298,21 @@ function M.on_child_settled(child, aborted)
             return
         end
         if not report or report == "" then
-            Manifest.patch(
-                child.id,
-                with_integration({
-                    status = final_status,
-                    last_error = Manifest.REMOVE,
-                    last_active_at = Manifest.iso_now(),
-                }),
-                manifest_cwd
-            )
+            Manifest.patch(child.id, {
+                status = final_status,
+                last_error = Manifest.REMOVE,
+                last_active_at = Manifest.iso_now(),
+            }, manifest_cwd)
             after_completed(parent)
             return
         end
         if not parent or not parent.rpc:is_running() then
-            Manifest.patch(
-                child.id,
-                with_integration({
-                    status = final_status,
-                    last_report = report,
-                    last_error = Manifest.REMOVE,
-                    last_active_at = Manifest.iso_now(),
-                }),
-                manifest_cwd
-            )
+            Manifest.patch(child.id, {
+                status = final_status,
+                last_report = report,
+                last_error = Manifest.REMOVE,
+                last_active_at = Manifest.iso_now(),
+            }, manifest_cwd)
             after_completed(parent)
             return
         end
@@ -1473,28 +1320,20 @@ function M.on_child_settled(child, aborted)
         parent.rpc:send({ type = "prompt", message = msg }, function(res)
             vim.schedule(function()
                 if res.success then
-                    Manifest.patch(
-                        child.id,
-                        with_integration({
-                            status = final_status,
-                            reported = true,
-                            last_report = report,
-                            last_error = Manifest.REMOVE,
-                            last_active_at = Manifest.iso_now(),
-                        }),
-                        manifest_cwd
-                    )
+                    Manifest.patch(child.id, {
+                        status = final_status,
+                        reported = true,
+                        last_report = report,
+                        last_error = Manifest.REMOVE,
+                        last_active_at = Manifest.iso_now(),
+                    }, manifest_cwd)
                 else
-                    Manifest.patch(
-                        child.id,
-                        with_integration({
-                            status = final_status,
-                            last_report = report,
-                            last_error = Manifest.REMOVE,
-                            last_active_at = Manifest.iso_now(),
-                        }),
-                        manifest_cwd
-                    )
+                    Manifest.patch(child.id, {
+                        status = final_status,
+                        last_report = report,
+                        last_error = Manifest.REMOVE,
+                        last_active_at = Manifest.iso_now(),
+                    }, manifest_cwd)
                 end
                 SessionList.request_refresh()
                 SessionList.acknowledge_reported_children_for_current_tab(parent)
@@ -1504,39 +1343,7 @@ function M.on_child_settled(child, aborted)
         end)
     end
 
-    -- Integration runs **first**: the engine must see the settle before the
-    -- batch accounting and before any waiter is woken, so the parent's tool
-    -- result (and a blocked `wait_subagents`) already carries the child's
-    -- integration state. The engine may be asynchronous (it has to run git), so
-    -- the rest of the settle waits for its `done` callback.
-    if was_aborted or run_failed or not integration_auto() then
-        -- Aborted and failed runs are never integrated automatically: the user
-        -- cancelled, or the child died half-way, so applying its checkout to the
-        -- parent would ship unfinished work. No integration record is written
-        -- (`finish_settle(nil)`), the worktree stays on disk for diagnosis, and
-        -- the row keeps its `interrupted` / `failed` status.
-        finish_settle(nil)
-        return
-    end
-    local mod = integration_mod()
-    if not mod or type(mod.on_child_settled) ~= "function" then
-        finish_settle(nil)
-        return
-    end
-    local called = false
-    ---@param state string? engine outcome or persisted state name
-    ---@param record table? persisted integration record
-    local function done(state, record)
-        if called then
-            return
-        end
-        called = true
-        finish_settle(integration_outcome(state, record))
-    end
-    local ok, err = pcall(mod.on_child_settled, child, entry, manifest_cwd, done)
-    if not ok then
-        finish_settle({ state = "needs_attention", error = tostring(err) })
-    end
+    finish_settle()
 end
 
 --- Session id encoded in a pi session filename (`<timestamp>_<id>.jsonl`).
@@ -1811,25 +1618,6 @@ function M.rebuild_statuses()
             seen[scope.path] = true
             pcall(rebuild_scope, scope)
         end
-    end
-    -- Engine reconciliation runs **after** the statuses are rebuilt (it reads
-    -- them), and retention runs **after** reconcile completes (it must not race
-    -- an integration that is still resolving). `enforce_retention` — not the
-    -- orphan backstop — is what eventually removes `applied` checkouts.
-    local mod = integration_mod()
-    if not mod or type(mod.reconcile) ~= "function" then
-        return
-    end
-    local function enforce()
-        integration_call("enforce_retention")
-    end
-    local ok = pcall(mod.reconcile, function()
-        -- `reconcile` may call back synchronously; never re-enter the engine
-        -- from inside its own stack.
-        vim.schedule(enforce)
-    end)
-    if not ok then
-        enforce()
     end
 end
 

@@ -18,13 +18,6 @@ Worktree support is opt-in per session, not a mode: you start a session in a wor
 - [Removing a worktree (`:PiWorktreeRemove`)](#removing-a-worktree-piworktreeremove)
 - [Cleanup when a session closes](#cleanup-when-a-session-closes)
 - [Sub-sessions](#sub-sessions)
-- [Automatic integration](#automatic-integration)
-  - [Safety windows](#safety-windows)
-  - [Conflicts and resolving](#conflicts-and-resolving)
-  - [Repeat runs on the same checkout](#repeat-runs-on-the-same-checkout)
-  - [What happens to the checkout](#what-happens-to-the-checkout)
-  - [Crash recovery](#crash-recovery)
-- [Managing disk usage](#managing-disk-usage)
 - [Resuming across worktrees](#resuming-across-worktrees)
 - [Where you see it](#where-you-see-it)
 - [Configuration](#configuration)
@@ -191,66 +184,7 @@ That is a deliberate trade. A checkout per child costs a `git worktree add`, a `
 
 A child revived from a manifest written by an earlier version keeps running in the checkout recorded on its row while that directory still exists; once it is gone, the revive starts in the parent's workspace cwd and warns instead of failing. `worktree.isolate_subagents` no longer exists, and neither does the per-child system-prompt paragraph about an isolated path.
 
-## Automatic integration
-
-> **Dormant since per-child checkouts were removed.** A dispatch no longer creates a checkout, so nothing reaches this path any more. The engine (`pi.worktree_integration`), its `:PiSessions` glyphs, its chat records and the `worktree.integration` knobs are retained in the codebase; a leftover `sub-…` directory from an earlier version is an ordinary checkout you can inspect or delete with `git worktree remove`.
-
-An isolated child is useless if its work has to be copied out by hand after every run, so settling one triggers **automatic integration** (`pi.worktree_integration`): the child's patch is captured, snapshotted, and applied to the **parent checkout's working tree** — never committed, never staged — as soon as doing that is safe. `:PiWorktreeApply` stays the manual, reviewed route for everything else (a top-level worktree session, a checkout you want to review first).
-
-What happens when a child that owns a worktree settles:
-
-1. **Capture** the checkout's patch relative to its base commit (untracked files included, same all-or-nothing rules as a snapshot). An empty diff means there is nothing to integrate: the run is reported as skipped and the checkout is left to the normal [release](#cleanup-when-a-session-closes) rules.
-2. **Snapshot** it durably under `<git common dir>/pi2-worktree-snapshots/<name>/` (`<timestamp>.patch` plus a `.patch.json` sidecar naming the worktree, repo, base commit, HEAD and capture time). The record on the manifest row keeps `patch_sha`, `base_sha`, `head_sha`, the touched `files` and the snapshot path.
-3. **Integrate** when a safe window exists (`queued` → `applying` → `applied`), or park the patch as `queued` until one does.
-
-Two runs are never integrated automatically: an **aborted** run (you cancelled the work) and a **failed** one. Both leave the checkout exactly as it is and record no integration state, so nothing is applied behind your back after an error.
-
-### Safety windows
-
-The apply only runs while the parent cannot be reading or writing those files:
-
-- **Blocked in a wait** — the parent's turn is suspended inside `wait_subagents`, so the write lands before its next tool call (the child's result already carries the integration outcome).
-- **Idle** — the parent has no turn in flight.
-
-Everything else **parks** the patch as `queued` and retries on the next readiness signal (a wait begins or ends, a turn finishes, a session is resumed). A busy parent is normal, not an error, so it never toasts. The other blockers are reported as `needs_attention` and re-queued automatically once they clear: a **modified Neovim buffer** the patch would overwrite (`modified_buffer` — save or revert it) and a **second live session** rooted in the target checkout (`other_session`). A worktree session does not count as a second session in the target: it owns a separate checkout.
-
-### Conflicts and resolving
-
-Applying is **idempotent and checked, not blind**: `git apply --check` decides between `clean` (apply), `already` (the patch is present — record `applied` and never write twice) and `conflict` (nothing is written; a patch is never partially applied). After a successful write the patch is probed again, and only `already` records success. A captured patch whose base commit no longer matches the target's `HEAD` is treated as a conflict rather than textually applied across drift, and `patch_sha` prevents replaying a different patch from the same row.
-
-With `worktree.integration.auto_resolve` (default on), a conflict — or a stale base commit, or a failed apply — is handed back to the **still running child agent once**: it receives a prompt to rebase its own checkout onto the parent's current `HEAD`, resolve the conflicts, run the tests there, and report back, with explicit instructions not to touch the parent checkout, commit, push, or create nested worktrees. The row turns `resolving` (attempt N/M) and the next settle re-captures the checkout — typically only the delta — and tries again. `worktree.integration.max_attempts` (default 1) bounds the rounds; at the limit, or when the child process is gone, or when `auto_resolve` is off, the integration stops in `needs_attention` with the reason and the child's error text (`patch_conflict`, `base_drift`, `apply_failed`, `resolve_failed`). Set `max_attempts = 0` (or `auto_resolve = false`) to never involve the agent and always stop for a human.
-
-### Repeat runs on the same checkout
-
-A revived child reuses its checkout, so a second run must integrate only its **own** work, never a replay of the first round:
-
-- The previous round was committed and the checkout's base is unchanged → the capture is diffed from the recorded `head_sha`, so only newer work is included.
-- The checkout's base changed (fresh, or rebased by a resolving round) → the base already contains the applied work, so a plain base→now capture *is* the delta.
-- Anything else (the previous work is still uncommitted, or no baseline was recorded) → `needs_attention:delta_baseline_missing`. The old patch is never replayed; commit the earlier round or start a fresh checkout.
-
-### What happens to the checkout
-
-After the patch is confirmed present in the parent, the child's checkout is deleted only when **nothing else would be lost**, and the deletion is re-checked at fire time:
-
-- no other live π process is rooted in it (the settled child's own process is closed first, so its next tool call cannot hit a deleted cwd — and its tab must not be open);
-- the child checkout was not reused for a newer run in the meantime (`run_generation`);
-- the snapshot is still on disk;
-- it has **no ignored content** (files git ignores are never part of a patch, so deleting would destroy them);
-- a fresh re-capture of the checkout still hashes to the integrated patch — a background writer that changed the checkout after integration keeps the directory (`checkout_changed`).
-
-When any of those fails the row stays `applied` with `kept_reason` and the chat record says `checkout kept (<reason>)`; the directory is then left for retention (which re-verifies everything) or for you. A successful removal is recorded with `worktree_removed` and the message `checkout removed (snapshot kept)`.
-
-### Crash recovery
-
-State is written to the manifest row **before** the first write, so a crashed or restarted Neovim is reconciled at startup: an `applying` row (the crash marker) is probed — `already` becomes `applied` and disposal resumes, `clean` goes back to `queued`, anything else stops in `needs_attention:reconcile_conflict`; `queued` rows are re-enqueued; a `resolving` row whose child process died is stopped with `resolver_gone`. A missing snapshot at that point is `snapshot_missing`, never a silent skip.
-
-## Managing disk usage
-
-> **Dormant,** like automatic integration: with no child checkouts being created, retention has nothing left to manage. The rules below describe the retained engine.
-
-Applied child checkouts otherwise accumulate: every sub-session run leaves one behind until retention removes it. `worktree.integration.keep_count` (default 15) is a **soft cap** over the managed checkouts of every workspace; once the total exceeds it, the oldest candidates are deleted first (by `applied_at`).
-
-Only checkouts that are provably safe to delete are removed: `applied`, **verified present in the target**, inactive (no live process), not pinned, not deliberately kept (`kept_reason`), still a linked worktree of the same repository, snapshot intact and matching `patch_sha`, with no ignored content. Everything else still counts toward the total but is **never** removed for quota — an unintegrated, parked (`queued` / `applying` / `resolving`) or `needs_attention` checkout always survives. Retention runs after the startup reconcile and after integrations settle, so the cap converges without a timer of its own. It never touches the main checkout, top-level worktree sessions, or snapshots.
+A `sub-…` checkout recorded by an earlier version is an ordinary directory now: the idle reaper still releases one that no live π session owns, and anything it cannot prove is safe to delete is yours to remove with `git worktree remove`.
 
 ## Resuming across worktrees
 
@@ -270,9 +204,7 @@ A listed checkout can be gone by the time you pick it (retention removed it, or 
 
 - **Chat history title** — a session running in a linked worktree shows `󰙅 <name>` next to the panel title (in the side-layout winbar and the float border), with a trailing `*` while the checkout is dirty or has commits ahead of its base commit. When the session's cwd is **not** Neovim's cwd — normally the case for every worktree session, since starting one does not change Neovim's cwd, and also for a session resumed from another directory — the badge is prefixed with `⚠` in the warning color, because paths you open from your own buffers and paths the agent touches may diverge. A session in the repository's main worktree with Neovim's cwd shows no badge.
 - **`:PiSessions`** — once the list spans **two or more distinct worktrees**, rows are grouped under a worktree header (`▾ 󰙅 <name> · ~/path`, and `▸ 󰙅 <name> (n) · ~/path` while the group is folded), and `<Tab>` / `za` folds a whole group (`zM` / `zR` collapse or expand everything). The `(n)` is the group's **structural** size — every parent row plus its sub-sessions — and it is displayed while the group is collapsed, does not move when a parent row *inside* the group folds, and only folding the group itself changes what is shown. The header carries the worktree's name for its whole group, and a sub-session row inside it repeats the name in its subtitle (a parent row is already under that header), while a worktree fork carries the `↳ forked from <name>` marker. Sessions whose cwd is not a work tree keep their flat rows, so a single-repository list looks exactly as before. `R` re-detects worktrees along with session names.
-- **Integration status in `:PiSessions`** — a child row carries exactly one status glyph for [automatic integration](#automatic-integration), so columns keep their alignment and a long error can never widen the list: `⧗` queued (dim), `…` applying or resolving (busy color), `✓` applied (ok color), `!` needs attention (warning, bold). Rows with a pending or attention-needing integration stay visible even when their completion was already read — hiding them would hide the badge you need to act on. The glyph colours come from `PiSessionsListIntegration{Queued,Running,Applied,Attention}`.
-- **Integration records in the chat** — an integration event is written into the parent chat's history as a persistent line, never only a transient notification: `󰙅 <label> → applied 3 file(s) · checkout removed (snapshot kept)`, `… → queued (modified_buffer)`, `… → resolving in its checkout (attempt 1/1)`, `… → needs attention: patch_conflict (…)`. A patch parked simply because the parent is busy is the normal steady state and is deliberately **silent** (no chat line, no toast); its row still shows the `⧗` glyph in `:PiSessions`. The history buffer keeps the records for the chat's lifetime (the newest 20 per chat), so an integration that finished while the tab was hidden is still visible when you come back; `PiWorktreeIntegrationIcon` / `PiWorktreeIntegration` style the glyph and text.
-- **Highlight groups** — `PiChatHistoryWorktree` (badge in the history title), `PiSessionsListWorktree` (worktree group header), the integration glyph set and the chat record groups, see [Highlight groups](highlight-groups.md).
+- **Highlight groups** — `PiChatHistoryWorktree` (badge in the history title) and `PiSessionsListWorktree` (worktree group header); see [Highlight groups](highlight-groups.md).
 - **Workspace-scoped features follow the session cwd, not Neovim's**: [`:PiDiff`](diff-review.md#session-diff-review-pidiff) anchors each changed file at the session's directory, [quickfix](usage.md#quickfix) resolves `grep`/`find` paths against it, [`@mentions`](usage.md#mentions) (`@git-diff`, `@git-log`, file existence) and `gf`/buffer reload resolve paths there, and [prompt history](usage.md#prompt-history) / [drafts](usage.md#draft-persistence) are keyed per workspace. A resumed session adopts the cwd recorded in its session file, so a resumed worktree session keeps pointing at its worktree.
 - **Session storage is per cwd** — the worktree's own session files (and therefore its `.pi2-subsessions.json` manifest and batch records, which it owns when its sessions spawn children) live in the session directory of *that* cwd, separate from the main checkout's (see [Sessions → Storage and scoping](sessions.md#storage-and-scoping)). A child started *by* a worktree session records its row in the worktree session's workspace, next to that directory, even though the child's own transcript lives in the child's checkout.
 
@@ -318,6 +250,6 @@ Full annotated reference: [Configuration](configuration.md). The `pi.worktree*` 
 
 - **No moving a live conversation.** A session cannot be relocated into or out of a worktree mid-conversation; its cwd is fixed at spawn.
 - **No nested worktrees.** A session (or sub-session) that already runs in a worktree never creates another checkout inside it.
-- **No automatic commit.** Automatic integration and `:PiWorktreeApply` write to a **working tree** only (never the index, never a commit), and `:PiWorktreeShip` only prefills a prompt — commits and pushes stay yours (or the agent's, once you send that prompt).
+- **No automatic commit.** `:PiWorktreeApply` writes to a **working tree** only (never the index, never a commit), and `:PiWorktreeShip` only prefills a prompt — commits and pushes stay yours (or the agent's, once you send that prompt).
 - **`:PiContinue` is still cwd-scoped.** It means "the most recent session *here*"; the cross-worktree enumeration lives in `:PiResume`.
 - **Retention is not a garbage collector.** The soft cap only removes checkouts it can prove were applied, verified and inactive; snapshots, unintegrated work, parked rows and `needs_attention` rows are never deleted for quota.

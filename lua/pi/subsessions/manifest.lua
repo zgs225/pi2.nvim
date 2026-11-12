@@ -21,8 +21,7 @@ local MANIFEST_FILE = ".pi2-subsessions.json"
 ---@field last_active_at string
 ---@field agent_spawned? boolean True when spawned by parent Agent tool (skip prompt injection).
 ---@field parent_epoch? integer Parent conversation epoch when spawned (default 0).
----@field run_generation? integer Monotonic run counter: 1 on spawn, bumped by every revive/reuse (read by the integration engine to reject a stale apply/cleanup).
----@field integration? table Worktree integration record for this child: `{ state = "queued"|"resolving"|"applying"|"applied"|"needs_attention", files?, error?, reason?, generation? }` (owned by `pi.worktree_integration`).
+---@field run_generation? integer Monotonic run counter: 1 on spawn, bumped by every revive/reuse, so a late settle can tell a superseded run from the current one.
 ---@field workspace? string Workspace cwd that owns this row (the parent session's cwd). Recorded so a row found on disk — whose workspace directory name cannot be decoded — still yields a usable base for revive/rebuild.
 ---@field session_file? string pi session transcript file reported by the backend at spawn/revive. Authoritative for a child whose JSONL lives in another workspace (its own worktree).
 ---@field worktree? table Worktree metadata when the child runs in an isolated checkout (recorded by `pi.subsessions.spawn`).
@@ -546,40 +545,6 @@ function M.is_child_session(session_id, cwd)
     end
     local entry = M.load(cwd)[session_id]
     return type(entry) == "table" and entry.parent_id ~= nil
-end
-
---- Integration states that own the child's checkout while they are current:
---- the engine is turning the child's worktree into parent changes, so the
---- process must not be closed and the checkout must not be released underneath
---- it.
----@type table<string, boolean>
-M.INTEGRATION_BUSY = { queued = true, resolving = true, applying = true }
-
---- Integration state recorded on a manifest row, if any.
----@param entry any
----@return string?
-function M.integration_state(entry)
-    if type(entry) ~= "table" then
-        return nil
-    end
-    local integration = entry.integration
-    if type(integration) ~= "table" then
-        return nil
-    end
-    local state = integration.state
-    if type(state) ~= "string" or state == "" then
-        return nil
-    end
-    return state
-end
-
---- True when the row's integration state owns the checkout (queued / resolving /
---- applying), i.e. close, reap and worktree release must leave the child alone.
----@param entry any
----@return boolean
-function M.integration_busy(entry)
-    local state = M.integration_state(entry)
-    return state ~= nil and M.INTEGRATION_BUSY[state] == true
 end
 
 --- Name derived from the task text when the caller supplies none.

@@ -41,7 +41,6 @@ local waiters = {}
 ---@field generation? integer Run generation the item was dispatched against.
 ---@field output? string
 ---@field error? string
----@field integration? table Worktree integration outcome for this item (`state` = "queued"|"resolving"|"applying"|"applied"|"needs_attention"|"skipped", plus `files`, `error`, `reason`), so the parent tool result can explain what happened to the child's worktree changes.
 
 ---@class pi.SubsessionBatch
 ---@field id string
@@ -174,44 +173,6 @@ local function new_id()
     return ("%s-%s"):format(os.time(), math.random(100000, 999999))
 end
 
---- Aggregate integration states of a batch's items.
----
---- The parent tool result uses this to say, in one line, whether the children's
---- worktree changes were applied, are still queued, or need attention.
----@param batch pi.SubsessionBatch
----@return { applied: integer, queued: integer, applying: integer, resolving: integer, needs_attention: integer, skipped: integer, files: string[] }
-local function integration_summary(batch)
-    local out = {
-        applied = 0,
-        queued = 0,
-        applying = 0,
-        resolving = 0,
-        needs_attention = 0,
-        skipped = 0,
-        files = {},
-    }
-    local seen_files = {}
-    for _, item in ipairs(batch.items or {}) do
-        local integration = item.integration
-        local state = type(integration) == "table" and integration.state or nil
-        if type(state) == "string" then
-            if out[state] ~= nil then
-                out[state] = out[state] + 1
-            end
-            local files = type(integration) == "table" and integration.files or nil
-            if type(files) == "table" then
-                for _, file in ipairs(files) do
-                    if type(file) == "string" and file ~= "" and not seen_files[file] then
-                        seen_files[file] = true
-                        out.files[#out.files + 1] = file
-                    end
-                end
-            end
-        end
-    end
-    return out
-end
-
 ---@param batch pi.SubsessionBatch
 ---@return table
 function M.snapshot(batch)
@@ -235,7 +196,6 @@ function M.snapshot(batch)
         batch_id = batch.id,
         status = batch.status,
         summary = summary,
-        integration = integration_summary(batch),
         items = vim.deepcopy(batch.items),
     }
 end
@@ -388,8 +348,7 @@ end
 ---@param batch_id string
 ---@param ref string
 ---@param ok boolean
----@param opts? { output?: string, error?: string, cwd?: string, integration?: table } `cwd` is the owning session's workspace (default: Neovim's current cwd);
----   `integration` is the worktree integration outcome recorded on the item so the parent tool result can report it.
+---@param opts? { output?: string, error?: string, cwd?: string } `cwd` is the owning session's workspace (default: Neovim's current cwd).
 function M.complete_item(batch_id, ref, ok, opts)
     opts = opts or {}
     local batch = M.get(batch_id, opts.cwd)
@@ -416,9 +375,6 @@ function M.complete_item(batch_id, ref, ok, opts)
         })
         maybe_cancel_siblings(batch, ref)
     end
-    if type(opts.integration) == "table" then
-        patch_item(batch, ref, { integration = opts.integration })
-    end
     recompute_status(batch)
     persist(batch, opts.cwd)
     notify_waiters(batch_id)
@@ -442,9 +398,8 @@ end
 ---@param child_id string
 ---@param outcome? pi.SubsessionItemOutcome
 ---@param cwd? string workspace cwd (default: Neovim's current cwd)
----@param integration? table Worktree integration outcome to record on the completed items.
 ---@return boolean claimed True when this settle completed a running batch item.
-function M.on_child_settled(child_id, outcome, cwd, integration)
+function M.on_child_settled(child_id, outcome, cwd)
     -- The row belongs to the parent's workspace, which the caller usually knows
     -- (the child session carries it). A mismatch must not strand the batch, so
     -- fall back to locating the row and settle against *its* workspace.
@@ -503,7 +458,6 @@ function M.on_child_settled(child_id, outcome, cwd, integration)
                         output = output,
                         error = claimed_outcome.ok and nil or (claimed_outcome.error or "sub-agent run failed"),
                         cwd = cwd,
-                        integration = integration,
                     })
                     claimed = true
                 end
@@ -991,8 +945,8 @@ function M.wait(batch_id, callback, opts)
         end
     end
     waiters[batch_id] = waiters[batch_id] or {}
-    -- The workspace is resolved once here: the integration engine compares it
-    -- against its own scope without re-resolving Neovim's cwd later.
+    -- The workspace is resolved once here, so the recorded scope cannot drift
+    -- when Neovim's cwd changes while the caller waits.
     table.insert(waiters[batch_id], { cb = finish, owner = owner, cwd = cwd, scope = Manifest.path(cwd) })
     vim.defer_fn(tick, interval_ms)
 end
@@ -1000,10 +954,9 @@ end
 --- True when `lineage` is currently blocked in a wait on a batch of `cwd`'s
 --- workspace.
 ---
---- The integration engine asks this before applying a settled child's changes:
---- while the parent sits in `wait_subagents` (or `dispatch(wait = true)`), the
---- applied result must reach that waiting call instead of racing it as a
---- separate prompt.
+--- A waiter is parked until its batch reaches a terminal status, so this is the
+--- authoritative test for "the parent is blocked right now" (as opposed to
+--- `pi.subsessions.parent_waiting`, which reads the session-level depth marker).
 ---@param cwd? string workspace cwd (default: Neovim's current cwd)
 ---@param lineage string lineage id (any session id of the lineage)
 ---@return boolean
@@ -1164,8 +1117,7 @@ end
 --- most** that value — the aborted run and anything older, never a newer run the
 --- parent started by reusing this child after the abort.
 ---@param child_id string
----@param opts? { generation?: integer, reason?: string, cwd?: string, integration?: table } `cwd` is the workspace the batches live in (default: Neovim's cwd);
----   `integration` is recorded on every cancelled item (an aborted run is never integrated).
+---@param opts? { generation?: integer, reason?: string, cwd?: string } `cwd` is the workspace the batches live in (default: Neovim's cwd).
 ---@return integer n Number of items marked cancelled.
 function M.interrupt_items_for_child(child_id, opts)
     opts = opts or {}
@@ -1191,9 +1143,6 @@ function M.interrupt_items_for_child(child_id, opts)
                 then
                     item.status = "cancelled"
                     item.error = opts.reason or "cancelled: aborted by user"
-                    if type(opts.integration) == "table" then
-                        item.integration = opts.integration
-                    end
                     note_child_aborted(item.target, item.generation)
                     changed = changed + 1
                 end
