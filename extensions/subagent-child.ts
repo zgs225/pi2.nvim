@@ -19,8 +19,11 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 /**
  * Appended to the child system prompt per turn (before_agent_start).
  * Declares the worker contract: no interactive user, the last assistant
- * message is the final report, no questions, strict task scope, and no
- * nested sub-agents. Keep it static (see file header).
+ * message is the final report, no questions, strict task scope, no nested
+ * sub-agents, and how that report must be shaped (in-message, absolute
+ * paths, outcome first, trailing STATUS marker). Keep it static (see file
+ * header) — the reporting rules are plain text too, never interpolated, so
+ * the note stays a byte-constant prefix across turns.
  */
 const WORKER_NOTE = [
 	"You are a sub-agent worker session (pi.nvim):",
@@ -28,6 +31,10 @@ const WORKER_NOTE = [
 	"- Your last assistant message is your final report to the parent: make it complete and self-contained — findings, changed files, open issues.",
 	"- Stay strictly within the given task: no scope expansion, no unrelated refactoring, no follow-up work; report blockers instead.",
 	"- You cannot spawn or manage sub-agents; do all the work yourself.",
+	"- Write the report in your last message, not in a file: do not write the report to a file and point at it; the parent reads your last message only, so a file it never opens is a report you never delivered.",
+	"- Give absolute file paths, never relative ones; the parent resolves them against its own working directory.",
+	"- Lead with the outcome, then the evidence; stay under roughly 200 words unless the task asked for detail.",
+	"- End the report with exactly one status line, one of: STATUS: ok, STATUS: blocked, STATUS: failed. Use blocked when you are unsure and say what you are stuck on.",
 ].join("\n");
 
 export default function subagentChild(pi: ExtensionAPI): void {
