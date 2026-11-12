@@ -36,6 +36,7 @@ local waiters = {}
 ---@field name? string
 ---@field model? pi.ModelRef
 ---@field thinking_level? string
+---@field tools? string[] Child tool allowlist (spawn items only; nil = inherit every tool)
 ---@field status "queued"|"spawning"|"running"|"ok"|"failed"|"cancelled"
 ---@field generation? integer Run generation the item was dispatched against.
 ---@field output? string
@@ -409,6 +410,9 @@ function M.complete_item(batch_id, ref, ok, opts)
         patch_item(batch, ref, {
             status = "failed",
             error = opts.error or "failed",
+            -- A run that failed after producing text keeps it: the parent can
+            -- still tell how far the child got, and the error says why it stopped.
+            output = opts.output,
         })
         maybe_cancel_siblings(batch, ref)
     end
@@ -421,11 +425,26 @@ function M.complete_item(batch_id, ref, ok, opts)
     require("pi.ui.sessions").request_refresh()
 end
 
+--- Outcome of a settled child run, as decided by the settle handler
+--- (subsessions/init.lua), which is the only place that can tell an aborted run
+--- from a failed one (`stopReason: "error"` plus the provider's `errorMessage`).
+---@class pi.SubsessionItemOutcome
+---@field ok boolean False when the run itself failed.
+---@field error? string Provider/runtime error text for a failed run.
+---@field output? string Text the run produced (kept on failure when non-empty).
+
+--- Settle the running items that this child's finished run owns.
+---
+--- `outcome` is authoritative when given. Without it the manifest's `failed`
+--- status is the fallback — that is the unexpected-exit path, where the manager
+--- patches `failed` before settling because a crashed child leaves no assistant
+--- turn to read.
 ---@param child_id string
+---@param outcome? pi.SubsessionItemOutcome
 ---@param cwd? string workspace cwd (default: Neovim's current cwd)
 ---@param integration? table Worktree integration outcome to record on the completed items.
 ---@return boolean claimed True when this settle completed a running batch item.
-function M.on_child_settled(child_id, cwd, integration)
+function M.on_child_settled(child_id, outcome, cwd, integration)
     -- The row belongs to the parent's workspace, which the caller usually knows
     -- (the child session carries it). A mismatch must not strand the batch, so
     -- fall back to locating the row and settle against *its* workspace.
@@ -445,17 +464,32 @@ function M.on_child_settled(child_id, cwd, integration)
         return false
     end
     local batches = M.load(cwd)
-    -- The transcript file recorded at spawn time is authoritative: a child's
-    -- JSONL can live in a different workspace (its worktree) than the batch.
-    local session_file = entry.session_file
-    local path = nil
-    if type(session_file) == "string" and session_file ~= "" and vim.fn.filereadable(session_file) == 1 then
-        path = session_file
-    else
-        path = Read.find_path(child_id, { cwd = cwd })
+    local claimed_outcome = type(outcome) == "table" and type(outcome.ok) == "boolean" and outcome or nil
+    if not claimed_outcome then
+        local failed = entry.status == "failed"
+        claimed_outcome = {
+            ok = not failed,
+            error = failed and (entry.last_error or "sub-session failed") or nil,
+        }
     end
-    local output = path and Read.last_assistant_message(path) or ""
-    local failed = entry.status == "failed"
+    local output = claimed_outcome.output
+    if claimed_outcome.ok and type(output) ~= "string" then
+        -- The transcript file recorded at spawn time is authoritative: a child's
+        -- JSONL can live in a different workspace (its worktree) than the batch.
+        local path = nil
+        local session_file = entry.session_file
+        if type(session_file) == "string" and session_file ~= "" and vim.fn.filereadable(session_file) == 1 then
+            path = session_file
+        else
+            path = Read.find_path(child_id, { cwd = cwd })
+        end
+        output = path and Read.last_assistant_message(path) or ""
+    end
+    -- A failed run usually produced no text at all (quota/auth/network errors
+    -- arrive before any content); keep a partial report when it did.
+    if not claimed_outcome.ok and (type(output) ~= "string" or output == "") then
+        output = nil
+    end
     local claimed = false
     for batch_id, batch in pairs(batches) do
         if batch.status == "running" or batch.status == "pending" then
@@ -465,9 +499,9 @@ function M.on_child_settled(child_id, cwd, integration)
                     and item.generation == gen
                     and (item.status == "running" or item.status == "spawning")
                 then
-                    M.complete_item(batch_id, item.ref, not failed, {
-                        output = failed and nil or output,
-                        error = failed and "sub-session failed" or nil,
+                    M.complete_item(batch_id, item.ref, claimed_outcome.ok, {
+                        output = output,
+                        error = claimed_outcome.ok and nil or (claimed_outcome.error or "sub-agent run failed"),
                         cwd = cwd,
                         integration = integration,
                     })
@@ -528,8 +562,8 @@ local function normalize_item(raw, index)
     end
     if is_reuse then
         -- Spawn-only fields are rejected rather than silently dropped: a reused
-        -- child keeps its own model/thinking level and name.
-        for _, field in ipairs({ "name", "model", "thinking_level" }) do
+        -- child keeps its own model/thinking level, name and tool allowlist.
+        for _, field in ipairs({ "name", "model", "thinking_level", "tools" }) do
             if present(raw[field]) then
                 return nil, ("item %d: `%s` is not accepted on a reuse item ({ target, message })"):format(index, field)
             end
@@ -546,12 +580,19 @@ local function normalize_item(raw, index)
             nil
     end
     if is_spawn then
+        -- `tools` is a whole-selection allowlist, so a malformed value must fail
+        -- the item: silently dropping it would hand the child every tool.
+        local tools, tools_err = Manifest.normalize_tools(present(raw.tools) and raw.tools or nil)
+        if tools_err then
+            return nil, ("item %d: %s"):format(index, tools_err)
+        end
         return {
             ref = ref,
             task = raw.task,
             name = type(raw.name) == "string" and raw.name or nil,
             model = present(raw.model) and raw.model or nil,
             thinking_level = present(raw.thinking_level) and raw.thinking_level or nil,
+            tools = tools,
             status = "queued",
         },
             nil
@@ -601,6 +642,7 @@ local function run_batch(batch, parent)
                 name = item.name,
                 model = item.model,
                 thinking_level = item.thinking_level,
+                tools = item.tools,
                 agent_spawned = true,
             }, function(child, err)
                 local b, live = live_item("spawning")
@@ -656,7 +698,14 @@ local function run_batch(batch, parent)
             persist(b, cwd)
             child.rpc:send({ type = "prompt", message = item.message }, function(res)
                 if not res.success then
-                    M.complete_item(batch.id, item.ref, false, { error = "prompt failed", cwd = cwd })
+                    -- Carry the backend's reason (e.g. "No API key found for …")
+                    -- instead of an opaque "prompt failed": the parent can act
+                    -- on the former and only guess at the latter.
+                    local reason = type(res.error) == "string" and res.error ~= "" and res.error or nil
+                    M.complete_item(batch.id, item.ref, false, {
+                        error = reason and ("prompt failed: " .. reason) or "prompt failed",
+                        cwd = cwd,
+                    })
                 end
             end)
         end
@@ -1172,19 +1221,21 @@ end
 --- Reconcile running batches after Neovim restart.
 ---@param cwd? string workspace cwd (default: Neovim's current cwd)
 function M.rebuild(cwd)
-    M.rebuild_at(M.path(cwd))
+    M.rebuild_at(M.path(cwd), Manifest.path(cwd))
 end
 
 --- Reconcile running batches in one batch file.
 ---@param path string batch file path
-function M.rebuild_at(path)
+---@param manifest_path? string manifest of the same workspace (default: the manifest file next to the batch file)
+function M.rebuild_at(path, manifest_path)
     local ttl_hours = (Config.options.subagent or {}).batch_ttl_hours or 24
     local now = os.time()
     local batches = M.load_at(path)
-    -- Items are settled against the manifest of the same workspace (the file
-    -- next to this batch file), so a rebuild in one workspace never reads
-    -- another's rows.
-    local manifest = Manifest.load_at(Manifest.path_for_batch(path))
+    -- Items are settled against the manifest of the same workspace, so a rebuild
+    -- in one workspace never reads another's rows. The caller's workspace wins
+    -- when it resolves one (`M.rebuild`); a batch file reached purely by path
+    -- falls back to the manifest next to it.
+    local manifest = Manifest.load_at(manifest_path or Manifest.path_for_batch(path))
     local changed = false
     for id, batch in pairs(batches) do
         local created = batch.created_at or ""
@@ -1225,7 +1276,11 @@ function M.rebuild_at(path)
                         changed = true
                     elseif entry and entry.run_generation == item.generation and entry.status == "failed" then
                         item.status = "failed"
-                        item.error = "sub-session failed"
+                        -- The settle recorded why (provider error, process exit);
+                        -- a manifest written before that field existed falls back
+                        -- to the generic text.
+                        item.error = type(entry.last_error) == "string" and entry.last_error ~= "" and entry.last_error
+                            or "sub-session failed"
                         changed = true
                     end
                 end

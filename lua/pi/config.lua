@@ -332,6 +332,7 @@
 ---@field max_batch_size? integer Max items per dispatch_subagents batch (default 5)
 ---@field batch_timeout_ms? integer Default wait_subagents timeout (default 300000)
 ---@field batch_ttl_hours? integer Hours to retain completed batch records (default 24)
+---@field tools? string[] Child tool allowlist (default: nil — inherit every tool)
 ---@field show_full_ids? boolean Show full UUIDs in sub-agent tool rows (default false; truncated)
 ---@field reap_after_minutes? number Minutes a settled child process idles before auto-close (default 30; 0 disables event-driven reaping)
 ---@field reap_sweep_minutes? number Minutes between periodic idle sweeps (default 10; 0 disables the sweep)
@@ -529,6 +530,9 @@ local defaults = {
     subagent = {
         enabled = true,
         max_children = 5,
+        -- `tools` is intentionally absent: the default is nil = inherit every
+        -- tool, and vim.tbl_deep_extend cannot express a nil default. Set it to
+        -- a list of tool names to constrain every child spawned from now on.
         report_mode = "last_message",
         default_config = "inherit",
         max_batch_size = 5,

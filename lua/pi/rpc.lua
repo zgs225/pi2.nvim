@@ -359,6 +359,7 @@ end
 ---@field cwd? string Working directory for the pi process (default: Neovim's cwd).
 ---@field worktree_path? string Worktree root published to extensions as `PI_NVIM_WORKTREE_PATH`.
 ---@field extra_args? string[] Extra CLI args forwarded to `Cli.command` (session bootstrap, e.g. `--fork`).
+---@field tools? string[] Child tool allowlist, forwarded to the CLI as `--tools` (replacing any `--tools` from cli.args).
 
 ---@return boolean
 ---@param opts? pi.RpcStartOpts
@@ -377,7 +378,7 @@ function Rpc:start(opts)
     self._stdout_parts = {}
     -- A stale process's pending callbacks must never survive into the new one.
     self._pending = {}
-    local cmd = Cli.command({ subagent = opts.subagent, extra_args = opts.extra_args })
+    local cmd = Cli.command({ subagent = opts.subagent, tools = opts.tools, extra_args = opts.extra_args })
     -- The bundled vision extension reads its configured model from this
     -- runtime file on every input event (config.setup keeps it published).
     -- The auto-title extension reads its options from PI_NVIM_TITLE_FILE on

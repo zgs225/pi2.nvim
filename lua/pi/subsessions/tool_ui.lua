@@ -415,6 +415,94 @@ function M.batch_status_text(details)
     return nil
 end
 
+--- Items a batch detail may name before the rest are elided as `+N`.
+local BATCH_LABELS_MAX = 3
+--- Display width the joined item labels may take.
+local BATCH_LABELS_WIDTH = 60
+
+--- Join up to BATCH_LABELS_MAX/BATCH_LABELS_WIDTH of `labels`, eliding the rest
+--- as `+N`.
+---@param labels string[]
+---@return string
+local function join_labels(labels)
+    local shown = {}
+    local width = 0
+    for _, label in ipairs(labels) do
+        local extra = (#shown > 0 and 2 or 0) + vim.fn.strdisplaywidth(label)
+        if #shown >= BATCH_LABELS_MAX or width + extra > BATCH_LABELS_WIDTH then
+            shown[#shown + 1] = ("+%d"):format(#labels - #shown)
+            break
+        end
+        shown[#shown + 1] = label
+        width = width + extra
+    end
+    return table.concat(shown, ", ")
+end
+
+--- What a `poll_subagents` / `wait_subagents` call is actually about: the
+--- labels of the batch's items (`auth-review, schema-fix, +2`).
+---
+--- `batch …123456` names something the human never typed — the batch id is a
+--- handle for the model, and a row of it says nothing about which work is being
+--- waited on. The labels come from the persisted batch record (the same source
+--- the batch rows in `:PiSessions` use), so a replayed block resolves as well;
+--- when the record is gone the id stays as the fallback.
+---@param batch_id? string
+---@return string?
+function M.batch_items_text(batch_id)
+    if type(batch_id) ~= "string" or batch_id == "" then
+        return nil
+    end
+    local fallback = "batch " .. (M.short_id(batch_id) or batch_id)
+    -- Lazy: batch.lua pulls the session layer, which pulls this module.
+    local batch = require("pi.subsessions.batch").get(batch_id)
+    local items = batch and batch.items
+    if type(items) ~= "table" or #items == 0 then
+        return fallback
+    end
+    local labels, seen = {}, {}
+    for _, item in ipairs(items) do
+        local label = M.item_label(item)
+        if label ~= "?" and not seen[label] then
+            seen[label] = true
+            labels[#labels + 1] = label
+        end
+    end
+    if #labels == 0 then
+        return fallback
+    end
+    return join_labels(labels)
+end
+
+--- Status extra for the inline poll/wait rows: the counters plus the items that
+--- did not come back cleanly (`5/5 partial · ✗ schema-fix, ✗ docs-sweep`).
+---
+--- Those two tools render as a single line with no body, so the header is the
+--- only place a failed item can surface — the counters say *how many* failed,
+--- never *which* ones.
+---@param details? table
+---@return string?
+function M.batch_outcome_text(details)
+    local base = M.batch_status_text(details)
+    if not base then
+        return nil
+    end
+    local items = type(details) == "table" and details.items or nil
+    if type(items) ~= "table" then
+        return base
+    end
+    local marks = {}
+    for _, item in ipairs(items) do
+        if item.status == "failed" or item.status == "cancelled" then
+            marks[#marks + 1] = DISPATCH_MARKS[item.status].glyph .. " " .. M.item_label(item)
+        end
+    end
+    if #marks == 0 then
+        return base
+    end
+    return base .. " · " .. join_labels(marks)
+end
+
 ---@param details? table
 ---@return string?
 function M.list_subagents_status(details)
@@ -454,15 +542,99 @@ function M.list_batches_status(details)
     return ("(%d batches, %d running)"):format(#details.batches, running)
 end
 
+--- Status values a worker report may close with. Anything else is not a
+--- marker (see M.split_report_status).
+---@type table<string, boolean>
+local REPORT_STATUSES = {
+    ok = true,
+    blocked = true,
+    failed = true,
+}
+
+--- Split a worker's trailing status marker off its report.
+---
+--- Children are told to close with a single STATUS line
+--- (extensions/subagent-child.ts WORKER_NOTE). Only the last non-empty line is
+--- inspected, and only a legal value counts: no marker, an unknown word, or a
+--- marker with nothing before it all return nil plus the report untouched, so a
+--- missing marker never fabricates a status.
+---@param report string
+---@return "ok"|"blocked"|"failed"|nil status
+---@return string body
+function M.split_report_status(report)
+    if type(report) ~= "string" or report == "" then
+        return nil, report
+    end
+
+    -- Offsets of the last line that has non-whitespace content.
+    local last_text, last_start = nil, nil
+    local pos = 1
+    while pos <= #report do
+        local nl = report:find("\n", pos, true)
+        local line_end = nl and (nl - 1) or #report
+        local line = report:sub(pos, line_end)
+        if line:match("%S") then
+            last_text, last_start = line, pos
+        end
+        if not nl then
+            break
+        end
+        pos = nl + 1
+    end
+
+    -- STATUS is matched case-insensitively (the line is lowercased first; only
+    -- the marker word is ever needed from it).
+    local status = last_text and last_text:lower():match("^%s*status:%s*(%w+)%s*$")
+    if not status or not REPORT_STATUSES[status] then
+        return nil, report
+    end
+
+    local body = report:sub(1, last_start - 1):gsub("%s+$", "")
+    if body == "" then
+        -- Marker only, no report to attach it to.
+        return nil, report
+    end
+    return status, body
+end
+
 --- Completion report injected into the parent chat (user-spawned children).
+---
+--- The header only changes when the worker actually closed with a status marker
+--- (M.split_report_status): a report without one keeps this wording byte for
+--- byte, so children that never learned the marker render exactly as before and
+--- no status is invented for them.
 ---@param name string
 ---@param report string
 ---@return string
 function M.completion_report(name, report)
+    local status, body = M.split_report_status(report)
     if M.resolve_lang() == "zh" then
+        if status then
+            return ("[子会话「%s」已完成：%s] %s"):format(name, status, body)
+        end
         return ("[子会话「%s」已完成] %s"):format(name, report)
     end
+    if status then
+        return ('[Sub-session "%s" completed: %s] %s'):format(name, status, body)
+    end
     return ('[Sub-session "%s" completed] %s'):format(name, report)
+end
+
+--- Failure notice injected into the parent chat (user-spawned children).
+---
+--- A failed run has no report to quote, so the notice carries the reason the
+--- backend recorded instead. It is deliberately distinct from
+--- M.completion_report: "completed: failed" would read as a self-declared
+--- outcome, while this line says the child never got to report anything.
+---@param name string
+---@param reason string Provider/runtime error text, e.g. `429: {"…insufficient_quota"}`
+---@return string
+function M.failure_report(name, reason)
+    local detail = type(reason) == "string" and reason ~= "" and reason or "unknown error"
+    if M.resolve_lang() == "zh" then
+        return ("[子会话「%s」失败] %s"):format(name, detail)
+    end
+    return ('[Sub-session "%s" failed] %s'):format(name, detail)
 end
 
 --- dispatch uses inline rendering only for a single item with wait:true.

@@ -11,10 +11,11 @@ local MANIFEST_FILE = ".pi2-subsessions.json"
 ---@field parent_id string
 ---@field name string
 ---@field task_prompt string
----@field config { model: pi.ModelRef, thinking_level?: string }
+---@field config { model: pi.ModelRef, thinking_level?: string, tools?: string[] }
 ---@field status "active"|"completed"|"failed"|"interrupted"|"dormant"
 ---@field reported boolean
 ---@field last_report? string
+---@field last_error? string Reason a run failed (provider/auth/quota/network error, or a process exit). Set when a settle books the run as `failed` and cleared on the next successful one, so a later revision of the same child does not inherit a stale error.
 ---@field name_source? "explicit"|"fallback"|"auto" Where `name` came from: "explicit" (caller-supplied — dispatch `name`, the :PiSubNew dialog) is never overwritten; "fallback" is derived from `task_prompt` and may be replaced by the child's auto-generated title; "auto" is that title. Absent in manifests written before this field existed — see `M.is_derived_name`.
 ---@field created_at string
 ---@field last_active_at string
@@ -235,6 +236,39 @@ function M.locate(id, cwd)
     return nil, nil, nil
 end
 
+--- Normalize a child tool allowlist (`subagent.tools`, a spawn item's `tools`
+--- field, or a persisted manifest entry's `config.tools`).
+---
+--- `nil` is the documented default and means "inherit every tool", so it passes
+--- through untouched. An empty array is rejected instead of meaning "no tools":
+--- a child with no tools at all cannot do the work it was spawned for, which is
+--- invariably a caller mistake rather than an intent.
+---@param value any
+---@return string[]? normalized Fresh array of tool names (safe to mutate), or nil
+---@return string? err Human-readable reason when `value` is not a valid allowlist
+function M.normalize_tools(value)
+    if value == nil then
+        return nil, nil
+    end
+    if type(value) ~= "table" then
+        return nil, "tools must be an array of tool names"
+    end
+    if #value == 0 then
+        return nil, "tools must list at least one tool; omit it to inherit every tool"
+    end
+    local out = {} ---@type string[]
+    for i, item in ipairs(value) do
+        -- Rejected rather than trimmed: a padded name is a typo, and silently
+        -- accepting it would let "read " reach the CLI. The array is a fresh
+        -- copy so the caller's table is never aliased through the result.
+        if type(item) ~= "string" or item == "" or item:find("%s") or item:find(",", 1, true) then
+            return nil, ("tools[%d] must be a single tool name without commas or whitespace"):format(i)
+        end
+        out[#out + 1] = item
+    end
+    return out, nil
+end
+
 --- Drop the in-memory cache and spawn reservations (tests / path overrides).
 function M._reset()
     cache = {}
@@ -334,6 +368,15 @@ function M.save(manifest, cwd)
     return M.save_at(manifest, M.path(cwd))
 end
 
+--- Sentinel for `M.patch`: a field set to this value is **deleted** from the
+--- entry. `pairs` skips `nil` values, so `{ last_error = nil }` cannot clear a
+--- field — this is how a successful run drops a previous failure reason.
+M.REMOVE = setmetatable({}, {
+    __tostring = function()
+        return "pi.Manifest.REMOVE"
+    end,
+})
+
 ---@param id string
 ---@param entry pi.SubsessionManifestEntry
 ---@param cwd? string workspace cwd (default: Neovim's current cwd)
@@ -368,7 +411,11 @@ function M.patch(id, patch, cwd)
         return false
     end
     for k, v in pairs(patch) do
-        entry[k] = v
+        if v == M.REMOVE then
+            entry[k] = nil
+        else
+            entry[k] = v
+        end
     end
     manifest[id] = entry
     M.save_at(manifest, path)

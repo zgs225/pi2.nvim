@@ -68,6 +68,18 @@ All highlight groups are defined with `default = true`, so they can be overridde
 | `PiDiffAddSign` | The `+` sign on added diff lines (semantic color from `DiffAdd`) |
 | `PiDiffDeleteSign` | The `-` sign on removed diff lines (semantic color from `DiffDelete`) |
 
+## Terminal colours in tool output (`PiAnsi*`)
+
+Tool output carrying ANSI SGR sequences is highlighted with **dynamically generated** groups, one per distinct style, named `PiAnsi` plus a canonical encoding of the style — e.g. `PiAnsii1________________` (ANSI palette 1, no attributes) or `PiAnsir255_105_180_______` (24-bit colour). They are the one family in this document that is **not** defined at load time: a group is created the first time a tool result uses that style, and every group is re-resolved on `ColorScheme` so switching themes repaints the colours.
+
+They cannot be listed one by one, but they are predictable and overridable:
+
+- Colours are resolved through your colorscheme's semantic groups where one matches, so a theme change flows through automatically. ANSI 1/9 borrow `DiagnosticError`, 2/10 `DiagnosticOk`, 3/11 `DiagnosticWarn`, 4/12 `DiagnosticInfo`, 5/13 `Constant`, 6/14 `DiagnosticHint`, 0/7/8/15 `Normal`/`Comment`. Any 16-colour entry without a usable theme colour falls back to the standard xterm palette; 256-colour and 24-bit values are converted to RGB (`ctermfg`/`ctermbg` is set for palette indices, so terminals without truecolor still get the right index).
+- A span extmark carries `priority = 300`, above `PiToolOutput`/`PiBashOutput` (200) and treesitter, so the colour wins inside a block.
+- To restyle a specific one, define it yourself — an explicit `vim.api.nvim_set_hl(0, "PiAnsii1________________", { fg = "#ff0000" })` survives until the next `ColorScheme`, at which point π re-applies the computed value. For a global look, override the semantic group the ANSI colour borrows from instead.
+
+Inspect what a block actually uses with `:Inspect` over the coloured text, or list the generated groups with `:hi PiAnsi`.
+
 ## Attachments
 
 | Group | Role |

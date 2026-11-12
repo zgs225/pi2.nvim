@@ -2,6 +2,8 @@
 
 local Path = require("pi.path")
 local Render = require("pi.ui.render")
+local Ansi = require("pi.ui.chat.ansi")
+local Tasks = require("pi.tasks")
 local SubToolUi = require("pi.subsessions.tool_ui")
 local TodoToolUi = require("pi.todo.tool_ui")
 local CodemodeToolUi = require("pi.codemode.tool_ui")
@@ -27,6 +29,7 @@ end
 ---@type table<string, string>
 local TOOL_ICONS = {
     bash = nf(0xE795), -- nf-dev-terminal
+    wait_task = nf(0xF051F), -- nf-md-timer_sand (blocking wait on a bash task)
     codemode = nf(0xF031E), -- nf-md-language_javascript
     read = nf(0xF0219), -- nf-md-file-document
     edit = nf(0xF03EB), -- nf-md-pencil
@@ -93,10 +96,7 @@ end
 ---@param text string?
 ---@return string
 function M.sanitize_text(text)
-    if type(text) ~= "string" then
-        text = text == nil and "" or tostring(text)
-    end
-    return (text:gsub("%z", "␀"))
+    return Ansi.strip(text)
 end
 
 --- Collapse newlines for single-line buffer rows (nvim_buf_set_lines rejects `\n` in one item).
@@ -107,6 +107,12 @@ function M.flatten_line(text)
     return (text:gsub("[\r\n]+", " "):gsub("%s+", " "))
 end
 
+--- Extract the raw (still escape-bearing) result text.
+---
+--- Sanitizing deliberately happens at the *write* step, not here: the output
+--- renderers lex these strings with `ui/chat/ansi.lua` so SGR sequences become
+--- colour spans. Anything that only measures or flattens the text goes through
+--- `sanitize_text`/`flatten_line`, which strips.
 ---@param result? table
 ---@return string?
 local function extract_result_text_raw(result)
@@ -117,7 +123,7 @@ local function extract_result_text_raw(result)
     -- Replay toolResult: msg.content may be a string or array of strings
     local content = result.content
     if type(content) == "string" then
-        local trimmed = vim.trim(M.sanitize_text(content))
+        local trimmed = vim.trim(content)
         return trimmed ~= "" and trimmed or nil
     end
     if type(content) ~= "table" then
@@ -126,9 +132,9 @@ local function extract_result_text_raw(result)
     local parts = {}
     for _, block in ipairs(content) do
         if type(block) == "table" and block.type == "text" and type(block.text) == "string" then
-            parts[#parts + 1] = M.sanitize_text(block.text)
+            parts[#parts + 1] = block.text
         elseif type(block) == "string" then
-            parts[#parts + 1] = M.sanitize_text(block)
+            parts[#parts + 1] = block
         end
     end
     if #parts > 0 then
@@ -381,7 +387,6 @@ end
 ---@param lang? string  language hint for the code fence (e.g. "bash")
 ---@return integer? next_insert_at  advanced insertion cursor (nil when appending)
 local function render_output(history, text, insert_at, lang)
-    text = M.sanitize_text(text)
     local sep_row
     if insert_at then
         sep_row, insert_at = history:_insert_lines(insert_at, { "" })
@@ -389,9 +394,20 @@ local function render_output(history, text, insert_at, lang)
         sep_row = history:_append_lines({ "" })
     end
     M.set_border(history, sep_row, M.GLYPHS.INDENT)
-    local output_lines = vim.split(text, "\n", { plain = true })
+    -- Lex the raw text first: SGR spans become extmark highlights while every
+    -- line written to the buffer is escape-free (see ui/chat/ansi.lua).
+    if type(text) ~= "string" then
+        text = text == nil and "" or tostring(text)
+    end
+    local items = Ansi.scan(vim.split(text, "\n", { plain = true }))
+    local output_lines = {}
+    for i, item in ipairs(items) do
+        output_lines[i] = item.text
+    end
 
     local auto_closed = false
+    -- Row shift between an item and its buffer row, when a fence is prepended.
+    local row_offset = 0
 
     if Render.engine() == "render-markdown" then
         -- Wrap output in a fenced code block so render-markdown.nvim treats
@@ -407,6 +423,7 @@ local function render_output(history, text, insert_at, lang)
         end
         local fence = string.rep("`", math.max(max_run + 1, 3))
         table.insert(output_lines, 1, fence .. (lang or ""))
+        row_offset = 1
         output_lines[#output_lines + 1] = fence
     else
         -- Builtin engine: treesitter PARSES ``` as fence delimiters regardless
@@ -442,6 +459,7 @@ local function render_output(history, text, insert_at, lang)
             })
         end
     end
+    Ansi.apply(history:buf(), history:ns(), start, items, { row_offset = row_offset })
     if auto_closed then
         local close_row = start + #output_lines - 1
         vim.api.nvim_buf_set_extmark(history:buf(), history:ns(), close_row, 3, {
@@ -921,6 +939,59 @@ function M.apply_collapsed_extmarks(history, base_row, specs, lines)
     end
 end
 
+---@class pi.AnsiMark
+---@field row integer 0-indexed row relative to the region's first line
+---@field col integer
+---@field end_col integer
+---@field hl_group string
+
+--- Map ANSI span marks from a tool block's expanded rows onto its collapsed rows.
+---
+--- A collapsed block is a *duplicate* of the expanded tail: the last N output
+--- lines are copied verbatim (that is what `build_collapsed_view` emits). Their
+--- SGR colour spans live as extmarks on the expanded rows, so walking both
+--- lists bottom-up and matching row text copies the marks across without
+--- re-lexing anything — and without depending on where fences or elision
+--- summary rows end up.
+---@param collapsed string[]
+---@param specs string[] parallel line-kind array for `collapsed`
+---@param source_lines string[] expanded inner lines (marks are relative to this)
+---@param marks pi.AnsiMark[] captured span marks
+---@return pi.AnsiMark[] mapped marks, rows relative to `collapsed`
+function M.map_collapsed_ansi(collapsed, specs, source_lines, marks)
+    local out = {}
+    if #marks == 0 or #source_lines == 0 then
+        return out
+    end
+    local by_row = {}
+    for _, m in ipairs(marks) do
+        by_row[m.row] = by_row[m.row] or {}
+        table.insert(by_row[m.row], m)
+    end
+    local cursor = #source_lines
+    for i = #collapsed, 1, -1 do
+        if specs[i] == "output" and collapsed[i] ~= "" then
+            local j = cursor
+            while j >= 1 and source_lines[j] ~= collapsed[i] do
+                j = j - 1
+            end
+            if j < 1 then
+                break
+            end
+            cursor = j - 1
+            for _, m in ipairs(by_row[j - 1] or {}) do
+                out[#out + 1] = {
+                    row = i - 1,
+                    col = m.col,
+                    end_col = m.end_col,
+                    hl_group = m.hl_group,
+                }
+            end
+        end
+    end
+    return out
+end
+
 --- Extract input lines and actual output lines from a tool block's inner range.
 ---@param history pi.ChatHistory
 ---@param block pi.ToolBlock
@@ -1101,6 +1172,69 @@ local function codemode_live_rows(msg)
     return lines
 end
 
+--- Display width the command in a `wait_task` body row may take. A command is
+--- an arbitrary shell string and the row has to stay scannable.
+local WAIT_TASK_COMMAND_WIDTH = 80
+
+--- Human-readable label for a `wait_task` call: the command the task runs, then
+--- the id.
+---
+--- The id alone (`bf4f98f`) says nothing about what is being waited on, and the
+--- task that owns it may have been started many turns ago. The command comes
+--- from the task registry, which the extension's `started` event populates — so
+--- it is known for a block rendered live and for one replayed from a session
+--- file (the custom message is in the transcript). A session resumed after pi
+--- itself restarted has no registry record: then the bare id is all there is.
+---@param task_id string
+---@return string
+local function wait_task_label(task_id)
+    local task = Tasks.get(task_id)
+    local command = task and task.command
+    if type(command) ~= "string" then
+        return task_id
+    end
+    command = M.flatten_line(command)
+    if command == "" then
+        return task_id
+    end
+    if vim.fn.strdisplaywidth(command) > WAIT_TASK_COMMAND_WIDTH then
+        command = vim.fn.strcharpart(command, 0, WAIT_TASK_COMMAND_WIDTH - 1) .. "…"
+    end
+    return command .. " · " .. task_id
+end
+
+--- Header status for a `wait_task` block: why the wait returned.
+---
+--- A deadline hit is not a failure (the process keeps running), so the header
+--- says `still running` instead of leaving the block to be read as an error. A
+--- clean exit stays silent — the result body already reports `exited with code
+--- 0` — while a signal or a non-zero exit is what the reader scans the header
+--- for.
+---@param result table?
+---@return string?
+local function wait_task_status(result)
+    local details = result and result.details
+    if type(details) ~= "table" then
+        return nil
+    end
+    if details.status == "still_running" then
+        return "still running"
+    end
+    if details.status == "cancelled" then
+        return "wait cancelled"
+    end
+    if details.status ~= "exited" then
+        return nil
+    end
+    if type(details.signal) == "string" and details.signal ~= "" then
+        return "signal " .. details.signal
+    end
+    if type(details.exitCode) == "number" and details.exitCode ~= 0 then
+        return ("exit %d"):format(details.exitCode)
+    end
+    return nil
+end
+
 ---@type table<string, pi.ToolRenderer>
 local renderers = {
     -- Synthetic block rendered by pi.nvim (not a real tool call): the
@@ -1125,6 +1259,32 @@ local renderers = {
                 render_input(history, lines, "bash")
             end
         end,
+        on_end = function(history, _, result, _, insert_at)
+            local text = extract_result_text(result)
+            if text and text ~= "" then
+                insert_at = render_output(history, text, insert_at)
+            end
+            return insert_at
+        end,
+    },
+    -- wait_task blocks on a background bash task and returns that task's
+    -- output, so it renders like a bash block with the command instead of the
+    -- task id: the result body is the only place a backgrounded command's
+    -- output reaches the chat, so it must never be hidden on a single line.
+    wait_task = {
+        input_visible = 1,
+        output_visible = 6,
+        on_start = function(history, args)
+            if not (args and type(args.task_id) == "string") then
+                return
+            end
+            local line = wait_task_label(args.task_id)
+            if type(args.timeout_ms) == "number" and args.timeout_ms > 0 then
+                line = string.format("%s (timeout %ds)", line, math.floor(args.timeout_ms / 1000))
+            end
+            render_body_line(history, line)
+        end,
+        inline_status = wait_task_status,
         on_end = function(history, _, result, _, insert_at)
             local text = extract_result_text(result)
             if text and text ~= "" then
@@ -1627,13 +1787,10 @@ local renderers = {
             return SubToolUi.display_name("poll_subagents")
         end,
         inline_text = function(_, args)
-            if not args or type(args.batch_id) ~= "string" then
-                return nil
-            end
-            return "batch " .. (SubToolUi.short_id(args.batch_id) or args.batch_id)
+            return SubToolUi.batch_items_text(args and args.batch_id)
         end,
         inline_status = function(result)
-            return SubToolUi.batch_status_text(SubToolUi.result_details(result))
+            return SubToolUi.batch_outcome_text(SubToolUi.result_details(result))
         end,
     },
     wait_subagents = {
@@ -1642,13 +1799,14 @@ local renderers = {
             return SubToolUi.display_name("wait_subagents")
         end,
         inline_text = function(_, args)
-            if not args or type(args.batch_id) ~= "string" then
-                return nil
+            local text = SubToolUi.batch_items_text(args and args.batch_id)
+            if text and type(args.timeout_ms) == "number" and args.timeout_ms > 0 then
+                text = string.format("%s (timeout %ds)", text, math.floor(args.timeout_ms / 1000))
             end
-            return "batch " .. (SubToolUi.short_id(args.batch_id) or args.batch_id)
+            return text
         end,
         inline_status = function(result)
-            return SubToolUi.batch_status_text(SubToolUi.result_details(result))
+            return SubToolUi.batch_outcome_text(SubToolUi.result_details(result))
         end,
     },
     list_batches = {

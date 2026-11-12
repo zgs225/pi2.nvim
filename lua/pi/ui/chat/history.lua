@@ -146,6 +146,7 @@ local Ft = require("pi.filetypes")
 local Config = require("pi.config")
 local Path = require("pi.path")
 local Tools = require("pi.ui.chat.tools")
+local Ansi = require("pi.ui.chat.ansi")
 local Render = require("pi.ui.render")
 local Text = require("pi.ui.chat.text")
 
@@ -227,6 +228,38 @@ local function restore_extmarks(buf, ns_id, base_row, saved)
             opts.end_row = base_row + opts.end_row
         end
         pcall(vim.api.nvim_buf_set_extmark, buf, ns_id, base_row + em.row, em.col, opts)
+    end
+end
+
+--- ANSI span marks among captured extmarks (see ui/chat/ansi.lua).
+---
+--- A collapsed block duplicates the expanded output tail, so its SGR spans are
+--- copied across by row content rather than re-lexed: the raw escape bytes are
+--- gone from the buffer once rendered.
+---@param saved table[]
+---@return pi.AnsiMark[]
+local function ansi_marks_of(saved)
+    local out = {}
+    for _, em in ipairs(saved) do
+        local hl = em.opts and em.opts.hl_group
+        if type(hl) == "string" and hl:match("^PiAnsi") then
+            out[#out + 1] = { row = em.row, col = em.col, end_col = em.opts.end_col or em.col, hl_group = hl }
+        end
+    end
+    return out
+end
+
+--- Re-apply mapped ANSI spans onto a collapsed block's rows.
+---@param history pi.ChatHistory
+---@param base_row integer 0-indexed first row of the collapsed region
+---@param marks pi.AnsiMark[] rows relative to base_row
+local function apply_mapped_ansi(history, base_row, marks)
+    for _, m in ipairs(marks) do
+        pcall(vim.api.nvim_buf_set_extmark, history:buf(), history:ns(), base_row + m.row, m.col, {
+            end_col = m.end_col,
+            hl_group = m.hl_group,
+            priority = Ansi.PRIORITY,
+        })
     end
 end
 
@@ -2989,6 +3022,16 @@ function History:_maybe_collapse_tool(tool_call_id)
         vim.api.nvim_buf_set_lines(self._buf, inner_start, footer_row, false, collapsed)
     end)
     Tools.apply_collapsed_extmarks(self, inner_start, specs, collapsed)
+    apply_mapped_ansi(
+        self,
+        inner_start,
+        Tools.map_collapsed_ansi(
+            collapsed,
+            specs,
+            block.expanded_inner_lines,
+            ansi_marks_of(block.expanded_inner_extmarks)
+        )
+    )
     reanchor_end_extmark(self, block, inner_start + #collapsed)
 
     block.expanded = false
@@ -3042,6 +3085,18 @@ function History:_set_tool_block_expanded(target_block, expanded)
         end
     end)
     local written = expanded and target_block.expanded_inner_lines or target_block.collapsed_inner_lines
+    if not expanded then
+        apply_mapped_ansi(
+            self,
+            inner_start,
+            Tools.map_collapsed_ansi(
+                target_block.collapsed_inner_lines,
+                target_block.collapsed_specs,
+                target_block.expanded_inner_lines or {},
+                ansi_marks_of(target_block.expanded_inner_extmarks or {})
+            )
+        )
+    end
     reanchor_end_extmark(self, target_block, inner_start + #written)
     target_block.expanded = expanded
     -- Toggle fold indicator on header line
@@ -3194,13 +3249,15 @@ function History:toggle_blocks_expanded()
     return self:set_blocks_expanded(not self:_all_blocks_expanded())
 end
 
+--- Raw (still escape-bearing) live-update text. Sanitizing happens on the way
+--- into the buffer so `Ansi.scan` can turn SGR sequences into highlight spans.
 ---@param msg table?
 ---@return string?
 local function extract_tool_update_text(msg)
     local partial = msg and msg.partialResult
     local content = partial and partial.content
     if type(content) == "string" then
-        local trimmed = vim.trim(Tools.sanitize_text(content))
+        local trimmed = vim.trim(content)
         return trimmed ~= "" and trimmed or nil
     end
     if type(content) ~= "table" then
@@ -3209,9 +3266,9 @@ local function extract_tool_update_text(msg)
     local parts = {}
     for _, item in ipairs(content) do
         if type(item) == "table" and item.type == "text" and type(item.text) == "string" then
-            parts[#parts + 1] = Tools.sanitize_text(item.text)
+            parts[#parts + 1] = item.text
         elseif type(item) == "string" then
-            parts[#parts + 1] = Tools.sanitize_text(item)
+            parts[#parts + 1] = item
         end
     end
     if #parts == 0 then
@@ -3224,7 +3281,7 @@ end
 ---@param text string
 ---@return string[]
 local function build_tool_live_update_lines(text)
-    local output_lines = vim.split(Tools.sanitize_text(text), "\n", { plain = true })
+    local output_lines = vim.split(text, "\n", { plain = true })
     local fences = 0
     for _, line in ipairs(output_lines) do
         if line:match("^```") then
@@ -3242,7 +3299,8 @@ end
 
 ---@param start_row integer
 ---@param lines string[]
-function History:_apply_tool_live_update_extmarks(start_row, lines)
+---@param items? pi.AnsiItem[] escape-free texts + SGR spans for `lines`
+function History:_apply_tool_live_update_extmarks(start_row, lines, items)
     Tools.set_border(self, start_row, Tools.GLYPHS.INDENT)
     for i = 2, #lines do
         local row = start_row + i - 1
@@ -3255,6 +3313,9 @@ function History:_apply_tool_live_update_extmarks(start_row, lines)
                 priority = 200,
             })
         end
+    end
+    if items then
+        Ansi.apply(self._buf, ns, start_row, items)
     end
 end
 
@@ -3317,6 +3378,13 @@ function History:_apply_tool_update(tool_call_id, msg)
         lines = build_tool_live_update_lines(text)
     end
 
+    -- Lex the raw rows first: SGR becomes extmark spans and the buffer only
+    -- ever receives escape-free text (see ui/chat/ansi.lua).
+    local items = Ansi.scan(lines)
+    for i, item in ipairs(items) do
+        lines[i] = item.text
+    end
+
     local start_row
     local old_line_count = block.live_update_line_count
     if block.live_update_extmark and old_line_count then
@@ -3353,7 +3421,7 @@ function History:_apply_tool_update(tool_call_id, msg)
 
     block.live_update_extmark = vim.api.nvim_buf_set_extmark(self._buf, ns, start_row, 0, {})
     block.live_update_line_count = #lines
-    self:_apply_tool_live_update_extmarks(start_row, lines)
+    self:_apply_tool_live_update_extmarks(start_row, lines, items)
     self:_update_status_extmark()
     if self:_should_auto_scroll() then
         self:_scroll_to_bottom()

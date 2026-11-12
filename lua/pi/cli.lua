@@ -29,6 +29,9 @@ local warned_version_unknown = false
 ---@type boolean
 local warned_provider = false
 
+---@type boolean
+local warned_tools_override = false
+
 ---@type string?
 local cached_version = nil
 
@@ -139,6 +142,7 @@ function M._reset()
     warned_gated = {}
     warned_version_unknown = false
     warned_provider = false
+    warned_tools_override = false
     cached_version = nil
     version_probed = false
 end
@@ -211,6 +215,44 @@ function M.args()
     return M.filter_args(cli.args)
 end
 
+--- Drop every `--tools` / `-t` selection (separate value or `=value` form)
+--- from a command array, in place.
+---
+--- Only the caller's local copy is touched: `M.args()` is the shared, filtered
+--- view of `cli.args` and must keep the user's flags for parent processes.
+---@param cmd string[]
+---@return boolean stripped True when at least one selection was removed.
+local function strip_tool_args(cmd)
+    local kept = {} ---@type string[]
+    local stripped = false
+    local i = 1
+    while i <= #cmd do
+        local arg = cmd[i]
+        if type(arg) ~= "string" then
+            kept[#kept + 1] = arg
+            i = i + 1
+        else
+            local name = flag_name(arg)
+            if name == "--tools" or name == "-t" then
+                stripped = true
+                i = i + ((arg == name) and 2 or 1)
+            else
+                kept[#kept + 1] = arg
+                i = i + 1
+            end
+        end
+    end
+    if stripped then
+        for j = 1, #kept do
+            cmd[j] = kept[j]
+        end
+        for j = #kept + 1, #cmd do
+            cmd[j] = nil
+        end
+    end
+    return stripped
+end
+
 --- Absolute path to the plugin root (the directory containing lua/).
 ---@return string
 local function plugin_root()
@@ -275,6 +317,7 @@ end
 ---@class pi.CliCommandOpts
 ---@field subagent? boolean false marks a child (sub-session) process: inject subagent-child.ts instead of subagent.ts (default: parent — inject subagent.ts).
 ---@field extra_args? string[] Extra args appended right after the configured `cli.args`, e.g. `{ "--fork", path }`. Used to bootstrap a session into a new process; plain pass-through (not filtered or version-gated).
+---@field tools? string[] Child tool allowlist; when set it replaces `cli.args`' own --tools for this process.
 
 ---@param opts? pi.CliCommandOpts
 ---@return string[]
@@ -370,6 +413,18 @@ function M.command(opts)
             cmd[#cmd + 1] = "--extension"
             cmd[#cmd + 1] = sub_ext
         end
+    end
+    -- A child tool allowlist replaces the whole tool selection on the pi side,
+    -- so the user's own `--tools` in cli.args would fight it (the last flag
+    -- would win silently). Strip it from this copy of the command and pass
+    -- ours last.
+    if type(opts.tools) == "table" and #opts.tools > 0 then
+        if strip_tool_args(cmd) and not warned_tools_override then
+            warned_tools_override = true
+            Notify.warn("subagent.tools overrides --tools from cli.args for child processes")
+        end
+        cmd[#cmd + 1] = "--tools"
+        cmd[#cmd + 1] = table.concat(opts.tools, ",")
     end
     cmd[#cmd + 1] = "--mode"
     cmd[#cmd + 1] = "rpc"
