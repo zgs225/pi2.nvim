@@ -53,6 +53,17 @@ tail -f ~/.local/state/nvim/log/pi/*/rpc.log
 
 When filing an issue, attaching the relevant section of `rpc.log` is by far the most useful thing you can include.
 
+## The first open is slow
+
+pi2.nvim loads on first use, so the first `<leader>ap` (`:Pi`, `pi.toggle()`, …) also runs the **startup status rebuild**: every sub-session manifest under `~/.pi/agent/sessions` is reconciled, and each child's transcript is consulted to recover its run status. That work is kept off the byte path — session ids resolve from the `<timestamp>_<id>.jsonl` filename convention, a transcript is read from its **end** (the last JSONL entry is the answer), and a transcript whose mtime has not changed since the last rebuild is not read again — so on a multi-GB sessions tree the rebuild costs a few hundred milliseconds, not seconds.
+
+Two costs are still expected:
+
+- **The first start after upgrading** re-infers every recorded child once, because the previous build left no mtime stamp to short-circuit on. That pass costs roughly a millisecond per sub-session row and stamps the mtime, so the next start skips them: a one-off, not a leak.
+- **A large history tree costs more.** `ls ~/.pi/agent/sessions | wc -l` counts workspaces — one per project *and* one per git worktree. Abandoned ones keep their manifests in the scan; deleting a `--…--` directory you no longer need removes that project's session history, sub-session metadata included.
+
+If the first open still takes seconds, the rebuild — not the chat UI — is what to measure: time `require("pi.sessions.manager")` (which lazy-loads the plugin) and `require("pi").setup({})` under your config, then report the numbers. Pushing the first open back into the seconds range is a bug: the budget is an iron rule (`AGENTS.md` → *Startup cost is a hard budget*), and `tests/subsessions_rebuild_spec.lua` / `tests/subsessions_read_spec.lua` pin it.
+
 ## Sub-agent wait stuck after children finish
 
 `wait_subagents` / `dispatch_subagents({ wait = true })` blocks the parent pi process on a host `select` until Neovim replies with `extension_ui_response`. The tunneled sub-agent tools forward the tool `AbortSignal` to that select, so `:PiAbort` interrupts a pending wait immediately instead of hanging until `subagent.batch_timeout_ms`. If a reply is dropped (encode/send failure), the parent may still stay busy even though the child row looks idle and `.pi2-sub-batches.json` already says `completed` — abort the parent (`:PiAbort`) and retry the wait. With `debug = true` or `:PiToggleDebug`, `rpc.log` should show the `extension_ui_response` (or `Failed to encode RPC command` / `Failed to send RPC command`).
