@@ -54,6 +54,7 @@ const HOST_TITLE = "__pi_subagent__";
  */
 const ORCHESTRATOR_NOTE = [
 	"You are a coding agent that may spawn subagents. Use them for parallelizable, modular, or context-heavy work: independent modules, broad exploration, large migrations, batch fixes, and separate review/testing. Keep architecture, interfaces, and final integration. Avoid them for small edits, tightly coupled changes, sequential dependencies, or shared runtime context. Give each subagent clear scope, exclusive files, acceptance criteria, and concise reports. Spawn only when coordination cost beats doing it yourself.",
+	'Constrain a read-only child with tools: ["read", "grep", "find", "ls"] so it cannot edit — a prompt alone will not stop it.',
 ].join("\n");
 
 const ModelRefSchema = Type.Object(
@@ -194,9 +195,9 @@ const ItemRefSchema = Type.Optional(
  *
  * The union is documentation, not enforcement: these TypeBox objects do not set
  * `additionalProperties: false`, so a payload that adds `name` / `model` /
- * `thinking_level` to a reuse item still validates against the reuse variant.
- * lua/pi/subsessions/batch.lua:normalize_item is the enforcement point and
- * fails such an item with a self-correcting error.
+ * `thinking_level` / `tools` to a reuse item still validates against the reuse
+ * variant. lua/pi/subsessions/batch.lua:normalize_item is the enforcement point
+ * and fails such an item with a self-correcting error.
  *
  * Union-of-objects is safe even for Google: pi only converts tool schemas to
  * the legacy `parameters` / strict OpenAPI form for tools that opt in via
@@ -224,6 +225,12 @@ const DispatchItemSchema = Type.Union([
 					"Thinking level for the new child: 'off', 'minimal', 'low', 'medium', 'high', 'xhigh' or 'max'. Pair it with the model choice: low/off for mechanical, fully-specified tasks, high for deep debugging, design or cross-file architecture work. Only meaningful for a reasoning-capable model. Omitted: inherits the parent's level when the child also inherits the parent's model, otherwise the backend default.",
 			}),
 		),
+		tools: Type.Optional(
+			Type.Array(Type.String(), {
+				description:
+					"Tool allowlist for the new child (e.g. ['read', 'grep', 'find', 'ls'] for a read-only scout). Replaces the whole tool selection, so list every tool the child needs. Omit to inherit every tool. Rejected on reuse items (`{ target, message }`) — the child keeps its configuration.",
+			}),
+		),
 	}),
 	Type.Object({
 		ref: ItemRefSchema,
@@ -233,7 +240,7 @@ const DispatchItemSchema = Type.Union([
 		}),
 		message: Type.String({
 			description:
-				"Follow-up message for that child. It keeps its prior conversation and its own model/thinking level. The spawn-only fields (`name`, `model`, `thinking_level`) are rejected here rather than ignored.",
+				"Follow-up message for that child. It keeps its prior conversation and its own model/thinking level. The spawn-only fields (`name`, `model`, `thinking_level`, `tools`) are rejected here rather than ignored.",
 		}),
 	}),
 ]);
@@ -295,7 +302,7 @@ export default function subagentBridge(pi: ExtensionAPI) {
 		label: "Dispatch Sub-agents",
 		promptSnippet: "Run sub-agent tasks in parallel (fan out, or reuse an existing child)",
 		description:
-			"Run one or more sub-agent tasks in parallel. Each item is either { task, ... } (spawn a new child) or { target, message } (reuse an existing id from list_subagents). Prefer reuse when list_subagents already has a matching child — dormant, completed, failed and interrupted ids are revived automatically; do not spawn a new child only because status is not active. Spawn items take an optional `name`, `model` and `thinking_level`; on reuse items those three spawn-only fields are rejected rather than ignored (the revived child keeps its own configuration), and `target` must belong to this session's lineage. Returns the batch snapshot { batch_id, status, summary, items }, where `status` is 'running' until terminal ('completed', 'partial', 'failed' or 'cancelled'), item statuses are 'queued', 'spawning', 'running', 'ok', 'failed' or 'cancelled', and `summary` counts { total, done, ok, failed, cancelled, running }. A batch is limited to subagent.max_batch_size items (default 5) and to subagent.max_children concurrent children per parent lineage (default 5; dormant target revivals count toward the cap alongside new spawns, while reusing an alive child does not; hitting the cap auto-closes the oldest settled child outside this batch's reuse targets to make room, failing only if all live children are active); exceeding either returns { error } with no batch_id, as does an item that is neither a valid spawn nor a valid reuse. Collect results with wait:true, or poll_subagents / wait_subagents on the returned batch_id. Default failure policy: collect_errors.",
+			"Run one or more sub-agent tasks in parallel. Each item is either { task, ... } (spawn a new child) or { target, message } (reuse an existing id from list_subagents). Prefer reuse when list_subagents already has a matching child — dormant, completed, failed and interrupted ids are revived automatically; do not spawn a new child only because status is not active. Spawn items take an optional `name`, `model`, `thinking_level` and `tools` (the last replaces the child's whole tool selection, so list every tool it needs); on reuse items those four spawn-only fields are rejected rather than ignored (the revived child keeps its own configuration), and `target` must belong to this session's lineage. Returns the batch snapshot { batch_id, status, summary, items }, where `status` is 'running' until terminal ('completed', 'partial', 'failed' or 'cancelled'), item statuses are 'queued', 'spawning', 'running', 'ok', 'failed' or 'cancelled', and `summary` counts { total, done, ok, failed, cancelled, running }. A batch is limited to subagent.max_batch_size items (default 5) and to subagent.max_children concurrent children per parent lineage (default 5; dormant target revivals count toward the cap alongside new spawns, while reusing an alive child does not; hitting the cap auto-closes the oldest settled child outside this batch's reuse targets to make room, failing only if all live children are active); exceeding either returns { error } with no batch_id, as does an item that is neither a valid spawn nor a valid reuse. Collect results with wait:true, or poll_subagents / wait_subagents on the returned batch_id. Default failure policy: collect_errors.",
 		parameters: Type.Object({
 			items: Type.Array(DispatchItemSchema, {
 				description:

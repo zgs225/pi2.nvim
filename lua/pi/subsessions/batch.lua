@@ -33,6 +33,7 @@ local waiters = {}
 ---@field name? string
 ---@field model? pi.ModelRef
 ---@field thinking_level? string
+---@field tools? string[] Child tool allowlist (spawn items only; nil = inherit every tool)
 ---@field status "queued"|"spawning"|"running"|"ok"|"failed"|"cancelled"
 ---@field generation? integer
 ---@field output? string
@@ -436,8 +437,8 @@ local function normalize_item(raw, index)
     end
     if is_reuse then
         -- Spawn-only fields are rejected rather than silently dropped: a reused
-        -- child keeps its own model/thinking level and name.
-        for _, field in ipairs({ "name", "model", "thinking_level" }) do
+        -- child keeps its own model/thinking level, name and tool allowlist.
+        for _, field in ipairs({ "name", "model", "thinking_level", "tools" }) do
             if present(raw[field]) then
                 return nil, ("item %d: `%s` is not accepted on a reuse item ({ target, message })"):format(index, field)
             end
@@ -454,12 +455,19 @@ local function normalize_item(raw, index)
             nil
     end
     if is_spawn then
+        -- `tools` is a whole-selection allowlist, so a malformed value must fail
+        -- the item: silently dropping it would hand the child every tool.
+        local tools, tools_err = Manifest.normalize_tools(present(raw.tools) and raw.tools or nil)
+        if tools_err then
+            return nil, ("item %d: %s"):format(index, tools_err)
+        end
         return {
             ref = ref,
             task = raw.task,
             name = type(raw.name) == "string" and raw.name or nil,
             model = present(raw.model) and raw.model or nil,
             thinking_level = present(raw.thinking_level) and raw.thinking_level or nil,
+            tools = tools,
             status = "queued",
         },
             nil
@@ -506,6 +514,7 @@ local function run_batch(batch, parent)
                 name = item.name,
                 model = item.model,
                 thinking_level = item.thinking_level,
+                tools = item.tools,
                 agent_spawned = true,
             }, function(child, err)
                 local b, live = live_item("spawning")

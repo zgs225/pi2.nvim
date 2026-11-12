@@ -11,7 +11,7 @@ local MANIFEST_FILE = ".pi2-subsessions.json"
 ---@field parent_id string
 ---@field name string
 ---@field task_prompt string
----@field config { model: pi.ModelRef, thinking_level?: string }
+---@field config { model: pi.ModelRef, thinking_level?: string, tools?: string[] }
 ---@field status "active"|"completed"|"failed"|"interrupted"|"dormant"
 ---@field reported boolean
 ---@field last_report? string
@@ -69,6 +69,39 @@ end
 ---@return string
 function M.path()
     return History.get_sessions_dir() .. "/" .. MANIFEST_FILE
+end
+
+--- Normalize a child tool allowlist (`subagent.tools`, a spawn item's `tools`
+--- field, or a persisted manifest entry's `config.tools`).
+---
+--- `nil` is the documented default and means "inherit every tool", so it passes
+--- through untouched. An empty array is rejected instead of meaning "no tools":
+--- a child with no tools at all cannot do the work it was spawned for, which is
+--- invariably a caller mistake rather than an intent.
+---@param value any
+---@return string[]? normalized Fresh array of tool names (safe to mutate), or nil
+---@return string? err Human-readable reason when `value` is not a valid allowlist
+function M.normalize_tools(value)
+    if value == nil then
+        return nil, nil
+    end
+    if type(value) ~= "table" then
+        return nil, "tools must be an array of tool names"
+    end
+    if #value == 0 then
+        return nil, "tools must list at least one tool; omit it to inherit every tool"
+    end
+    local out = {} ---@type string[]
+    for i, item in ipairs(value) do
+        -- Rejected rather than trimmed: a padded name is a typo, and silently
+        -- accepting it would let "read " reach the CLI. The array is a fresh
+        -- copy so the caller's table is never aliased through the result.
+        if type(item) ~= "string" or item == "" or item:find("%s") or item:find(",", 1, true) then
+            return nil, ("tools[%d] must be a single tool name without commas or whitespace"):format(i)
+        end
+        out[#out + 1] = item
+    end
+    return out, nil
 end
 
 --- Drop the in-memory cache and spawn reservations (tests / path overrides).

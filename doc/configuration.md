@@ -217,6 +217,7 @@ require("pi").setup({
         max_children = 5,           -- max live child processes per parent lineage (auto-closes oldest settled child to make room; dead don't count)
         report_mode = "last_message", -- completion report uses child's last assistant output
         default_config = "inherit",   -- "inherit" parent model/thinking, or "default"
+        -- tools = { "read", "grep", "find", "ls" }, -- child tool allowlist: replaces the whole selection (nil = inherit every tool)
         max_batch_size = 5,           -- max items per dispatch_subagents batch
         batch_timeout_ms = 300000,    -- default wait_subagents timeout (5 min)
         batch_ttl_hours = 24,         -- retain completed batch records (hours)
@@ -467,6 +468,8 @@ Notes on a few fields:
 - `layout.default`, `layout.side`, and `layout.float` each also accept a **function** returning the value, so you can compute sizes from `vim.o.columns` / `vim.o.lines` at open time. A function-return for `side`/`float` is deep-merged over the defaults, so returning a partial table is fine.
 - `panels.<panel>.name` takes a `fun(tab_id): string` that computes the underlying buffer name per tab — useful for distinguishing multiple π conversations in `:buffers`, statuslines, or tab bars.
 - Several fields (`diff.keys`, `dialog.keys`, `zen.keys`) accept **key specs** — plain strings, `{ key, modes = ... }` tables, or lists of those. See [Keymaps](keymaps.md#key-specs).
+
+`subagent.tools` narrows the tools a **child** sub-session may call; it is deliberately absent from the defaults table because `nil` *is* the default — every child inherits every tool, the pre-feature behavior. Set it to a list of tool names (`{ "read", "grep", "find", "ls" }`) and each child spawned from then on runs with `pi --tools read,grep,find,ls`. That list **replaces** the child's whole tool selection rather than adding to it, so it must name every tool the child needs, and an empty array is rejected (`tools must list at least one tool; omit it to inherit every tool`) instead of meaning "no tools". One pi-side limit makes it a soft constraint: `--tools` only filters the tools declared to the model, so MCP tools stay callable regardless. A single `dispatch_subagents` spawn can override the setting per item, and the resolved allowlist is persisted per child — see [Sessions → Constraining a child's tools](sessions.md#constraining-a-childs-tools).
 
 ## CLI args and version gating
 

@@ -355,7 +355,7 @@ function Rpc:_dispatch(msg)
 end
 
 ---@return boolean
----@param opts? { subagent?: boolean }
+---@param opts? { subagent?: boolean, tools?: string[] } `subagent = false` marks a child process; `tools` is that child's tool allowlist, forwarded to the CLI as `--tools` (replacing any `--tools` from cli.args).
 function Rpc:start(opts)
     opts = opts or {}
     if self._job_id then
@@ -364,7 +364,7 @@ function Rpc:start(opts)
     self._stdout_parts = {}
     -- A stale process's pending callbacks must never survive into the new one.
     self._pending = {}
-    local cmd = Cli.command({ subagent = opts.subagent })
+    local cmd = Cli.command({ subagent = opts.subagent, tools = opts.tools })
     -- The bundled vision extension reads its configured model from this
     -- runtime file on every input event (config.setup keeps it published).
     -- The auto-title extension reads its options from PI_NVIM_TITLE_FILE on

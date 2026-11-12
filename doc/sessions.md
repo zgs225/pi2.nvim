@@ -88,6 +88,26 @@ When a user-spawned child finishes, its last assistant message is injected into 
 
 A settled child's RPC process does **not** exit on its own — it stays alive so `dispatch_subagents` can reuse it without a respawn. To keep long sessions from accumulating dozens of idle `pi` processes, pi2.nvim closes them automatically once they have been idle for `subagent.reap_after_minutes` (default 30): the manifest row turns `dormant`, the child's session JSONL is kept on disk, and the child stays fully revivable via `:PiSubSwitch` or `dispatch_subagents({ target, message })`. A periodic sweep every `subagent.reap_sweep_minutes` (default 10) is the backstop: it also catches children settled before the last restart or whose manifest row went missing, and it skips anything still `active` (revived / running a new task), any process that is already gone, and any child that is the current session of an open tab. Set both options to `0` to disable reaping entirely (`reap_after_minutes = 0` alone disables the event-driven close; `reap_sweep_minutes = 0` alone disables only the periodic sweep). In addition, when `dispatch_subagents`, spawn, or revive reaches `subagent.max_children`, settled-but-alive children are immediately auto-reaped oldest-first (by `last_active_at` LRU, skipping children currently viewed in an open tab and targets scheduled for reuse in the current batch) to make room, failing only if all live children are active or viewed.
 
+### Constraining a child's tools
+
+A child starts with the full tool surface of its backend, which is the wrong default for a scout: asked to "only read", a model will usually still reach for `bash` or an edit tool when a prompt makes that convenient. `subagent.tools` moves the constraint to the process level — a list of tool names forwarded to the child as `pi --tools read,grep,find,ls`, so the restricted tools are not merely discouraged but missing from the list the model is given:
+
+```lua
+require("pi").setup({
+    subagent = {
+        tools = { "read", "grep", "find", "ls" }, -- every child spawned from now on
+    },
+})
+```
+
+The list **replaces** the child's whole tool selection, so it has to contain everything that child needs: a search task whose allowlist omits `grep` cannot search, and one that omits `read` has nothing to look at. An empty array is an error (`tools must list at least one tool; omit it to inherit every tool`), never "no tools at all" — a child that can do nothing is invariably a caller mistake. The allowlist is also soft in one direction that bites: pi's `--tools` only filters the tools *declared to the model*, so MCP tools stay callable no matter what the list says and cannot be switched off from here. Leave the option unset (`nil`, the default — it is intentionally not in the defaults table) and every child inherits every tool, exactly as before. The `:PiSubNew` dialog has no tools field, so it can only spawn with whatever `subagent.tools` says; a one-off restriction comes from the Agent tool below, or from Lua via `require("pi.subsessions").spawn(parent, { task = "…", tools = { … } })`.
+
+For a single child, pass `tools` on the spawn item instead of changing the global setting: `dispatch_subagents({ items = { { task = "…", tools = { "read", "grep", "find", "ls" } } } })`. Precedence is item `tools` → `subagent.tools` → `nil` (inherit all), so one read-only scout can sit in the same batch as a sibling that may edit. A reuse item (`{ target, message }`) **refuses** `tools`, just like `name`, `model` and `thinking_level`, and fails the item instead of silently dropping it: the child already has a configuration, and reviving it keeps that one.
+
+The resolved allowlist is persisted in the manifest entry's `config.tools`, so the restriction outlives the process: after [idle reaping](#idle-process-reaping), `:PiSubSwitch` and `dispatch_subagents({ target, message })` revive the child with the same `--tools` it was spawned with, and a later `setup()` change only applies to children spawned afterwards. A manifest written before this feature has no `config.tools` and revives unrestricted; a corrupted value is ignored with a warning (`sub-session tool allowlist ignored on revive: …`) rather than blocking the revival. If your `cli.args` carries its own `--tools` / `-t`, the child's command line drops it in favour of the resolved allowlist and warns once (`subagent.tools overrides --tools from cli.args for child processes`) — the parent process keeps the flag untouched, so a parent can still run with a different selection.
+
+This has to be a flag rather than a sentence because a prompt is advice: the orchestrator note now tells the parent *Constrain a read-only child with `tools: [...]` so it cannot edit — a prompt alone will not stop it*, and that sentence is static text so the parent's system prompt stays byte-constant (prompt cache intact). The note teaches the mechanism; the mechanism does the restricting.
+
 ### Sub-session names
 
 A child's label — its row in `:PiSessions`, the entries of the `:PiSubSwitch` / `:PiSubView` pickers, the `dispatch_subagents` block header, and the completion notice above — resolves in this order:
