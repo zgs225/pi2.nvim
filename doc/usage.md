@@ -38,6 +38,8 @@ The chat is rendered in one of two layouts.
 
 Pick a default with `layout.default = "side" | "float"`, or override per-invocation with `:Pi layout=side` / `:Pi layout=float`. Side dimensions live under `layout.side` (`position` is `"left"`, `"right"`, or `"bottom"`, plus `width`); float dimensions live under `layout.float` (`width`, `height`, `border`). Both `side` and `float` also accept a function returning the table, which lets you compute size based on screen dimensions or other state at open time.
 
+A second start flag selects the *workspace*: `:Pi worktree=<name>` / `:PiNewTab worktree=<name>` opens a **fresh** conversation in an **existing** managed worktree (`<repo>/.worktrees/<name>`, see [Worktrees](worktrees.md)). No checkout is created and none is removed — the flag only chooses where the new session runs, and `worktree=` names complete in both commands. `:PiNewTab` always opens a new tab; `:Pi` uses the current tab and refuses while it already runs a session (the message points at `:PiNewTab`). An unknown name is an error rather than an implicit create — use `:PiWorktreeNew <name>` for that — and `:PiContinue` / `:PiResume` reject the flag, because they pick their own workspace.
+
 Each chat contains three panels:
 
 | Panel | Filetype | Role |

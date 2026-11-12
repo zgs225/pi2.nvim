@@ -246,10 +246,10 @@ require("pi").setup({
 
 | Command | Description |
 | --- | --- |
-| `:Pi [layout=side\|float]` | Open or toggle the chat in the current tab |
-| `:PiNewTab` | Open a fresh session in a new tabpage |
+| `:Pi [layout=side\|float] [worktree=<name>]` | Open or toggle the chat in the current tab (optionally in an existing worktree) |
+| `:PiNewTab [worktree=<name>]` | Open a fresh session in a new tabpage (optionally in an existing worktree) |
 | `:PiContinue [layout=side\|float]` | Continue the most recent session for the current working directory |
-| `:PiResume [layout=side\|float]` | Pick and resume a past session for the current working directory — with Telescope: `<CR>`/`o` here, `t`/`<C-t>` in a new tab |
+| `:PiResume [layout=side\|float]` | Pick and resume a past session for the current working directory, grouped per checkout — with Telescope: `<CR>`/`o` here, `t`/`<C-t>` in a new tab |
 | `:PiToggleChat` | Toggle chat visibility |
 | `:PiToggleLayout` | Switch between side and float layout |
 | `:PiAbort` | Abort the current agent operation |

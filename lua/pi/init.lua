@@ -466,6 +466,21 @@ function M.worktree_fork(opts)
     require("pi.worktree_session").fork(opts)
 end
 
+--- Open a fresh session in an **existing** git worktree
+--- (`:Pi worktree=<name>` / `:PiNewTab worktree=<name>`): no checkout is
+--- created and none is ever removed, so a failure leaves the user's work
+--- alone. The target must already exist — `name` resolves to
+--- `<repo>/.worktrees/<name>`, `cwd` wins when given and must itself be a
+--- linked worktree — otherwise the call errors and points at
+--- `:PiWorktreeNew` for creation. The current tabpage is used when
+--- `new_tab = false` (refused while it already runs a session), a new tab
+--- otherwise (default).
+---@param opts pi.WorktreeOpenOpts
+---@param callback? fun(session: pi.Session?, err?: string)
+function M.worktree_open(opts, callback)
+    require("pi.worktree_session").open_existing(opts, callback)
+end
+
 --- Move the current worktree session onto an explicit branch
 --- (:PiWorktreeBranch), since worktrees start on a detached HEAD.
 ---@param branch string

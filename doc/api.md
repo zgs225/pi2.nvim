@@ -30,6 +30,8 @@ pi.worktree_new(opts?)        -- start a fresh session in a new git worktree (:P
                               -- opts: { name?, layout? }
 pi.worktree_fork(opts?)       -- fork the current conversation into a new git worktree (:PiWorktreeFork);
                               -- opts: { name?, layout? }
+pi.worktree_open(opts?, cb?)  -- start a fresh session in an EXISTING worktree (:Pi worktree=<name> /
+                              -- :PiNewTab worktree=<name>); opts: { name?, cwd?, layout?, new_tab? }
 pi.worktree_branch(branch)    -- put the current worktree session on `branch`, creating it
                               -- when it does not exist (:PiWorktreeBranch)
 pi.worktree_apply(opts?)      -- review a worktree's patch in the diff-review panel and apply it to
@@ -131,7 +133,7 @@ Most functions are no-ops (or warn) when no session is active in the current tab
 
 ## Worktrees
 
-The six `pi.worktree_*` entry points above mirror the [`:PiWorktree*` commands](worktrees.md) one-to-one and share their rules: a session inside a worktree refuses to create a nested one, `worktree_apply` never commits and never touches the index, `worktree_ship` never sends the prompt, and `worktree_remove` refuses while a live session runs in the checkout.
+The seven `pi.worktree_*` entry points above cover the [`:PiWorktree*` commands](worktrees.md) and the `worktree=<name>` start flag, and share their rules: a session inside a worktree refuses to create a nested one, `worktree_apply` never commits and never touches the index, `worktree_ship` never sends the prompt, `worktree_remove` refuses while a live session runs in the checkout, and `worktree_open` never creates or removes a checkout — an existing one only.
 
 ```lua
 local pi = require("pi")
@@ -142,6 +144,9 @@ pi.worktree_new({ name = "fix-auth", layout = "side" })
 -- Carry this conversation into a new checkout (parent session left untouched).
 pi.worktree_fork({ name = "spike" })
 
+-- Fresh session in a checkout that already exists (no create, no remove).
+pi.worktree_open({ name = "fix-auth", layout = "side" }, function(session, err) ... end)
+
 -- Git side of the current worktree session.
 pi.worktree_branch("feat/auth")
 
@@ -151,7 +156,7 @@ pi.worktree_ship()
 pi.worktree_remove({ name = "spike" })
 ```
 
-Each accepts an optional **second argument** — `fun(ok: boolean, err?: string)` — called on the terminal path (except a user-cancelled review or a cancelled removal, which simply report `false`). `pi.worktree_new` / `pi.worktree_fork` take `fun(session: pi.Session?)` instead, so a script can follow the session they started.
+Each accepts an optional **second argument** — `fun(ok: boolean, err?: string)` — called on the terminal path (except a user-cancelled review or a cancelled removal, which simply report `false`). `pi.worktree_new` / `pi.worktree_fork` / `pi.worktree_open` take `fun(session: pi.Session?, err?: string)` instead, so a script can follow the session they started.
 
 The git layer is a separate module, `require("pi.worktree")`, which is what `pi.worktree_*` and the sub-session spawner call. It never touches buffers, windows or notifications; every function takes a node-style callback `cb(result, err)` and runs git asynchronously:
 

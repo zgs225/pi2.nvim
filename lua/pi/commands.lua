@@ -5,42 +5,14 @@ local M = {}
 ---@type table<string, string[]>
 local flag_values = { layout = { "side", "float" } }
 
----@param args string
----@return pi.SessionCreateOpts
-local function parse_flags(args)
-    ---@type pi.SessionCreateOpts
-    local flags = {}
-    local layout = args:match("layout=(%S+)")
-    if layout == "side" or layout == "float" then
-        flags.layout = layout
-    end
-    return flags
-end
-
----@param prefix string
----@return string[]
-local function complete_flags(prefix)
-    ---@type string[]
-    local candidates = {}
-    for k, vals in pairs(flag_values) do
-        for _, v in ipairs(vals) do
-            candidates[#candidates + 1] = k .. "=" .. v
-        end
-    end
-    table.sort(candidates)
-    return vim.tbl_filter(function(c)
-        return c:find(prefix, 1, true) == 1
-    end, candidates)
-end
-
---- Complete existing worktree names for `:PiWorktreeApply/Ship/Remove`.
+--- Worktree names of the current session's repository.
+---
 --- Names come from `<repo>/.worktrees/*`, where the repository root is the
 --- current session's worktree root or (falling back) the git checkout its cwd
---- lives in. Completion is best-effort: no worktree module / not in a repo
---- simply yields no candidates, never an error.
----@param prefix string
+--- lives in. Best-effort: no worktree module / not in a repo simply yields no
+--- candidates, never an error.
 ---@return string[]
-local function complete_worktree_names(prefix)
+local function worktree_names()
     local ok, Worktree = pcall(require, "pi.worktree")
     if not ok or type(Worktree) ~= "table" or type(Worktree.detect) ~= "function" then
         return {}
@@ -66,13 +38,104 @@ local function complete_worktree_names(prefix)
             if type(Worktree.validate_name) == "function" then
                 valid = Worktree.validate_name(name) == true
             end
-            if valid and name:find(prefix, 1, true) == 1 then
+            if valid then
                 names[#names + 1] = name
             end
         end
     end
     table.sort(names)
     return names
+end
+
+---@param prefix string
+---@return string[]
+local function complete_flags(prefix)
+    ---@type string[]
+    local candidates = {}
+    for k, vals in pairs(flag_values) do
+        for _, v in ipairs(vals) do
+            candidates[#candidates + 1] = k .. "=" .. v
+        end
+    end
+    for _, name in ipairs(worktree_names()) do
+        candidates[#candidates + 1] = "worktree=" .. name
+    end
+    table.sort(candidates)
+    return vim.tbl_filter(function(c)
+        return c:find(prefix, 1, true) == 1
+    end, candidates)
+end
+
+--- Flags parsed from a `:Pi*` argument list.
+---
+--- `worktree` is kept beside `pi.SessionCreateOpts` on purpose: only `:Pi` and
+--- `:PiNewTab` act on it (`pi.worktree_open`), while the continue/resume paths
+--- forward their opts to the session manager and refuse the combination
+--- instead of silently dropping the flag.
+---@class pi.CommandFlags
+---@field opts pi.SessionCreateOpts Session creation opts (`layout=`).
+---@field worktree? string Existing worktree name from `worktree=<name>`.
+---@field worktree_error? string Set when `worktree=` carries no name.
+
+---@param args string
+---@return pi.CommandFlags
+local function parse_flags(args)
+    ---@type pi.SessionCreateOpts
+    local opts = {}
+    local layout = args:match("layout=(%S+)")
+    if layout == "side" or layout == "float" then
+        opts.layout = layout
+    end
+
+    ---@type pi.CommandFlags
+    local flags = { opts = opts }
+    local worktree = args:match("worktree=(%S*)")
+    if worktree ~= nil then
+        worktree = vim.trim(worktree)
+        if worktree == "" then
+            flags.worktree_error = "worktree= requires a worktree name"
+        else
+            flags.worktree = worktree
+        end
+    end
+    return flags
+end
+
+--- Reject a malformed `worktree=` value (`worktree=` with nothing after it).
+---@param flags pi.CommandFlags
+---@return boolean ok
+local function check_worktree_value(flags)
+    if not flags.worktree_error then
+        return true
+    end
+    require("pi.notify").error(flags.worktree_error)
+    return false
+end
+
+--- `worktree=` starts a fresh conversation in an *existing* checkout, while
+--- continue/resume pick their own workspace — combining them is ambiguous, so
+--- refuse the flag instead of silently ignoring it.
+---@param flags pi.CommandFlags
+---@param command string
+---@return boolean ok
+local function reject_worktree_flag(flags, command)
+    if not check_worktree_value(flags) then
+        return false
+    end
+    if not flags.worktree then
+        return true
+    end
+    require("pi.notify").warn(command .. " does not take worktree=<name>; use :PiNewTab worktree=" .. flags.worktree)
+    return false
+end
+
+--- Complete existing worktree names for `:PiWorktreeApply/Ship/Remove`.
+---@param prefix string
+---@return string[]
+local function complete_worktree_names(prefix)
+    return vim.tbl_filter(function(name)
+        return name:find(prefix, 1, true) == 1
+    end, worktree_names())
 end
 
 --- Handle :PiSteeringMode / :PiFollowUpMode. With a `mode` argument, set it
@@ -118,19 +181,45 @@ function M.setup()
     local Pi = require("pi")
 
     vim.api.nvim_create_user_command("Pi", function(cmd)
-        Pi.toggle(parse_flags(cmd.args))
+        local flags = parse_flags(cmd.args)
+        if not check_worktree_value(flags) then
+            return
+        end
+        if flags.worktree then
+            -- Current tabpage: `open_existing` refuses when it already runs a
+            -- session, instead of silently stealing the tab.
+            Pi.worktree_open({ name = flags.worktree, layout = flags.opts.layout, new_tab = false })
+            return
+        end
+        Pi.toggle(flags.opts)
     end, { nargs = "*", complete = complete_flags, desc = "Show or toggle π chat" })
 
-    vim.api.nvim_create_user_command("PiNewTab", function()
+    vim.api.nvim_create_user_command("PiNewTab", function(cmd)
+        local flags = parse_flags(cmd.args)
+        if not check_worktree_value(flags) then
+            return
+        end
+        if flags.worktree then
+            Pi.worktree_open({ name = flags.worktree, layout = flags.opts.layout, new_tab = true })
+            return
+        end
         Pi.new_tab()
-    end, { desc = "Open a fresh π session in a new tab" })
+    end, { nargs = "*", complete = complete_flags, desc = "Open a fresh π session in a new tab" })
 
     vim.api.nvim_create_user_command("PiContinue", function(cmd)
-        Pi.continue_session(parse_flags(cmd.args))
+        local flags = parse_flags(cmd.args)
+        if not reject_worktree_flag(flags, ":PiContinue") then
+            return
+        end
+        Pi.continue_session(flags.opts)
     end, { nargs = "*", complete = complete_flags, desc = "Continue last π conversation" })
 
     vim.api.nvim_create_user_command("PiResume", function(cmd)
-        Pi.resume_session(parse_flags(cmd.args))
+        local flags = parse_flags(cmd.args)
+        if not reject_worktree_flag(flags, ":PiResume") then
+            return
+        end
+        Pi.resume_session(flags.opts)
     end, { nargs = "*", complete = complete_flags, desc = "Select a past π conversation" })
 
     vim.api.nvim_create_user_command("PiToggleChat", function()
