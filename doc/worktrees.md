@@ -2,11 +2,12 @@
 
 π sessions are cheap, and several of them can share one checkout — until they start editing the same files, or until one of them switches a branch under the others. A **git worktree session** gives a conversation its own checkout of the same repository, created under `<repo>/.worktrees/<name>` and left on a **detached HEAD**, so parallel agents never race on one working tree or on a branch.
 
-Worktree support is opt-in per session, not a mode: you start a session in a worktree with `:PiWorktreeNew` or `:PiWorktreeFork`, and everything else — a session started with plain `:Pi` — behaves exactly as before.
+Worktree support is opt-in per session, not a mode: you start a session in a worktree with `:PiWorktreeNew` or `:PiWorktreeFork` (or reopen a fresh one in an existing checkout with `worktree=<name>`), and everything else — a session started with plain `:Pi` — behaves exactly as before.
 
 - [What a worktree session is](#what-a-worktree-session-is)
 - [Creating one](#creating-one)
   - [Naming](#naming)
+- [Opening another session in an existing worktree](#opening-another-session-in-an-existing-worktree)
 - [Repository hygiene](#repository-hygiene)
   - [`.gitignore`](#gitignore)
   - [`.worktreeinclude`](#worktreeinclude)
@@ -65,6 +66,24 @@ If the process fails to start after the checkout was created, the fresh worktree
 The optional argument names the directory under `<repo>/.worktrees/`. Without one, the name is generated from the current time plus this Neovim process's pid and a spawn counter (`wt-<YYYYmmdd-HHMMSS>-<pid>-<seq>`) — a timestamp alone repeats within the same second, so back-to-back creations would collide on one directory. Sub-agent checkouts use the same idea with a `sub-` prefix (`sub-<YYYYmmdd-HHMMSS>-<n>-<pid>`), so a batch fanned out at once still gets distinct names.
 
 Valid names are 1–64 characters, must not start with `.`, and may only contain letters, digits, `.`, `_` and `-`. A name is always a single directory component — `:PiWorktreeApply` / `:PiWorktreeShip` / `:PiWorktreeRemove` accept one too, and completion offers the existing names of the current repository.
+
+## Opening another session in an existing worktree
+
+A managed checkout outlives the session that created it: it stays on disk until it is released or removed. To open a **fresh** conversation in one that already exists, pass `worktree=<name>` to a start command instead of creating a checkout:
+
+| Command | What it does |
+| --- | --- |
+| `:PiNewTab worktree=<name>` | Start a fresh conversation in a **new** tabpage whose cwd is `<repo>/.worktrees/<name>`. |
+| `:Pi worktree=<name>` | The same, in the **current** tabpage; refused while that tab already runs a session (the message points at `:PiNewTab`). |
+
+From Lua the same entry point is `pi.worktree_open(opts, callback)`:
+
+```lua
+pi.worktree_open({ name = "fix-auth", layout = "side" }, function(session, err) ... end)
+pi.worktree_open({ cwd = "/repo/.worktrees/fix-auth", new_tab = false })
+```
+
+`new_tab` defaults to `true`; `cwd` wins over `name` and must itself be a linked worktree (the main checkout is refused — open a normal session there). The flag never creates and never removes a checkout: a name that does not exist is an error pointing at `:PiWorktreeNew <name>`, and a failed process start only closes the empty scratch tab — the checkout is left exactly as you left it, because it holds your work. Names complete from the current repository's `<repo>/.worktrees/*` in both commands, and `:PiContinue` / `:PiResume` reject the flag (they pick their own workspace). A worktree's recorded session binding is written only when it has none, so opening a second session there never steals the first one's binding.
 
 ## Repository hygiene
 
@@ -234,7 +253,7 @@ Only checkouts that are provably safe to delete are removed: `applied`, **verifi
 
 ## Resuming across worktrees
 
-`:PiResume` lists the sessions of Neovim's cwd **and of every managed worktree of the same repository**, so a worktree session can be reopened without `:cd`-ing into its checkout. Worktree rows carry the checkout's name (`… · 󰙅 <name>`) and their info table; opening one restarts the process **in that checkout** (closing the current one first when the cwd differs, and refusing while that session is streaming) instead of loading the transcript in the main checkout. Enumeration covers checkouts git still reports (including prunable ones whose directory is gone) **and** checkouts deleted but still present in the snapshot store (`Worktree.snapshot_worktrees` reads `<git common dir>/pi2-worktree-snapshots/`, including the empty patches a clean release leaves). It only runs when the repository has a `.worktrees/` directory or a snapshot store — a plain project keeps the old single-workspace picker and never spawns git for it.
+`:PiResume` lists the sessions of Neovim's cwd **and of every managed worktree of the same repository**, so a worktree session can be reopened without `:cd`-ing into its checkout. Each row carries its checkout's info table, and the picker groups sessions per checkout — a `󰙅 <name>` title per managed worktree and the project name for the main checkout, shown once the list spans two or more checkouts (a single checkout stays a flat list). Opening one restarts the process **in that checkout** (closing the current one first when the cwd differs, and refusing while that session is streaming) instead of loading the transcript in the main checkout. Enumeration covers checkouts git still reports (including prunable ones whose directory is gone) **and** checkouts deleted but still present in the snapshot store (`Worktree.snapshot_worktrees` reads `<git common dir>/pi2-worktree-snapshots/`, including the empty patches a clean release leaves). It only runs when the repository has a `.worktrees/` directory or a snapshot store — a plain project keeps the old single-workspace picker and never spawns git for it.
 
 A listed checkout can be gone by the time you pick it (retention removed it, or it was deleted by hand). Recovery runs **before** any process is touched and never falls back to the main checkout:
 
