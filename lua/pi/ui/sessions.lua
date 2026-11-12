@@ -1478,6 +1478,7 @@ local HELP_ENTRIES = {
     { "t", "Navigate this session's tree (:PiTree)" },
     { "p", "Preview session (read-only viewer)" },
     { "x", "Close sub-session process (:PiSubClose)" },
+    { "W", "New session in this worktree (new tab)" },
     { "<Tab>, za", "Fold / unfold worktree groups and sub-sessions" },
     { "zM, zR", "Collapse / expand all groups and sub-sessions" },
     { "H", "Toggle hidden / prior-conversation sub-sessions (all sessions)" },
@@ -1811,6 +1812,59 @@ local function preview_under_cursor()
     require("pi.ui.subsession_viewer").open(id, { name = row.name, cwd = workspace })
 end
 
+--- Checkout path a row belongs to: the worktree group the row is listed under
+--- (`group_id` is set on a group header and on every member row, the main
+--- checkout partition included), else the row session's detected worktree,
+--- else its cwd.
+---@param row pi.SessionsListRow?
+---@return string?
+function M.row_checkout(row)
+    if not row then
+        return nil
+    end
+    if type(row.group_id) == "string" and row.group_id ~= "" then
+        return row.group_id
+    end
+    local worktree = row.session and row.session.worktree
+    if type(worktree) == "table" and type(worktree.path) == "string" and worktree.path ~= "" then
+        return worktree.path
+    end
+    local cwd = row.session and row.session.cwd
+    if type(cwd) == "string" and cwd ~= "" then
+        return cwd
+    end
+    return nil
+end
+
+--- Open a fresh π session in a new tab rooted at the checkout under the cursor
+--- (the `W` key). Works on a worktree group header, on any row inside a group
+--- and on a row of the main-checkout partition alike. The list stays open: a
+--- created session refreshes it through the normal session events.
+local function new_session_in_worktree_under_cursor()
+    local row = rows[vim.api.nvim_win_get_cursor(0)[1]]
+    if not row then
+        return
+    end
+    local Notify = require("pi.notify")
+    local path = M.row_checkout(row)
+    if not path then
+        Notify.warn("Cannot open a session: this row has no checkout")
+        return
+    end
+    if vim.fn.isdirectory(path) == 0 then
+        Notify.warn("Cannot open a session: " .. vim.fn.fnamemodify(path, ":~") .. " no longer exists")
+        return
+    end
+    local ok, WorktreeSession = pcall(require, "pi.worktree_session")
+    if not ok or type(WorktreeSession) ~= "table" or type(WorktreeSession.open_existing) ~= "function" then
+        Notify.warn("Cannot open a session: worktree session support is unavailable")
+        return
+    end
+    -- `open_existing` reports its own failures (bad target, busy tab, spawn
+    -- errors), so no callback is needed here.
+    WorktreeSession.open_existing({ cwd = path })
+end
+
 --- Toggle fold/unfold for the session under cursor.
 --- On a parent row with children: toggles fold state for that parent.
 --- On a child row: collapses that child's parent and moves cursor to the parent row.
@@ -2069,6 +2123,12 @@ local function ensure_buf()
             require("pi.subsessions").close(row.child_id)
         end
     end, vim.tbl_extend("force", map_opts, { desc = "Close sub-session process" }))
+    vim.keymap.set(
+        "n",
+        "W",
+        new_session_in_worktree_under_cursor,
+        vim.tbl_extend("force", map_opts, { desc = "New session in this worktree (new tab)" })
+    )
     vim.keymap.set(
         "n",
         "<Tab>",
