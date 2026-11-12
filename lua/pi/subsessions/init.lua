@@ -495,15 +495,12 @@ function M.on_parent_resumed(session, session_path)
     require("pi.ui.sessions").request_refresh()
 end
 
---- Worktree metadata for a child session: the `pi.WorktreeInfo` record returned
---- by `pi.worktree.create` / `detect`, round-tripped through the manifest so a
---- revive can reuse the checkout.
---- What the worktree resolver reads from a session: where to create a checkout
---- from, and whether that session already lives in one. A live `pi.Session`
---- qualifies, and so does a synthetic `{ cwd = manifest_workspace }` base used
---- by a revive whose parent process is not running.
----@alias pi.SubsessionWorktreeBase pi.Session|{ cwd?: string, worktree?: table }
-
+--- Worktree metadata recorded on a child's manifest row.
+---
+--- Sub-sessions no longer get a checkout of their own, so a fresh row never
+--- carries one; a row written by an older version still records the checkout
+--- that child used to run in, which `resolve_child_cwd` honours while that
+--- directory exists.
 ---@class pi.SubsessionWorktree
 ---@field path string Worktree root — the child session cwd.
 ---@field name? string Worktree name (`sub-<timestamp>-<n>-<pid>` for children).
@@ -518,9 +515,8 @@ end
 
 --- Worktree module, loaded lazily.
 ---
---- Isolation is an optional layer: when `pi.worktree` cannot be loaded the
---- spawn path keeps working with the parent's cwd (exactly the behavior of an
---- install without the module) instead of failing every sub-session.
+--- Only releasing a leftover child checkout needs it (the reaper's orphan
+--- sweep); when `pi.worktree` cannot be loaded that sweep is simply skipped.
 ---@return table?
 local function worktree_mod()
     local ok, mod = pcall(require, "pi.worktree")
@@ -530,234 +526,34 @@ local function worktree_mod()
     return nil
 end
 
---- True when each new sub-session gets its own worktree (`worktree.isolate_subagents`, default true).
----@return boolean
-local function isolation_enabled()
-    local wt = Config.options.worktree or {}
-    return wt.isolate_subagents ~= false
-end
-
---- Session cwd, or nil when the session has none recorded.
----@param session pi.SubsessionWorktreeBase?
+--- Resolve the cwd a child process runs in.
+---
+--- A sub-session never gets a checkout of its own: a spawned child runs in its
+--- parent's workspace cwd, always, so parallel children share one directory and
+--- its rows (manifest, batch) live where the parent's process runs.
+---
+--- The one exception is a child spawned by an older version, whose row records
+--- the checkout it used to run in: while that directory still exists, that
+--- recorded cwd is a usable workspace, so a revive keeps running there. Once it
+--- is gone the child falls back to the parent's workspace with a single warning
+--- — a revive never creates a checkout and never fails over a missing one.
+---@param recorded pi.SubsessionWorktree? Checkout recorded on the child's manifest row.
+---@param parent_cwd string? Parent workspace cwd (the fallback).
 ---@return string?
-local function session_cwd(session)
-    local cwd = session and session.cwd
-    if type(cwd) == "string" and cwd ~= "" then
-        return cwd
-    end
-    return nil
-end
-
---- The linked worktree `session` already runs in, or nil.
----
---- Sub-sessions never nest worktrees: a child of a session that already lives
---- in one inherits that cwd instead of creating a second checkout (the parent's
---- checkout is never released by a child). `session.worktree` is the manager's
---- own record; `detect` covers a cwd adopted from a resumed session file.
----@param session pi.SubsessionWorktreeBase?
----@return pi.SubsessionWorktree?
-local function detect_worktree(session)
-    if type(session) ~= "table" then
-        return nil
-    end
-    if type(session.worktree) == "table" and type(session.worktree.path) == "string" then
-        return session.worktree
-    end
-    local mod = worktree_mod()
-    local cwd = session_cwd(session)
-    if not mod or type(mod.detect) ~= "function" or not cwd then
-        return nil
-    end
-    local ok, info = pcall(mod.detect, cwd)
-    if ok and type(info) == "table" and info.kind == "linked" and type(info.path) == "string" and info.path ~= "" then
-        return info
-    end
-    return nil
-end
-
---- Monotonic counter behind `child_worktree_name` (per Neovim process).
-local child_worktree_seq = 0
-
---- Unique name for a child checkout.
----
---- `pi.worktree`'s default name is second-resolution (`wt-<YYYYmmdd-HHMMSS>`), so
---- children dispatched together — a batch fans out up to `max_children` at
---- once — would collide on one name. A spawn counter plus the process pid keeps
---- them distinct, also across concurrent Neovim instances. The `sub-` prefix
---- tells child checkouts apart from user-created `wt-*` worktrees.
----@return string
-local function child_worktree_name()
-    child_worktree_seq = child_worktree_seq + 1
-    return ("sub-%s-%d-%x"):format(os.date("%Y%m%d-%H%M%S"), child_worktree_seq, vim.fn.getpid())
-end
-
---- Repository root `mod.detect(cwd)` reports for `cwd`, or nil outside a repository.
----
---- A `main` info names the main work tree in `path`; a linked one points at it
---- through `repo_root`.
----@param mod table
----@param cwd string
----@return string?
-local function detected_repo_root(mod, cwd)
-    if type(mod.detect) ~= "function" then
-        return nil
-    end
-    local ok, info = pcall(mod.detect, cwd)
-    if not ok or type(info) ~= "table" then
-        return nil
-    end
-    local root = info.kind == "main" and (info.path or info.repo_root) or info.repo_root
-    if type(root) == "string" and root ~= "" then
-        return root
-    end
-    return nil
-end
-
---- Name to recreate a recorded checkout under.
----
---- The recorded name is authoritative — it *is* the directory component under
---- `<repo>/.worktrees/`; rows written before names were tracked fall back to the
---- recorded path's basename, which is the directory that checkout used.
----@param reuse pi.SubsessionWorktree
----@return string
-local function recorded_worktree_name(reuse)
-    if type(reuse.name) == "string" and reuse.name ~= "" then
-        return reuse.name
-    end
-    return vim.fn.fnamemodify(reuse.path, ":t")
-end
-
---- Resolve the cwd (and owned worktree) a child process should start in.
----
---- Cases, in order:
---- 1. `reuse` — a worktree recorded on the child's manifest row (revive) that
----    still exists on disk is reused as-is, dirty or not: it holds that
----    child's uncommitted work.
---- 2. the parent already lives in a linked worktree — the child inherits that
----    cwd and owns nothing (a parent's worktree is never released by a child).
---- 3. a recorded checkout that is gone is recreated at its recorded path (same
----    repository only) — see the block below.
---- 4. otherwise create a fresh worktree for the child.
----
---- `info` is only non-nil when the child *owns* the worktree (created or
---- reused), so callers know what `release` may later delete. `err` is set only
---- when a creation fails — the caller must then release its spawn reservation and
---- report the error, never silently share the parent's directory.
----@param parent pi.SubsessionWorktreeBase? Live parent, or a synthetic
----   `{ cwd = manifest_workspace }` base when the parent process is not running.
----@param reuse pi.SubsessionWorktree?
----@param callback fun(info: pi.SubsessionWorktree?, cwd: string?, err: string?)
-local function prepare_worktree(parent, reuse, callback)
-    local mod = worktree_mod()
-    if not mod then
-        callback(nil, session_cwd(parent), nil)
-        return
-    end
-
-    if type(reuse) == "table" and type(reuse.path) == "string" and reuse.path ~= "" then
-        if vim.fn.isdirectory(reuse.path) == 1 then
-            callback(reuse, reuse.path, nil)
-            return
+local function resolve_child_cwd(recorded, parent_cwd)
+    local path = type(recorded) == "table" and recorded.path or nil
+    if type(path) == "string" and path ~= "" then
+        if vim.fn.isdirectory(path) == 1 then
+            return path
         end
+        Notify.warn(
+            ("Sub-session checkout %s is gone; the child runs in %s"):format(
+                path,
+                parent_cwd or "the current directory"
+            )
+        )
     end
-
-    local inherited = detect_worktree(parent)
-    if inherited then
-        callback(nil, inherited.path, nil)
-        return
-    end
-
-    -- Isolation needs a deterministic base to create from. Every live session
-    -- carries `cwd` (the manager sets it), so a missing one means there is no
-    -- workspace to isolate — the child keeps the process default.
-    local cwd = session_cwd(parent)
-    if not cwd then
-        callback(nil, nil, nil)
-        return
-    end
-
-    if not isolation_enabled() or type(mod.create) ~= "function" then
-        callback(nil, cwd, nil)
-        return
-    end
-
-    local done = false
-    ---@param info pi.SubsessionWorktree?
-    ---@param dir string?
-    ---@param err string?
-    local function finish(info, dir, err)
-        if done then
-            return
-        end
-        done = true
-        callback(info, dir, err)
-    end
-
-    --- Create a checkout; `cb` receives the info or a non-empty error string.
-    ---@param opts pi.WorktreeCreateOpts
-    ---@param cb fun(info: pi.SubsessionWorktree?, err: string?)
-    local function create(opts, cb)
-        local ok, create_err = pcall(mod.create, opts, function(info, err)
-            vim.schedule(function()
-                if type(info) ~= "table" or type(info.path) ~= "string" or info.path == "" then
-                    local reason = (type(err) == "string" and err ~= "") and err
-                        or "failed to create sub-session worktree"
-                    cb(nil, reason)
-                    return
-                end
-                cb(info, nil)
-            end)
-        end)
-        if not ok then
-            cb(nil, "failed to create sub-session worktree: " .. tostring(create_err))
-        end
-    end
-
-    -- A revived child's transcript records the checkout it ran in as its cwd,
-    -- and a resume refuses to load from a missing directory. So a recorded
-    -- checkout that is gone (a clean close released it — the documented normal
-    -- path) must come back at the *same* directory: a freshly named one could
-    -- never be opened, and every revive would repeat the cycle. Replaying is
-    -- only safe within one repository — a checkout of some other repo is
-    -- isolated afresh instead (today's behaviour).
-    if type(reuse) == "table" and type(reuse.path) == "string" and reuse.path ~= "" then
-        local recorded_repo = type(reuse.repo_root) == "string" and reuse.repo_root or nil
-        if recorded_repo and detected_repo_root(mod, cwd) == recorded_repo then
-            local name = recorded_worktree_name(reuse)
-            local base = type(reuse.base_sha) == "string" and vim.trim(reuse.base_sha) or ""
-            create({ cwd = cwd, mode = "new", name = name, base = base ~= "" and base or nil }, function(info, err)
-                if info then
-                    finish(info, info.path, nil)
-                    return
-                end
-                -- The recorded base commit can be gone (rewritten history,
-                -- pruned objects): retry once at the repository HEAD instead of
-                -- failing an otherwise recoverable revive.
-                if base ~= "" and type(err) == "string" and err:find("invalid base commit", 1, true) then
-                    create({ cwd = cwd, mode = "new", name = name }, function(retry_info, retry_err)
-                        if retry_info then
-                            finish(retry_info, retry_info.path, nil)
-                        else
-                            finish(nil, nil, retry_err)
-                        end
-                    end)
-                    return
-                end
-                -- Never fall back to a new name here: the transcript would not
-                -- load, which is exactly the bug this path exists to fix.
-                finish(nil, nil, err)
-            end)
-            return
-        end
-    end
-
-    create({ cwd = cwd, mode = "new", name = child_worktree_name() }, function(info, err)
-        if info then
-            finish(info, info.path, nil)
-        else
-            finish(nil, nil, err)
-        end
-    end)
+    return parent_cwd
 end
 
 --- Ask `pi.worktree` to release an owned worktree.
@@ -829,21 +625,6 @@ function M.release_worktree(child_id)
         end
     end
     return release_worktree_info(info)
-end
-
---- Publish worktree ↔ session ownership to `pi.worktree`.
----@param info pi.SubsessionWorktree?
----@param session_id string?
----@param session_file string?
-local function bind_worktree(info, session_id, session_file)
-    if type(info) ~= "table" then
-        return
-    end
-    local mod = worktree_mod()
-    if not mod or type(mod.bind) ~= "function" then
-        return
-    end
-    pcall(mod.bind, info, { session_id = session_id, session_file = session_file })
 end
 
 --- Session file recorded on a manifest row, when it still exists on disk.
@@ -948,28 +729,21 @@ function M.spawn(parent, opts, callback)
         end
 
         local tab = parent.attached_tab or vim.api.nvim_get_current_tabpage()
-        --- Start the child process in the already-resolved cwd/worktree.
-        ---@param wt pi.SubsessionWorktree? Worktree the child owns (nil when it shares a cwd).
-        ---@param child_cwd string? Process cwd (inherited parent cwd, or nil = process default).
-        local function start_child(wt, child_cwd)
+        --- Start the child process in the parent's workspace cwd.
+        local function start_child()
             local child = Sessions.create_detached(tab, {
                 subagent = false,
                 tools = tools,
-                cwd = child_cwd,
-                worktree = wt,
+                cwd = cwd,
             })
             if not child then
                 unreserve()
-                release_worktree_info(wt)
                 callback(nil, "failed to start sub-session process")
                 return
             end
-            if wt then
-                child.worktree = wt
-            end
             child.parent_id = parent_id
             -- Sub-session bookkeeping for this child lives in the parent's
-            -- workspace manifest, not in the child's own (worktree) cwd.
+            -- workspace manifest — the same directory the child runs in.
             child.manifest_cwd = cwd
             -- First run on a brand-new row. Every later run (revive / reuse)
             -- bumps it, which is what lets the integration engine reject a late
@@ -1019,13 +793,9 @@ function M.spawn(parent, opts, callback)
                     agent_spawned = opts.agent_spawned == true,
                     run_generation = FIRST_RUN_GENERATION,
                     session_file = child.session_file,
-                    worktree = wt or nil,
                     workspace = cwd,
                 }, cwd)
                 unreserve()
-                -- Isolation bookkeeping: `pi.worktree` keeps the worktree's
-                -- session file in sync with the backend session id.
-                bind_worktree(wt, session_id, child.session_file)
                 apply_config(child, config, function(ok, config_err)
                     -- Abort can land during the config round-trip: the child is in
                     -- the manifest but has not received its task yet, so reclaim it
@@ -1096,24 +866,14 @@ function M.spawn(parent, opts, callback)
             end)
         end
 
-        -- Isolate the child before starting its process: a failed worktree
-        -- creation drops the spawn reservation and reports the error instead of
-        -- letting the child work in the parent's checkout.
-        prepare_worktree(parent, nil, function(wt, child_cwd, wt_err)
-            if wt_err then
-                unreserve()
-                callback(nil, wt_err)
-                return
-            end
-            if M.abort_epoch(lineage_id) ~= epoch then
-                -- Freshly created and still empty: nobody owns it yet.
-                release_worktree_info(wt)
-                unreserve()
-                callback(nil, "sub-session aborted while spawning")
-                return
-            end
-            start_child(wt, child_cwd)
-        end)
+        -- No checkout to prepare: the child runs in the parent's workspace, so
+        -- the process starts straight away.
+        if M.abort_epoch(lineage_id) ~= epoch then
+            unreserve()
+            callback(nil, "sub-session aborted while spawning")
+            return
+        end
+        start_child()
     end)
 end
 
@@ -1165,8 +925,8 @@ function M._bind_and_load(current, child, tab, chat, callback)
     local label = parent_name and parent_name.name or "parent"
     chat:set_subsession_breadcrumb(label, root_parent_id)
     -- The backend-reported file is authoritative; the lookup covers a child
-    -- whose process has not reported one yet, searching the child's own
-    -- workspace (its worktree) rather than Neovim's cwd.
+    -- whose process has not reported one yet, searching the child's workspace
+    -- (a leftover checkout of an older child) rather than Neovim's cwd.
     -- The file that *belongs to this child id* is authoritative for a view
     -- switch: when the live process is on a different file, `switch_session`
     -- must move it back. `session_file` is the fallback for a child whose file
@@ -1332,8 +1092,9 @@ function M.revive(child_id, callback)
     end
 
     local recorded = entry_worktree(entry)
-    -- The transcript lives in the child's own workspace — its worktree when it
-    -- has one — which can differ from the manifest workspace.
+    -- The transcript lives in the workspace the child ran in — a leftover
+    -- checkout recorded by an older version — which can differ from the manifest
+    -- workspace.
     local transcript_cwd = (type(recorded) == "table" and recorded.path) or manifest_cwd
     -- Prefer the session file recorded at spawn/revive; fall back to a lookup for
     -- rows written before `session_file` was tracked.
@@ -1384,70 +1145,60 @@ function M.revive(child_id, callback)
     end
 
     local tab = vim.api.nvim_get_current_tabpage()
-    -- A revived child keeps its own worktree when it still exists (dirty work
-    -- included); a child whose worktree is gone is re-isolated the same way a
-    -- fresh spawn is, and never nests inside a parent that already runs in one.
-    local base = Sessions.find_by_lineage(lineage_id) --[[@as pi.SubsessionWorktreeBase?]]
-    if not base and manifest_cwd then
-        -- The parent process is not live (revive from the sessions list), but the
-        -- manifest workspace is still the base a replacement checkout comes from.
-        base = { cwd = manifest_cwd }
-    end
-    prepare_worktree(base, recorded, function(wt, child_cwd, wt_err)
-        if wt_err then
-            unreserve()
-            callback(nil, wt_err)
-            return
-        end
-        local child = Sessions.create_detached(tab, {
-            subagent = false,
-            tools = tools,
-            cwd = child_cwd,
-            worktree = wt,
-        })
-        if not child then
-            unreserve()
-            release_worktree_info(wt)
-            callback(nil, "failed to start process")
-            return
-        end
-        if wt then
-            child.worktree = wt
-        end
-        child.manifest_cwd = manifest_cwd
-        child.run_generation = generation
-        Sessions.ensure_id(child, child_id)
+    -- A child runs in its parent's workspace. A row written by an older version
+    -- may still record the checkout that child used to run in: that recorded cwd
+    -- is honoured while the directory exists, and never recreated when it is not
+    -- (see `resolve_child_cwd`). The parent process owns no live checkout here —
+    -- the manifest workspace stands in for a parent revived from the list.
+    local parent_session = Sessions.find_by_lineage(lineage_id)
+    local parent_cwd = (parent_session and Manifest.workspace(parent_session)) or manifest_cwd
+    local child_cwd = resolve_child_cwd(recorded, parent_cwd)
+    local recorded_path = type(recorded) == "table" and recorded.path or nil
+    local keeps_checkout = type(recorded_path) == "string" and recorded_path ~= "" and recorded_path == child_cwd
+
+    local child = Sessions.create_detached(tab, {
+        subagent = false,
+        tools = tools,
+        cwd = child_cwd,
+    })
+    if not child then
         unreserve()
-        child.parent_id = entry.parent_id
-        -- A revive can rebuild the checkout (the recorded one was gone): record
-        -- the worktree this run actually uses, plus the transcript, so the next
-        -- revive reuses it and settle/release bookkeeping stays accurate.
-        if wt then
-            Manifest.patch(child_id, { worktree = wt, session_file = path, workspace = manifest_cwd }, manifest_cwd)
+        callback(nil, "failed to start process")
+        return
+    end
+    child.manifest_cwd = manifest_cwd
+    child.run_generation = generation
+    Sessions.ensure_id(child, child_id)
+    unreserve()
+    child.parent_id = entry.parent_id
+    -- Record the transcript this run uses. The row's `worktree` only stays while
+    -- the child really runs in that leftover checkout: a gone one is dropped, so
+    -- neither the reaper nor the integration engine acts on a missing directory.
+    Manifest.patch(child_id, {
+        session_file = path,
+        worktree = keeps_checkout and recorded or Manifest.REMOVE,
+        workspace = manifest_cwd,
+    }, manifest_cwd)
+    Sessions.load_session_path(child, path, function(ok)
+        if ok then
+            -- `integration` is deliberately not in this patch: a resume keeps
+            -- the recorded integration outcome (applied / queued / needs
+            -- attention) so the parent can still report what happened to that
+            -- checkout, and the engine can reconcile it.
+            Manifest.patch(child_id, {
+                status = "active",
+                last_active_at = Manifest.iso_now(),
+                run_generation = generation,
+                session_file = child.session_file or path,
+                workspace = manifest_cwd,
+            }, manifest_cwd)
+            callback(child, nil)
+        else
+            unreserve()
+            Sessions.close_session(child)
+            callback(nil, "failed to switch session")
         end
-        bind_worktree(wt, child_id, path)
-        Sessions.load_session_path(child, path, function(ok)
-            if ok then
-                -- `integration` is deliberately not in this patch: a resume keeps
-                -- the recorded integration outcome (applied / queued / needs
-                -- attention) so the parent can still report what happened to that
-                -- checkout, and the engine can reconcile it.
-                Manifest.patch(child_id, {
-                    status = "active",
-                    last_active_at = Manifest.iso_now(),
-                    run_generation = generation,
-                    session_file = child.session_file or path,
-                    worktree = wt or recorded,
-                    workspace = manifest_cwd,
-                }, manifest_cwd)
-                callback(child, nil)
-            else
-                unreserve()
-                Sessions.close_session(child)
-                callback(nil, "failed to switch session")
-            end
-        end, { rebind_parent_context = false })
-    end)
+    end, { rebind_parent_context = false })
 end
 
 --- Adopt a child's own session title as its manifest name.
@@ -1503,7 +1254,7 @@ function M.on_child_settled(child, aborted)
     local SessionList = require("pi.ui.sessions")
 
     -- The child's row lives in the parent's workspace (`manifest_cwd`, set at
-    -- spawn/revive), never in the child's own worktree cwd. A child registered
+    -- spawn/revive), which is also the cwd the child runs in. A child registered
     -- before this field existed, or a row living elsewhere, is located: a settle
     -- that misses the row leaves its batch running forever.
     local manifest_cwd = Manifest.workspace(child)
@@ -1534,9 +1285,9 @@ function M.on_child_settled(child, aborted)
     end
 
     -- Transcript: the backend-reported file is what the child is actually
-    -- writing to (it can live in the child's own worktree workspace); the row's
-    -- recorded file, then an id lookup in the child's workspace, cover a process
-    -- that has not reported one yet.
+    -- writing to (a leftover checkout of an older child has its own workspace);
+    -- the row's recorded file, then an id lookup in the child's workspace, cover
+    -- a process that has not reported one yet.
     local path = child.session_file
     if type(path) ~= "string" or path == "" then
         path = manifest_session_file(entry)
@@ -1964,8 +1715,9 @@ local function rebuild_scope(scope)
     local changed = false
     for id, entry in pairs(manifest) do
         if Manifest.is_entry_id(id) and type(entry) == "table" and entry.parent_id ~= nil then
-            -- The transcript recorded at spawn/revive wins: a child in its own
-            -- worktree keeps its JSONL there, not in the parent's workspace.
+            -- The transcript recorded at spawn/revive wins: a child running in a
+            -- leftover checkout keeps its JSONL there, not in the parent's
+            -- workspace.
             local path = manifest_session_file(entry)
             if not path then
                 index_cache = index_cache or {}

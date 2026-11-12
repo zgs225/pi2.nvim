@@ -7,12 +7,10 @@
  * host bridge; this extension's only job is to append a worker note to the
  * system prompt on every turn (before_agent_start).
  *
- * Prompt-cache friendly: the note is either byte-constant or constant for the
- * whole process. The worktree paragraph is derived once per process from
- * `PI_NVIM_WORKTREE_PATH` (set by lua/pi/rpc.lua from the session's worktree),
- * so the prompt prefix stays stable across turns — same rationale as
- * extensions/vision.ts CAPABILITY_NOTE. The per-task brief travels in the
- * conversation as the child's first user message, not in the system prompt.
+ * Prompt-cache friendly: the note is byte-constant, so the prompt prefix stays
+ * stable across turns — same rationale as extensions/vision.ts CAPABILITY_NOTE.
+ * The per-task brief travels in the conversation as the child's first user
+ * message, not in the system prompt.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
@@ -38,39 +36,8 @@ const WORKER_NOTE = [
 	"- End the report with exactly one status line, one of: STATUS: ok, STATUS: blocked, STATUS: failed. Use blocked when you are unsure and say what you are stuck on.",
 ].join("\n");
 
-/** Env var carrying the child's isolated worktree path (lua/pi/rpc.lua). */
-const WORKTREE_ENV = "PI_NVIM_WORKTREE_PATH";
-
-/**
- * Worktree paragraph, appended only when this child runs in an isolated
- * checkout. States the cwd and forbids nested worktrees — the parent owns the
- * worktree lifecycle, and a nested checkout would never be released.
- *@param path Isolated worktree root (`PI_NVIM_WORKTREE_PATH`).
- */
-function worktreeNote(path: string): string {
-	return [
-		`You are running inside an isolated git worktree at ${path}.`,
-		"- That directory is your working directory: read, edit and run commands there, never in the parent check-out, and do not switch branches.",
-		"- Do not create nested git worktrees or sub-sessions; the parent owns worktree lifecycle and cleanup.",
-	].join("\n");
-}
-
-/**
- * Suffix appended after WORKER_NOTE: the worktree paragraph when this process
- * runs in an isolated checkout, the empty string (byte-identical prompt to the
- * pre-worktree behavior) otherwise.
- */
-function worktreeSuffix(): string {
-	const path = process.env[WORKTREE_ENV];
-	if (!path) {
-		return "";
-	}
-	return `\n\n${worktreeNote(path)}`;
-}
-
 export default function subagentChild(pi: ExtensionAPI): void {
 	pi.on("before_agent_start", (event) => {
-		const note = WORKER_NOTE + worktreeSuffix();
-		return { systemPrompt: `${event.systemPrompt}\n\n${note}` };
+		return { systemPrompt: `${event.systemPrompt}\n\n${WORKER_NOTE}` };
 	});
 }

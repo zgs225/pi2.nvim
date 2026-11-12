@@ -10,9 +10,9 @@
 --      there, so `wait_subagents` wakes instead of answering "batch not found".
 --   2. the settle path still finds the row when the child carries no workspace
 --      hint (locate fallback) — the shape manager hooks have.
---   3. revive: rebuilds a vanished worktree and records it, prefers the recorded
---      transcript, and reuses an already-live process instead of spawning a
---      second one.
+--   3. revive: runs the child in the parent workspace (never a checkout),
+--      prefers the recorded transcript, and reuses an already-live process
+--      instead of spawning a second one.
 --   4. reaper/rebuild: sweep and rebuild cover each live session's workspace and
 --      the manifests on disk, not just Neovim's cwd; a recorded `session_file`
 --      beats the workspace id index.
@@ -234,11 +234,10 @@ describe("sub-session workspace consistency", function()
         assert.is_not_nil(entry, "child row must live in the parent workspace manifest")
         assert.is_nil(Manifest.load(other_cwd)[child.id])
         assert.equals(parent_cwd, child.manifest_cwd, "bookkeeping follows the parent's workspace")
-        -- The child process itself is isolated in its own checkout (worktree
-        -- isolation), which is exactly why the manifest workspace must be
-        -- recorded separately from the child's own cwd.
-        assert.equals(child.worktree.path, child.cwd)
-        assert.equals(child.cwd, created[1].opts.cwd)
+        -- The child runs in the parent's workspace cwd as well: no checkout of
+        -- its own, so the manifest workspace is also the process cwd.
+        assert.equals(parent_cwd, child.cwd)
+        assert.equals(parent_cwd, created[1].opts.cwd)
         assert.is_nil(Batch.poll(batch_id), "the batch is invisible from Neovim's cwd by design")
     end)
 
@@ -319,7 +318,6 @@ describe("sub-session revive workspace handling", function()
     local original_cwd
     local real = {}
     local created ---@type table[]
-    local bound ---@type table[]
 
     before_each(function()
         original_cwd = vim.fn.getcwd()
@@ -336,7 +334,6 @@ describe("sub-session revive workspace handling", function()
         Batch._reset()
         Sessions._reset()
         created = {}
-        bound = {}
 
         real.create_detached = Sessions.create_detached
         Sessions.create_detached = function(_, opts)
@@ -357,34 +354,11 @@ describe("sub-session revive workspace handling", function()
                 cb(true)
             end
         end
-
-        real.worktree = package.loaded["pi.worktree"]
-        package.loaded["pi.worktree"] = {
-            create = function(opts, cb)
-                local path = parent_cwd .. "/revived-wt"
-                vim.fn.mkdir(path, "p")
-                vim.schedule(function()
-                    cb({ kind = "linked", path = path, name = opts.name, repo_root = opts.cwd }, nil)
-                end)
-            end,
-            detect = function()
-                return nil
-            end,
-            release = function(_, cb)
-                if cb then
-                    cb(true)
-                end
-            end,
-            bind = function(info, fields)
-                bound[#bound + 1] = { info = info, fields = fields }
-            end,
-        }
     end)
 
     after_each(function()
         Sessions.create_detached = real.create_detached
         Sessions.load_session_path = real.load_session_path
-        package.loaded["pi.worktree"] = real.worktree
         Reaper._reset()
         Sessions._reset()
         Manifest._reset()
@@ -436,7 +410,7 @@ describe("sub-session revive workspace handling", function()
         fn(child, err)
     end
 
-    it("writes the rebuilt worktree and the session file back to the row", function()
+    it("starts the revived child in the parent workspace and records its transcript", function()
         local session_file = seed_child("child-revive", { kind = "linked", path = parent_cwd .. "/gone-wt" })
 
         revive("child-revive", function(child, err)
@@ -446,15 +420,13 @@ describe("sub-session revive workspace handling", function()
 
         local entry = Manifest.load(parent_cwd)["child-revive"]
         assert.equals("active", entry.status)
-        assert.equals(parent_cwd .. "/revived-wt", entry.worktree.path, "the rebuilt checkout must be recorded")
         assert.equals(session_file, entry.session_file)
-        assert.equals(parent_cwd .. "/revived-wt", created[1].opts.cwd)
-        assert.equals(parent_cwd .. "/revived-wt", created[1].opts.worktree.path)
+        -- A row recording a checkout that no longer exists falls back to the
+        -- parent's workspace: no checkout is recreated for the child.
+        assert.equals(parent_cwd, created[1].opts.cwd)
+        assert.is_nil(created[1].opts.worktree)
+        assert.is_nil(entry.worktree, "the vanished checkout is no longer recorded")
         assert.equals(parent_cwd, created[1].session.manifest_cwd)
-
-        assert.is_true(#bound >= 1, "the worktree must be bound to the session")
-        assert.equals("child-revive", bound[#bound].fields.session_id)
-        assert.equals(session_file, bound[#bound].fields.session_file)
     end)
 
     it("reuses an already-live process for the same id", function()

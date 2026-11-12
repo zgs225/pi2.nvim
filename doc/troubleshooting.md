@@ -116,6 +116,8 @@ A rough triage checklist for common symptoms:
 | Prompt paste shows `^[[106;5u` instead of a line break | The terminal pasted Ctrl+J as Kitty CSI-u (or `^[[27;5;106~` / `^[[13;2u`) instead of LF. π rewrites those sequences in the prompt paste handler. Type a newline with `<S-CR>` (or `<C-j>`); `<CR>` still submits. |
 | `:PiTree` shows "Failed to decode RPC message: Found too many nested data structures" | The `get_tree` response for a very long session (roughly 500+ messages) is deeper than Neovim's built-in JSON decoder allows. See [Deep RPC payloads](#deep-rpc-payloads) below. |
 
+The rows about automatic integration describe the [dormant](worktrees.md#automatic-integration) engine: a spawned sub-session no longer gets a checkout of its own, so there is nothing to integrate any more — they only apply to checkouts recorded by an earlier version.
+
 ## Deep RPC payloads
 
 Neovim's `vim.json` (the bundled lua-cjson library) hard-caps JSON nesting at 1000 levels, which cannot be raised at runtime. The pi backend nests the session tree one level **per message**, so `get_tree` responses for long sessions — and with it `:PiTree` — used to fail with `Failed to decode RPC message: Found too many nested data structures (1001) at character N`, and the tree picker never opened.

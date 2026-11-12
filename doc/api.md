@@ -188,6 +188,9 @@ The git layer is a separate module, `require("pi.worktree")`, which is what `pi.
 
 ### Automatic integration (`pi.worktree_integration`)
 
+**Retained but dormant:** a spawned sub-session no longer gets a checkout of its own (see [Worktrees → Sub-sessions](worktrees.md#sub-sessions)), so the engine no longer triggers on a dispatch. Its API is documented here because the module still ships.
+
+
 The rules — capture, snapshot, safe window, conflict handling, retention — are documented in [Worktrees → Automatic integration](worktrees.md#automatic-integration). The module itself is driven by the sub-session layer and is safe to call directly:
 
 | Function | Contract |

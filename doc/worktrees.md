@@ -17,7 +17,7 @@ Worktree support is opt-in per session, not a mode: you start a session in a wor
 - [Shipping the work (`:PiWorktreeShip`)](#shipping-the-work-piworktreeship)
 - [Removing a worktree (`:PiWorktreeRemove`)](#removing-a-worktree-piworktreeremove)
 - [Cleanup when a session closes](#cleanup-when-a-session-closes)
-- [Sub-session isolation](#sub-session-isolation)
+- [Sub-sessions](#sub-sessions)
 - [Automatic integration](#automatic-integration)
   - [Safety windows](#safety-windows)
   - [Conflicts and resolving](#conflicts-and-resolving)
@@ -183,20 +183,17 @@ An explicit close is the normal end of a worktree session, and it cleans up afte
 - Closing a tab does **not** close the session (see [Sessions → One chat per tab](sessions.md#one-chat-per-tab)), so it does not release the worktree either — an ordinary background session keeps its checkout.
 - `:PiWorktreeRemove` is the explicit path when you want the directory gone regardless of state (subject to its snapshot).
 
-## Sub-session isolation
+## Sub-sessions
 
-Sub-sessions ([Sessions → Sub-sessions](sessions.md#sub-sessions)) can be isolated the same way, which is often what you want: several agents working in parallel on one repository.
+Sub-sessions ([Sessions → Sub-sessions](sessions.md#sub-sessions)) run in the **parent session's cwd**. They are not given a checkout of their own: a spawned child edits the same working tree as its parent, so several children in one batch share those files.
 
-- With `worktree.isolate_subagents` (default `true`), every spawned child gets **its own worktree** (`sub-<timestamp>-<n>-<pid>`), so parallel children cannot overwrite each other's edits. The parent's checkout is not affected.
-- A child of a parent that **already runs in a worktree** inherits that cwd and owns nothing — worktrees are never nested, and a child never releases its parent's checkout.
-- A revived child reuses the worktree recorded on its manifest row as long as it still exists (dirty work included). If the directory is gone, the checkout is recreated at its **recorded path** — the transcript records that directory as its cwd and a resume refuses a missing one, so a freshly named checkout could never be opened — but only when the recorded checkout belongs to the same repository; a checkout of a different repository is isolated afresh (a new `sub-…` name).
-- Releasing follows the same rule as everywhere else: a child's checkout is deleted only when it is clean, so uncommitted child work survives a close/revive cycle. The idle reaper's sweep also releases checkouts recorded for children **no live π session owns any more** (the state left behind by a Neovim restart), which keeps abandoned child checkouts from accumulating on disk. The sweep walks every workspace's manifest, so a child is still found after Neovim moved to another checkout.
-- **Bookkeeping stays with the parent.** A child's row lives in the manifest of the **parent session's workspace** (with the child's own transcript path and the checkout it owns recorded on the row), while its JSONL lives in its own worktree's session directory. Locating that row — for close, revive, the reaper, or a name update — searches across workspaces, so a revive or a sweep works even when Neovim's cwd is in a different checkout.
-- Set `worktree.isolate_subagents = false` to have children run in the parent's cwd as before (no per-child checkout, no isolation).
+That is a deliberate trade. A checkout per child costs a `git worktree add`, a `.worktreeinclude` copy and a `worktree.setup_cmd` run on every spawn, and the work left in it then has to be moved back into the parent's tree. When a batch must not touch your own checkout, isolate at the **session** level instead: dispatch from a session that already runs in a worktree (`:PiWorktreeNew`, `:PiNewTab worktree=<name>`), and every child inherits that checkout while your main checkout stays clean. For children that only read, constrain them with `subagent.tools` (`{ "read", "grep", "find", "ls" }`) — that is enforcement, not a request.
 
-Children are told about their checkout in their system-prompt worker note (`PI_NVIM_WORKTREE_PATH`): the isolated path is their working directory, and they must not create nested worktrees or sub-sessions. The note is derived once per process, so it stays prefix-stable for pi's prompt cache.
+A child revived from a manifest written by an earlier version keeps running in the checkout recorded on its row while that directory still exists; once it is gone, the revive starts in the parent's workspace cwd and warns instead of failing. `worktree.isolate_subagents` no longer exists, and neither does the per-child system-prompt paragraph about an isolated path.
 
 ## Automatic integration
+
+> **Dormant since per-child checkouts were removed.** A dispatch no longer creates a checkout, so nothing reaches this path any more. The engine (`pi.worktree_integration`), its `:PiSessions` glyphs, its chat records and the `worktree.integration` knobs are retained in the codebase; a leftover `sub-…` directory from an earlier version is an ordinary checkout you can inspect or delete with `git worktree remove`.
 
 An isolated child is useless if its work has to be copied out by hand after every run, so settling one triggers **automatic integration** (`pi.worktree_integration`): the child's patch is captured, snapshotted, and applied to the **parent checkout's working tree** — never committed, never staged — as soon as doing that is safe. `:PiWorktreeApply` stays the manual, reviewed route for everything else (a top-level worktree session, a checkout you want to review first).
 
@@ -249,6 +246,8 @@ State is written to the manifest row **before** the first write, so a crashed or
 
 ## Managing disk usage
 
+> **Dormant,** like automatic integration: with no child checkouts being created, retention has nothing left to manage. The rules below describe the retained engine.
+
 Applied child checkouts otherwise accumulate: every sub-session run leaves one behind until retention removes it. `worktree.integration.keep_count` (default 15) is a **soft cap** over the managed checkouts of every workspace; once the total exceeds it, the oldest candidates are deleted first (by `applied_at`).
 
 Only checkouts that are provably safe to delete are removed: `applied`, **verified present in the target**, inactive (no live process), not pinned, not deliberately kept (`kept_reason`), still a linked worktree of the same repository, snapshot intact and matching `patch_sha`, with no ignored content. Everything else still counts toward the total but is **never** removed for quota — an unintegrated, parked (`queued` / `applying` / `resolving`) or `needs_attention` checkout always survives. Retention runs after the startup reconcile and after integrations settle, so the cap converges without a timer of its own. It never touches the main checkout, top-level worktree sessions, or snapshots.
@@ -287,15 +286,13 @@ require("pi").setup({
         -- a non-zero exit keeps the checkout but fails the creation.
         setup_cmd = nil, -- e.g. { "mise", "install" }
 
-        -- Give every spawned sub-session its own worktree (default true).
-        isolate_subagents = true,
-
         -- Snapshot a worktree's patch before :PiWorktreeRemove / Worktree.remove
         -- deletes it (default true).
         snapshot_before_remove = true,
 
-        -- Automatic integration of a settled sub-session's patch into the
-        -- parent checkout's working tree (see the section above).
+        -- Retained but DORMANT (no per-child checkout exists to integrate;
+        -- see the section above).
+
         integration = {
             -- Apply automatically at all (default true). false = the patch is
             -- only ever moved by :PiWorktreeApply.

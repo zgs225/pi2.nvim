@@ -112,7 +112,7 @@ describe("sub-session integration wiring", function()
         Config.setup({
             agent_dir = agent_dir,
             subagent = { enabled = true, max_children = 5, reap_after_minutes = 30 },
-            worktree = { isolate_subagents = true, integration = { auto = true } },
+            worktree = { integration = { auto = true } },
         })
         vim.cmd("cd " .. vim.fn.fnameescape(other_cwd))
         Manifest._reset()
@@ -414,7 +414,7 @@ describe("sub-session integration wiring", function()
         assert.is_nil(Manifest.load(parent_cwd)["child-1"].integration)
     end)
 
-    it("never auto-integrates a failed run and keeps the checkout for diagnosis", function()
+    it("never auto-integrates a failed run", function()
         local parent = make_parent("parent-integration-11")
         Sessions._register_for_test(parent)
         local batch_id, child = dispatch_one(parent)
@@ -436,7 +436,10 @@ describe("sub-session integration wiring", function()
         local row = Manifest.load(parent_cwd)[child.id]
         assert.equals("failed", row.status, "a failed run must stay failed, not be flipped to completed")
         assert.is_nil(row.integration, "a half-finished checkout must never be recorded as applied")
-        assert.equals(1, vim.fn.isdirectory(child.worktree.path), "the worktree stays on disk for diagnosis")
+        -- A child owns no checkout any more: it ran in the parent's workspace, so
+        -- there is nothing to keep or release for diagnosis.
+        assert.is_nil(child.worktree)
+        assert.equals(parent_cwd, child.cwd)
     end)
 
     it("degrades to needs_attention when the engine raises", function()

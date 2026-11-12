@@ -218,20 +218,14 @@ require("pi").setup({
         -- worktree root as cwd; nil = no setup step. A non-zero exit keeps
         -- the checkout on disk but fails the creation (no session starts).
         setup_cmd = nil, -- e.g. { "mise", "install" }
-        -- Give every spawned sub-session its own worktree instead of the
-        -- parent's checkout, so parallel children cannot overwrite each
-        -- other's edits. A child of a session that already runs in a
-        -- worktree inherits that cwd instead (no nesting).
-        isolate_subagents = true,
         -- Snapshot a worktree's patch (base commit → now, untracked files
         -- included) before :PiWorktreeRemove / Worktree.remove deletes it.
         -- When false, the confirmation warns that the work is lost.
         snapshot_before_remove = true,
-        -- Automatic integration of a settled sub-session's patch into the
-        -- parent checkout's working tree (pi.worktree_integration): capture +
-        -- snapshot, then apply only while the parent is blocked in
-        -- wait_subagents or idle; otherwise park as `queued` and retry on the
-        -- next readiness signal. Aborted and failed runs are never integrated.
+        -- Retained but DORMANT: a spawned sub-session no longer gets a
+        -- checkout of its own, so there is nothing to integrate. The engine
+        -- (pi.worktree_integration) and its knobs stay for checkouts recorded
+        -- by earlier versions; see doc/worktrees.md#automatic-integration.
         integration = {
             -- Apply automatically at all (default true). false = only
             -- :PiWorktreeApply moves work out of a checkout.

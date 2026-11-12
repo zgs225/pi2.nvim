@@ -198,25 +198,23 @@ describe("worktree config", function()
         Config.setup({})
         local cfg = Config.options.worktree
         assert.is_nil(cfg.setup_cmd)
-        assert.is_true(cfg.isolate_subagents)
         assert.is_true(cfg.snapshot_before_remove)
+        -- Per-child checkouts are gone: the option no longer exists.
+        assert.is_nil((cfg --[[@as table]]).isolate_subagents)
     end)
 
     it("merges user overrides without leaking into the defaults", function()
         Config.setup({
             worktree = {
                 setup_cmd = { "make", "deps" },
-                isolate_subagents = false,
                 snapshot_before_remove = false,
             },
         })
         assert.are.same({ "make", "deps" }, Config.options.worktree.setup_cmd)
-        assert.is_false(Config.options.worktree.isolate_subagents)
         assert.is_false(Config.options.worktree.snapshot_before_remove)
 
         Config.setup({})
         assert.is_nil(Config.options.worktree.setup_cmd)
-        assert.is_true(Config.options.worktree.isolate_subagents)
         assert.is_true(Config.options.worktree.snapshot_before_remove)
     end)
 end)

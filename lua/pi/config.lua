@@ -259,7 +259,6 @@
 
 ---@class pi.WorktreeConfig
 ---@field setup_cmd? string[] Command run inside a freshly created worktree before the creation callback fires. Executed directly (no shell) with the worktree root as cwd; a non-zero exit keeps the worktree in place and fails the creation.
----@field isolate_subagents? boolean Give every new sub-session its own linked worktree (`sub-<timestamp>-<seq>-<pid>`); a child whose parent already runs in a worktree inherits that checkout instead of nesting another one, and a parent worktree is never released by a child (default true)
 ---@field snapshot_before_remove? boolean Write a patch snapshot before removing a worktree (`Worktree.remove`, `:PiWorktreeRemove`) (default true)
 ---@field integration? pi.WorktreeIntegrationConfig Automatic integration of a settled sub-session's patch into the parent checkout (see `doc/worktrees.md`)
 
@@ -518,7 +517,6 @@ local defaults = {
     },
     worktree = {
         setup_cmd = nil,
-        isolate_subagents = true,
         snapshot_before_remove = true,
         integration = {
             auto = true,

@@ -1,7 +1,9 @@
 --- Automatic integration of sub-session worktree patches into the parent checkout.
 ---
---- A sub-session may run in its own linked git worktree (`worktree.isolate_subagents`).
---- When it settles, its work stays isolated until someone moves it out. This
+--- **Retained but dormant:** spawned sub-sessions no longer get a checkout of their
+--- own (they run in the parent's cwd), so a fresh dispatch never reaches this path.
+--- The module still ships for checkouts recorded by earlier versions.
+--- When a child does own one and settles, its work stays isolated until someone moves it out. This
 --- module is the **automatic** path: it captures the child's patch, writes a
 --- durable snapshot, and applies the patch to the parent's working tree when
 --- (and only when) doing so is safe. `:PiWorktreeApply` stays the manual,
@@ -1361,8 +1363,8 @@ end
 --- revived child may reuse that process **without** spawning a new checkout —
 --- so deleting a directory a live process is rooted in would break the child's
 --- next tool call. Closing it here is what makes the removal safe: a later
---- revive spawns a fresh checkout (the recorded path is gone, so
---- `prepare_worktree` re-isolates), and `close` refuses while the engine owns
+--- revive starts in the parent's workspace cwd (the recorded path is gone),
+--- and `close` refuses while the engine owns
 --- the row, so this never races a concurrent decision.
 ---
 --- Refused when a tab is currently showing the child (same rule as the idle
