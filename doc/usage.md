@@ -758,6 +758,19 @@ Tools come in two rendering styles:
 - **Inline tools** render as a single line. `read` is the canonical example — it shows `read tools.lua (42 lines)` and stays on one line even when the file is huge, because inlining the content would just be noise. Consecutive inline tool calls are grouped without blank lines between them.
 - **Full-block tools** get the multi-line indented block shown above. `bash`, `wait_task`, `edit`, `write`, the built-in read-only search tools (`grep`, `find`, `ls`), the four [pi-web-access](https://github.com/nicobailon/pi-web-access) tools (`web_search`, `fetch_content`, `source_check`, `get_search_content`), [`codemode`](#code-mode-codemode), and any tool pi2.nvim doesn't have a dedicated renderer for fall into this category.
 
+### Terminal colours (ANSI)
+
+Tool output often carries terminal control sequences — `ls --color`, `git status --color`, `grep --color`, pytest and cargo report their results in colour. The pi backend hands pi2.nvim that text verbatim, so pi2.nvim renders it: **SGR colour codes become real highlights in the tool block**, using the active colorscheme where it has a matching semantic hue (an ANSI red borrows `DiagnosticError`'s foreground, green `DiagnosticOk`, yellow `DiagnosticWarn`, and so on) and the xterm palette otherwise. 16-colour, 256-colour and 24-bit (`38;2;r;g;b`) values all work, as do bold, dim, italic, underline, strikethrough and reverse video.
+
+The escape bytes themselves never reach the buffer. They would otherwise show up as caret notation (`^[[1;32m`) and count as two display columns each, breaking every width computation — copy, search, `gf`, and the collapse thresholds above all see only the visible text. Colours survive `<Tab>`: a collapsed block re-colours the output tail it duplicates.
+
+Two limits are deliberate:
+
+- **Non-colour sequences are dropped, not emulated.** Cursor movement, line erases and OSC titles from progress bars leave nothing behind, so a `\r`-animated progress bar reads as its last rendered line rather than replaying the animation. A true terminal emulator would be needed for that; a chat log is not one.
+- **A `!` block has no colours to show.** The backend already strips ANSI from direct bash output before streaming it (`bash_executor` sanitises each chunk), so `!ls --color` is plain text while the same command run by the *agent* through the `bash` tool keeps its colours.
+
+Colouring is automatic and self-disabling: pi2.nvim has no option for it. If creating a highlight group or extmark ever fails (an old Neovim, a torn-down buffer), the renderer turns itself off for the rest of the session and tool blocks keep rendering the escape-free text. Assistant prose, thinking blocks and the prompt are not ANSI-processed — they are markdown, not terminal output.
+
 ### Path display
 
 Models usually refer to files by absolute path (`/home/you/proj/apps/web/src/Foo.vue`). The workspace prefix is implied by the session, so tool blocks strip it:
@@ -780,7 +793,7 @@ A few renderers opt out. `always_expanded` (used by `todo_write`) bypasses the a
 
 A collapsed line that is still wider than the window is elided in the **middle** (`apps/web-antd/src/views…/ReportMetricsFormDrawer.vue`) rather than cut off at the right edge, so the file name of a path — or the end of a command — stays readable. Expanding the block (`<Tab>`) always shows the full line.
 
-A collapsed block puts the `+N lines` input marker **below** the visible input line(s) rather than above them, so the first line of the block is the first line of the call — the script, the command, the pattern — and only the elision marker follows. A collapsed block also auto-closes an unbalanced markdown fence: when the visible output contains ```` ``` ````, a closing fence is appended for the collapsed render, so tool output can never bleed code styling into the rest of the conversation.
+A collapsed block puts the `+N lines` input marker **below** the visible input line(s) rather than above them, so the first line of the block is the first line of the call — the script, the command, the pattern — and only the elision marker follows. A collapsed block also auto-closes an unbalanced markdown fence: when the visible output contains ```` ``` ````, a closing fence is appended for the collapsed render, so tool output can never bleed code styling into the rest of the conversation. When the visible tail carries [terminal colours](#terminal-colours-ansi), the collapsed line keeps them.
 
 Bind `pi.toggle_history_blocks()` to expand/collapse all expandable history blocks at once; the [Keymaps](keymaps.md) example uses `<C-o>`.
 
