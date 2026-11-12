@@ -37,6 +37,8 @@
 ---@field _detached_retrying? boolean Auto-retry backoff (detached or captured on unbind).
 ---@field _busy_started_at? integer Run clock (`vim.uv.hrtime()/1e9`); first `agent_start` of the run.
 ---@field _busy_verb? string Active-verb snapshot for view-switch restore.
+---@field _last_stop_reason? string Stop reason of the last assistant turn (`message_end`), reset on `agent_start`. The sub-session settle path reads it as the file-less fallback for a failed run.
+---@field _last_error_message? string `errorMessage` of that turn when `_last_stop_reason` is `"error"`.
 ---@field session_file? string Backend-reported session file path (from get_state responses). Lets the resume picker detect "still open in another tab" without extra RPC round-trips.
 ---@field startup_announcements table<string, pi.StartupAnnouncement> Extension startup data (keys ending with `:startup`) shown in the system preamble. Process-level: persists across session switches.
 ---@field system_errors pi.SystemErrorEntry[]
@@ -814,6 +816,9 @@ function M.handle_event(session, msg)
 
     if t == "agent_start" then
         mark_run_start(session)
+        -- A new run supersedes the previous turn's outcome.
+        session._last_stop_reason = nil
+        session._last_error_message = nil
         session._detached_retrying = false
         require("pi.ui.sessions").on_agent_start(session)
         if chat then
@@ -1089,6 +1094,16 @@ function M.handle_event(session, msg)
     elseif t == "message_end" then
         require("pi.ui.sessions").on_message_end(session)
         local message = msg.message
+        if type(message) == "table" and message.role == "assistant" then
+            -- Mirror the turn outcome on the session: a detached child has no
+            -- chat to hold it, and the sub-session settle path needs it even
+            -- when the child runs without a session file.
+            session._last_stop_reason = type(message.stopReason) == "string" and message.stopReason or nil
+            session._last_error_message = type(message.errorMessage) == "string"
+                    and message.errorMessage ~= ""
+                    and message.errorMessage
+                or nil
+        end
         if type(message) == "table" and message.stopReason == "error" then
             require("pi.ui.sessions").mark_error(session)
         end

@@ -289,15 +289,22 @@ local function apply_config(session, config, callback)
     end
 end
 
+--- Send the child's task prompt.
+---
+--- A rejected prompt is a real backend answer (`success: false` plus an
+--- `error` such as "No API key found for …"), and that text is the only
+--- explanation the parent will ever get: dropping it leaves a useless
+--- "failed to send task".
 ---@param session pi.Session
 ---@param task string
----@param callback fun(ok: boolean)
+---@param callback fun(ok: boolean, err?: string)
 local function send_task(session, task, callback)
     local sent = session.rpc:send({ type = "prompt", message = task }, function(res)
-        callback(res.success == true)
+        local err = type(res.error) == "string" and res.error ~= "" and res.error or nil
+        callback(res.success == true, err)
     end)
     if not sent then
-        callback(false)
+        callback(false, nil)
     end
 end
 
@@ -511,14 +518,22 @@ function M.spawn(parent, opts, callback)
                     callback(nil, config_err or "failed to apply sub-session config")
                     return
                 end
-                send_task(child, opts.task, function(sent_ok)
+                send_task(child, opts.task, function(sent_ok, send_err)
                     if sent_ok then
                         require("pi.ui.sessions").request_refresh()
                         callback(child, nil)
                     else
-                        Manifest.patch(session_id, { status = "failed", last_active_at = Manifest.iso_now() })
+                        Manifest.patch(session_id, {
+                            status = "failed",
+                            last_error = send_err or "failed to send task to sub-session",
+                            last_active_at = Manifest.iso_now(),
+                        })
                         Sessions.close_session(child)
-                        callback(nil, "failed to send task to sub-session")
+                        callback(
+                            nil,
+                            send_err and ("failed to send task to sub-session: " .. send_err)
+                                or "failed to send task to sub-session"
+                        )
                     end
                 end)
             end)
@@ -805,13 +820,20 @@ function M.on_child_session_name(session, name)
     return true
 end
 
---- Called on child agent_settled — inject completion report into parent.
+--- Called on child agent_settled — record the run outcome and inject the
+--- completion (or failure) notice into the parent.
 ---
---- `aborted` is the authoritative cancel signal added in pi >= 1.1.0
---- (`agent_settled.aborted`). Older pi omits the field, so the run's abort
---- state falls back to the session file's last stop reason; the per-child
---- generation watermark stays the guard that keeps a late settle of an aborted
---- run from touching a newer run on the same child.
+--- The outcome is decided in this order: **aborted** (the authoritative
+--- `agent_settled.aborted` field on pi >= 1.1.0; the session file's stop reason
+--- on older pi), **failed**, else completed. A failed run is what pi persists as
+--- an assistant message with `stopReason: "error"` and no content — a quota,
+--- auth or network failure — so the message text is empty while `errorMessage`
+--- carries the reason. Booking that as a completion is how a dead child used to
+--- read back as an empty `ok` result, so the failure is taken from the turn
+--- itself rather than from the manifest, which only knows spawn-time failures.
+---
+--- The per-child generation watermark stays the guard that keeps a late settle of
+--- an aborted run from touching a newer run on the same child.
 ---@param child pi.Session
 ---@param aborted? boolean
 function M.on_child_settled(child, aborted)
@@ -837,9 +859,32 @@ function M.on_child_settled(child, aborted)
     end
 
     local path = child.session_file or Read.find_path(child.id)
-    local report = path and Read.last_assistant_message(path) or nil
-    -- Prefer the event field when present; only read the file on older pi.
-    local was_aborted = aborted == true or (path ~= nil and Read.last_stop_reason(path) == "aborted")
+    -- One pass for text, stop reason and provider error. The live mirror on the
+    -- session is the fallback for a child that keeps no session file (or whose
+    -- file is already gone); it is also what the process-exit path leaves.
+    local turn = path and Read.last_turn(path) or nil
+    local report = turn and turn.text or nil
+    local stop_reason = (turn and turn.stop_reason) or child._last_stop_reason
+    local error_message = (turn and turn.error_message) or child._last_error_message
+    local was_aborted = aborted == true or stop_reason == "aborted"
+    -- `entry.status == "failed"` keeps the unexpected-exit path working: the
+    -- manager patches it before settling because a crashed child leaves no
+    -- assistant turn to read.
+    local failed = not was_aborted and (stop_reason == "error" or entry.status == "failed")
+    local failure_reason
+    if failed then
+        if stop_reason == "error" then
+            -- Older pi may persist the turn without `errorMessage`; a reason
+            -- already recorded on the manifest then wins over a generic text.
+            local recorded = type(entry.last_error) == "string" and entry.last_error ~= "" and entry.last_error or nil
+            failure_reason = error_message or recorded or "sub-agent run failed"
+        else
+            -- Unexpected process exit: the manager patched the manifest `failed`
+            -- before settling, and any `last_error` there belongs to an earlier
+            -- run, so it must not be recycled as this run's reason.
+            failure_reason = "sub-agent process exited"
+        end
+    end
     local parent = Sessions.find_by_lineage(entry.parent_id)
 
     if was_aborted then
@@ -866,14 +911,18 @@ function M.on_child_settled(child, aborted)
         return
     end
 
-    local claimed = Batch.on_child_settled(child.id)
+    local claimed = Batch.on_child_settled(child.id, {
+        ok = not failed,
+        error = failure_reason,
+        output = report,
+    })
 
     -- Agent tool path or a running batch item: skip parent prompt injection.
     if entry.agent_spawned or claimed then
-        local status = entry.status == "failed" and "failed" or "completed"
         Manifest.patch(child.id, {
-            status = status,
+            status = failed and "failed" or "completed",
             last_report = report,
+            last_error = failed and failure_reason or Manifest.REMOVE,
             last_active_at = Manifest.iso_now(),
         })
         after_completed(parent)
@@ -885,11 +934,43 @@ function M.on_child_settled(child, aborted)
         return
     end
 
+    -- A failed run has no report to deliver, so the notice is built from the
+    -- error: a user-spawned child that died on a quota, auth or network failure
+    -- must not disappear into a silent manifest row.
+    if failed then
+        local patch = {
+            status = "failed",
+            last_report = report,
+            last_error = failure_reason,
+            last_active_at = Manifest.iso_now(),
+        }
+        if not parent or not parent.rpc:is_running() then
+            Manifest.patch(child.id, patch)
+            after_completed(parent)
+            return
+        end
+        local msg = require("pi.subsessions.tool_ui").failure_report(entry.name, failure_reason)
+        parent.rpc:send({ type = "prompt", message = msg }, function(res)
+            vim.schedule(function()
+                patch.reported = res.success == true
+                Manifest.patch(child.id, patch)
+                SessionList.request_refresh()
+                SessionList.acknowledge_reported_children_for_current_tab(parent)
+                pcall(Reaper.schedule, child.id)
+            end)
+        end)
+        return
+    end
+
     if not path then
         return
     end
     if not report or report == "" then
-        Manifest.patch(child.id, { status = "completed", last_active_at = Manifest.iso_now() })
+        Manifest.patch(child.id, {
+            status = "completed",
+            last_error = Manifest.REMOVE,
+            last_active_at = Manifest.iso_now(),
+        })
         after_completed(parent)
         return
     end
@@ -897,6 +978,7 @@ function M.on_child_settled(child, aborted)
         Manifest.patch(child.id, {
             status = "completed",
             last_report = report,
+            last_error = Manifest.REMOVE,
             last_active_at = Manifest.iso_now(),
         })
         after_completed(parent)
@@ -910,12 +992,14 @@ function M.on_child_settled(child, aborted)
                     status = "completed",
                     reported = true,
                     last_report = report,
+                    last_error = Manifest.REMOVE,
                     last_active_at = Manifest.iso_now(),
                 })
             else
                 Manifest.patch(child.id, {
                     status = "completed",
                     last_report = report,
+                    last_error = Manifest.REMOVE,
                     last_active_at = Manifest.iso_now(),
                 })
             end
@@ -982,6 +1066,20 @@ function M.rebuild_statuses()
                 elseif inferred == "interrupted" then
                     if entry.status ~= "interrupted" then
                         entry.status = "interrupted"
+                        changed = true
+                    end
+                elseif inferred == "failed" then
+                    -- A run that died on a provider/auth/quota error: the settle
+                    -- handler never got to patch it (Neovim was closed, or the
+                    -- pi backend died with it). Keep the reason readable too.
+                    if entry.status ~= "failed" then
+                        entry.status = "failed"
+                        changed = true
+                    end
+                    local turn = Read.last_turn(path)
+                    local reason = turn and turn.error_message or nil
+                    if reason and entry.last_error ~= reason then
+                        entry.last_error = reason
                         changed = true
                     end
                 end

@@ -15,6 +15,7 @@ local MANIFEST_FILE = ".pi2-subsessions.json"
 ---@field status "active"|"completed"|"failed"|"interrupted"|"dormant"
 ---@field reported boolean
 ---@field last_report? string
+---@field last_error? string Reason a run failed (provider/auth/quota/network error, or a process exit). Set when a settle books the run as `failed` and cleared on the next successful one, so a later revision of the same child does not inherit a stale error.
 ---@field name_source? "explicit"|"fallback"|"auto" Where `name` came from: "explicit" (caller-supplied — dispatch `name`, the :PiSubNew dialog) is never overwritten; "fallback" is derived from `task_prompt` and may be replaced by the child's auto-generated title; "auto" is that title. Absent in manifests written before this field existed — see `M.is_derived_name`.
 ---@field created_at string
 ---@field last_active_at string
@@ -178,6 +179,15 @@ function M.save(manifest)
     return ok == true
 end
 
+--- Sentinel for `M.patch`: a field set to this value is **deleted** from the
+--- entry. `pairs` skips `nil` values, so `{ last_error = nil }` cannot clear a
+--- field — this is how a successful run drops a previous failure reason.
+M.REMOVE = setmetatable({}, {
+    __tostring = function()
+        return "pi.Manifest.REMOVE"
+    end,
+})
+
 ---@param id string
 ---@param entry pi.SubsessionManifestEntry
 function M.upsert(id, entry)
@@ -195,7 +205,11 @@ function M.patch(id, patch)
         return
     end
     for k, v in pairs(patch) do
-        entry[k] = v
+        if v == M.REMOVE then
+            entry[k] = nil
+        else
+            entry[k] = v
+        end
     end
     manifest[id] = entry
     M.save(manifest)
