@@ -1788,17 +1788,95 @@ function M.on_child_settled(child, aborted)
     end
 end
 
+--- Session id encoded in a pi session filename (`<timestamp>_<id>.jsonl`).
+---@param path string
+---@return string?
+local function filename_session_id(path)
+    return vim.fn.fnamemodify(path, ":t"):match("_([%w%-]+)%.jsonl$")
+end
+
+--- Does this file's header record `id`?
+---
+--- The filename convention is only trusted after this one-line check: a
+--- renamed or hand-copied file must not make a manifest row point at the wrong
+--- transcript (the rebuild writes the inferred status back into the manifest).
+---@param path string
+---@param id string
+---@return boolean
+local function session_path_has_id(path, id)
+    local file = io.open(path, "r")
+    if not file then
+        return false
+    end
+    local header_line = file:read("*l")
+    file:close()
+    if not header_line then
+        return false
+    end
+    local ok, header = pcall(vim.json.decode, header_line)
+    return ok and type(header) == "table" and header.type == "session" and header.id == id
+end
+
+--- The session directory a scope's transcripts live in.
+---@param scope pi.SubsessionScope
+---@return string
+local function scope_session_dir(scope)
+    if scope.cwd then
+        return require("pi.sessions.history").get_sessions_dir(scope.cwd)
+    end
+    return vim.fn.fnamemodify(scope.path, ":h")
+end
+
 --- Session files of one workspace, newest first: an id → path index.
 ---
---- Built from the directory that holds the manifest (one glob plus one header
---- parse per file) rather than `History.list(cwd)`, because a scope discovered
---- on disk has no cwd to pass. Entries whose file is gone (the common dormant
---- case in a long-lived project) must not each pay a fallback full scan through
---- find_path — that was the O(children × sessions) freeze of issue #110.
+--- Built from the `<timestamp>_<id>.jsonl` filename convention — one `glob()`
+--- and no file reads — instead of `History.parse` per file, which walks every
+--- line of every transcript to find its latest `session_info` name. On a large
+--- sessions tree that parse cost seconds and it ran on the startup path (see the
+--- startup-cost iron rule in `AGENTS.md`). Each hit is verified against the file
+--- header before use (`session_path_has_id`), and ids without a conventionally
+--- named file fall back to `scope_session_index_deep`, so the resolution
+--- semantics are unchanged.
+---@param scope pi.SubsessionScope
+---@return table<string, string> index
+---@return boolean unconventional true when the directory holds a transcript the
+---   filename convention cannot name (so a parse scan could still find it)
+local function scope_session_index(scope)
+    local paths = vim.fn.glob(scope_session_dir(scope) .. "/*.jsonl", false, true)
+    -- Newest file first: keeping the first match for an id then preserves
+    -- find_path's newest-file semantics when several files share an id.
+    table.sort(paths, function(a, b)
+        local ma, mb = vim.fn.getftime(a), vim.fn.getftime(b)
+        if ma ~= mb then
+            return ma > mb
+        end
+        return a > b
+    end)
+    ---@type table<string, string>
+    local index = {}
+    local unconventional = false
+    for _, path in ipairs(paths) do
+        local id = filename_session_id(path)
+        if not id then
+            unconventional = true
+        elseif index[id] == nil then
+            index[id] = path
+        end
+    end
+    return index, unconventional
+end
+
+--- Parse-based id → path index: the slow path behind `scope_session_index`.
+---
+--- Only runs for ids whose transcript does not follow the filename convention
+--- (a renamed or externally written file). Entries whose file is gone (the
+--- common dormant case in a long-lived project) must not each pay a fallback
+--- full scan — that was the O(children × sessions) freeze of issue #110.
 ---@param scope pi.SubsessionScope
 ---@return table<string, string>
-local function scope_session_index(scope)
+local function scope_session_index_deep(scope)
     local History = require("pi.sessions.history")
+    ---@type table<string, string>
     local index = {}
     if scope.cwd then
         -- Known workspace: `History.list` is newest-first, so keeping the first
@@ -1812,8 +1890,7 @@ local function scope_session_index(scope)
     end
     -- Workspace discovered on disk (no cwd to hand to History.list): index the
     -- directory that holds the manifest, newest file first for the same reason.
-    local dir = vim.fn.fnamemodify(scope.path, ":h")
-    local paths = vim.fn.glob(dir .. "/*.jsonl", false, true)
+    local paths = vim.fn.glob(scope_session_dir(scope) .. "/*.jsonl", false, true)
     table.sort(paths, function(a, b)
         local ma, mb = vim.fn.getftime(a), vim.fn.getftime(b)
         if ma ~= mb then
@@ -1828,6 +1905,39 @@ local function scope_session_index(scope)
         end
     end
     return index
+end
+
+--- Resolve a manifest row's transcript path within its scope.
+---
+--- Fast path first (filename index + header check), parse-based scan only for a
+--- miss. Both indices are built at most once per scope and only when a row
+--- actually needs one.
+---@class pi.SessionIndexCache
+---@field fast? table<string, string>
+---@field unconventional? boolean the fast index could not name every transcript
+---@field deep? table<string, string>
+
+---@param scope pi.SubsessionScope
+---@param id string
+---@param cache pi.SessionIndexCache
+---@return string?
+local function lookup_session_path(scope, id, cache)
+    if not cache.fast then
+        cache.fast, cache.unconventional = scope_session_index(scope)
+    end
+    local path = cache.fast[id]
+    if path and session_path_has_id(path, id) then
+        return path
+    end
+    -- A row whose transcript is simply gone (the common dormant case in a
+    -- long-lived project) must not trigger a parse scan: there is nothing for it
+    -- to find. Only a directory holding files the convention cannot name, or a
+    -- filename that lies about its header, needs the slow index.
+    if not path and not cache.unconventional then
+        return nil
+    end
+    cache.deep = cache.deep or scope_session_index_deep(scope)
+    return cache.deep[id]
 end
 
 --- Rebuild one workspace's statuses (manifest + batches that live beside it).
@@ -1850,7 +1960,7 @@ local function rebuild_scope(scope)
         )
         return
     end
-    local index ---@type table<string, string>?
+    local index_cache ---@type pi.SessionIndexCache?
     local changed = false
     for id, entry in pairs(manifest) do
         if Manifest.is_entry_id(id) and type(entry) == "table" and entry.parent_id ~= nil then
@@ -1858,8 +1968,8 @@ local function rebuild_scope(scope)
             -- worktree keeps its JSONL there, not in the parent's workspace.
             local path = manifest_session_file(entry)
             if not path then
-                index = index or scope_session_index(scope)
-                path = index[id]
+                index_cache = index_cache or {}
+                path = lookup_session_path(scope, id, index_cache)
             end
             if not path then
                 if entry.status == "active" then
@@ -1868,34 +1978,44 @@ local function rebuild_scope(scope)
                 end
             else
                 local mtime = tostring(os.date("!%Y-%m-%dT%H:%M:%SZ", vim.fn.getftime(path)))
-                if entry.last_active_at ~= mtime then
+                local stale = entry.last_active_at ~= mtime
+                if stale then
                     entry.last_active_at = mtime
                     changed = true
                 end
-                local inferred = Read.infer_run_status(path)
-                if inferred == "completed" then
-                    if entry.status ~= "completed" then
-                        entry.status = "completed"
-                        changed = true
-                    end
-                elseif inferred == "interrupted" then
-                    if entry.status ~= "interrupted" then
-                        entry.status = "interrupted"
-                        changed = true
-                    end
-                elseif inferred == "failed" then
-                    -- A run that died on a provider/auth/quota error: the settle
-                    -- handler never got to patch it (Neovim was closed, or the
-                    -- pi backend died with it). Keep the reason readable too.
-                    if entry.status ~= "failed" then
-                        entry.status = "failed"
-                        changed = true
-                    end
-                    local turn = Read.last_turn(path)
-                    local reason = turn and turn.error_message or nil
-                    if reason and entry.last_error ~= reason then
-                        entry.last_error = reason
-                        changed = true
+                -- Decode the transcript only when it moved since the last
+                -- rebuild: an unchanged file still ends with the same entry, so
+                -- the status booked from it still holds. Decoding every row's
+                -- whole JSONL is what froze startup (startup-cost iron rule in
+                -- `AGENTS.md`). A row still marked `active` is the exception —
+                -- an unclean shutdown left it unsettled, and only the
+                -- transcript can say whether the run finished.
+                if stale or entry.status == "active" then
+                    local inferred = Read.infer_run_status(path)
+                    if inferred == "completed" then
+                        if entry.status ~= "completed" then
+                            entry.status = "completed"
+                            changed = true
+                        end
+                    elseif inferred == "interrupted" then
+                        if entry.status ~= "interrupted" then
+                            entry.status = "interrupted"
+                            changed = true
+                        end
+                    elseif inferred == "failed" then
+                        -- A run that died on a provider/auth/quota error: the settle
+                        -- handler never got to patch it (Neovim was closed, or the
+                        -- pi backend died with it). Keep the reason readable too.
+                        if entry.status ~= "failed" then
+                            entry.status = "failed"
+                            changed = true
+                        end
+                        local turn = Read.last_turn(path)
+                        local reason = turn and turn.error_message or nil
+                        if reason and entry.last_error ~= reason then
+                            entry.last_error = reason
+                            changed = true
+                        end
                     end
                 end
                 local live = Sessions.get_by_id(id)

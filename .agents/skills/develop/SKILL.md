@@ -90,6 +90,7 @@ A feature is **not complete until the CI run for its merge commit is green** —
 - **Checkable requirements (deps / version floors / config)** → `lua/pi/health.lua` + `lua/pi/compat.lua`: 新特性若引入用户可诊断的依赖、版本下限或配置要求，必须同步给 `:checkhealth pi` 新增检查项（ok/error/warn 三态），并在 `doc/troubleshooting.md` 描述该检查项。版本常量集中放在 `compat.lua`（如 vision fallback 的 `vision_min_supported = "0.81.0"`，与 `min_supported`/`validated` 同处），不要在 health.lua 里硬编码。参考实例：vision fallback 的 pi 0.81.0+ 版本下限检查（`feat(health): check pi version floor for vision fallback`）。
 - **Docs (README + `doc/`) + CHANGELOG** → docs-code consistency is mandatory: user-facing changes update `README.md` / the relevant `doc/*.md` in the same commit; internal changes still verify the docs remain accurate and fix any drift. Run `make docs-links` before committing.
 - **Tests** → `tests/<name>_spec.lua`; e2e per `references/testing.md`.
+- **Startup-sensitive code** (anything `pi.setup()` runs synchronously, session/manifest scans) → `AGENTS.md` § *Startup cost is a hard budget* is the rule; `references/architecture.md` has the *why*. Measure `require("pi.sessions.manager")` plus `require("pi").setup({})` under the real config and put the number in the implementation comment; `tests/subsessions_rebuild_spec.lua` (no per-file parse, mtime short-circuit) and `tests/subsessions_read_spec.lua` (bounded decode count) fail if the fast path regresses.
 
 ## Docs sync gate (before merge)
 

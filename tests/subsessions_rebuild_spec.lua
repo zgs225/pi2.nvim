@@ -151,6 +151,8 @@ describe("rebuild_statuses (issue #110)", function()
     local saved_cwd
     local saved_get_by_id
     local real_list
+    local real_parse
+    local real_infer
 
     before_each(function()
         agent_dir = vim.fn.tempname()
@@ -164,6 +166,8 @@ describe("rebuild_statuses (issue #110)", function()
         vim.cmd("cd " .. vim.fn.fnameescape(cwd))
         Manifest._reset()
         real_list = History.list
+        real_parse = History.parse
+        real_infer = Read.infer_run_status
         saved_get_by_id = Sessions.get_by_id
         Sessions.get_by_id = function()
             return nil
@@ -173,6 +177,8 @@ describe("rebuild_statuses (issue #110)", function()
     after_each(function()
         Sessions.get_by_id = saved_get_by_id
         History.list = real_list
+        History.parse = real_parse
+        Read.infer_run_status = real_infer
         Config.options.agent_dir = saved_agent_dir
         vim.cmd("cd " .. vim.fn.fnameescape(saved_cwd))
         vim.fn.delete(agent_dir, "rf")
@@ -184,7 +190,7 @@ describe("rebuild_statuses (issue #110)", function()
         return agent_dir .. "/sessions/" .. encode_cwd(cwd)
     end
 
-    it("scans the session directory exactly once, not once per manifest entry", function()
+    it("resolves rows from filenames, without parsing any transcript", function()
         write_session(sessions_dir() .. "/2026-09-01T00-00-00-000Z_child-a.jsonl", "child-a")
         write_session(
             sessions_dir() .. "/2026-09-01T00-00-01-000Z_child-b.jsonl",
@@ -198,20 +204,104 @@ describe("rebuild_statuses (issue #110)", function()
         seed_child("gone-1", "parent-1", "active")
         seed_child("gone-2", "parent-1", "active")
 
-        local scans = 0
-        History.list = function()
-            scans = scans + 1
-            return real_list()
+        -- History.parse walks every line of a transcript to find its latest
+        -- `session_info` name; doing that per file is the startup cost this
+        -- path must not pay (the id→path index comes from filenames).
+        local parses, lists = 0, 0
+        History.parse = function(...)
+            parses = parses + 1
+            return real_parse(...)
+        end
+        History.list = function(...)
+            lists = lists + 1
+            return real_list(...)
         end
 
         Subsessions.rebuild_statuses()
 
-        assert.equals(1, scans, "rebuild_statuses must build its id→path index from a single scan")
+        assert.equals(0, parses, "the index must come from filenames, not from parsing transcripts")
+        assert.equals(0, lists, "no full-directory scan on the fast path")
         local manifest = Manifest.load()
         assert.equals("completed", manifest["child-a"].status)
         assert.equals("interrupted", manifest["child-b"].status)
         assert.equals("dormant", manifest["gone-1"].status)
         assert.equals("dormant", manifest["gone-2"].status)
+    end)
+
+    it("falls back to a parse-based scan for a non-conventionally named transcript", function()
+        -- Header id does not match the filename suffix, so the filename index
+        -- misses and the old scan semantics must still find the file.
+        write_session(sessions_dir() .. "/renamed.jsonl", "child-x", { type = "tool_use", name = "bash" })
+        seed_child("child-x", "parent-1", "active")
+
+        Subsessions.rebuild_statuses()
+
+        assert.equals("interrupted", Manifest.load()["child-x"].status)
+    end)
+
+    it("does not trust a filename whose header records another id", function()
+        -- The convention-named file claims `child-y` in its name but its header
+        -- says otherwise; the real transcript lives under a non-conventional
+        -- name. Book the status from the real one, not from the impostor.
+        write_session(sessions_dir() .. "/2026-09-01T00-00-00-000Z_child-y.jsonl", "someone-else")
+        write_session(sessions_dir() .. "/renamed-y.jsonl", "child-y", { type = "tool_use", name = "bash" })
+        seed_child("child-y", "parent-1", "active")
+
+        Subsessions.rebuild_statuses()
+
+        assert.equals("interrupted", Manifest.load()["child-y"].status)
+    end)
+
+    it("does not re-decode a transcript that has not moved since the last rebuild", function()
+        local path = sessions_dir() .. "/2026-09-01T00-00-00-000Z_settled.jsonl"
+        write_session(path, "settled")
+        local epoch = 1756684800
+        vim.uv.fs_utime(path, epoch, epoch)
+        local mtime_iso = os.date("!%Y-%m-%dT%H:%M:%SZ", epoch)
+        seed_child("settled", "parent-1", "completed")
+        -- Already reconciled: status settled and the mtime stamp matches.
+        local manifest = Manifest.load()
+        manifest["settled"].last_active_at = mtime_iso
+        Manifest.save(manifest)
+
+        local calls = 0
+        Read.infer_run_status = function(...)
+            calls = calls + 1
+            return real_infer(...)
+        end
+
+        Subsessions.rebuild_statuses()
+
+        assert.equals(0, calls, "an unchanged transcript must not be decoded on every startup")
+    end)
+
+    it("re-infers when the transcript moved since the last rebuild", function()
+        local path = sessions_dir() .. "/2026-09-01T00-00-00-000Z_moved.jsonl"
+        write_session(path, "moved", { type = "tool_use", name = "bash" })
+        seed_child("moved", "parent-1", "completed")
+        local manifest = Manifest.load()
+        manifest["moved"].last_active_at = "2026-01-01T00:00:00Z"
+        Manifest.save(manifest)
+
+        Subsessions.rebuild_statuses()
+
+        assert.equals("interrupted", Manifest.load()["moved"].status)
+    end)
+
+    it("re-infers a row left active by an unclean shutdown, mtime unchanged", function()
+        local path = sessions_dir() .. "/2026-09-01T00-00-00-000Z_crashed.jsonl"
+        write_session(path, "crashed", { type = "tool_use", name = "bash" })
+        local epoch = 1756684800
+        vim.uv.fs_utime(path, epoch, epoch)
+        local mtime_iso = os.date("!%Y-%m-%dT%H:%M:%SZ", epoch)
+        seed_child("crashed", "parent-1", "active")
+        local manifest = Manifest.load()
+        manifest["crashed"].last_active_at = mtime_iso
+        Manifest.save(manifest)
+
+        Subsessions.rebuild_statuses()
+
+        assert.equals("interrupted", Manifest.load()["crashed"].status)
     end)
 
     it("marks entries without a session file as dormant and leaves finished ones alone", function()
