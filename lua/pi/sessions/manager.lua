@@ -75,6 +75,7 @@ local Dialog = require("pi.ui.dialog")
 local Extension = require("pi.ui.extension")
 local CommandsCache = require("pi.cache.commands")
 local Tasks = require("pi.tasks")
+local ResumeLayout = require("pi.sessions.resume_layout")
 
 ---@class pi.StartupSection
 ---@field header string
@@ -2334,6 +2335,7 @@ end
 ---@field session pi.ResumeSessionInfo
 ---@field file string
 ---@field worktree? table Managed worktree the session runs in (resume target).
+---@field worktree_info? table Alias for `worktree` — the resume layout reads either spelling.
 
 --- Two worktree info tables describe the same checkout (identity or path).
 ---@param a any
@@ -2370,16 +2372,12 @@ local function resume_target_for(item)
 end
 
 --- Shared renderer for resume-picker rows: date + display name or first message.
---- A managed-worktree session also names its worktree so rows from different
---- checkouts of the same repository are distinguishable.
+--- Which checkout a session belongs to is the picker's group title, never a
+--- per-row suffix (`pi.sessions.resume_layout` renders both backends).
 ---@param session pi.ResumeSessionInfo
 ---@return string
 local function format_resume_item(session)
-    local date = session.timestamp:match("^(%d%d%d%d%-%d%d%-%d%d)") or session.timestamp
-    local label = session.name or (session.first_message ~= "" and session.first_message or "(empty)")
-    local worktree = type(session.worktree) == "string" and session.worktree ~= "" and session.worktree or nil
-    local suffix = worktree and ("  · 󰙅 " .. worktree) or ""
-    return date .. "  " .. label .. suffix
+    return ResumeLayout.format_session(session)
 end
 
 --- Find a live session in another tab backed by the given session file.
@@ -2501,12 +2499,50 @@ local function open_resume_target(session_path, opts, new_tab, resume)
     proceed(nil)
 end
 
+--- Repository name shown as the main checkout's group title. `Worktree.detect`
+--- is pure filesystem work (and cached), so naming the main partition spawns no
+--- git subprocess; anything unexpected falls back to the cwd basename.
+---@return string
+local function resume_repo_name()
+    local cwd = vim.fn.getcwd()
+    local ok, Worktree = pcall(require, "pi.worktree")
+    if ok and type(Worktree) == "table" and type(Worktree.detect) == "function" then
+        local detected, info = pcall(Worktree.detect, cwd)
+        if detected and type(info) == "table" and type(info.repo_root) == "string" and info.repo_root ~= "" then
+            return vim.fs.basename(info.repo_root)
+        end
+    end
+    return vim.fs.basename(cwd)
+end
+
+--- Picker rows for the collected items: one partition per checkout, optionally
+--- narrowed by the prompt. `pi.sessions.resume_layout` owns every decision.
+---@param items pi.SessionSelectItem[]
+---@param query? string
+---@param repo_name? string
+---@return pi.ResumeRow[]
+local function resume_rows(items, query, repo_name)
+    ---@type pi.ResumeRow[]
+    local rows = ResumeLayout.rows(items, { query = query, repo_name = repo_name or resume_repo_name() })
+    return rows
+end
+
+-- Defined below; the pickers reopen themselves from group rows and after a
+-- deletion, so the two backend functions need it in scope.
+---@type fun(items: pi.SessionSelectItem[], opts: pi.SessionCreateOpts?)
+local show_resume_picker
+
 --- Open the resume list through a dedicated telescope picker.
 --- Returns false when telescope is unavailable so the caller falls back to
 --- the generic vim.ui.select flow below.
 ---
+--- Rows and ordering come from `pi.sessions.resume_layout`, so the finder is
+--- dynamic (recomputed per prompt) and the sorter is empty: filtering and
+--- ordering already happened, telescope only paints.
+---
 --- Keybindings (hinted in the picker title): <CR>/o open in the current tab,
---- t/<C-t> open in a new tab, <C-x> delete the selected session(s).
+--- t/<C-t> open in a new tab, <C-x> delete the selected session(s). Group title
+--- rows are not sessions: the keys step to the next session row.
 ---@param items pi.SessionSelectItem[]
 ---@param opts? pi.SessionCreateOpts
 ---@return boolean handled
@@ -2523,10 +2559,60 @@ local function open_with_telescope(items, opts)
     local actions = require("telescope.actions")
     local action_state = require("telescope.actions.state")
 
-    ---@param item pi.SessionSelectItem
+    local repo_name = resume_repo_name()
+    --- Rows behind the current prompt; a group row is only a title, so the
+    --- selection helpers walk this list to find the next session row.
+    ---@type pi.ResumeRow[]
+    local current_rows = {}
+
+    ---@param row pi.ResumeRow
     ---@return table telescope entry
-    local function entry_maker(item)
-        return { value = item, display = format_resume_item(item.session), ordinal = format_resume_item(item.session) }
+    local function entry_maker(row)
+        local entry = { value = row, ordinal = row.text }
+        if row.kind == "group" then
+            -- Title row: painted like the :PiSessions worktree header (and
+            -- non-resumable, see below).
+            entry.display = function(e)
+                return e.value.text, "PiSessionsListWorktree"
+            end
+        else
+            entry.display = row.text
+        end
+        return entry
+    end
+
+    ---@param prompt string
+    ---@return pi.ResumeRow[]
+    local function rows_for(prompt)
+        current_rows = resume_rows(items, prompt, repo_name)
+        return current_rows
+    end
+
+    --- Session behind the selection; a group title resolves to the next session
+    --- row (wrapping around), so every open key acts on a resumable row.
+    ---@param prompt_bufnr integer
+    ---@return pi.SessionSelectItem?
+    local function selected_item(prompt_bufnr)
+        local selection = action_state.get_selected_entry(prompt_bufnr)
+        if not selection or type(selection.value) ~= "table" then
+            return nil
+        end
+        if selection.value.kind == "session" then
+            return selection.value.item
+        end
+        local count = #current_rows
+        if count == 0 then
+            return nil
+        end
+        -- `entry.index` is the 1-based position in the rows the finder shows.
+        local index = tonumber(selection.index) or 0
+        for offset = 1, count do
+            local row = current_rows[((index + offset - 1) % count) + 1]
+            if row.kind == "session" then
+                return row.item
+            end
+        end
+        return nil
     end
 
     -- NOTE: pickers.new(opts, defaults) lets `opts` (this first table) win on
@@ -2540,17 +2626,17 @@ local function open_with_telescope(items, opts)
                 results_title = " <CR>/o open · t/<C-t> new tab · <C-x> delete ",
             }),
             {
-                finder = finders.new_table({ results = items, entry_maker = entry_maker }),
-                sorter = conf.generic_sorter(),
+                finder = finders.new_dynamic({ entry_maker = entry_maker, fn = rows_for }),
+                sorter = conf.empty_sorter(),
                 attach_mappings = function(prompt_bufnr, map)
                     local function open(new_tab)
-                        local selection = action_state.get_selected_entry(prompt_bufnr)
-                        if not selection then
+                        local item = selected_item(prompt_bufnr)
+                        if not item then
                             return
                         end
                         actions.close(prompt_bufnr)
                         vim.schedule(function()
-                            open_resume_target(selection.value.file, opts, new_tab, resume_target_for(selection.value))
+                            open_resume_target(item.file, opts, new_tab, resume_target_for(item))
                         end)
                     end
 
@@ -2571,14 +2657,18 @@ local function open_with_telescope(items, opts)
                     end)
 
                     map({ "n", "i" }, "<C-x>", function()
-                        local targets = {} ---@type string[]
+                        ---@type pi.SessionSelectItem[]
+                        local targets = {}
                         for _, entry in ipairs(action_state.get_multi_selection(prompt_bufnr)) do
-                            targets[#targets + 1] = entry.value.file
+                            local row = entry.value
+                            if type(row) == "table" and row.kind == "session" then
+                                targets[#targets + 1] = row.item
+                            end
                         end
                         if #targets == 0 then
-                            local selection = action_state.get_selected_entry(prompt_bufnr)
-                            if selection then
-                                targets[1] = selection.value.file
+                            local item = selected_item(prompt_bufnr)
+                            if item then
+                                targets[1] = item
                             end
                         end
                         if #targets == 0 then
@@ -2590,11 +2680,11 @@ local function open_with_telescope(items, opts)
                         end
                         ---@type table<string, boolean>
                         local deleted = {}
-                        for _, path in ipairs(targets) do
-                            deleted[path] = true
-                            local ok, err = os.remove(path)
+                        for _, target in ipairs(targets) do
+                            deleted[target.file] = true
+                            local ok, err = os.remove(target.file)
                             if not ok then
-                                Notify.warn("Failed to delete session: " .. (err or path))
+                                Notify.warn("Failed to delete session: " .. (err or target.file))
                             end
                         end
                         local remaining = {}
@@ -2609,9 +2699,9 @@ local function open_with_telescope(items, opts)
                             Notify.info("No sessions remaining")
                             return
                         end
-                        action_state
-                            .get_current_picker(prompt_bufnr)
-                            :refresh(finders.new_table({ results = remaining, entry_maker = entry_maker }))
+                        -- The dynamic finder re-runs `rows_for`, so a plain
+                        -- refresh re-groups the surviving sessions.
+                        action_state.get_current_picker(prompt_bufnr):refresh()
                     end)
                     return true
                 end,
@@ -2948,7 +3038,7 @@ end
 --- `vim.ui.select`) and open the chosen session.
 ---@param items pi.SessionSelectItem[]
 ---@param opts? pi.SessionCreateOpts
-local function show_resume_picker(items, opts)
+function show_resume_picker(items, opts)
     -- Telescope gets a purpose-built picker (dedicated keybindings plus a
     -- fixed key-hint title); every other backend keeps the generic
     -- vim.ui.select rendering below.
@@ -2956,15 +3046,23 @@ local function show_resume_picker(items, opts)
         return
     end
 
-    vim.ui.select(items, {
+    -- The same rows the telescope finder gets (partition titles included),
+    -- computed once: `vim.ui.select` has no dynamic finder, and choosing a
+    -- title only reopens the picker.
+    local rows = resume_rows(items, nil)
+
+    vim.ui.select(rows, {
         prompt = "Resume session",
         kind = "pi-resume-session",
-        -- Pass picker items with a `file` field so backends like snacks.nvim
-        -- can preview the raw session file when preview is enabled. Other
-        -- vim.ui.select implementations ignore extra fields and render via
+        -- Pass rows whose session carries a `file` field so backends like
+        -- snacks.nvim can preview the raw session file when preview is enabled.
+        -- Other vim.ui.select implementations ignore extra fields and render via
         -- `format_item`. Same row rendering as the telescope picker above.
-        format_item = function(item)
-            return format_resume_item(item.session)
+        format_item = function(row)
+            if row.kind == "session" then
+                return format_resume_item(row.item.session)
+            end
+            return row.text
         end,
         snacks = {
             -- snacks.nvim (if installed) overrides vim.ui.select with its picker.
@@ -2976,7 +3074,7 @@ local function show_resume_picker(items, opts)
                 config = function(layout)
                     for _, box in ipairs(layout.layout) do
                         if box.win == "list" then
-                            box.height = math.floor(math.max(math.min(#items, vim.o.lines * 0.8 - 10), 2))
+                            box.height = math.floor(math.max(math.min(#rows, vim.o.lines * 0.8 - 10), 2))
                         end
                     end
                 end,
@@ -2997,35 +3095,48 @@ local function show_resume_picker(items, opts)
             },
             actions = {
                 resume_new_tab = function(picker)
-                    local selected = picker:selected({ fallback = true })
-                    if #selected == 0 then
+                    ---@type pi.SessionSelectItem?
+                    local item = nil
+                    for _, sel in ipairs(picker:selected({ fallback = true })) do
+                        local row = sel.item
+                        if type(row) == "table" and row.kind == "session" then
+                            item = row.item
+                            break
+                        end
+                    end
+                    if not item then
                         return
                     end
                     picker:close()
                     vim.schedule(function()
-                        local item = selected[1].item
                         open_resume_target(item.file, opts, true, resume_target_for(item))
                     end)
                 end,
                 delete_session = function(picker)
-                    local selected = picker:selected({ fallback = true })
-                    if #selected == 0 then
+                    ---@type pi.SessionSelectItem[]
+                    local targets = {}
+                    for _, sel in ipairs(picker:selected({ fallback = true })) do
+                        local row = sel.item
+                        if type(row) == "table" and row.kind == "session" then
+                            targets[#targets + 1] = row.item
+                        end
+                    end
+                    if #targets == 0 then
                         return
                     end
-                    local n = #selected
+                    local n = #targets
                     local msg = n == 1 and "Delete session?" or ("Delete %d sessions?"):format(n)
                     if vim.fn.confirm(msg, "&Yes\n&No", 2) ~= 1 then
                         return
                     end
                     ---@type table<string, boolean>
                     local deleted = {}
-                    for _, sel in ipairs(selected) do
-                        local path = sel.item.file
-                        local ok, err = os.remove(path)
+                    for _, target in ipairs(targets) do
+                        local ok, err = os.remove(target.file)
                         if ok then
-                            deleted[path] = true
+                            deleted[target.file] = true
                         else
-                            Notify.warn("Failed to delete session: " .. (err or path))
+                            Notify.warn("Failed to delete session: " .. (err or target.file))
                         end
                     end
                     for i = #items, 1, -1 do
@@ -3033,20 +3144,29 @@ local function show_resume_picker(items, opts)
                             table.remove(items, i)
                         end
                     end
+                    picker:close()
                     if #items == 0 then
-                        picker:close()
                         Notify.info("No sessions remaining")
-                    else
-                        picker:refresh()
+                        return
                     end
+                    -- Reopen instead of refresh: the rows (titles included) are
+                    -- recomputed from the surviving items.
+                    show_resume_picker(items, opts)
                 end,
             },
         },
-    }, function(item)
-        if not item then
+    }, function(row)
+        if not row then
             return
         end
-        open_resume_target(item.file, opts, nil, resume_target_for(item))
+        if row.kind ~= "session" then
+            -- A group title is not resumable: reopen the full list.
+            vim.schedule(function()
+                show_resume_picker(items, opts)
+            end)
+            return
+        end
+        open_resume_target(row.item.file, opts, nil, resume_target_for(row.item))
     end)
 end
 

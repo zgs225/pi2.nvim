@@ -16,6 +16,7 @@ local Config = require("pi.config")
 local Rpc = require("pi.rpc")
 local Sessions = require("pi.sessions.manager")
 local History = require("pi.sessions.history")
+local Worktree = require("pi.worktree")
 local Pi = require("pi")
 
 Config.setup({})
@@ -31,6 +32,14 @@ local real_rpc = { start = Rpc.start, stop = Rpc.stop, send = Rpc.send }
 local real_history_list = History.list
 local real_notify = vim.notify
 local real_select = vim.ui.select
+-- The resume picker's partition titles come from `Worktree.detect` and its
+-- multi-checkout collection from `Worktree.list`; both are stubbed so a spec
+-- never spawns git or depends on this checkout's own `.worktrees` directory.
+local real_worktree = {
+    detect = Worktree.detect,
+    list = Worktree.list,
+    snapshot_worktrees = Worktree.snapshot_worktrees,
+}
 
 --- Commands sent through the stub, in order.
 local sent = {}
@@ -84,6 +93,16 @@ local function install_stub()
         select_spy.pending = on_choice
     end
 
+    Worktree.detect = function()
+        return nil
+    end
+    Worktree.list = function(_, callback)
+        callback(nil, nil)
+    end
+    Worktree.snapshot_worktrees = function()
+        return {}
+    end
+
     responders.get_commands = function()
         return { type = "response", success = true, data = { commands = {} } }
     end
@@ -128,6 +147,9 @@ local function restore_stub(first_tab)
     History.list = real_history_list
     vim.notify = real_notify
     vim.ui.select = real_select
+    Worktree.detect = real_worktree.detect
+    Worktree.list = real_worktree.list
+    Worktree.snapshot_worktrees = real_worktree.snapshot_worktrees
 end
 
 --- Wait until fn() is truthy; fail the spec with `what` otherwise.
@@ -158,6 +180,26 @@ local function last_select_call(kind)
     return nil
 end
 
+--- Rows the telescope finder produces for `prompt` (dynamic finder).
+---@param cfg table
+---@param prompt? string
+---@return pi.ResumeRow[]
+local function picker_rows(cfg, prompt)
+    return cfg.finder.fn(prompt or "")
+end
+
+--- First session row of the picker (skipping partition titles).
+---@param cfg table
+---@return pi.ResumeRow?
+local function first_session_row(cfg)
+    for _, row in ipairs(picker_rows(cfg)) do
+        if row.kind == "session" then
+            return row
+        end
+    end
+    return nil
+end
+
 --- Create the fake telescope module tree and return recording state.
 local function install_fake_telescope()
     ---@class FakeTeleState
@@ -182,11 +224,20 @@ local function install_fake_telescope()
         new_table = function(tbl)
             return tbl
         end,
+        -- The resume picker uses a dynamic finder: rows are recomputed from the
+        -- prompt, so specs call `cfg.finder.fn(prompt)` to see them.
+        new_dynamic = function(tbl)
+            return tbl
+        end,
     }
     package.loaded["telescope.config"] = {
         values = {
             generic_sorter = function()
                 return "sorter"
+            end,
+            -- Rows are already filtered and ordered by resume_layout.
+            empty_sorter = function()
+                return "empty_sorter"
             end,
         },
     }
@@ -206,7 +257,7 @@ local function install_fake_telescope()
             return state.entry
         end,
         get_multi_selection = function(_bufnr)
-            return {}
+            return state.multi or {}
         end,
         get_current_picker = function(_bufnr)
             return {
@@ -274,8 +325,10 @@ describe("pi resume picker", function()
         assert.is_not_nil(call)
         assert.equals("Resume session", call.opts.prompt)
         assert.equals(2, #call.items)
-        assert.equals(T_TARGET, call.items[1].file)
-        assert.equals("named session", call.items[2].session.name)
+        -- Single partition: flat session rows (row.item is the picker item).
+        assert.equals("session", call.items[1].kind)
+        assert.equals(T_TARGET, call.items[1].item.file)
+        assert.equals("named session", call.items[2].item.session.name)
 
         -- Row rendering stays date + label.
         local label = call.opts.format_item(call.items[1])
@@ -405,6 +458,39 @@ describe("pi resume picker", function()
     describe("with telescope installed", function()
         local tele
 
+        --- Picker over two partitions: this checkout's session plus a managed
+        --- worktree's (main newest, so its title row comes first).
+        ---@return table telescope config
+        local function picker_with_worktree()
+            History.list = function()
+                return {
+                    {
+                        path = T_TARGET,
+                        name = "main session",
+                        timestamp = "2025-06-01T10:00:00.000Z",
+                        first_message = "",
+                        modified = 500,
+                    },
+                    {
+                        path = T_OTHER,
+                        name = "worktree session",
+                        timestamp = "2025-06-02T11:00:00.000Z",
+                        first_message = "",
+                        modified = 400,
+                        worktree = "fix-auth",
+                        worktree_info = {
+                            kind = "linked",
+                            name = "fix-auth",
+                            path = "/tmp/pi-resume-spec/repo/.worktrees/fix-auth",
+                            repo_root = "/tmp/pi-resume-spec/repo",
+                        },
+                    },
+                }
+            end
+            Sessions.resume_session()
+            return tele.new_cfgs[#tele.new_cfgs]
+        end
+
         before_each(function()
             tele = install_fake_telescope()
         end)
@@ -426,8 +512,11 @@ describe("pi resume picker", function()
 
             local cfg = tele.new_cfgs[1]
             assert.equals(false, theme.previewer)
-            assert.equals(2, #cfg.finder.results)
-            assert.equals(T_TARGET, cfg.finder.results[1].file)
+            assert.equals("empty_sorter", cfg.sorter, "rows arrive pre-filtered and pre-ordered")
+            local rows = picker_rows(cfg)
+            assert.equals(2, #rows)
+            assert.equals("session", rows[1].kind)
+            assert.equals(T_TARGET, rows[1].item.file)
         end)
 
         it("maps o/t/<C-t> and opens rows via select_default and <C-t>", function()
@@ -440,7 +529,7 @@ describe("pi resume picker", function()
             end)
 
             -- select_default -> current tab.
-            tele.entry = { value = cfg.finder.results[1] }
+            tele.entry = { value = first_session_row(cfg) }
             tele.select_default()
             wait_or_fail(function()
                 local switch, sidx = find_after(0, "switch_session")
@@ -459,8 +548,8 @@ describe("pi resume picker", function()
             cfg.attach_mappings(8, function(_modes, lhs, fn)
                 tele.maps[lhs] = fn
             end)
-            tele.entry = { value = cfg.finder.results[1] }
-            local o_target_path = tele.entry.value.file
+            tele.entry = { value = first_session_row(cfg) }
+            local o_target_path = tele.entry.value.item.file
             assert.equals(T_TARGET, o_target_path)
             tele.maps["o"]()
             wait_or_fail(function()
@@ -476,7 +565,7 @@ describe("pi resume picker", function()
             cfg.attach_mappings(9, function(_modes, lhs, fn)
                 tele.maps[lhs] = fn
             end)
-            tele.entry = { value = cfg.finder.results[1] }
+            tele.entry = { value = first_session_row(cfg) }
             tele.maps["t"]()
 
             wait_or_fail(function()
@@ -493,12 +582,61 @@ describe("pi resume picker", function()
             cfg.attach_mappings(10, function(_modes, lhs, fn)
                 tele.maps[lhs] = fn
             end)
-            tele.entry = { value = cfg.finder.results[1] }
+            tele.entry = { value = first_session_row(cfg) }
             tele.maps["<C-t>"]()
             wait_or_fail(function()
                 return #vim.api.nvim_list_tabpages() == tabs_before_ct + 1
                     and find_after(base_ct, "switch_session") ~= nil
             end, "<C-t> did not open a new tab")
+        end)
+
+        it("groups rows by checkout and steps over a group row when opening", function()
+            local cfg = picker_with_worktree()
+            cfg.attach_mappings(11, function(_modes, lhs, fn)
+                tele.maps[lhs] = fn
+            end)
+
+            local rows = picker_rows(cfg)
+            assert.are.same(
+                { "group", "session", "group", "session" },
+                vim.tbl_map(function(row)
+                    return row.kind
+                end, rows)
+            )
+            -- Main checkout: project name, no worktree glyph.
+            assert.is_false(rows[1].worktree)
+            -- Linked worktree: the glyph names the checkout.
+            assert.is_true(rows[3].worktree)
+            assert.truthy(rows[3].text:find("󰙅 fix-auth", 1, true))
+
+            -- A title row is not resumable: select_default opens the session below it.
+            tele.entry = { value = rows[1], index = 1 }
+            tele.select_default()
+            wait_or_fail(function()
+                local switch, sidx = find_after(0, "switch_session")
+                return switch ~= nil and sidx ~= nil and find_after(sidx, "get_messages") ~= nil
+            end, "select_default on a group row did not open the next session")
+            assert.equals(T_TARGET, find_after(0, "switch_session").sessionPath)
+        end)
+
+        it("keeps group rows out of the <C-x> selection", function()
+            local cfg = picker_with_worktree()
+            cfg.attach_mappings(12, function(_modes, lhs, fn)
+                tele.maps[lhs] = fn
+            end)
+            local rows = picker_rows(cfg)
+            tele.multi = { { value = rows[1] }, { value = rows[2] } }
+
+            local confirmed = nil
+            local orig_confirm = vim.fn.confirm
+            vim.fn.confirm = function(msg)
+                confirmed = msg
+                return 2 -- No: this spec only checks which rows count as targets.
+            end
+            tele.maps["<C-x>"]()
+            vim.fn.confirm = orig_confirm
+
+            assert.equals("Delete session?", confirmed, "a group row must not count as a deletion target")
         end)
     end)
 
@@ -533,6 +671,6 @@ describe("pi resume picker", function()
         Manifest.is_child_session = orig_is_child
 
         assert.equals(1, #call.items)
-        assert.equals("parent-session-id", call.items[1].session.id)
+        assert.equals("parent-session-id", call.items[1].item.session.id)
     end)
 end)

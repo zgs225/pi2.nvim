@@ -710,7 +710,7 @@ describe("cross-worktree resume", function()
         vim.ui.select = function(items, opts, on_choice)
             picked = { items = items, opts = opts }
             for _, item in ipairs(items) do
-                if item.worktree then
+                if item.kind == "session" then
                     on_choice(item)
                     return
                 end
@@ -723,8 +723,11 @@ describe("cross-worktree resume", function()
         end)
         assert.equals(1, list_calls)
         assert.equals(1, #picked.items)
-        assert.equals("wt1", picked.items[1].session.worktree)
-        assert.is_truthy(picked.opts.format_item(picked.items[1]):find("wt1", 1, true))
+        -- A single checkout stays flat: one session row, no group title and no
+        -- per-row worktree suffix (the checkout is named only by a title row).
+        assert.equals("session", picked.items[1].kind)
+        assert.equals("wt1", picked.items[1].item.session.worktree)
+        assert.equals("2025-01-01  worktree work", picked.opts.format_item(picked.items[1]))
 
         wait_for(function()
             local session = Sessions.get()
@@ -1316,12 +1319,22 @@ describe("worktree discovery and continue for resume", function()
         assert.equals(1, snapshot_calls)
         assert.equals(1, calls[gone])
         assert.equals(1, calls[snap]) -- both sources deduped to one listing
-        assert.equals(2, #picked.items)
+        -- Two checkouts => one title row per checkout, each followed by its
+        -- session row; row text never carries the worktree name.
+        assert.equals(4, #picked.items)
         assert.is_nil(calls[unmanaged]) -- unmanaged linked checkout not listed
-        assert.equals("gone", picked.items[1].session.worktree)
-        assert.equals("snapshot-only", picked.items[2].session.worktree)
-        assert.is_truthy(picked.opts.format_item(picked.items[1]):find("gone", 1, true))
-        assert.is_truthy(picked.opts.format_item(picked.items[2]):find("snapshot-only", 1, true))
+        assert.equals("group", picked.items[1].kind)
+        assert.equals("󰙅 gone", picked.items[1].text)
+        assert.equals("󰙅 gone", picked.opts.format_item(picked.items[1]))
+        assert.equals("session", picked.items[2].kind)
+        assert.equals("gone", picked.items[2].item.session.worktree)
+        assert.equals("2025-01-01  gone work", picked.opts.format_item(picked.items[2]))
+        assert.equals("group", picked.items[3].kind)
+        assert.equals("󰙅 snapshot-only", picked.items[3].text)
+        assert.equals("󰙅 snapshot-only", picked.opts.format_item(picked.items[3]))
+        assert.equals("session", picked.items[4].kind)
+        assert.equals("snapshot-only", picked.items[4].item.session.worktree)
+        assert.equals("2025-01-02  snapshot work", picked.opts.format_item(picked.items[4]))
     end)
 
     it("recovers a deleted worktree from its snapshot and restarts there", function()

@@ -178,7 +178,7 @@ The dashboard reuses `PiToolHeader` for its section headers, `Comment` for dimme
 | `PiSessionsListDotDim` | Dim phase of blinking dots |
 | `PiSessionsListCurrent` | Marks the current tab's own session dot in the agent color |
 | `PiSessionsListFloatTitle` | Float title for the sessions list window |
-| `PiSessionsListWorktree` | Worktree group header (`󰙅 name · ~/path`) when the list spans several worktrees |
+| `PiSessionsListWorktree` | Worktree group header in `:PiSessions` (`󰙅 name · ~/path`) and the partition title in the `:PiResume` picker (`󰙅 name` for a linked worktree, the project name for the main checkout) |
 | `PiSessionsListIntegrationQueued` | Integration status glyph `⧗` on a child row — captured and parked, waiting for a safe window (dim) |
 | `PiSessionsListIntegrationRunning` | Integration status glyph `…` — applying or resolving (busy color, bold) |
 | `PiSessionsListIntegrationApplied` | Integration status glyph `✓` — the child's patch is present in the parent checkout (links to `DiagnosticOk`) |
