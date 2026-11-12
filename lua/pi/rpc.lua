@@ -354,17 +354,30 @@ function Rpc:_dispatch(msg)
     end
 end
 
+---@class pi.RpcStartOpts
+---@field subagent? boolean false marks a child (sub-session) process.
+---@field cwd? string Working directory for the pi process (default: Neovim's cwd).
+---@field worktree_path? string Worktree root published to extensions as `PI_NVIM_WORKTREE_PATH`.
+---@field extra_args? string[] Extra CLI args forwarded to `Cli.command` (session bootstrap, e.g. `--fork`).
+
 ---@return boolean
----@param opts? { subagent?: boolean }
+---@param opts? pi.RpcStartOpts
 function Rpc:start(opts)
     opts = opts or {}
     if self._job_id then
         return true
     end
+    -- `jobstart` would fail with an opaque -1 for a missing directory, which
+    -- our generic "failed to start" message cannot explain. Surface the real
+    -- cause (usually a worktree that was removed underneath the session).
+    if type(opts.cwd) == "string" and opts.cwd ~= "" and vim.fn.isdirectory(opts.cwd) == 0 then
+        Notify.error("Working directory does not exist: " .. opts.cwd)
+        return false
+    end
     self._stdout_parts = {}
     -- A stale process's pending callbacks must never survive into the new one.
     self._pending = {}
-    local cmd = Cli.command({ subagent = opts.subagent })
+    local cmd = Cli.command({ subagent = opts.subagent, extra_args = opts.extra_args })
     -- The bundled vision extension reads its configured model from this
     -- runtime file on every input event (config.setup keeps it published).
     -- The auto-title extension reads its options from PI_NVIM_TITLE_FILE on
@@ -384,13 +397,21 @@ function Rpc:start(opts)
     -- file on every context event, so option changes apply without respawning
     -- the RPC process (same rationale as the title file).
     require("pi.todo.tool_ui").publish(Config.options.todo)
-    self._job_id = vim.fn.jobstart(cmd, {
-        env = {
-            PI_NVIM_VISION_FILE = require("pi.vision").state_path(),
-            PI_NVIM_TITLE_FILE = require("pi.title").state_path(),
-            PI_NVIM_SCOPE_FILE = scope_path,
-            PI_NVIM_TODO_FILE = require("pi.todo.tool_ui").state_path(),
-        },
+    local env = {
+        PI_NVIM_VISION_FILE = require("pi.vision").state_path(),
+        PI_NVIM_TITLE_FILE = require("pi.title").state_path(),
+        PI_NVIM_SCOPE_FILE = scope_path,
+        PI_NVIM_TODO_FILE = require("pi.todo.tool_ui").state_path(),
+    }
+    -- Extensions (e.g. subagent.ts) must know this process runs inside an
+    -- isolated git worktree. The spawn-time env is the only channel that
+    -- cannot be clobbered by a concurrent session, and it is absent for
+    -- ordinary sessions, so an extension can test for its presence.
+    if type(opts.worktree_path) == "string" and opts.worktree_path ~= "" then
+        env.PI_NVIM_WORKTREE_PATH = opts.worktree_path
+    end
+    local job_opts = {
+        env = env,
         on_stdout = function(_, data)
             self:_on_stdout(data)
         end,
@@ -409,7 +430,15 @@ function Rpc:start(opts)
         end,
         stdout_buffered = false,
         stderr_buffered = false,
-    })
+    }
+    -- pi resolves project context, tool paths and session storage from the
+    -- process cwd (it has no --cwd flag), so an explicit cwd is the only way
+    -- to actually run a session in a worktree. jobstart's cwd does not touch
+    -- Neovim's own cwd.
+    if type(opts.cwd) == "string" and opts.cwd ~= "" then
+        job_opts.cwd = opts.cwd
+    end
+    self._job_id = vim.fn.jobstart(cmd, job_opts)
     if self._job_id <= 0 then
         Notify.error("Failed to start process. Is 'pi' installed?")
         self._job_id = nil

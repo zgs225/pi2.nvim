@@ -84,6 +84,46 @@ function Layout:bash_mode()
     return self._bash_mode
 end
 
+---@alias pi.ChatHistoryTitleChunk { [1]: string, [2]: string? }
+
+--- Set the history window title from highlighted chunks — the side-layout
+--- winbar (statusline syntax) or the float border title (plain text, no
+--- per-chunk highlight). No-op when the history window is gone, or in side
+--- layout when `panels.history.winbar` is disabled (no bar to write).
+--- Callers own the text; a literal `%` is escaped here for the winbar path
+--- only, because a float title is not a statusline expression.
+---@param chunks pi.ChatHistoryTitleChunk[]
+function Layout:set_history_title(chunks)
+    local hwin = self:history_win()
+    if not hwin or #chunks == 0 then
+        return
+    end
+    if self._mode == "float" then
+        local parts = {}
+        for _, chunk in ipairs(chunks) do
+            parts[#parts + 1] = chunk[1]
+        end
+        -- Chunks are separated by one space, mirroring the winbar path.
+        pcall(vim.api.nvim_win_set_config, hwin, {
+            title = " " .. table.concat(parts, " ") .. " ",
+            title_pos = "center",
+        })
+        return
+    end
+    local side_cfg = Config.resolve_side_layout()
+    if not side_cfg.panels.history.winbar then
+        return
+    end
+    local out = "%#PiChatHistoryWinbar#%="
+    for _, chunk in ipairs(chunks) do
+        local hl = chunk[2] or "PiChatHistoryWinbar"
+        -- A literal % starts a statusline field, so it must be doubled.
+        local text = (chunk[1]:gsub("%%", "%%%%"))
+        out = out .. "%#" .. hl .. "# " .. text
+    end
+    vim.wo[hwin].winbar = out .. " %#PiChatHistoryWinbar#%="
+end
+
 --- Re-apply the prompt window title text and colors from the current
 --- bash-mode / attention state. Bash mode wins over attention styling.
 function Layout:_refresh_prompt_chrome()

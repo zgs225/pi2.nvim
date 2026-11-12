@@ -107,13 +107,19 @@ function M.short_id(id)
 end
 
 --- Manifest display name (same source as :PiSessions child rows).
+---
+--- Tool rendering has no session context to hand, and the row lives in the
+--- parent's workspace manifest (not necessarily Neovim's cwd), so the workspace
+--- is a hint: `Manifest.locate` searches the live sessions' workspaces and the
+--- manifests on disk when the hint misses.
 ---@param child_id? string
+---@param cwd? string workspace cwd expected to own the row (default: locate it)
 ---@return string?
-function M.child_name(child_id)
+function M.child_name(child_id, cwd)
     if type(child_id) ~= "string" or child_id == "" then
         return nil
     end
-    local entry = Manifest.load()[child_id]
+    local entry = Manifest.locate(child_id, cwd)
     if entry and type(entry.name) == "string" and entry.name ~= "" then
         return entry.name
     end
@@ -143,8 +149,9 @@ end
 --- Checks item.model and item.thinking_level (or item.think_level), and falls back
 --- to manifest config for target sub-agents when not explicitly supplied.
 ---@param item table
+---@param cwd? string workspace cwd expected to own the target's row (default: locate it)
 ---@return string?
-function M.item_config_label(item)
+function M.item_config_label(item, cwd)
     if type(item) ~= "table" then
         return nil
     end
@@ -153,7 +160,7 @@ function M.item_config_label(item)
     local thinking_level = item.thinking_level or item.think_level
 
     if (not model or not thinking_level) and type(item.target) == "string" and item.target ~= "" then
-        local entry = Manifest.load()[item.target]
+        local entry = Manifest.locate(item.target, cwd)
         local cfg = entry and entry.config
         if cfg then
             if not model and cfg.model then

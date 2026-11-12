@@ -9,6 +9,7 @@ local Config = require("pi.config")
 ---@field modified number      file mtime (for sorting)
 ---@field first_message string first user message (truncated)
 ---@field name? string         display name from session_info entry
+---@field cwd? string          working directory recorded in the session header (nil when the session did not store one)
 
 --- Resolve the pi agent directory.
 ---@return string
@@ -48,12 +49,36 @@ local function encode_cwd(cwd)
     return "--" .. encoded .. "--"
 end
 
---- Get the sessions directory for the current cwd.
+--- Resolve a workspace cwd to the canonical form pi encodes into a directory
+--- name. An explicit cwd (a session's own working directory, possibly a git
+--- worktree) is expanded and symlink-resolved so it matches the path the pi
+--- process reports; an unusable value falls back to Neovim's cwd, which keeps
+--- the historical single-workspace behaviour.
+---@param cwd? string
 ---@return string
-function M.get_sessions_dir()
+local function resolve_cwd(cwd)
+    if type(cwd) ~= "string" or vim.trim(cwd) == "" then
+        return vim.fn.getcwd()
+    end
+    local path = vim.trim(cwd)
+    local is_absolute = path:sub(1, 1) == "/" or path:match("^%a:[/\\]") ~= nil or path:sub(1, 2) == "\\\\"
+    if not is_absolute then
+        path = vim.fn.fnamemodify(path, ":p")
+    end
+    return vim.fs.normalize(vim.uv.fs_realpath(path) or path)
+end
+
+--- Sessions directory for a workspace cwd.
+---
+--- pi groups session files by the working directory a session runs in, so a
+--- worktree session lives in a different directory than a session started in
+--- the main checkout. Callers pass the session's own cwd; omitting it keeps
+--- the process-cwd behaviour used by single-workspace callers.
+---@param cwd? string workspace cwd (default: Neovim's current cwd)
+---@return string
+function M.get_sessions_dir(cwd)
     local agent_dir = get_agent_dir()
-    local cwd = vim.fn.getcwd()
-    return join_path(agent_dir, "sessions", encode_cwd(cwd))
+    return join_path(agent_dir, "sessions", encode_cwd(resolve_cwd(cwd)))
 end
 
 --- Decode a line if it is a `session_info` entry carrying a non-empty name.
@@ -129,6 +154,14 @@ function M.parse(path)
     -- Truncate to single line, max 80 chars
     first_message = first_message:gsub("\n", " "):sub(1, 80)
 
+    -- The header records the directory the session ran in. Sessions written by
+    -- older pi versions may omit it (or store ""), so `cwd` stays nil rather
+    -- than an empty string: callers keep their current workspace then.
+    local header_cwd = header.cwd
+    if type(header_cwd) ~= "string" or vim.trim(header_cwd) == "" then
+        header_cwd = nil
+    end
+
     return {
         path = path,
         id = header.id or "",
@@ -136,6 +169,7 @@ function M.parse(path)
         modified = vim.fn.getftime(path),
         first_message = first_message,
         name = name,
+        cwd = header_cwd,
     }
 end
 
@@ -150,12 +184,13 @@ end
 --- preserves the old `list()`-scan semantics exactly, including picking the
 --- newest file when several share an id.
 ---@param id string
+---@param cwd? string workspace cwd to search (default: Neovim's current cwd)
 ---@return pi.SessionInfo?
-function M.find_by_id(id)
+function M.find_by_id(id, cwd)
     if type(id) ~= "string" or id == "" then
         return nil
     end
-    local dir = M.get_sessions_dir()
+    local dir = M.get_sessions_dir(cwd)
     local files = vim.fn.glob(join_path(dir, "*_" .. id .. ".jsonl"), false, true)
     ---@type pi.SessionInfo?
     local best = nil
@@ -168,7 +203,7 @@ function M.find_by_id(id)
     if best then
         return best
     end
-    for _, info in ipairs(M.list()) do
+    for _, info in ipairs(M.list(cwd)) do
         if info.id == id then
             return info
         end
@@ -176,10 +211,11 @@ function M.find_by_id(id)
     return nil
 end
 
---- List all sessions for the current cwd, sorted by modified time (newest first).
+--- List all sessions for a workspace cwd, sorted by modified time (newest first).
+---@param cwd? string workspace cwd (default: Neovim's current cwd)
 ---@return pi.SessionInfo[]
-function M.list()
-    local dir = M.get_sessions_dir()
+function M.list(cwd)
+    local dir = M.get_sessions_dir(cwd)
     ---@type string[]
     local files = vim.fn.glob(join_path(dir, "*.jsonl"), false, true)
     ---@type pi.SessionInfo[]

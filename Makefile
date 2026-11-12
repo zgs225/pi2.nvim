@@ -3,6 +3,7 @@
 #   make test    — run the plenary unit test suite (hermetic, -u tests/minimal_init.lua)
 #   make e2e     — run headless end-to-end scripts (tests/*_e2e.lua)
 #   make e2e-reaper — real-pi e2e: subagent idle reaper + max_children cap (needs pi binary + provider; not CI)
+#   make e2e-worktrees — real-git e2e: worktree create/apply/remove/ship/release (needs pi binary; no provider calls)
 #   make smoke   — headless end-to-end smoke check (loads the user config, opens the chat)
 #   make format  — reformat lua/ and tests/ in place with stylua
 #   make style   — check formatting only (stylua --check); non-zero exit on drift, for CI/hooks
@@ -18,7 +19,7 @@ MIN_INIT := tests/minimal_init.lua
 STYLUA_BIN ?= stylua
 LUA_LS_BIN ?= lua-language-server
 
-.PHONY: test smoke format style lint docs-links e2e e2e-reaper
+.PHONY: test smoke format style lint docs-links e2e e2e-reaper e2e-worktrees
 
 test:
 	PLENARY_PATH=$(PLENARY_PATH) $(NVIM_BIN) --headless -u $(MIN_INIT) \
@@ -35,6 +36,9 @@ e2e:
 # configured provider. See .agents/skills/develop/references/testing.md.
 e2e-reaper:
 	$(NVIM_BIN) --headless -u $(MIN_INIT) -l scripts/e2e/reaper.lua
+
+e2e-worktrees:
+	$(NVIM_BIN) --headless -u $(MIN_INIT) -l scripts/e2e/worktrees.lua
 
 smoke:
 	$(NVIM_BIN) --headless -u $(HOME)/.config/nvim/init.lua -l scripts/smoke.lua

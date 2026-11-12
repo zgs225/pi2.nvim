@@ -251,6 +251,18 @@
 ---@field border? string|string[] Float border style (default "rounded")
 ---@field list pi.DiffReviewListConfig Side file-list window
 
+---@class pi.WorktreeIntegrationConfig
+---@field auto? boolean Apply a settled sub-session's worktree patch to the parent checkout automatically (`pi.worktree_integration`): capture + snapshot, then apply only while the parent is blocked in a wait or idle, otherwise park as `queued` (default true)
+---@field auto_resolve? boolean On a conflict or a stale base commit, ask the (still running) child agent to rebase and resolve inside its own checkout once, then retry (default true; `max_attempts = 0` disables it)
+---@field max_attempts? integer How many resolving rounds a child gets before the integration stops in `needs_attention` (default 1)
+---@field keep_count? integer Soft cap on applied child checkouts kept on disk. Only `applied` + verified + inactive + unpinned checkouts are removed, oldest first; unintegrated, parked and `needs_attention` checkouts are never removed for quota (default 15)
+
+---@class pi.WorktreeConfig
+---@field setup_cmd? string[] Command run inside a freshly created worktree before the creation callback fires. Executed directly (no shell) with the worktree root as cwd; a non-zero exit keeps the worktree in place and fails the creation.
+---@field isolate_subagents? boolean Give every new sub-session its own linked worktree (`sub-<timestamp>-<seq>-<pid>`); a child whose parent already runs in a worktree inherits that checkout instead of nesting another one, and a parent worktree is never released by a child (default true)
+---@field snapshot_before_remove? boolean Write a patch snapshot before removing a worktree (`Worktree.remove`, `:PiWorktreeRemove`) (default true)
+---@field integration? pi.WorktreeIntegrationConfig Automatic integration of a settled sub-session's patch into the parent checkout (see `doc/worktrees.md`)
+
 ---@class pi.DialogKeys
 ---@field confirm? pi.KeySpecs
 ---@field cancel? pi.KeySpecs
@@ -354,6 +366,7 @@
 ---@field quickfix pi.QuickfixConfig
 ---@field abort pi.AbortConfig
 ---@field tree pi.TreeConfig
+---@field worktree pi.WorktreeConfig
 ---@field subagent pi.SubagentConfig
 ---@field vision pi.VisionConfig
 ---@field title pi.TitleConfig
@@ -501,6 +514,17 @@ local defaults = {
     },
     tree = {
         enabled = true,
+    },
+    worktree = {
+        setup_cmd = nil,
+        isolate_subagents = true,
+        snapshot_before_remove = true,
+        integration = {
+            auto = true,
+            auto_resolve = true,
+            max_attempts = 1,
+            keep_count = 15,
+        },
     },
     subagent = {
         enabled = true,

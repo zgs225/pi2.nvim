@@ -274,6 +274,7 @@ end
 
 ---@class pi.CliCommandOpts
 ---@field subagent? boolean false marks a child (sub-session) process: inject subagent-child.ts instead of subagent.ts (default: parent — inject subagent.ts).
+---@field extra_args? string[] Extra args appended right after the configured `cli.args`, e.g. `{ "--fork", path }`. Used to bootstrap a session into a new process; plain pass-through (not filtered or version-gated).
 
 ---@param opts? pi.CliCommandOpts
 ---@return string[]
@@ -281,6 +282,16 @@ function M.command(opts)
     opts = opts or {}
     local cmd = { M.bin() }
     vim.list_extend(cmd, M.args())
+    -- Session-bootstrap args ride directly behind the configured ones and
+    -- never land after `--mode rpc`. Empty/non-string entries are dropped
+    -- rather than poisoning the argv (a nil would make jobstart throw).
+    if type(opts.extra_args) == "table" then
+        for _, arg in ipairs(opts.extra_args) do
+            if type(arg) == "string" and arg ~= "" then
+                cmd[#cmd + 1] = arg
+            end
+        end
+    end
     -- Inject the bundled extension that bridges session-tree navigation
     -- (:PiTree) into RPC mode; explicit -e paths work even if the user
     -- passed --no-extensions in cli.args.

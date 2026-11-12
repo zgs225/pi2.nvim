@@ -19,6 +19,7 @@ local TodoToolUi = require("pi.todo.tool_ui")
 ---@class pi.SubsessionViewerOpts
 ---@field on_close? fun()
 ---@field name? string Display-name override (beats manifest entry and JSONL session_info)
+---@field cwd? string Workspace whose manifest holds the row (default: locate it)
 ---@field width? number Width in columns (>=1) or fraction of editor width (<1)
 ---@field height? number Height in lines (>=1) or fraction of editor height (<1)
 ---@field border? string|string[] Float border style
@@ -1141,9 +1142,13 @@ function M.open(child_id, opts)
     -- 1. Close any existing viewer
     M.close()
 
-    -- 2. Look up manifest entry for name/status
-    local manifest = Manifest.load()
-    local entry = manifest[child_id]
+    -- 2. Look up the child's manifest row. Sub-session rows live in the *parent*
+    -- session's workspace manifest, which is not necessarily Neovim's cwd (a tab
+    -- can run in a worktree checkout): `opts.cwd` is the hint, otherwise the row
+    -- is located across live workspaces and the manifests on disk.
+    local workspace = type(opts.cwd) == "string" and opts.cwd ~= "" and opts.cwd or nil
+    local entry, entry_cwd = Manifest.locate(child_id, workspace)
+    workspace = entry_cwd or workspace
 
     -- Name precedence: opts.name > manifest entry name > JSONL session_info > raw id.
     ---@type string?
@@ -1203,7 +1208,8 @@ function M.open(child_id, opts)
     -- cwd, or a session file opened by id).
     local session_cwd = (session and session.cwd) or nil
     if not is_live then
-        local path = (session and session.session_file) or Read.find_path(child_id)
+        local path = (session and session.session_file)
+            or Read.find_path(child_id, { cwd = (session and session.cwd) or workspace })
         if not path and vim.fn.filereadable(child_id) == 1 then
             path = child_id
         end
@@ -1300,7 +1306,7 @@ function M.open(child_id, opts)
     viewer_win = win
     viewer_history = history
     viewer_child_id = child_id
-    viewer_is_child = Manifest.is_child_session(child_id)
+    viewer_is_child = type(entry) == "table" and entry.parent_id ~= nil
     viewer_session_name = name
     viewer_loading = false
     viewer_event_queue = nil

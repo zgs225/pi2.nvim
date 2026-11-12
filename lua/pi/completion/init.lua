@@ -1,10 +1,29 @@
 --- Shared matching logic for @-mention and /command completion sources.
 
-local FilesCache = require("pi.cache.files")
 local CommandsCache = require("pi.cache.commands")
 local Providers = require("pi.mention_providers")
 
 local M = {}
+
+--- Workspace cwd of the current tab's session (nil = Neovim's cwd).
+---
+--- The project file cache is workspace-scoped, and a worktree (or resumed)
+--- session's cwd is not Neovim's. Resolved lazily and defensively: completion
+--- must keep working when the session layer is unavailable (startup, a tab
+--- without a session, specs).
+---@return string?
+local function session_cwd()
+    local ok, manager = pcall(require, "pi.sessions.manager")
+    if not ok or type(manager) ~= "table" or type(manager.get) ~= "function" then
+        return nil
+    end
+    local ok_get, session = pcall(manager.get)
+    if not ok_get or type(session) ~= "table" then
+        return nil
+    end
+    local cwd = session.cwd
+    return type(cwd) == "string" and cwd ~= "" and cwd or nil
+end
 
 --- Stop the fuzzy pass after this many results. Completion menus page
 --- through far fewer than this; on huge repos an unbounded fuzzy scan is
@@ -66,7 +85,10 @@ end
 ---@param make_item fun(path: string, kind: "file"|"dir", is_fuzzy: boolean): table
 ---@return table[]
 function M.complete_files(prefix, make_item)
-    local project_files = FilesCache.list()
+    -- Lazy: the file cache belongs to the workspace, so it is only consulted
+    -- once there is a query, with the session cwd (not Neovim's).
+    local FilesCache = require("pi.cache.files")
+    local project_files = FilesCache.list(session_cwd())
     local items = {}
     local seen_dirs = {}
     local prefix_matched = {}

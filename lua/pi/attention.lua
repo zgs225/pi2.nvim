@@ -327,6 +327,10 @@ local function build_entry(session, msg)
                         send_response(session, { type = "extension_ui_response", id = id, value = result })
                     end, {
                         timeout = timeout,
+                        -- Anchor relative tool paths at the session's own workspace
+                        -- (a worktree session must never review/write the main
+                        -- checkout's copy of the file).
+                        cwd = session.cwd,
                         on_timeout = function()
                             notify_expired("diff")
                         end,

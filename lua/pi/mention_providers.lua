@@ -14,7 +14,7 @@
 ---@field name string mention name without the @ prefix
 ---@field description string shown in the completion menu
 ---@field lang? string fence language for the materialized block
----@field fn fun(): string?
+---@field fn fun(cwd?: string): string? `cwd` is the workspace to read (nil = Neovim's cwd)
 
 local M = {}
 
@@ -25,11 +25,15 @@ local Notify = require("pi.notify")
 --- blow up the message; larger payloads are truncated with a marker.
 local MAX_CONTENT_BYTES = 256 * 1024
 
---- Run a shell command in the current cwd, returning trimmed stdout or nil.
+--- Run a shell command in the given workspace, returning trimmed stdout or nil.
+--- Built-in providers read workspace state (`git diff`, …), so they must consult
+--- the session's cwd rather than Neovim's: a worktree session's diff lives in
+--- the worktree. Omitting `cwd` keeps the process-cwd behaviour.
 ---@param args string[]
+---@param cwd? string workspace cwd (default: Neovim's current cwd)
 ---@return string?
-local function run_cmd(args)
-    local ok, proc = pcall(vim.system, args, { cwd = vim.uv.cwd(), text = true })
+local function run_cmd(args, cwd)
+    local ok, proc = pcall(vim.system, args, { cwd = cwd or vim.uv.cwd(), text = true })
     if not ok then
         return nil
     end
@@ -84,23 +88,24 @@ local function lsp_errors_content()
     return table.concat(lines, "\n")
 end
 
---- Built-in providers, in menu order.
+--- Built-in providers, in menu order. Each `fn` receives the workspace cwd the
+--- caller materializes from (nil = Neovim's cwd).
 ---@type pi.MentionProvider[]
 local builtins = {
     {
         name = "git-diff",
         description = "git diff HEAD (staged + unstaged changes)",
         lang = "diff",
-        fn = function()
-            return run_cmd({ "git", "diff", "HEAD" })
+        fn = function(cwd)
+            return run_cmd({ "git", "diff", "HEAD" }, cwd)
         end,
     },
     {
         name = "git-log",
         description = "git log --oneline -20 (recent commits)",
         lang = "",
-        fn = function()
-            return run_cmd({ "git", "log", "--oneline", "-20" })
+        fn = function(cwd)
+            return run_cmd({ "git", "log", "--oneline", "-20" }, cwd)
         end,
     },
     {
@@ -177,13 +182,14 @@ end
 --- Run a provider and return its materialized content, or nil when it
 --- produced nothing. Errors are reported to the user, never raised.
 ---@param name string
+---@param cwd? string workspace cwd passed to the provider (default: Neovim's current cwd)
 ---@return string? content trimmed, truncated to MAX_CONTENT_BYTES
-function M.materialize(name)
+function M.materialize(name, cwd)
     local provider = M.get(name)
     if not provider then
         return nil
     end
-    local ok, content = pcall(provider.fn)
+    local ok, content = pcall(provider.fn, cwd)
     if not ok then
         Notify.warn(("Mention provider @%s failed: %s"):format(name, vim.trim(tostring(content))))
         return nil

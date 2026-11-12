@@ -17,6 +17,11 @@
 ---
 --- Closing goes through `Subsessions.close`: manifest turns `dormant`, the
 --- session JSONL is retained and the child stays revivable via dispatch.
+---
+--- The same module also owns the worktree backstop (`release_orphaned_worktrees`,
+--- run at the top of every sweep): closing a child releases its worktree, but a
+--- child that died without a close/settle (Neovim restarted, RPC exit raced the
+--- manifest) still owns a checkout on disk.
 
 local M = {}
 
@@ -70,8 +75,9 @@ end
 
 --- True when conditions (a), (b) and (c) all hold for `child_id`.
 ---@param child_id string
+---@param cwd? string workspace cwd expected to hold the row (default: locate it)
 ---@return boolean
-local function can_reap(child_id)
+local function can_reap(child_id, cwd)
     if type(child_id) ~= "string" or child_id == "" then
         return false
     end
@@ -82,9 +88,22 @@ local function can_reap(child_id)
         return false
     end
 
-    -- (b) manifest must report a settled run
-    local entry = Manifest.load()[child_id]
+    -- (b) manifest must report a settled run. The row lives in the owner
+    -- parent's workspace; the caller's cwd is only a hint, so fall back to
+    -- locating it (a reap driven by a timer has no session context).
+    ---@type pi.SubsessionManifestEntry?
+    local entry = Manifest.load(cwd)[child_id]
+    if type(entry) ~= "table" then
+        entry = Manifest.locate(child_id, cwd)
+    end
     if type(entry) ~= "table" or not settled_status[entry.status] then
+        return false
+    end
+
+    -- (d) the integration engine owns the checkout while it is queued /
+    -- resolving / applying — closing the process would pull the directory out
+    -- from under it.
+    if Manifest.integration_busy(entry) then
         return false
     end
 
@@ -99,9 +118,10 @@ end
 --- Fire-time check: close `child_id` only when conditions (a), (b) and (c)
 --- all hold. Silent no-op otherwise.
 ---@param child_id string
+---@param cwd? string workspace cwd expected to hold the row (default: locate it)
 ---@return boolean closed True when the child process was closed.
-function M.reap(child_id)
-    if not can_reap(child_id) then
+function M.reap(child_id, cwd)
+    if not can_reap(child_id, cwd) then
         return false
     end
 
@@ -116,13 +136,14 @@ end
 ---@param lineage_id string
 ---@param needed integer
 ---@param exclude? table<string, boolean> Child ids never to reap (e.g. reuse targets of the batch being admitted).
+---@param cwd? string workspace cwd holding the lineage's manifest (default: Neovim's cwd)
 ---@return integer reaped
-function M.reap_oldest_settled(lineage_id, needed, exclude)
+function M.reap_oldest_settled(lineage_id, needed, exclude, cwd)
     if type(needed) ~= "number" or needed <= 0 or type(lineage_id) ~= "string" or lineage_id == "" then
         return 0
     end
 
-    local manifest = Manifest.load()
+    local manifest = Manifest.load(cwd)
     local candidates = {}
     for id, entry in pairs(manifest) do
         if
@@ -151,7 +172,7 @@ function M.reap_oldest_settled(lineage_id, needed, exclude)
         if reaped >= needed then
             break
         end
-        if M.reap(candidate.id) then
+        if M.reap(candidate.id, cwd) then
             reaped = reaped + 1
         end
     end
@@ -159,11 +180,63 @@ function M.reap_oldest_settled(lineage_id, needed, exclude)
     return reaped
 end
 
+--- Release worktrees of orphaned children in one manifest.
+---
+--- The session manager owns worktree release for every session it still knows
+--- about: `close_session` (which `Subsessions.close` / `M.reap` go through) and
+--- the `_process_exit` handler both hand the worktree back with a once-only
+--- guard. This backstop only covers rows no registry session owns — the state left
+--- behind by a Neovim restart, where a child's checkout would otherwise live on
+--- disk forever — and `Subsessions.release_worktree` still refuses a path any
+--- live session is rooted in (the manifest id can lag the registry id during a
+--- revive). `pi.worktree.release` deletes a clean checkout only, so uncommitted
+--- child work always survives for a revive to reuse; an already removed
+--- directory is skipped before the call.
+---@param manifest table<string, pi.SubsessionManifestEntry>
+---@return integer released Number of children whose worktree was released.
+local function release_orphans_in(manifest)
+    local released = 0
+    for id, entry in pairs(manifest) do
+        -- The worktree record is read structurally: the manifest row class is
+        -- owned by the manifest module, this is just the backstop consumer.
+        local row = entry --[[@as table]]
+        if Manifest.is_entry_id(id) and type(row) == "table" and Sessions.get_by_id(id) == nil then
+            -- Rows the integration engine has a record for are the engine's
+            -- business, not this backstop's: `queued`/`resolving`/`applying` are
+            -- mid-flight, and an `applied`/`needs_attention` checkout may still
+            -- hold changes the engine has not finished with. Direct
+            -- `Worktree.release` would also refuse a dirty checkout forever.
+            -- Engine-driven cleanup is `Integration.enforce_retention`.
+            local engine_owned = Manifest.integration_state(row) ~= nil
+            local info = row.worktree
+            local path = type(info) == "table" and info.path or nil
+            if
+                not engine_owned
+                and type(path) == "string"
+                and path ~= ""
+                and vim.fn.isdirectory(path) == 1
+                and require("pi.subsessions").release_worktree(id)
+            then
+                released = released + 1
+            end
+        end
+    end
+    return released
+end
+
+--- Release the worktrees of orphaned children in `cwd`'s manifest.
+---@param cwd? string workspace cwd (default: Neovim's current cwd)
+---@return integer released Number of children whose worktree was released.
+function M.release_orphaned_worktrees(cwd)
+    return release_orphans_in(Manifest.load(cwd))
+end
+
 --- Event-driven arming: fire a single re-check after `reap_after_minutes`.
 --- The defer is not cancellable — a revived child is caught by the status
 --- re-check inside `M.reap` when the timer fires. No-op when the option is 0.
 ---@param child_id string
-function M.schedule(child_id)
+---@param cwd? string workspace cwd that holds the child's row (default: locate it)
+function M.schedule(child_id, cwd)
     if type(child_id) ~= "string" or child_id == "" then
         return
     end
@@ -174,25 +247,27 @@ function M.schedule(child_id)
     vim.defer_fn(function()
         -- uv timer callbacks are fast events; reap() touches registry/manifest.
         vim.schedule(function()
-            M.reap(child_id)
+            M.reap(child_id, cwd)
         end)
     end, math.floor(minutes * 60 * 1000))
 end
 
---- Full sweep: every settled child idle longer than `reap_after_minutes`.
---- Iterates the manifest first (age-gated by `last_active_at`), then live
---- registry children that have **no** manifest row (lost/corrupt manifest):
---- those fall back to the session JSONL for settled-ness and its file mtime
---- for idleness. A no-op when `reap_after_minutes` is 0.
----@return integer closed Number of children closed by this sweep.
-function M.sweep()
-    local minutes = reap_after_minutes()
+--- Sweep one manifest scope: storage backstop plus idle reaping.
+---@param scope pi.SubsessionScope
+---@param minutes integer reap threshold in minutes (0 = storage cleanup only)
+---@param cutoff string ISO cutoff derived from `minutes`
+---@return integer closed Number of children closed by this scope.
+local function sweep_scope(scope, minutes, cutoff)
+    local manifest = Manifest.load_at(scope.path)
+    local closed = 0
+
+    -- Storage backstop, independent of process reaping: a worktree left behind
+    -- by a dead child is disk usage, not a live-process leak.
+    pcall(release_orphans_in, manifest)
+
     if minutes <= 0 then
         return 0
     end
-    local cutoff = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time() - math.floor(minutes * 60))
-    local manifest = Manifest.load()
-    local closed = 0
 
     -- Manifest children: settled status + idle past the threshold; `reap`
     -- re-validates registry liveness and tab view at close time.
@@ -204,20 +279,34 @@ function M.sweep()
                 and type(last) == "string"
                 and last ~= ""
                 and last < cutoff
-                and M.reap(id)
+                and M.reap(id, scope.cwd)
             then
                 closed = closed + 1
             end
         end
     end
 
-    -- Detached children missing from the manifest: prove settled from the
-    -- session JSONL and idleness from its mtime (no manifest row means no
-    -- `last_active_at` to age against).
+    -- Detached children whose workspace reports this manifest but that have
+    -- **no** row in it (lost/corrupt manifest): prove settled-ness from the
+    -- session JSONL and idleness from its mtime. The transcript lives in the
+    -- child's own workspace (its worktree), so the lookup uses the session's
+    -- own cwd and recorded file, not the manifest's.
     for _, session in ipairs(Sessions.list_all()) do
         local id = session.id
-        if type(id) == "string" and id ~= "" and session.parent_id ~= nil and manifest[id] == nil then
-            local path = session.session_file or Read.find_path(id)
+        if
+            type(id) == "string"
+            and id ~= ""
+            and session.parent_id ~= nil
+            and manifest[id] == nil
+            and Manifest.path(Manifest.workspace(session)) == scope.path
+        then
+            local session_file = session.session_file
+            local path
+            if type(session_file) == "string" and session_file ~= "" and vim.fn.filereadable(session_file) == 1 then
+                path = session_file
+            else
+                path = Read.find_path(id, { cwd = session.cwd })
+            end
             local rpc = session.rpc
             local alive = rpc ~= nil and rpc:is_running() == true
             local inferred = path ~= nil and Read.infer_run_status(path) or nil
@@ -235,6 +324,33 @@ function M.sweep()
         end
     end
 
+    return closed
+end
+
+--- Full sweep across every workspace.
+---
+--- Scopes come from `Manifest.scopes`: the process cwd, every live session's
+--- workspace, and every manifest on disk — so a tab running in another checkout
+--- (or a workspace no live session reports after a restart) is swept too, which
+--- the old process-cwd-only sweep silently skipped. Within a scope the manifest
+--- comes first (age-gated by `last_active_at`), then live registry children
+--- with no row in that workspace's manifest. A no-op for reaping when
+--- `reap_after_minutes` is 0 (the storage backstop still runs).
+---@return integer closed Number of children closed by this sweep.
+function M.sweep()
+    local minutes = reap_after_minutes()
+    local cutoff = ""
+    if minutes > 0 then
+        cutoff = tostring(os.date("!%Y-%m-%dT%H:%M:%SZ", os.time() - math.floor(minutes * 60)))
+    end
+    local closed = 0
+    local seen = {}
+    for _, scope in ipairs(Manifest.scopes({ disk = true })) do
+        if not seen[scope.path] then
+            seen[scope.path] = true
+            closed = closed + sweep_scope(scope, minutes, cutoff)
+        end
+    end
     return closed
 end
 

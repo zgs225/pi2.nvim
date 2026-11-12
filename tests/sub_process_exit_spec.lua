@@ -14,7 +14,7 @@ local SessionsList = require("pi.ui.sessions")
 local Batch = require("pi.subsessions.batch")
 local Manifest = require("pi.subsessions.manifest")
 
-Config.setup({})
+Config.setup({ worktree = { integration = { auto = false } } })
 
 local real = {
     start = Rpc.start,

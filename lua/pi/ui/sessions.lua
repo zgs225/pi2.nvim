@@ -29,13 +29,13 @@ local show_hidden_children = false
 ---@field tab? pi.TabId
 ---@field session_id? string
 ---@field child_id? string Manifest child id when no live session
----@field depth integer 0 = parent tab row, 1 = sub-session
+---@field depth? integer 0 = parent tab row, 1 = sub-session, nil = worktree group header
 ---@field status pi.SessionsListStatus
 ---@field attention integer pending attention request count
 ---@field done boolean last turn finished while the user was elsewhere
 ---@field error boolean last turn failed and the user hasn't seen it yet
----@field name string? display name (nil while still fetching)
----@field title_generating boolean backend auto-title generation in progress
+---@field name? string display name (nil while still fetching)
+---@field title_generating? boolean backend auto-title generation in progress
 ---@field subtitle? string model · thinking badge for sub-rows
 ---@field dormant? boolean process not running (disk only)
 ---@field session? pi.Session live session reference when available
@@ -46,6 +46,12 @@ local show_hidden_children = false
 ---@field has_children? boolean parent row has visible sub-sessions
 ---@field collapsed? boolean whether child sub-sessions are folded
 ---@field child_count? integer number of visible sub-sessions
+---@field is_group? boolean worktree group header row (not a session)
+---@field group_id? string worktree root of a group header and its members
+---@field worktree? string worktree name shown on a group header / sub-session row
+---@field worktree_path? string display path of a worktree group header
+---@field forked_from? string display name of the session this one was forked from
+---@field integration_state? string automatic worktree integration state of a sub-session row
 
 ---@type integer? shared list buffer
 local buf = nil
@@ -212,7 +218,7 @@ local function parent_key(parent_sess)
         return parent_sess
     end
     local Manifest = require("pi.subsessions.manifest")
-    local lineage = Manifest.lineage_for_session(parent_sess)
+    local lineage = Manifest.lineage_for_session(parent_sess, Manifest.workspace(parent_sess))
     if lineage and lineage ~= "" then
         return lineage
     end
@@ -266,6 +272,211 @@ local function toggle_parent_collapsed(parent_sess, is_active_parent)
     return parent_folds[key]
 end
 
+--- Worktree glyph shared by the group header and the sub-session row suffix.
+local WORKTREE_GLYPH = "󰙅"
+
+--- Compact status for a manifest child's automatic worktree integration: one
+--- glyph appended to the row body, so the existing name / subtitle columns keep
+--- their alignment and a long integration error can never widen the list.
+--- `applied` also covers a checkout removed after a successful apply
+--- (`worktree_removed`), whose state stays `applied`.
+---@type table<string, { glyph: string, hl: string }>
+local INTEGRATION_STATUS = {
+    queued = { glyph = "⧗", hl = "PiSessionsListIntegrationQueued" },
+    applying = { glyph = "…", hl = "PiSessionsListIntegrationRunning" },
+    resolving = { glyph = "…", hl = "PiSessionsListIntegrationRunning" },
+    applied = { glyph = "✓", hl = "PiSessionsListIntegrationApplied" },
+    needs_attention = { glyph = "!", hl = "PiSessionsListIntegrationAttention" },
+}
+
+---@class pi.SessionsListWorktree
+---@field kind "main"|"linked"
+---@field name string worktree directory name
+---@field path string worktree root
+---@field repo_root? string main checkout root (linked worktrees)
+
+--- Memoized `pi.worktree.detect` per directory. Detection is filesystem-only
+--- (no git), so it is safe on the render path — the blink/spinner timers call
+--- `_render` every 120–500 ms. Dirty/ahead state is Chat-side only.
+---@type table<string, pi.SessionsListWorktree|false>
+local worktree_cache = {}
+
+---@param dir string
+---@return pi.SessionsListWorktree?
+local function detect_worktree(dir)
+    local cached = worktree_cache[dir]
+    if cached ~= nil then
+        return cached or nil
+    end
+    local info = nil
+    local ok, mod = pcall(require, "pi.worktree")
+    if ok and type(mod) == "table" and type(mod.detect) == "function" then
+        local detected = mod.detect(dir)
+        if type(detected) == "table" and type(detected.path) == "string" and type(detected.name) == "string" then
+            info = detected
+        end
+    end
+    worktree_cache[dir] = info or false
+    return info
+end
+
+--- Worktree of a session, keyed by its cwd (nil for non-git directories).
+---@param session pi.Session?
+---@return pi.SessionsListWorktree?
+local function session_worktree(session)
+    local cwd = session and session.cwd
+    if type(cwd) ~= "string" or cwd == "" then
+        return nil
+    end
+    return detect_worktree(cwd)
+end
+
+--- Fold-state key of a worktree group header. The `wt:` namespace keeps it
+--- from colliding with a session lineage or session id.
+---@param root string
+---@return string
+local function group_fold_key(root)
+    return "wt:" .. root
+end
+
+--- Fold-state key of any row: a worktree group header uses its own key,
+--- everything else keeps the lineage/session-id key.
+---@param row pi.SessionsListRow
+---@return string?
+local function row_fold_key(row)
+    if row.is_group then
+        return row.group_id and group_fold_key(row.group_id) or nil
+    end
+    return parent_key(row.session) or row.session_id
+end
+
+--- Group parent rows (and their sub-session rows) by git worktree.
+---
+--- Groups appear only when the rows span at least two distinct worktrees, so a
+--- single-worktree or non-git list keeps exactly the flat shape it has today.
+--- Rows whose session cwd is not a work tree keep their order in a trailing
+--- ungrouped bucket, members keep tabline order inside their group, and a
+--- sub-session row inherits the worktree of the parent row above it (and names
+--- it in its subtitle).
+---@param flat pi.SessionsListRow[]
+---@return pi.SessionsListRow[]
+local function group_by_worktree(flat)
+    ---@type table<string, pi.SessionsListRow[]>
+    local buckets = {}
+    ---@type string[] root order of first appearance
+    local order = {}
+    ---@type table<string, pi.SessionsListWorktree>
+    local infos = {}
+    ---@type pi.SessionsListRow[]
+    local ungrouped = {}
+    ---@type string?
+    local current = nil
+
+    for _, row in ipairs(flat) do
+        if row.depth and row.depth > 0 then
+            -- Sub-session rows follow the parent row they were emitted under.
+            if current and buckets[current] then
+                buckets[current][#buckets[current] + 1] = row
+            else
+                ungrouped[#ungrouped + 1] = row
+            end
+        else
+            local info = session_worktree(row.session)
+            current = nil
+            if info then
+                local root = info.path
+                if not buckets[root] then
+                    buckets[root] = {}
+                    order[#order + 1] = root
+                    infos[root] = info
+                end
+                buckets[root][#buckets[root] + 1] = row
+                current = root
+            else
+                ungrouped[#ungrouped + 1] = row
+            end
+        end
+    end
+
+    if #order < 2 then
+        return flat
+    end
+
+    ---@type pi.SessionsListRow[]
+    local out = {}
+    for _, root in ipairs(order) do
+        local info = infos[root]
+        local members = buckets[root]
+        local collapsed = parent_folds[group_fold_key(root)] == true
+        -- Fixed structural size of the group: every parent row plus its
+        -- sub-sessions. Taken from the parent rows' own `child_count` rather
+        -- than from the emitted rows, because folding a parent removes its
+        -- child rows from `members` — the group's size must not move when a
+        -- row inside it folds. Only folding the group changes what is shown.
+        local member_count = 0
+        for _, row in ipairs(members) do
+            if not (row.depth and row.depth > 0) then
+                member_count = member_count + 1 + (row.child_count or 0)
+            end
+        end
+        out[#out + 1] = {
+            is_group = true,
+            group_id = root,
+            status = "idle",
+            attention = 0,
+            done = false,
+            error = false,
+            worktree = info.name,
+            worktree_path = vim.fn.fnamemodify(root, ":~"),
+            has_children = true,
+            child_count = member_count,
+            collapsed = collapsed,
+        }
+        if not collapsed then
+            for _, row in ipairs(members) do
+                row.group_id = root
+                if row.depth and row.depth > 0 then
+                    row.worktree = info.name
+                end
+                out[#out + 1] = row
+            end
+        end
+    end
+    for _, row in ipairs(ungrouped) do
+        out[#out + 1] = row
+    end
+    return out
+end
+
+--- Format a worktree group header: `▾ 󰙅 name (n) · ~/path`, the member count
+--- shown while collapsed (same convention as a collapsed parent row). The count
+--- sits in front of the path: the list window does not wrap, so the long path
+--- is the part clipped at the right edge, never the fold count.
+---@param row pi.SessionsListRow
+---@return string line
+---@return integer[][] chunks
+function M.format_group_line(row)
+    local prefix = row.collapsed and "▸ " or "▾ "
+    local count = (row.collapsed and row.child_count and row.child_count > 0) and (" (" .. row.child_count .. ")") or ""
+    local name = row.worktree or WORKTREE_GLYPH
+    local path = row.worktree_path or ""
+    local label = name .. count
+    local separator = path ~= "" and (" · " .. path) or ""
+    local line = prefix .. WORKTREE_GLYPH .. " " .. label .. separator
+    local glyph_start = #prefix
+    local label_start = glyph_start + #WORKTREE_GLYPH + 1
+    local chunks = {
+        { 0, #prefix, "PiSessionsListDotDim" },
+        { glyph_start, glyph_start + #WORKTREE_GLYPH, "PiSessionsListWorktree" },
+        { label_start, label_start + #label, "PiSessionsListWorktree" },
+    }
+    if separator ~= "" then
+        local separator_start = label_start + #label
+        chunks[#chunks + 1] = { separator_start, separator_start + #separator, "PiSessionsListDotDim" }
+    end
+    return line, chunks
+end
+
 --- Format a row: the status dot at the left edge, the name right after it.
 --- While the backend generates a title the pending placeholder is animated.
 --- Chunks are byte ranges: { col_start, col_end, hl_group }.
@@ -274,10 +485,28 @@ end
 ---@return string line
 ---@return integer[][] chunks
 function M.format_line(row, tick)
+    if row.is_group then
+        return M.format_group_line(row)
+    end
     local dot = row.dormant and "◌" or "●"
     local name = row.name or "…"
     local pending = row.name == nil
-    local subtitle = (row.subtitle and row.subtitle ~= "") and (" · " .. row.subtitle) or ""
+    local extra = {}
+    if row.subtitle and row.subtitle ~= "" then
+        extra[#extra + 1] = row.subtitle
+    end
+    if row.worktree then
+        extra[#extra + 1] = WORKTREE_GLYPH .. " " .. row.worktree
+    end
+    local subtitle = #extra > 0 and (" · " .. table.concat(extra, " · ")) or ""
+    local forked = row.forked_from and (" ↳ forked from " .. row.forked_from) or ""
+    local integration_status = row.integration_state and INTEGRATION_STATUS[row.integration_state] or nil
+    local integration = ""
+    local integration_hl = nil
+    if integration_status then
+        integration = " " .. integration_status.glyph
+        integration_hl = integration_status.hl
+    end
     local provisional = pending or name == "(unnamed)"
     local spinner = row.title_generating and provisional and M.spinner_frame(tick)
 
@@ -294,13 +523,29 @@ function M.format_line(row, tick)
         prefix = "  "
     end
 
-    local line = prefix .. dot .. " " .. (spinner and spinner .. " " or "") .. name .. subtitle .. count
+    local line = prefix
+        .. dot
+        .. " "
+        .. (spinner and spinner .. " " or "")
+        .. name
+        .. forked
+        .. subtitle
+        .. integration
+        .. count
     local dot_start = #prefix
     local name_start = dot_start + #dot + 1 + (spinner and #spinner + 1 or 0)
     local chunks = {
         { dot_start, dot_start + #dot, M.dot_hl(row, tick) },
-        { name_start, name_start + #name + #subtitle, pending and "PiSessionsListPending" or "Normal" },
+        { name_start, name_start + #name + #forked + #subtitle, pending and "PiSessionsListPending" or "Normal" },
     }
+    if #forked > 0 then
+        chunks[#chunks + 1] = { name_start + #name, name_start + #name + #forked, "PiSessionsListDotDim" }
+    end
+    if integration ~= "" and integration_hl then
+        -- Skip the separating space: only the glyph carries the status color.
+        local start = name_start + #name + #forked + #subtitle + 1
+        chunks[#chunks + 1] = { start, start + #integration - 1, integration_hl }
+    end
     if spinner then
         table.insert(chunks, 2, { name_start - #spinner - 1, name_start - 1, "PiSessionsListSpinner" })
     end
@@ -337,12 +582,13 @@ function M.acknowledge_reported_children(parent)
         return
     end
     local Manifest = require("pi.subsessions.manifest")
-    local lineage = Manifest.lineage_for_session(parent)
+    local cwd = Manifest.workspace(parent)
+    local lineage = Manifest.lineage_for_session(parent, cwd)
     if lineage == "" then
         return
     end
     local changed = false
-    for _, entry in ipairs(Manifest.children_of(lineage)) do
+    for _, entry in ipairs(Manifest.children_of(lineage, cwd)) do
         local child_id = entry._id
         if entry.status == "completed" and entry.reported and type(child_id) == "string" and child_id ~= "" then
             if not child_completion_seen[child_id] then
@@ -392,6 +638,9 @@ local function append_child_row(out, entry, tab, opts)
         -- surfaced in the parent chat instead. `child_completion_seen` only controls list visibility.
         done = false,
         error = entry.status == "failed",
+        -- One-glyph status of the child's automatic worktree integration; an
+        -- unknown/absent state renders nothing (row stays byte-identical).
+        integration_state = type(entry.integration) == "table" and entry.integration.state or nil,
         name = entry.name,
         title_generating = false,
         subtitle = subtitle,
@@ -489,7 +738,7 @@ local function resolve_child_owners(rows)
     ---@type table<string, pi.SessionsListLineageGroup>
     local groups = {}
     for index, row in ipairs(rows) do
-        local lineage = Manifest.lineage_for_session(row.root)
+        local lineage = Manifest.lineage_for_session(row.root, Manifest.workspace(row.root))
         if lineage ~= "" then
             local group = groups[lineage]
             if not group then
@@ -515,7 +764,9 @@ local function resolve_child_owners(rows)
             owners = owners or {}
             ---@type table<string, string>
             local by_child = {}
-            for _, entry in ipairs(Manifest.children_of(lineage)) do
+            -- Roots of one lineage share the workspace that owns its children.
+            local group_cwd = Manifest.workspace(group.roots[1].session)
+            for _, entry in ipairs(Manifest.children_of(lineage, group_cwd)) do
                 local child_id = entry._id
                 if type(child_id) == "string" and child_id ~= "" then
                     by_child[child_id] = resolve_owner_for_entry(group, entry)
@@ -537,7 +788,9 @@ local function get_visible_children(parent_sess, current_child_id, owned)
         return {}
     end
     local Manifest = require("pi.subsessions.manifest")
-    local lineage = Manifest.lineage_for_session(parent_sess)
+    -- Child rows live in the parent session's workspace manifest.
+    local cwd = Manifest.workspace(parent_sess)
+    local lineage = Manifest.lineage_for_session(parent_sess, cwd)
     if lineage == "" then
         return {}
     end
@@ -545,7 +798,7 @@ local function get_visible_children(parent_sess, current_child_id, owned)
     local ctx = child_filter_ctx()
     local visible_entries = {}
     local hidden_shown = show_hidden_children or (parent_hidden[parent_key(parent_sess) or lineage] == true)
-    for _, entry in ipairs(Manifest.children_of(lineage)) do
+    for _, entry in ipairs(Manifest.children_of(lineage, cwd)) do
         local child_id = entry._id
         local owner = type(child_id) == "string" and owned and owned[child_id] or nil
         -- A child owned by another live session on the same lineage is rendered
@@ -597,6 +850,36 @@ function M.show_hidden_children()
     return show_hidden_children
 end
 
+--- Display name of the session this one was forked from, for the
+--- `↳ forked from …` marker. `session.forked_from` is set client-side by
+--- :PiFork (pi records no lineage in the session file, and the fork RPC
+--- response carries only the message text), so accept a plain string or a
+--- table with a name/label/session-file.
+---@param session pi.Session?
+---@return string?
+local function forked_from_label(session)
+    local from = session and session.forked_from
+    if type(from) == "string" then
+        return from ~= "" and from or nil
+    end
+    if type(from) ~= "table" then
+        return nil
+    end
+    for _, key in ipairs({ "name", "label", "session_name" }) do
+        local value = from[key]
+        if type(value) == "string" and value ~= "" then
+            return value
+        end
+    end
+    -- Worktree forks record the source transcript file; its basename is the
+    -- best available label when no name was captured.
+    local file = from.session_file
+    if type(file) == "string" and file ~= "" then
+        return vim.fn.fnamemodify(file, ":t:r")
+    end
+    return nil
+end
+
 --- Build a parent (depth 0) row for a live session process.
 ---@param out pi.SessionsListRow[]
 ---@param session pi.Session
@@ -621,6 +904,7 @@ local function append_parent_row(out, session, tab, opts, attention_count, name_
         has_children = opts.has_children == true,
         collapsed = opts.collapsed == true,
         child_count = opts.child_count,
+        forked_from = forked_from_label(session),
     }
 end
 
@@ -688,7 +972,7 @@ function M.build_rows(sessions, attention_count, name_of, flags_of, generating_o
         local tab = session.tab
         -- Stable key per parent session; a session without an id stays independent.
         local root_key = type(root.id) == "string" and root.id or ("row:" .. tostring(index))
-        local owned = owners and owners[Manifest.lineage_for_session(root)] or nil
+        local owned = owners and owners[Manifest.lineage_for_session(root, Manifest.workspace(root))] or nil
         local visible_children = get_visible_children(root, plan.in_child_view and session.id or nil, owned)
         ---@type { entry: pi.SubsessionManifestEntry, is_current: boolean }[]
         local pending = {}
@@ -732,7 +1016,9 @@ function M.build_rows(sessions, attention_count, name_of, flags_of, generating_o
             end
         end
     end
-    return out
+    -- Group by git worktree only when the rows span at least two distinct
+    -- worktrees; otherwise this returns `out` untouched.
+    return group_by_worktree(out)
 end
 
 -- Turn flags (done / error) -----------------------------------------------------
@@ -1192,8 +1478,8 @@ local HELP_ENTRIES = {
     { "t", "Navigate this session's tree (:PiTree)" },
     { "p", "Preview session (read-only viewer)" },
     { "x", "Close sub-session process (:PiSubClose)" },
-    { "<Tab>, za", "Fold / unfold sub-sessions" },
-    { "zM, zR", "Collapse / expand all sub-sessions" },
+    { "<Tab>, za", "Fold / unfold worktree groups and sub-sessions" },
+    { "zM, zR", "Collapse / expand all groups and sub-sessions" },
     { "H", "Toggle hidden / prior-conversation sub-sessions (all sessions)" },
     { "h", "Toggle hidden / prior-conversation sub-sessions of this session" },
     { "R", "Refresh the list" },
@@ -1519,7 +1805,10 @@ local function preview_under_cursor()
     if not id then
         return
     end
-    require("pi.ui.subsession_viewer").open(id, { name = row.name })
+    -- The row's session knows which workspace owns its manifest row (a child
+    -- carries its parent's workspace), so the viewer does not have to search.
+    local workspace = session and require("pi.subsessions.manifest").workspace(session) or nil
+    require("pi.ui.subsession_viewer").open(id, { name = row.name, cwd = workspace })
 end
 
 --- Toggle fold/unfold for the session under cursor.
@@ -1534,11 +1823,27 @@ local function toggle_fold_under_cursor()
         return
     end
 
+    if row.is_group then
+        -- Worktree group header: fold its session rows; keep the cursor on it.
+        local key = row_fold_key(row)
+        if key then
+            parent_folds[key] = not (row.collapsed == true)
+            M._render()
+            for new_lnum, r in ipairs(rows) do
+                if r.is_group and r.group_id == row.group_id then
+                    pcall(vim.api.nvim_win_set_cursor, cur_win, { new_lnum, 0 })
+                    break
+                end
+            end
+        end
+        return
+    end
+
     if row.depth and row.depth > 0 then
         local parent_row = nil
         local parent_lnum = nil
         for p = lnum - 1, 1, -1 do
-            if rows[p] and (rows[p].depth == nil or rows[p].depth == 0) then
+            if rows[p] and not rows[p].is_group and (rows[p].depth == nil or rows[p].depth == 0) then
                 parent_row = rows[p]
                 parent_lnum = p
                 break
@@ -1552,7 +1857,7 @@ local function toggle_fold_under_cursor()
             local Sessions = require("pi.sessions.manager")
             parent_sess = Sessions.get_by_id(parent_row.session_id)
         end
-        local key = parent_key(parent_sess) or parent_row.session_id
+        local key = row_fold_key(parent_row)
         if key then
             parent_folds[key] = true
             M._render()
@@ -1577,7 +1882,7 @@ local function toggle_fold_under_cursor()
             local Sessions = require("pi.sessions.manager")
             parent_sess = Sessions.get_by_id(row.session_id)
         end
-        local key = parent_key(parent_sess) or row.session_id
+        local key = row_fold_key(row)
         if key then
             local current = row.collapsed == true
             parent_folds[key] = not current
@@ -1634,7 +1939,7 @@ local function collapse_all_folds()
     local parent_to_target = nil
     if cur_row and cur_row.depth and cur_row.depth > 0 then
         for p = vim.api.nvim_win_get_cursor(cur_win)[1] - 1, 1, -1 do
-            if rows[p] and (rows[p].depth == nil or rows[p].depth == 0) then
+            if rows[p] and not rows[p].is_group and (rows[p].depth == nil or rows[p].depth == 0) then
                 parent_to_target = rows[p].session_id
                 break
             end
@@ -1643,7 +1948,7 @@ local function collapse_all_folds()
 
     for _, r in ipairs(rows) do
         if r.has_children then
-            local key = parent_key(r.session) or r.session_id
+            local key = row_fold_key(r)
             if key then
                 parent_folds[key] = true
             end
@@ -1684,7 +1989,7 @@ local function expand_all_folds()
     end
     for _, r in ipairs(rows) do
         if r.has_children then
-            local key = parent_key(r.session) or r.session_id
+            local key = row_fold_key(r)
             if key then
                 parent_folds[key] = false
             end
@@ -1795,6 +2100,9 @@ local function ensure_buf()
     )
     vim.keymap.set("n", "R", function()
         name_cache = setmetatable({}, { __mode = "k" })
+        -- A repository can appear (git init / worktree add) while the list is
+        -- open; R re-detects the worktrees along with the names.
+        worktree_cache = {}
         M._render()
     end, vim.tbl_extend("force", map_opts, { desc = "Refresh session list" }))
     vim.keymap.set("n", "q", function()
@@ -2065,6 +2373,7 @@ function M._reset()
     child_completion_seen = {}
     parent_folds = {}
     parent_hidden = {}
+    worktree_cache = {}
 end
 
 return M

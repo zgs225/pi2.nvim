@@ -208,6 +208,49 @@ require("pi").setup({
         enabled = true,
     },
 
+    -- Git worktree isolation (:PiWorktreeNew / Fork / Branch / Apply / Ship /
+    -- Remove). A worktree session runs its pi process with a linked checkout
+    -- under <repo>/.worktrees/<name> (detached HEAD) as cwd. See
+    -- doc/worktrees.md.
+    worktree = {
+        -- Command run inside a freshly created worktree, before its session
+        -- process starts. A string[] executed directly (no shell) with the
+        -- worktree root as cwd; nil = no setup step. A non-zero exit keeps
+        -- the checkout on disk but fails the creation (no session starts).
+        setup_cmd = nil, -- e.g. { "mise", "install" }
+        -- Give every spawned sub-session its own worktree instead of the
+        -- parent's checkout, so parallel children cannot overwrite each
+        -- other's edits. A child of a session that already runs in a
+        -- worktree inherits that cwd instead (no nesting).
+        isolate_subagents = true,
+        -- Snapshot a worktree's patch (base commit → now, untracked files
+        -- included) before :PiWorktreeRemove / Worktree.remove deletes it.
+        -- When false, the confirmation warns that the work is lost.
+        snapshot_before_remove = true,
+        -- Automatic integration of a settled sub-session's patch into the
+        -- parent checkout's working tree (pi.worktree_integration): capture +
+        -- snapshot, then apply only while the parent is blocked in
+        -- wait_subagents or idle; otherwise park as `queued` and retry on the
+        -- next readiness signal. Aborted and failed runs are never integrated.
+        integration = {
+            -- Apply automatically at all (default true). false = only
+            -- :PiWorktreeApply moves work out of a checkout.
+            auto = true,
+            -- On a conflict / stale base, ask the still-running child to
+            -- rebase and resolve inside its own checkout once, then retry
+            -- (default true; max_attempts = 0 disables it).
+            auto_resolve = true,
+            -- Resolving rounds a child gets before the integration stops in
+            -- needs_attention (default 1).
+            max_attempts = 1,
+            -- Soft cap on applied child checkouts kept on disk: only
+            -- `applied` + verified + inactive + unpinned checkouts are
+            -- removed, oldest first; anything unintegrated, parked or in
+            -- needs_attention is never removed for quota (default 15).
+            keep_count = 15,
+        },
+    },
+
     -- Sub-sessions (子会话). When enabled (default), injects extensions/subagent.ts
     -- into parent RPC processes so the Agent can spawn and steer child sessions
     -- (children get extensions/subagent-child.ts: a worker system-prompt note only).

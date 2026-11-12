@@ -13,7 +13,7 @@ What the plugin does bind on its own:
 - `T` inside the sub-session viewer float toggles the viewed session's todo list panel (see [Usage → In the sub-session viewer](usage.md#in-the-sub-session-viewer)).
 - `dd` / `x` to remove an entry in the attachments buffer.
 - The [diff review](diff-review.md) keys inside the diff tab.
-- The `:PiDiff` session diff review: in the panel's file list, moving the cursor previews the file's diff, `<CR>`/`o` jumps to its first changed line, `<C-f>`/`<C-b>`/`<C-d>`/`<C-u>` scroll the diff on the right; in the diff area, `<CR>`/`o` jumps to the line under the cursor; `q` closes the whole review (see [Session diff review](diff-review.md#session-diff-review-pidiff)).
+- The `:PiDiff` session diff review: in the panel's file list, moving the cursor previews the file's diff, `<CR>`/`o` jumps to its first changed line, `<C-f>`/`<C-b>`/`<C-d>`/`<C-u>` scroll the diff on the right; in the diff area, `<CR>`/`o` jumps to the line under the cursor; `q` closes the whole review (see [Session diff review](diff-review.md#session-diff-review-pidiff)). When the panel was opened by [`:PiWorktreeApply`](worktrees.md#applying-a-patch-piworktreeapply), an extra `a` applies the reviewed patch to the main checkout.
 - The [sessions overview](sessions.md#sessions-overview-pisessions) keys inside the list.
 - The [background tasks](#background-tasks-panel-pitasks) panel keys inside the list.
 

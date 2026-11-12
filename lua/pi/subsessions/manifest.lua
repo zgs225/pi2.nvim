@@ -19,8 +19,12 @@ local MANIFEST_FILE = ".pi2-subsessions.json"
 ---@field created_at string
 ---@field last_active_at string
 ---@field agent_spawned? boolean True when spawned by parent Agent tool (skip prompt injection).
----@field run_generation? integer Monotonic run counter; incremented on each prompt to a child.
 ---@field parent_epoch? integer Parent conversation epoch when spawned (default 0).
+---@field run_generation? integer Monotonic run counter: 1 on spawn, bumped by every revive/reuse (read by the integration engine to reject a stale apply/cleanup).
+---@field integration? table Worktree integration record for this child: `{ state = "queued"|"resolving"|"applying"|"applied"|"needs_attention", files?, error?, reason?, generation? }` (owned by `pi.worktree_integration`).
+---@field workspace? string Workspace cwd that owns this row (the parent session's cwd). Recorded so a row found on disk — whose workspace directory name cannot be decoded — still yields a usable base for revive/rebuild.
+---@field session_file? string pi session transcript file reported by the backend at spawn/revive. Authoritative for a child whose JSONL lives in another workspace (its own worktree).
+---@field worktree? table Worktree metadata when the child runs in an isolated checkout (recorded by `pi.subsessions.spawn`).
 
 local LINEAGE_KEY = "__lineage__"
 
@@ -29,15 +33,19 @@ local LINEAGE_KEY = "__lineage__"
 --- M.fallback_name, so a derived name always matches what the caller saw.
 local FALLBACK_NAME_CHARS = 40
 
----@type table<string, any>?
-local cache = nil
----@type string?
-local cache_path = nil
+---@type table<string, any>
+local cache = {}
 
---- True when the last `load()` read an existing, non-empty file that failed to
---- decode. Callers that rewrite the whole manifest must check this and refuse
---- to save, or one unreadable byte would wipe every sub-session entry.
-local decode_failed = false
+--- Manifests that failed to decode, keyed by file path. Callers that rewrite a
+--- whole manifest must check this and refuse to save, or one unreadable byte
+--- would wipe every sub-session entry.
+---@type table<string, boolean>
+local decode_failed_paths = {}
+
+--- Path of the most recently loaded/saved manifest (compat for
+--- `M.decode_failed()` without a cwd).
+---@type string?
+local last_path = nil
 
 --- In-flight spawn reservations per lineage (not yet upserted as active).
 ---@type table<string, integer>
@@ -66,67 +74,241 @@ function M.is_entry_id(id)
     return is_child_entry_key(id)
 end
 
+--- Manifest file path for a workspace cwd.
+--- The manifest lives next to the session files it describes, so a session
+--- running in a git worktree keeps its own manifest there. Callers pass the
+--- owning session's cwd; omitting it keeps the process-cwd behaviour.
+---@param cwd? string workspace cwd (default: Neovim's current cwd)
 ---@return string
-function M.path()
-    return History.get_sessions_dir() .. "/" .. MANIFEST_FILE
+function M.path(cwd)
+    return History.get_sessions_dir(cwd) .. "/" .. MANIFEST_FILE
+end
+
+--- Manifest file that lives next to a batch file (same workspace directory).
+--- Lets a caller holding only a batch path reach its workspace manifest.
+---@param batch_path string
+---@return string
+function M.path_for_batch(batch_path)
+    return vim.fn.fnamemodify(batch_path, ":h") .. "/" .. MANIFEST_FILE
+end
+
+--- The workspace whose manifest owns a session's rows.
+---
+--- Sub-session bookkeeping belongs to the **owner parent session's** cwd,
+--- which is also the cwd the spawned pi process reported as `process.cwd()` —
+--- so a child session (running in its own worktree) carries the parent's
+--- workspace in `manifest_cwd`. Falls back to the session's own cwd, then to
+--- nil (process cwd), which keeps the historical single-workspace behaviour.
+---@param session pi.Session|{ cwd?: string, manifest_cwd?: string }?
+---@return string?
+function M.workspace(session)
+    if type(session) ~= "table" then
+        return nil
+    end
+    local cwd = session.manifest_cwd
+    if type(cwd) ~= "string" or cwd == "" then
+        cwd = session.cwd
+    end
+    if type(cwd) ~= "string" or cwd == "" then
+        return nil
+    end
+    return cwd
+end
+
+--- Where the workspace session files live (one subdirectory per workspace).
+---@return string
+local function sessions_root()
+    return vim.fn.fnamemodify(History.get_sessions_dir(), ":h")
+end
+
+--- Every manifest on disk, one per workspace. Cached for the current event
+--- loop tick: the render path may ask dozens of times per redraw, and a glob
+--- per call would be wasteful.
+---@type string[]?
+local disk_paths_cache = nil
+
+---@return string[]
+local function disk_manifest_paths()
+    if disk_paths_cache then
+        return disk_paths_cache
+    end
+    local root = sessions_root()
+    local paths = {}
+    if vim.fn.isdirectory(root) == 1 then
+        paths = vim.fn.glob(root .. "/*/" .. MANIFEST_FILE, false, true)
+    end
+    disk_paths_cache = paths
+    if vim.in_fast_event and vim.in_fast_event() then
+        disk_paths_cache = nil
+    else
+        vim.schedule(function()
+            disk_paths_cache = nil
+        end)
+    end
+    return paths
+end
+
+---@class pi.SubsessionScope
+---@field path string Manifest file path.
+---@field cwd? string Workspace cwd when known (nil for a workspace discovered on disk).
+
+--- Manifests worth consulting, in order of authority.
+---
+--- The caller's workspace comes first, then every live session's workspace,
+--- then (unless `opts.disk == false`) every manifest on disk — the backstop that
+--- lets a rebuild or sweep find rows of a workspace no live session reports
+--- (Neovim restarted in a different checkout).
+---@param opts? { cwd?: string, disk?: boolean } `cwd` is the preferred workspace (default: Neovim's cwd)
+---@return pi.SubsessionScope[]
+function M.scopes(opts)
+    opts = opts or {}
+    local out = {}
+    local seen = {}
+    ---@param cwd string?
+    ---@param path_or_nil string?
+    local function add(cwd, path_or_nil)
+        local path = path_or_nil or M.path(cwd)
+        if seen[path] then
+            return
+        end
+        seen[path] = true
+        out[#out + 1] = { path = path, cwd = cwd }
+    end
+
+    -- The process cwd comes first so legacy callers (no explicit workspace)
+    -- still resolve their own manifest without a scan.
+    add(type(opts.cwd) == "string" and opts.cwd ~= "" and opts.cwd or vim.fn.getcwd())
+    local ok_manager, Sessions = pcall(require, "pi.sessions.manager")
+    if ok_manager and type(Sessions) == "table" and type(Sessions.list_all) == "function" then
+        local ok_list, list = pcall(Sessions.list_all)
+        if ok_list and type(list) == "table" then
+            for _, session in ipairs(list) do
+                local cwd = M.workspace(session)
+                if cwd then
+                    add(cwd)
+                end
+            end
+        end
+    end
+    if opts.disk ~= false then
+        for _, path in ipairs(disk_manifest_paths()) do
+            add(nil, path)
+        end
+    end
+    return out
+end
+
+--- Find a session's manifest row across workspaces.
+---
+--- The row lives in its owner parent's workspace, which is not necessarily the
+--- process cwd (a tab may run anywhere). Callers that know the workspace pass it
+--- and pay a single file read; the search only kicks in for callers that do not
+--- (tool rendering, a session id handed in by the UI).
+---@param id string
+---@param cwd? string preferred workspace cwd
+---@return pi.SubsessionManifestEntry? entry
+---@return string? workspace cwd of the scope that holds the row (falls back to the row's own `workspace` record for a manifest discovered on disk)
+---@return string? path manifest file that holds the row
+function M.locate(id, cwd)
+    if type(id) ~= "string" or id == "" then
+        return nil, nil, nil
+    end
+    -- The preferred workspace goes through `M.load` (the one seam tests and
+    -- single-workspace callers override); the scan below reads scopes directly.
+    local primary = M.load(cwd)
+    if type(primary[id]) == "table" then
+        return primary[id], cwd, M.path(cwd)
+    end
+    for _, scope in ipairs(M.scopes({ cwd = cwd, disk = true })) do
+        local entry = M.load_at(scope.path)[id]
+        if type(entry) == "table" then
+            -- A workspace discovered on disk has no decoded cwd, so the row's
+            -- own `workspace` record stands in for it (see `M.upsert` callers).
+            local entry_row = entry --[[@as table]]
+            local workspace = scope.cwd
+            if workspace == nil and type(entry_row.workspace) == "string" and entry_row.workspace ~= "" then
+                workspace = entry_row.workspace
+            end
+            return entry, workspace, scope.path
+        end
+    end
+    return nil, nil, nil
 end
 
 --- Drop the in-memory cache and spawn reservations (tests / path overrides).
 function M._reset()
-    cache = nil
-    cache_path = nil
-    decode_failed = false
+    cache = {}
+    decode_failed_paths = {}
+    last_path = nil
+    disk_paths_cache = nil
     occupy = {}
 end
 
---- True when the last `load()` hit an existing, non-empty file that failed to
---- decode. In that state the in-memory manifest is not backed by the disk
---- file, so persisting it would overwrite the real (unreadable) manifest with
---- a rebuilt table — typically empty, destroying all sub-session metadata.
+--- True when `load()` hit an existing, non-empty file that failed to decode.
+--- In that state the in-memory manifest is not backed by the disk file, so
+--- persisting it would overwrite the real (unreadable) manifest — typically
+--- with an empty table, destroying all sub-session metadata.
+---@param cwd? string workspace cwd (default: the last manifest touched)
 ---@return boolean
-function M.decode_failed()
-    return decode_failed
+function M.decode_failed(cwd)
+    local path = cwd ~= nil and M.path(cwd) or last_path
+    return path ~= nil and decode_failed_paths[path] == true
 end
 
+--- True when a specific manifest file failed to decode (per-workspace form of
+--- `M.decode_failed`, used by the rebuild that walks every workspace).
+---@param path string
+---@return boolean
+function M.decode_failed_at(path)
+    return decode_failed_paths[path] == true
+end
+
+--- Read a manifest file by path (the primitive behind `M.load`).
+---@param path string
 ---@return table<string, pi.SubsessionManifestEntry>
-function M.load()
-    local path = M.path()
-    if cache ~= nil and cache_path == path then
-        return cache
+function M.load_at(path)
+    last_path = path
+    local cached = cache[path]
+    if cached ~= nil then
+        return cached
     end
     local file = io.open(path, "r")
     if not file then
-        cache = {}
-        cache_path = path
-        decode_failed = false
-        return cache
+        cache[path] = {}
+        decode_failed_paths[path] = nil
+        return cache[path]
     end
     local content = file:read("*a")
     file:close()
     if type(content) ~= "string" or content == "" then
-        cache = {}
-        cache_path = path
-        decode_failed = false
-        return cache
+        cache[path] = {}
+        decode_failed_paths[path] = nil
+        return cache[path]
     end
     local ok, data = pcall(vim.json.decode, content)
     if ok and type(data) == "table" then
-        cache = data
-        cache_path = path
-        decode_failed = false
-        return cache
+        cache[path] = data
+        decode_failed_paths[path] = nil
+        return cache[path]
     end
-    decode_failed = true
+    decode_failed_paths[path] = true
     return {}
 end
 
+---@param cwd? string workspace cwd whose manifest to read (default: Neovim's current cwd)
+---@return table<string, pi.SubsessionManifestEntry>
+function M.load(cwd)
+    return M.load_at(M.path(cwd))
+end
+
+--- Write a manifest file by path (the primitive behind `M.save`).
 ---@param manifest table<string, pi.SubsessionManifestEntry>
+---@param path string
 ---@return boolean
-function M.save(manifest)
-    local path = M.path()
-    cache = manifest
-    cache_path = path
-    decode_failed = false
+function M.save_at(manifest, path)
+    last_path = path
+    cache[path] = manifest
+    decode_failed_paths[path] = nil
     local dir = vim.fn.fnamemodify(path, ":h")
     if vim.fn.isdirectory(dir) == 0 then
         vim.fn.mkdir(dir, "p")
@@ -145,90 +327,147 @@ function M.save(manifest)
     return ok == true
 end
 
----@param id string
----@param entry pi.SubsessionManifestEntry
-function M.upsert(id, entry)
-    local manifest = M.load()
-    manifest[id] = entry
-    M.save(manifest)
+---@param manifest table<string, pi.SubsessionManifestEntry>
+---@param cwd? string workspace cwd whose manifest to write (default: Neovim's current cwd)
+---@return boolean
+function M.save(manifest, cwd)
+    return M.save_at(manifest, M.path(cwd))
 end
 
 ---@param id string
+---@param entry pi.SubsessionManifestEntry
+---@param cwd? string workspace cwd (default: Neovim's current cwd)
+function M.upsert(id, entry, cwd)
+    local manifest = M.load(cwd)
+    manifest[id] = entry
+    M.save(manifest, cwd)
+end
+
+--- Patch a row in the workspace that owns it.
+---
+--- Writes to `cwd`'s manifest when the row is there; otherwise locates the row
+--- (a child's row lives in the parent's workspace, which may differ from the
+--- caller's cwd) and patches it there, so a settle/abort that only knows the
+--- child id cannot silently miss the row.
+---@param id string
 ---@param patch table
-function M.patch(id, patch)
-    local manifest = M.load()
+---@param cwd? string workspace cwd (default: Neovim's current cwd)
+---@return boolean found True when a row was patched.
+function M.patch(id, patch, cwd)
+    local path = M.path(cwd)
+    local manifest = M.load_at(path)
+    if type(manifest[id]) ~= "table" then
+        local _, _, found_path = M.locate(id, cwd)
+        if found_path and found_path ~= path then
+            path = found_path
+            manifest = M.load_at(path)
+        end
+    end
     local entry = manifest[id]
-    if not entry then
-        return
+    if type(entry) ~= "table" then
+        return false
     end
     for k, v in pairs(patch) do
         entry[k] = v
     end
     manifest[id] = entry
-    M.save(manifest)
+    M.save_at(manifest, path)
+    return true
 end
 
 ---@param session_id string
 ---@param lineage_id string
-function M.register_session_lineage(session_id, lineage_id)
+---@param cwd? string workspace cwd (default: Neovim's current cwd)
+function M.register_session_lineage(session_id, lineage_id, cwd)
     if type(session_id) ~= "string" or session_id == "" or type(lineage_id) ~= "string" or lineage_id == "" then
         return
     end
-    local manifest = M.load()
+    local manifest = M.load(cwd)
     local map = lineage_map(manifest)
     map[session_id] = lineage_id
     manifest[LINEAGE_KEY] = map
-    M.save(manifest)
+    M.save(manifest, cwd)
 end
 
 ---@param session_id? string
+---@param cwd? string workspace cwd (default: Neovim's current cwd)
 ---@return string?
-function M.resolve_lineage(session_id)
+function M.resolve_lineage(session_id, cwd)
     if type(session_id) ~= "string" or session_id == "" then
         return nil
     end
-    local map = lineage_map(M.load())
+    local map = lineage_map(M.load(cwd))
     return map[session_id] or session_id
 end
 
----@param session { id?: string, lineage_id?: string }
+---@param session { id?: string, lineage_id?: string, cwd?: string, manifest_cwd?: string }
+---@param cwd? string workspace cwd (default: `session.cwd`, then Neovim's current cwd)
 ---@return string
-function M.lineage_for_session(session)
+function M.lineage_for_session(session, cwd)
     if type(session.lineage_id) == "string" and session.lineage_id ~= "" then
         return session.lineage_id
     end
     local id = session.id
-    if type(id) == "string" and id ~= "" then
-        return M.resolve_lineage(id) or id
+    if type(id) ~= "string" or id == "" then
+        return ""
     end
-    return ""
+    local workspace = cwd
+    if workspace == nil and type(session.cwd) == "string" then
+        workspace = session.cwd
+    end
+    local resolved = M.resolve_lineage(id, workspace)
+    if resolved ~= nil and resolved ~= id then
+        return resolved
+    end
+    -- A child session's own cwd is its worktree, not the workspace that owns the
+    -- lineage map — so a call without the parent workspace (a manager hook that
+    -- only has the session object) resolves against `manifest_cwd` instead.
+    local manifest_cwd = session.manifest_cwd
+    if type(manifest_cwd) == "string" and manifest_cwd ~= "" and manifest_cwd ~= workspace then
+        local again = M.resolve_lineage(id, manifest_cwd)
+        if again ~= nil and again ~= id then
+            return again
+        end
+    end
+    return resolved or id
 end
 
 --- Persist lineage on the session object and in the manifest map.
----@param session { id?: string, lineage_id?: string }
+---@param session { id?: string, lineage_id?: string, cwd?: string }
 ---@param session_id string
-function M.bind_session_lineage(session, session_id)
+---@param cwd? string workspace cwd (default: `session.cwd`, then Neovim's current cwd)
+function M.bind_session_lineage(session, session_id, cwd)
     if not session.lineage_id then
         session.lineage_id = session_id
     end
-    M.register_session_lineage(session_id, session.lineage_id)
+    local workspace = cwd
+    if workspace == nil and type(session.cwd) == "string" then
+        workspace = session.cwd
+    end
+    M.register_session_lineage(session_id, session.lineage_id, workspace)
 end
 
 --- Replace lineage after :PiResume / switch_session (tab reuses the session object).
----@param session { id?: string, lineage_id?: string }
+---@param session { id?: string, lineage_id?: string, cwd?: string }
 ---@param session_id string
-function M.rebind_lineage(session, session_id)
+---@param cwd? string workspace cwd (default: `session.cwd`, then Neovim's current cwd)
+function M.rebind_lineage(session, session_id, cwd)
     if type(session_id) ~= "string" or session_id == "" then
         return
     end
     session.lineage_id = session_id
-    M.register_session_lineage(session_id, session_id)
+    local workspace = cwd
+    if workspace == nil and type(session.cwd) == "string" then
+        workspace = session.cwd
+    end
+    M.register_session_lineage(session_id, session_id, workspace)
 end
 
 ---@param parent_id string Lineage id (stable parent key in the manifest).
+---@param cwd? string workspace cwd (default: Neovim's current cwd)
 ---@return pi.SubsessionManifestEntry[]
-function M.children_of(parent_id)
-    local manifest = M.load()
+function M.children_of(parent_id, cwd)
+    local manifest = M.load(cwd)
     ---@type pi.SubsessionManifestEntry[]
     local result = {}
     for id, entry in pairs(manifest) do
@@ -252,13 +491,48 @@ end
 
 --- True when `session_id` is registered as a sub-session child in the manifest.
 ---@param session_id? string
+---@param cwd? string workspace cwd (default: Neovim's current cwd)
 ---@return boolean
-function M.is_child_session(session_id)
+function M.is_child_session(session_id, cwd)
     if type(session_id) ~= "string" or session_id == "" then
         return false
     end
-    local entry = M.load()[session_id]
+    local entry = M.load(cwd)[session_id]
     return type(entry) == "table" and entry.parent_id ~= nil
+end
+
+--- Integration states that own the child's checkout while they are current:
+--- the engine is turning the child's worktree into parent changes, so the
+--- process must not be closed and the checkout must not be released underneath
+--- it.
+---@type table<string, boolean>
+M.INTEGRATION_BUSY = { queued = true, resolving = true, applying = true }
+
+--- Integration state recorded on a manifest row, if any.
+---@param entry any
+---@return string?
+function M.integration_state(entry)
+    if type(entry) ~= "table" then
+        return nil
+    end
+    local integration = entry.integration
+    if type(integration) ~= "table" then
+        return nil
+    end
+    local state = integration.state
+    if type(state) ~= "string" or state == "" then
+        return nil
+    end
+    return state
+end
+
+--- True when the row's integration state owns the checkout (queued / resolving /
+--- applying), i.e. close, reap and worktree release must leave the child alone.
+---@param entry any
+---@return boolean
+function M.integration_busy(entry)
+    local state = M.integration_state(entry)
+    return state ~= nil and M.INTEGRATION_BUSY[state] == true
 end
 
 --- Name derived from the task text when the caller supplies none.
@@ -302,9 +576,10 @@ function M.iso_now()
 end
 
 ---@param parent_id string Lineage id.
+---@param cwd? string workspace cwd (default: Neovim's current cwd)
 ---@return integer
-function M.count_active_children(parent_id)
-    local manifest = M.load()
+function M.count_active_children(parent_id, cwd)
+    local manifest = M.load(cwd)
     local n = 0
     for id, entry in pairs(manifest) do
         if
@@ -327,9 +602,10 @@ end
 --- in the caller — manifest must not require the sessions manager).
 ---@param lineage_id string
 ---@param is_alive pi.SubsessionChildAlivePred
+---@param cwd? string workspace cwd (default: Neovim's current cwd)
 ---@return integer
-function M.count_alive_children(lineage_id, is_alive)
-    local manifest = M.load()
+function M.count_alive_children(lineage_id, is_alive, cwd)
+    local manifest = M.load(cwd)
     local n = 0
     for id, entry in pairs(manifest) do
         if is_child_entry_key(id) and type(entry) == "table" and entry.parent_id == lineage_id and is_alive(id) then
@@ -352,12 +628,13 @@ end
 --- pass a predicate).
 ---@param lineage_id string
 ---@param is_alive? pi.SubsessionChildAlivePred
+---@param cwd? string workspace cwd (default: Neovim's current cwd)
 ---@return integer
-function M.spawn_occupancy(lineage_id, is_alive)
+function M.spawn_occupancy(lineage_id, is_alive, cwd)
     if is_alive then
-        return M.count_alive_children(lineage_id, is_alive) + M.pending_spawns(lineage_id)
+        return M.count_alive_children(lineage_id, is_alive, cwd) + M.pending_spawns(lineage_id)
     end
-    return M.count_active_children(lineage_id) + M.pending_spawns(lineage_id)
+    return M.count_active_children(lineage_id, cwd) + M.pending_spawns(lineage_id)
 end
 
 --- Reserve one spawn slot. Call `release_spawn` after upsert or on failure.
@@ -366,12 +643,13 @@ end
 ---@param is_alive? pi.SubsessionChildAlivePred Optional liveness predicate: when given, occupancy counts
 --- children of this lineage whose process is still running (any manifest status) instead of only
 --- status=="active" rows, so completed-but-alive processes keep occupying slots. Omit for legacy counting.
+---@param cwd? string workspace cwd (default: Neovim's current cwd)
 ---@return boolean
-function M.try_reserve_spawn(lineage_id, max_children, is_alive)
+function M.try_reserve_spawn(lineage_id, max_children, is_alive, cwd)
     if type(lineage_id) ~= "string" or lineage_id == "" then
         return false
     end
-    if M.spawn_occupancy(lineage_id, is_alive) >= max_children then
+    if M.spawn_occupancy(lineage_id, is_alive, cwd) >= max_children then
         return false
     end
     occupy[lineage_id] = (occupy[lineage_id] or 0) + 1

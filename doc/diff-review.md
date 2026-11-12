@@ -26,9 +26,15 @@ Where the two-way review above intercepts a single edit _before_ it lands, `:PiD
 
 `q` anywhere in the panel closes the whole review; closing any of its windows closes the rest. Re-running `:PiDiff` refreshes (it always re-reads the diffs).
 
+### Accepting a patch in the panel
+
+The same panel renders one review that is not read-only: [`:PiWorktreeApply`](worktrees.md#applying-a-patch-piworktreeapply) opens a worktree's patch (base commit → now, untracked files included) with an **`a`** action whose hint names the destination (`a apply to <repo>`, the main checkout's directory name). Pressing `a` closes the panel and applies the whole patch to the main checkout's working tree with `git apply` — no index changes, no commit, and nothing applied if you just close the panel. A conflicting apply is atomic: both checkouts stay untouched.
+
+`a` only exists in a panel that was opened with an accept action (`diff_review.render(..., { on_accept = fn, accept_label = "apply to …" })`); the ordinary `:PiDiff` and pre-execution reviews bind nothing there, and `a` is not part of `diff.keys`.
+
 Collection details:
 
-- Paths are anchored at the **session's working directory** (where the session was started), so moving around with `:cd` or opening the review from another work tree does not lose the session's files.
+- Paths are anchored at the **session's working directory** (where the session was started), so moving around with `:cd` or opening the review from another work tree does not lose the session's files. That is also what makes a session running in a [git worktree](worktrees.md) review its own checkout rather than the main one; a resumed session adopts the cwd recorded in its session file.
 - Each file is diffed against its own work tree's **`HEAD`** — the union of staged and unstaged changes — so files you `git add`ed are still shown (previously only unstaged changes appeared, and staged files vanished from the list). In a repository with no commits yet the diff falls back to the index (`--cached`).
 - Files the agent created render as full-file additions (git's `--no-index` mode); files outside any git work tree are skipped and counted in the list hint line.
 - Changes that were already **committed** are not shown: once the diff baseline is HEAD, a committed change is indistinguishable from the repository state, and `:PiDiff` keeps no snapshot of the pre-change content.

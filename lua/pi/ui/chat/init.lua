@@ -32,6 +32,11 @@
 ---@field _bash_running boolean
 ---@field _bash_req_id string?
 ---@field _bash_req_counter integer
+---@field _worktree? pi.WorktreeInfo git worktree of the session cwd (nil: not a work tree)
+---@field _worktree_same_cwd boolean session cwd equals Neovim's cwd
+---@field _worktree_status? { dirty?: boolean, ahead?: integer } async `git status` summary for the badge
+---@field _worktree_timer? uv.uv_timer_t debounced badge refresh (tool completion)
+---@field _worktree_records pi.ChatWorktreeRecord[] persistent integration records (oldest first)
 local Chat = {}
 Chat.__index = Chat
 
@@ -98,6 +103,11 @@ function Chat.new(tab, mode, agent)
     self._prompt_history = nil
     self._prompt_nav = nil
     self._cwd = nil
+    self._worktree = nil
+    self._worktree_same_cwd = true
+    self._worktree_status = nil
+    self._worktree_timer = nil
+    self._worktree_records = {}
     self._last_applied_prompt = nil
     self._bash_running = false
     self._bash_req_id = nil
@@ -127,34 +137,241 @@ function Chat:bind_agent(agent)
     self._agent = agent
 end
 
+--- Quiet period that coalesces badge refreshes triggered by tool completion:
+--- a turn can finish many tools, and one `git status` per quiet period is
+--- enough to keep the dirty/ahead marker current.
+local WORKTREE_REFRESH_DEBOUNCE_MS = 300
+
+--- Bounded history of automatic worktree integration records per chat: old
+--- events scroll away, but the newest are never dropped by a burst.
+local MAX_WORKTREE_RECORDS = 20
+
+---@class pi.ChatWorktreeRecord
+---@field text string the Integration module's sentence, verbatim
+---@field rendered boolean already written into the history buffer
+
+--- The worktree module when available. `detect` is synchronous and
+--- filesystem-only; dirty/ahead comes from an async `status` call, so nothing
+--- on the render path ever runs git.
+---@return table?
+local function worktree_module()
+    local ok, mod = pcall(require, "pi.worktree")
+    if ok and type(mod) == "table" and type(mod.detect) == "function" then
+        return mod
+    end
+    return nil
+end
+
+--- Title chunks for the worktree badge — pure, so the display matrix is unit
+--- testable without a repository:
+---   main worktree, session cwd == Neovim cwd  → nil (the title stays `π`)
+---   linked worktree, cwd matches              → `󰙅 name`, `*` when dirty/ahead
+---   session cwd ≠ Neovim cwd                  → `⚠ 󰙅 name` in the warning color
+---@param info pi.WorktreeInfo?
+---@param same_cwd boolean
+---@param status? { dirty?: boolean, ahead?: integer }
+---@return pi.ChatHistoryTitleChunk[]?
+function Chat.worktree_badge(info, same_cwd, status)
+    if type(info) ~= "table" or (info.kind ~= "main" and info.kind ~= "linked") then
+        return nil
+    end
+    local name = type(info.name) == "string" and info.name or ""
+    if name == "" then
+        return nil
+    end
+    local glyph = info.kind == "linked" and "󰙅 " or ""
+    if not same_cwd then
+        return { { "⚠ " .. glyph .. name, "PiStatusLineWarning" } }
+    end
+    if info.kind == "main" then
+        return nil
+    end
+    local marked = status ~= nil and (status.dirty == true or (type(status.ahead) == "number" and status.ahead > 0))
+    return { { glyph .. name .. (marked and "*" or ""), "PiChatHistoryWorktree" } }
+end
+
+--- Build the history lines for one integration record: the worktree glyph plus
+--- the Integration module's own text, continuation lines indented so a
+--- multi-line message stays one record.
+---@param text string
+---@return pi.CustomBlockLine[]
+local function worktree_record_lines(text)
+    local content = {}
+    for i, line in ipairs(vim.split(text, "\n", { plain = true })) do
+        content[#content + 1] = {
+            { i == 1 and "󰙅 " or "  ", "PiWorktreeIntegrationIcon" },
+            { line, "PiWorktreeIntegration" },
+        }
+    end
+    return content
+end
+
+--- Record one automatic worktree integration event in the history, as a
+--- persistent visible line — never only a transient notification. The history
+--- buffer exists for the chat's whole lifetime, so the record is written even
+--- while the chat has no window and is still there on the next show; if the
+--- buffer cannot take it yet, the record stays pending and is replayed then.
+---
+--- The text comes from `pi.worktree_integration` (`queued` / `applying` /
+--- `resolving` / `applied` / `needs_attention`, and `removed` as part of an
+--- applied sentence).
+---@param text string
+function Chat:show_worktree_integration(text)
+    if type(text) ~= "string" then
+        return
+    end
+    local trimmed = vim.trim(text)
+    if trimmed == "" then
+        return
+    end
+    self._worktree_records = self._worktree_records or {}
+    self._worktree_records[#self._worktree_records + 1] = { text = trimmed, rendered = false }
+    while #self._worktree_records > MAX_WORKTREE_RECORDS do
+        table.remove(self._worktree_records, 1)
+    end
+    self:_render_worktree_records()
+end
+
+--- Write every not-yet-rendered integration record into the history buffer.
+--- Records that cannot be written yet (no usable buffer) stay pending, so the
+--- next show retries them.
+function Chat:_render_worktree_records()
+    local records = self._worktree_records
+    if not records or #records == 0 then
+        return
+    end
+    local buf = self._history:buf()
+    if not buf or not vim.api.nvim_buf_is_valid(buf) then
+        return
+    end
+    for _, record in ipairs(records) do
+        if not record.rendered then
+            self:append_custom_block({
+                target = "history",
+                block = "custom",
+                content = worktree_record_lines(record.text),
+            })
+            record.rendered = true
+        end
+    end
+end
+
 --- Show a breadcrumb when viewing a sub-session (`◂ 父：…`).
 ---@param label string
 ---@param parent_id string
 function Chat:set_subsession_breadcrumb(label, parent_id)
     self._subsession_parent_id = parent_id
     self._subsession_breadcrumb = "◂ 父：" .. label
-    self:_update_subsession_breadcrumb()
+    self:_update_history_title()
 end
 
 function Chat:clear_subsession_breadcrumb()
     self._subsession_parent_id = nil
     self._subsession_breadcrumb = nil
-    self:_update_subsession_breadcrumb()
+    self:_update_history_title()
 end
 
-function Chat:_update_subsession_breadcrumb()
-    local hwin = self._layout:history_win()
-    if not hwin or not vim.api.nvim_win_is_valid(hwin) then
+--- Re-apply the history title: the sub-session breadcrumb when viewing a
+--- child, otherwise the panel title plus the worktree badge.
+function Chat:_update_history_title()
+    local chunks
+    if self._subsession_breadcrumb then
+        -- A sub-session view names its parent instead of its worktree.
+        chunks = { { self._subsession_breadcrumb, "PiSessionsListBusy" } }
+    else
+        chunks = { { Config.options.panels.history.title, "PiChatHistoryWinbar" } }
+        local badge = Chat.worktree_badge(self._worktree, self._worktree_same_cwd, self._worktree_status)
+        if badge then
+            for _, chunk in ipairs(badge) do
+                chunks[#chunks + 1] = chunk
+            end
+        end
+    end
+    self._layout:set_history_title(chunks)
+end
+
+--- Normalize a directory for cwd comparison: symlinks resolved, trailing
+--- separators and `.`/`..` folded. The fallback keeps a deleted or not yet
+--- existing path comparable instead of reporting a mismatch on every check.
+---@param dir string?
+---@return string?
+local function normalize_cwd(dir)
+    if type(dir) ~= "string" or vim.trim(dir) == "" then
+        return nil
+    end
+    local real = vim.uv.fs_realpath(vim.trim(dir))
+    if type(real) == "string" and real ~= "" then
+        return real
+    end
+    local abs = vim.fn.simplify(vim.fn.fnamemodify(vim.trim(dir), ":p"))
+    local stripped = abs:gsub("[\\/]+$", "")
+    if stripped ~= "" and stripped:match("^%a:$") == nil then
+        return stripped
+    end
+    return abs
+end
+
+--- Cancel a debounced badge refresh, if armed.
+---@param timer uv.uv_timer_t?
+local function cancel_timer(timer)
+    if not timer then
         return
     end
-    if self._subsession_breadcrumb then
-        vim.wo[hwin].winbar = "%#PiChatHistoryWinbar#%=%#PiSessionsListBusy# "
-            .. self._subsession_breadcrumb
-            .. " %#PiChatHistoryWinbar#%="
-    else
-        local title = Config.options.panels.history.title
-        vim.wo[hwin].winbar = "%#PiChatHistoryWinbar#%=%#PiChatHistoryWinbar# " .. title .. " %#PiChatHistoryWinbar#%="
+    pcall(timer.stop, timer)
+    if not timer:is_closing() then
+        pcall(timer.close, timer)
     end
+end
+
+--- Recompute the worktree badge: synchronous filesystem-only detection, then
+--- an async `git status` refresh for the `*` marker, re-rendering the title on
+--- both steps. Nothing here blocks on git, so it is safe on the show path, in
+--- completion/event handlers, and (in a later change) on a manager call after
+--- a cwd switch.
+function Chat:refresh_worktree()
+    local cwd = self._cwd
+    if type(cwd) ~= "string" or cwd == "" then
+        cwd = vim.fn.getcwd()
+    end
+    local session_dir = normalize_cwd(cwd)
+    self._worktree_same_cwd = session_dir ~= nil and session_dir == normalize_cwd(vim.fn.getcwd())
+    local mod = worktree_module()
+    self._worktree = mod and mod.detect(cwd) or nil
+    self._worktree_status = nil
+    self:_update_history_title()
+    local info = self._worktree
+    if not info or not mod or type(mod.status) ~= "function" then
+        return
+    end
+    -- The main worktree with a matching cwd renders no badge at all, so its
+    -- status can never change the title: don't spend a `git status` on it.
+    if info.kind == "main" and self._worktree_same_cwd then
+        return
+    end
+    -- A failed spawn must only cost the `*` marker, never the title.
+    pcall(mod.status, info, function(status)
+        vim.schedule(function()
+            if self._worktree ~= info then
+                return -- cwd switched while the status call was in flight
+            end
+            self._worktree_status = status
+            self:_update_history_title()
+        end)
+    end)
+end
+
+--- Coalesce an event-driven badge refresh: one finished turn can contain many
+--- tools, and each may have touched files, so re-check once per quiet period
+--- instead of once per tool.
+---@param delay? integer milliseconds (default: the tool-completion debounce)
+function Chat:_schedule_worktree_refresh(delay)
+    if self._worktree_timer then
+        return
+    end
+    self._worktree_timer = vim.defer_fn(function()
+        self._worktree_timer = nil
+        self:refresh_worktree()
+    end, delay or WORKTREE_REFRESH_DEBOUNCE_MS)
 end
 
 function Chat:_set_keymaps()
@@ -399,6 +616,12 @@ function Chat:show(opts)
         return
     end
     self:_set_keymaps()
+    -- A record that could not be written yet (no usable buffer) lands now.
+    self:_render_worktree_records()
+    -- Window creation resets the winbar / float title: re-apply it and re-read
+    -- the worktree state (files may have changed while the chat was hidden),
+    -- rather than replaying a cached badge.
+    self:refresh_worktree()
     if opts and opts.loading then
         self:show_loading()
     else
@@ -437,6 +660,7 @@ end
 function Chat:toggle_layout(cb)
     self._prompt._resume_insert = nil
     self._layout:toggle()
+    self:_update_history_title()
     self:refresh_prompt_attention()
 
     -- Determine how to re-enter insert mode based on the normal-mode
@@ -465,6 +689,7 @@ end
 ---@param mode pi.LayoutMode
 function Chat:set_layout(mode)
     self._layout:set_mode(mode)
+    self:_update_history_title()
     self:refresh_prompt_attention()
 end
 
@@ -939,7 +1164,9 @@ function Chat:_queue_compaction_message(mode)
     self._prompt:clear_text()
     local attachments = image_count > 0 and self._attachments:get() or nil
     self._attachments:clear()
-    local expanded = Mentions.expand(text)
+    -- Mentions resolve against the session workspace, not Neovim's cwd: a
+    -- worktree (or resumed) session must expand `@path` the same way pi does.
+    local expanded = Mentions.expand(text, self._cwd)
 
     if self:_is_extension_command(text) then
         self._history:add_user_message(text, nil, attachments and #attachments or nil)
@@ -994,11 +1221,17 @@ end
 --- the session manager right after creation; falls back to the current cwd
 --- when never set. Also anchors the prompt's unsent-draft persistence, which
 --- is workspace-scoped the same way, and the history's tool-path shortening.
+--- Switching workspaces drops the derived prompt-history store and readline
+--- cursor (both are per-workspace), and refreshes the history title's
+--- worktree badge.
 ---@param cwd string
 function Chat:set_cwd(cwd)
     self._cwd = cwd
     self._prompt:set_workspace(cwd)
     self._history:set_cwd(cwd)
+    self._prompt_history = nil
+    self._prompt_nav = nil
+    self:refresh_worktree()
 end
 
 --- Get the prompt-history store for this chat, honoring config. History is
@@ -1186,7 +1419,8 @@ function Chat:_send_message(queue_type)
     local attachments = self._attachments:count() > 0 and self._attachments:items() or nil
     self._attachments:clear()
 
-    local expanded = Mentions.expand(text)
+    -- Mentions resolve against the session workspace (see _send_message).
+    local expanded = Mentions.expand(text, self._cwd)
 
     local image_count = attachments and #attachments or nil
     ---@type pi.RpcImageContent[]?
@@ -1581,6 +1815,12 @@ function Chat:on_agent_end()
     self._history:on_agent_end(completion_text, { force_completion = force_completion, stop_reason = stop_reason })
     self:set_status(nil)
 
+    -- The turn is over: files are final, so refresh the badge now and drop any
+    -- debounced refresh queued by the turn's tools.
+    cancel_timer(self._worktree_timer)
+    self._worktree_timer = nil
+    self:refresh_worktree()
+
     -- Clear, eye-catching confirmation that the turn was aborted.
     if stop_reason == "aborted" then
         self:_show_aborted_notice()
@@ -1880,6 +2120,9 @@ end
 ---@param is_error? boolean
 function Chat:on_tool_end(tool_name, tool_call_id, result, is_error)
     self._history:on_tool_end(tool_name, tool_call_id, result, is_error)
+    -- A tool may have written files, so the worktree badge's dirty/ahead state
+    -- is stale now. Debounced: a turn runs many tools.
+    self:_schedule_worktree_refresh()
 end
 
 ---@param tool_name string
@@ -1940,6 +2183,10 @@ function Chat:clear()
     self._done_verb = nil
     self._last_turn_stop_reason = nil
     self._history:clear()
+    -- The buffer was wiped for a different conversation: its integration
+    -- records belong to the old one. (A hidden chat keeps them: clear() is the
+    -- conversation boundary, not hide().)
+    self._worktree_records = {}
     self._prompt:statusline():reset_usage()
 end
 

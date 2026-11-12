@@ -84,6 +84,9 @@ All highlight groups are defined with `default = true`, so they can be overridde
 | `PiFloatBorder` | Border for π float windows |
 | `PiChatHistoryWinbar` | Winbar background for the history panel (side layout) |
 | `PiChatHistoryWinbarTitle` | Winbar title for the history panel (side layout) |
+| `PiChatHistoryWorktree` | Git worktree badge (`󰙅 <name>`, with `*` when dirty/ahead) in the history title — winbar and float title. A session whose cwd differs from Neovim's renders the badge in `PiStatusLineWarning` instead. |
+| `PiWorktreeIntegrationIcon` | The `󰙅` glyph (and the two-space indent of continuation lines) of an automatic worktree integration record in chat history |
+| `PiWorktreeIntegration` | Text of an automatic worktree integration record (`applied … · checkout removed`, `queued (modified_buffer)`, `resolving … (attempt 1/1)`, `needs attention: …`). A patch parked only because the parent is busy writes no record — see [Worktrees](worktrees.md#where-you-see-it). |
 | `PiChatPromptWinbar` | Winbar background for the prompt panel (side layout) |
 | `PiChatPromptWinbarTitle` | Winbar title for the prompt panel (side layout) |
 | `PiChatPromptWinbarAttentionTitle` | Winbar title for the prompt panel when attention is pending |
@@ -163,6 +166,11 @@ The dashboard reuses `PiToolHeader` for its section headers, `Comment` for dimme
 | `PiSessionsListDotDim` | Dim phase of blinking dots |
 | `PiSessionsListCurrent` | Marks the current tab's own session dot in the agent color |
 | `PiSessionsListFloatTitle` | Float title for the sessions list window |
+| `PiSessionsListWorktree` | Worktree group header (`󰙅 name · ~/path`) when the list spans several worktrees |
+| `PiSessionsListIntegrationQueued` | Integration status glyph `⧗` on a child row — captured and parked, waiting for a safe window (dim) |
+| `PiSessionsListIntegrationRunning` | Integration status glyph `…` — applying or resolving (busy color, bold) |
+| `PiSessionsListIntegrationApplied` | Integration status glyph `✓` — the child's patch is present in the parent checkout (links to `DiagnosticOk`) |
+| `PiSessionsListIntegrationAttention` | Integration status glyph `!` — the integration stopped and needs a human (warning, bold) |
 
 ## Background tasks panel
 

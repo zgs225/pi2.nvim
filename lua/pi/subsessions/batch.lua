@@ -13,14 +13,17 @@ local BATCH_FILE = ".pi2-sub-batches.json"
 ---@type string?
 local path_override = nil
 
----@type table<string, pi.SubsessionBatch>?
-local cache = nil
----@type string?
-local cache_path = nil
+--- Batches keyed by their workspace file path (several workspaces can be
+--- consulted in one event-loop tick: a tab may live in a different workspace
+--- than Neovim's cwd).
+---@type table<string, table<string, pi.SubsessionBatch>>
+local cache = {}
 
 ---@class pi.SubsessionWaiter
 ---@field cb fun(result: table): boolean
----@field owner? string
+---@field owner? string Lineage/session id that is blocked on the wait.
+---@field cwd? string Workspace the waiter registered against (nil = process cwd).
+---@field scope? string Manifest path of that workspace, resolved at registration.
 
 ---@type table<string, pi.SubsessionWaiter[]>
 local waiters = {}
@@ -34,9 +37,10 @@ local waiters = {}
 ---@field model? pi.ModelRef
 ---@field thinking_level? string
 ---@field status "queued"|"spawning"|"running"|"ok"|"failed"|"cancelled"
----@field generation? integer
+---@field generation? integer Run generation the item was dispatched against.
 ---@field output? string
 ---@field error? string
+---@field integration? table Worktree integration outcome for this item (`state` = "queued"|"resolving"|"applying"|"applied"|"needs_attention"|"skipped", plus `files`, `error`, `reason`), so the parent tool result can explain what happened to the child's worktree changes.
 
 ---@class pi.SubsessionBatch
 ---@field id string
@@ -46,64 +50,73 @@ local waiters = {}
 ---@field updated_at string
 ---@field cancel_siblings_on_fail boolean
 ---@field items pi.SubsessionBatchItem[]
+---@field cwd? string workspace cwd the batch belongs to (additive; absent in older files = process cwd)
 
 ---@param path string
 function M._set_path(path)
     path_override = path
-    cache = nil
-    cache_path = nil
+    cache = {}
 end
 
 function M._reset()
     path_override = nil
-    cache = nil
-    cache_path = nil
+    cache = {}
     waiters = {}
 end
 
+--- Batch file path for a workspace cwd.
+--- The batch file lives next to the session files (and the sub-session
+--- manifest) it belongs to, so a worktree session keeps its own there.
+--- Callers pass the owning session's cwd; omitting it keeps the process-cwd
+--- behaviour.
+---@param cwd? string workspace cwd (default: Neovim's current cwd)
 ---@return string
-function M.path()
+function M.path(cwd)
     if path_override then
         return path_override
     end
     local History = require("pi.sessions.history")
-    return History.get_sessions_dir() .. "/" .. BATCH_FILE
+    return History.get_sessions_dir(cwd) .. "/" .. BATCH_FILE
 end
 
+--- Read a batch file by path (the primitive behind `M.load`).
+---@param path string
 ---@return table<string, pi.SubsessionBatch>
-function M.load()
-    local path = M.path()
-    if cache ~= nil and cache_path == path then
-        return cache
+function M.load_at(path)
+    local cached = cache[path]
+    if cached ~= nil then
+        return cached
     end
     local file = io.open(path, "r")
     if not file then
-        cache = {}
-        cache_path = path
-        return cache
+        cache[path] = {}
+        return cache[path]
     end
     local content = file:read("*a")
     file:close()
     if type(content) ~= "string" or content == "" then
-        cache = {}
-        cache_path = path
-        return cache
+        cache[path] = {}
+        return cache[path]
     end
     local ok, data = pcall(vim.json.decode, content)
     if ok and type(data) == "table" then
-        cache = data
-        cache_path = path
-        return cache
+        cache[path] = data
+        return cache[path]
     end
     return {}
 end
 
+---@param cwd? string workspace cwd whose batches to read (default: Neovim's current cwd)
+---@return table<string, pi.SubsessionBatch>
+function M.load(cwd)
+    return M.load_at(M.path(cwd))
+end
+
 ---@param batches table<string, pi.SubsessionBatch>
+---@param path string
 ---@return boolean
-local function save(batches)
-    local path = M.path()
-    cache = batches
-    cache_path = path
+function M.save_at(batches, path)
+    cache[path] = batches
     local dir = vim.fn.fnamemodify(path, ":h")
     if vim.fn.isdirectory(dir) == 0 then
         vim.fn.mkdir(dir, "p")
@@ -122,6 +135,13 @@ local function save(batches)
     return ok == true
 end
 
+---@param batches table<string, pi.SubsessionBatch>
+---@param cwd? string workspace cwd whose batches to write (default: Neovim's current cwd)
+---@return boolean
+local function save(batches, cwd)
+    return M.save_at(batches, M.path(cwd))
+end
+
 ---@param status? string
 ---@return boolean
 local function is_terminal_status(status)
@@ -129,22 +149,66 @@ local function is_terminal_status(status)
 end
 
 ---@param id string
+---@param cwd? string workspace cwd (default: Neovim's current cwd)
 ---@return pi.SubsessionBatch?
-function M.get(id)
-    return M.load()[id]
+function M.get(id, cwd)
+    return M.load(cwd)[id]
 end
 
 ---@param batch pi.SubsessionBatch
-local function persist(batch)
-    local batches = M.load()
+---@param cwd? string workspace cwd (default: `batch.cwd`, then Neovim's current cwd)
+local function persist(batch, cwd)
+    local workspace = cwd
+    if workspace == nil and type(batch.cwd) == "string" then
+        workspace = batch.cwd
+    end
+    local batches = M.load(workspace)
     batch.updated_at = Manifest.iso_now()
     batches[batch.id] = batch
-    save(batches)
+    save(batches, workspace)
 end
 
 ---@return string
 local function new_id()
     return ("%s-%s"):format(os.time(), math.random(100000, 999999))
+end
+
+--- Aggregate integration states of a batch's items.
+---
+--- The parent tool result uses this to say, in one line, whether the children's
+--- worktree changes were applied, are still queued, or need attention.
+---@param batch pi.SubsessionBatch
+---@return { applied: integer, queued: integer, applying: integer, resolving: integer, needs_attention: integer, skipped: integer, files: string[] }
+local function integration_summary(batch)
+    local out = {
+        applied = 0,
+        queued = 0,
+        applying = 0,
+        resolving = 0,
+        needs_attention = 0,
+        skipped = 0,
+        files = {},
+    }
+    local seen_files = {}
+    for _, item in ipairs(batch.items or {}) do
+        local integration = item.integration
+        local state = type(integration) == "table" and integration.state or nil
+        if type(state) == "string" then
+            if out[state] ~= nil then
+                out[state] = out[state] + 1
+            end
+            local files = type(integration) == "table" and integration.files or nil
+            if type(files) == "table" then
+                for _, file in ipairs(files) do
+                    if type(file) == "string" and file ~= "" and not seen_files[file] then
+                        seen_files[file] = true
+                        out.files[#out.files + 1] = file
+                    end
+                end
+            end
+        end
+    end
+    return out
 end
 
 ---@param batch pi.SubsessionBatch
@@ -170,6 +234,7 @@ function M.snapshot(batch)
         batch_id = batch.id,
         status = batch.status,
         summary = summary,
+        integration = integration_summary(batch),
         items = vim.deepcopy(batch.items),
     }
 end
@@ -230,9 +295,10 @@ end
 
 ---@param child_id string
 ---@param parent_epoch? integer
+---@param cwd? string workspace cwd (default: Neovim's current cwd)
 ---@return integer
-function M.bump_generation(child_id, parent_epoch)
-    local entry = Manifest.load()[child_id]
+function M.bump_generation(child_id, parent_epoch, cwd)
+    local entry = Manifest.load(cwd)[child_id]
     local gen = (entry and entry.run_generation or 0) + 1
     local patch = {
         run_generation = gen,
@@ -242,7 +308,7 @@ function M.bump_generation(child_id, parent_epoch)
     if parent_epoch ~= nil then
         patch.parent_epoch = parent_epoch
     end
-    Manifest.patch(child_id, patch)
+    Manifest.patch(child_id, patch, cwd)
     return gen
 end
 
@@ -321,10 +387,11 @@ end
 ---@param batch_id string
 ---@param ref string
 ---@param ok boolean
----@param opts? { output?: string, error?: string }
+---@param opts? { output?: string, error?: string, cwd?: string, integration?: table } `cwd` is the owning session's workspace (default: Neovim's current cwd);
+---   `integration` is the worktree integration outcome recorded on the item so the parent tool result can report it.
 function M.complete_item(batch_id, ref, ok, opts)
     opts = opts or {}
-    local batch = M.get(batch_id)
+    local batch = M.get(batch_id, opts.cwd)
     if not batch or batch.status == "cancelled" then
         return
     end
@@ -345,25 +412,48 @@ function M.complete_item(batch_id, ref, ok, opts)
         })
         maybe_cancel_siblings(batch, ref)
     end
+    if type(opts.integration) == "table" then
+        patch_item(batch, ref, { integration = opts.integration })
+    end
     recompute_status(batch)
-    persist(batch)
+    persist(batch, opts.cwd)
     notify_waiters(batch_id)
     require("pi.ui.sessions").request_refresh()
 end
 
 ---@param child_id string
+---@param cwd? string workspace cwd (default: Neovim's current cwd)
+---@param integration? table Worktree integration outcome to record on the completed items.
 ---@return boolean claimed True when this settle completed a running batch item.
-function M.on_child_settled(child_id)
-    local entry = Manifest.load()[child_id]
-    if not entry then
-        return false
+function M.on_child_settled(child_id, cwd, integration)
+    -- The row belongs to the parent's workspace, which the caller usually knows
+    -- (the child session carries it). A mismatch must not strand the batch, so
+    -- fall back to locating the row and settle against *its* workspace.
+    local entry = Manifest.load(cwd)[child_id]
+    if type(entry) ~= "table" then
+        local located, located_cwd = Manifest.locate(child_id, cwd)
+        if type(located) ~= "table" then
+            return false
+        end
+        entry = located
+        if located_cwd then
+            cwd = located_cwd
+        end
     end
     local gen = entry.run_generation
     if type(gen) ~= "number" then
         return false
     end
-    local batches = M.load()
-    local path = Read.find_path(child_id)
+    local batches = M.load(cwd)
+    -- The transcript file recorded at spawn time is authoritative: a child's
+    -- JSONL can live in a different workspace (its worktree) than the batch.
+    local session_file = entry.session_file
+    local path = nil
+    if type(session_file) == "string" and session_file ~= "" and vim.fn.filereadable(session_file) == 1 then
+        path = session_file
+    else
+        path = Read.find_path(child_id, { cwd = cwd })
+    end
     local output = path and Read.last_assistant_message(path) or ""
     local failed = entry.status == "failed"
     local claimed = false
@@ -378,6 +468,8 @@ function M.on_child_settled(child_id)
                     M.complete_item(batch_id, item.ref, not failed, {
                         output = failed and nil or output,
                         error = failed and "sub-session failed" or nil,
+                        cwd = cwd,
+                        integration = integration,
                     })
                     claimed = true
                 end
@@ -471,10 +563,13 @@ end
 ---@param parent pi.Session
 local function run_batch(batch, parent)
     local Subsessions = require("pi.subsessions")
+    -- The batch belongs to the parent session's workspace: every manifest /
+    -- batch lookup in this closure must resolve against it, not Neovim's cwd.
+    local cwd = parent and parent.cwd or batch.cwd
 
     ---@param item pi.SubsessionBatchItem
     local function start_item(item)
-        local current = M.get(batch.id)
+        local current = M.get(batch.id, cwd)
         if not current or is_terminal_status(current.status) then
             return
         end
@@ -487,7 +582,7 @@ local function run_batch(batch, parent)
         ---@param expected_status string
         ---@return pi.SubsessionBatch?, pi.SubsessionBatchItem?
         local function live_item(expected_status)
-            local b = M.get(batch.id)
+            local b = M.get(batch.id, cwd)
             if not b or is_terminal_status(b.status) then
                 return nil, nil
             end
@@ -500,7 +595,7 @@ local function run_batch(batch, parent)
 
         if item.task then
             item.status = "spawning"
-            persist(current)
+            persist(current, cwd)
             Subsessions.spawn(parent, {
                 task = item.task,
                 name = item.name,
@@ -521,26 +616,26 @@ local function run_batch(batch, parent)
                         Manifest.patch(child.id, {
                             status = "interrupted",
                             last_active_at = Manifest.iso_now(),
-                        })
+                        }, cwd)
                     end
                     return
                 end
                 if not child then
-                    M.complete_item(b.id, item.ref, false, { error = err or "spawn failed" })
+                    M.complete_item(b.id, item.ref, false, { error = err or "spawn failed", cwd = cwd })
                     return
                 end
-                local entry = Manifest.load()[child.id]
+                local entry = Manifest.load(cwd)[child.id]
                 live.target = child.id
                 live.generation = entry and entry.run_generation
                 live.status = "running"
-                persist(b)
+                persist(b, cwd)
             end)
             return
         end
 
         local target = item.target
         if not target then
-            M.complete_item(batch.id, item.ref, false, { error = "missing target" })
+            M.complete_item(batch.id, item.ref, false, { error = "missing target", cwd = cwd })
             return
         end
         local function send_to(child)
@@ -552,16 +647,16 @@ local function run_batch(batch, parent)
                 return
             end
             if not child then
-                M.complete_item(b.id, item.ref, false, { error = "sub-agent not found" })
+                M.complete_item(b.id, item.ref, false, { error = "sub-agent not found", cwd = cwd })
                 return
             end
-            local gen = M.bump_generation(target, parent.conversation_epoch)
+            local gen = M.bump_generation(target, parent.conversation_epoch, cwd)
             live.generation = gen
             live.status = "running"
-            persist(b)
+            persist(b, cwd)
             child.rpc:send({ type = "prompt", message = item.message }, function(res)
                 if not res.success then
-                    M.complete_item(batch.id, item.ref, false, { error = "prompt failed" })
+                    M.complete_item(batch.id, item.ref, false, { error = "prompt failed", cwd = cwd })
                 end
             end)
         end
@@ -573,7 +668,7 @@ local function run_batch(batch, parent)
         end
         Subsessions.revive(target, function(revived, err)
             if not revived then
-                M.complete_item(batch.id, item.ref, false, { error = err or "revive failed" })
+                M.complete_item(batch.id, item.ref, false, { error = err or "revive failed", cwd = cwd })
                 return
             end
             local b, live = live_item("queued")
@@ -588,7 +683,7 @@ local function run_batch(batch, parent)
                 Manifest.patch(revived.id, {
                     status = "interrupted",
                     last_active_at = Manifest.iso_now(),
-                })
+                }, cwd)
                 return
             end
             send_to(revived)
@@ -609,6 +704,9 @@ end
 ---@param callback fun(result: table)
 function M.dispatch(parent, opts, callback)
     local subcfg = Config.options.subagent or {}
+    -- The batch and its manifest rows belong to the parent session's workspace
+    -- (a worktree session keeps them in the worktree's session directory).
+    local cwd = type(parent.cwd) == "string" and parent.cwd or nil
     if subcfg.enabled == false then
         callback({ error = "subagent disabled" })
         return
@@ -632,8 +730,8 @@ function M.dispatch(parent, opts, callback)
             return
         end
 
-        Manifest.bind_session_lineage(parent, parent_id)
-        local lineage_id = Manifest.lineage_for_session(parent)
+        Manifest.bind_session_lineage(parent, parent_id, cwd)
+        local lineage_id = Manifest.lineage_for_session(parent, cwd)
         if lineage_id == "" then
             lineage_id = parent_id
         end
@@ -667,7 +765,7 @@ function M.dispatch(parent, opts, callback)
 
         for i, item in ipairs(items) do
             if item.target then
-                local entry = Manifest.load()[item.target]
+                local entry = Manifest.load(cwd)[item.target]
                 if type(entry) ~= "table" then
                     callback({ error = ("item %d: unknown sub-agent target %q"):format(i, item.target) })
                     return
@@ -704,14 +802,14 @@ function M.dispatch(parent, opts, callback)
         end
 
         local max_children = subcfg.max_children or 5
-        local occupancy = Manifest.spawn_occupancy(lineage_id, Subsessions.is_child_process_alive)
+        local occupancy = Manifest.spawn_occupancy(lineage_id, Subsessions.is_child_process_alive, cwd)
         if occupancy + new_spawns > max_children then
             local deficit = occupancy + new_spawns - max_children
             -- Auto-reap settled children to make room, but never reap targets this
             -- batch is about to reuse (otherwise run_batch would have to revive them,
             -- defeating the reap and risking over-quota spawn).
-            Reaper.reap_oldest_settled(lineage_id, deficit, reuse_exclude)
-            occupancy = Manifest.spawn_occupancy(lineage_id, Subsessions.is_child_process_alive)
+            Reaper.reap_oldest_settled(lineage_id, deficit, reuse_exclude, cwd)
+            occupancy = Manifest.spawn_occupancy(lineage_id, Subsessions.is_child_process_alive, cwd)
         end
         if occupancy + new_spawns > max_children then
             callback({ error = ("would exceed max %d concurrent sub-sessions"):format(max_children) })
@@ -727,8 +825,9 @@ function M.dispatch(parent, opts, callback)
             updated_at = Manifest.iso_now(),
             cancel_siblings_on_fail = opts.cancel_siblings_on_fail == true,
             items = items,
+            cwd = cwd,
         }
-        persist(batch)
+        persist(batch, cwd)
         callback(M.snapshot(batch))
         vim.defer_fn(function()
             run_batch(batch, parent)
@@ -737,9 +836,10 @@ function M.dispatch(parent, opts, callback)
 end
 
 ---@param batch_id string
+---@param cwd? string workspace cwd (default: Neovim's current cwd)
 ---@return table?
-function M.poll(batch_id)
-    local batch = M.get(batch_id)
+function M.poll(batch_id, cwd)
+    local batch = M.get(batch_id, cwd)
     if not batch then
         return nil
     end
@@ -747,14 +847,15 @@ function M.poll(batch_id)
 end
 
 ---@param parent_id string Session id or lineage id.
+---@param cwd? string workspace cwd (default: Neovim's current cwd)
 ---@return table[]
-function M.list_for_parent(parent_id)
-    local lineage = Manifest.resolve_lineage(parent_id) or parent_id
-    local batches = M.load()
+function M.list_for_parent(parent_id, cwd)
+    local lineage = Manifest.resolve_lineage(parent_id, cwd) or parent_id
+    local batches = M.load(cwd)
     ---@type table[]
     local out = {}
     for _, batch in pairs(batches) do
-        local batch_lineage = Manifest.resolve_lineage(batch.parent_id) or batch.parent_id
+        local batch_lineage = Manifest.resolve_lineage(batch.parent_id, cwd) or batch.parent_id
         if batch_lineage == lineage then
             out[#out + 1] = M.snapshot(batch)
         end
@@ -767,9 +868,10 @@ end
 
 ---@param batch_id string
 ---@param callback fun(result: table)
----@param opts? { timeout_ms?: integer, interval_ms?: integer, owner?: string }
+---@param opts? { timeout_ms?: integer, interval_ms?: integer, owner?: string, cwd?: string } `cwd` is the workspace the batch lives in (default: Neovim's cwd)
 function M.wait(batch_id, callback, opts)
     opts = opts or {}
+    local cwd = opts.cwd
     local timeout_ms = opts.timeout_ms or (Config.options.subagent or {}).batch_timeout_ms or 300000
     local interval_ms = opts.interval_ms or 200
     local owner = opts.owner
@@ -805,7 +907,7 @@ function M.wait(batch_id, callback, opts)
         if settled then
             return
         end
-        local snap = M.poll(batch_id)
+        local snap = M.poll(batch_id, cwd)
         if not snap then
             if finish({ error = "batch not found" }) then
                 return
@@ -829,7 +931,7 @@ function M.wait(batch_id, callback, opts)
         vim.defer_fn(tick, interval_ms)
     end
 
-    local batch = M.get(batch_id)
+    local batch = M.get(batch_id, cwd)
     if not batch then
         if finish({ error = "batch not found" }) then
             return
@@ -840,14 +942,50 @@ function M.wait(batch_id, callback, opts)
         end
     end
     waiters[batch_id] = waiters[batch_id] or {}
-    table.insert(waiters[batch_id], { cb = finish, owner = owner })
+    -- The workspace is resolved once here: the integration engine compares it
+    -- against its own scope without re-resolving Neovim's cwd later.
+    table.insert(waiters[batch_id], { cb = finish, owner = owner, cwd = cwd, scope = Manifest.path(cwd) })
     vim.defer_fn(tick, interval_ms)
 end
 
----@param batch_id string
+--- True when `lineage` is currently blocked in a wait on a batch of `cwd`'s
+--- workspace.
+---
+--- The integration engine asks this before applying a settled child's changes:
+--- while the parent sits in `wait_subagents` (or `dispatch(wait = true)`), the
+--- applied result must reach that waiting call instead of racing it as a
+--- separate prompt.
+---@param cwd? string workspace cwd (default: Neovim's current cwd)
+---@param lineage string lineage id (any session id of the lineage)
 ---@return boolean
-function M.cancel(batch_id)
-    local batch = M.get(batch_id)
+function M.is_waiting(cwd, lineage)
+    if type(lineage) ~= "string" or lineage == "" then
+        return false
+    end
+    local scope = Manifest.path(cwd)
+    local target = Manifest.resolve_lineage(lineage, cwd) or lineage
+    for _, entries in pairs(waiters) do
+        for _, waiter in ipairs(entries) do
+            local waiter_scope = type(waiter.scope) == "string" and waiter.scope or Manifest.path(waiter.cwd)
+            local owner = waiter.owner
+            if
+                waiter_scope == scope
+                and type(owner) == "string"
+                and owner ~= ""
+                and (Manifest.resolve_lineage(owner, cwd) or owner) == target
+            then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+---@param batch_id string
+---@param cwd? string workspace cwd (default: Neovim's current cwd)
+---@return boolean
+function M.cancel(batch_id, cwd)
+    local batch = M.get(batch_id, cwd)
     if not batch then
         return false
     end
@@ -862,24 +1000,25 @@ function M.cancel(batch_id)
             abort_child_process(item.target, true)
         end
     end
-    persist(batch)
+    persist(batch, cwd)
     notify_waiters(batch_id)
     return true
 end
 
 ---@param parent_id string Session id or lineage id.
 ---@param fn fun(batch_id: string, batch: pi.SubsessionBatch)
-local function for_each_target_batch(parent_id, fn)
-    local lineage = Manifest.resolve_lineage(parent_id) or parent_id
-    local batches = M.load()
+---@param cwd? string workspace cwd (default: Neovim's current cwd)
+local function for_each_target_batch(parent_id, fn, cwd)
+    local lineage = Manifest.resolve_lineage(parent_id, cwd) or parent_id
+    local batches = M.load(cwd)
     for id, batch in pairs(batches) do
         if batch.status == "running" or batch.status == "pending" then
-            local batch_lineage = Manifest.resolve_lineage(batch.parent_id) or batch.parent_id
+            local batch_lineage = Manifest.resolve_lineage(batch.parent_id, cwd) or batch.parent_id
             local matches = (batch_lineage == lineage)
             if not matches and waiters[id] then
                 for _, w in ipairs(waiters[id]) do
                     if w.owner and w.owner ~= "" then
-                        local owner_lineage = Manifest.resolve_lineage(w.owner) or w.owner
+                        local owner_lineage = Manifest.resolve_lineage(w.owner, cwd) or w.owner
                         if owner_lineage == lineage then
                             matches = true
                             break
@@ -895,13 +1034,14 @@ local function for_each_target_batch(parent_id, fn)
 end
 
 ---@param parent_id string Session id or lineage id.
-function M.cancel_for_parent(parent_id)
+---@param cwd? string workspace cwd (default: Neovim's current cwd)
+function M.cancel_for_parent(parent_id, cwd)
     if not parent_id or parent_id == "" then
         return
     end
     for_each_target_batch(parent_id, function(id)
-        M.cancel(id)
-    end)
+        M.cancel(id, cwd)
+    end, cwd)
 end
 
 --- Record the abort watermark for a child whose in-flight item is being
@@ -921,9 +1061,10 @@ end
 --- Abort-only cancellation of one batch: marks the batch cancelled and aborts
 --- (never closes) its in-flight children, then wakes any waiters.
 ---@param batch_id string
+---@param cwd? string workspace cwd (default: Neovim's current cwd)
 ---@return boolean ok
-function M.abort(batch_id)
-    local batch = M.get(batch_id)
+function M.abort(batch_id, cwd)
+    local batch = M.get(batch_id, cwd)
     if not batch then
         return false
     end
@@ -941,7 +1082,7 @@ function M.abort(batch_id)
             end
         end
     end
-    persist(batch)
+    persist(batch, cwd)
     notify_waiters(batch_id)
     return true
 end
@@ -950,18 +1091,19 @@ end
 --- lineage + batches this lineage is currently waiting on), but children are
 --- aborted instead of closed.
 ---@param parent_id string
+---@param cwd? string workspace cwd (default: Neovim's current cwd)
 ---@return integer n Batches aborted.
-function M.abort_for_parent(parent_id)
+function M.abort_for_parent(parent_id, cwd)
     if not parent_id or parent_id == "" then
         return 0
     end
     local n = 0
     for_each_target_batch(parent_id, function(id, batch)
         if batch.status == "running" or batch.status == "pending" then
-            M.abort(id)
+            M.abort(id, cwd)
             n = n + 1
         end
-    end)
+    end, cwd)
     return n
 end
 
@@ -973,7 +1115,8 @@ end
 --- most** that value — the aborted run and anything older, never a newer run the
 --- parent started by reusing this child after the abort.
 ---@param child_id string
----@param opts? { generation?: integer, reason?: string }
+---@param opts? { generation?: integer, reason?: string, cwd?: string, integration?: table } `cwd` is the workspace the batches live in (default: Neovim's cwd);
+---   `integration` is recorded on every cancelled item (an aborted run is never integrated).
 ---@return integer n Number of items marked cancelled.
 function M.interrupt_items_for_child(child_id, opts)
     opts = opts or {}
@@ -984,7 +1127,7 @@ function M.interrupt_items_for_child(child_id, opts)
         note_child_aborted(child_id, opts.generation)
     end
     local n = 0
-    local batches = M.load()
+    local batches = M.load(opts.cwd)
     for batch_id, batch in pairs(batches) do
         if batch.status == "running" or batch.status == "pending" then
             local changed = 0
@@ -999,13 +1142,16 @@ function M.interrupt_items_for_child(child_id, opts)
                 then
                     item.status = "cancelled"
                     item.error = opts.reason or "cancelled: aborted by user"
+                    if type(opts.integration) == "table" then
+                        item.integration = opts.integration
+                    end
                     note_child_aborted(item.target, item.generation)
                     changed = changed + 1
                 end
             end
             if changed > 0 then
                 recompute_status(batch)
-                persist(batch)
+                persist(batch, opts.cwd)
                 notify_waiters(batch_id)
                 n = n + changed
             end
@@ -1014,11 +1160,31 @@ function M.interrupt_items_for_child(child_id, opts)
     return n
 end
 
+--- Batch file that lives next to a manifest file (same workspace directory).
+--- Lets a caller that only knows a manifest path (a workspace discovered on
+--- disk) reach that workspace's batches.
+---@param manifest_path string
+---@return string
+function M.path_for_manifest(manifest_path)
+    return vim.fn.fnamemodify(manifest_path, ":h") .. "/" .. BATCH_FILE
+end
+
 --- Reconcile running batches after Neovim restart.
-function M.rebuild()
+---@param cwd? string workspace cwd (default: Neovim's current cwd)
+function M.rebuild(cwd)
+    M.rebuild_at(M.path(cwd))
+end
+
+--- Reconcile running batches in one batch file.
+---@param path string batch file path
+function M.rebuild_at(path)
     local ttl_hours = (Config.options.subagent or {}).batch_ttl_hours or 24
     local now = os.time()
-    local batches = M.load()
+    local batches = M.load_at(path)
+    -- Items are settled against the manifest of the same workspace (the file
+    -- next to this batch file), so a rebuild in one workspace never reads
+    -- another's rows.
+    local manifest = Manifest.load_at(Manifest.path_for_batch(path))
     local changed = false
     for id, batch in pairs(batches) do
         local created = batch.created_at or ""
@@ -1037,11 +1203,25 @@ function M.rebuild()
         if batch.status == "running" then
             for _, item in ipairs(batch.items) do
                 if item.status == "running" and item.target and item.generation then
-                    local entry = Manifest.load()[item.target]
+                    local entry = manifest[item.target]
                     if entry and entry.run_generation == item.generation and entry.status == "completed" then
-                        local path = Read.find_path(item.target)
+                        -- The row's recorded transcript is authoritative: a child
+                        -- in its own worktree keeps its JSONL in another workspace.
+                        local session_file = entry.session_file
+                        local transcript
+                        if
+                            type(session_file) == "string"
+                            and session_file ~= ""
+                            and vim.fn.filereadable(session_file) == 1
+                        then
+                            transcript = session_file
+                        else
+                            -- Same workspace as the row (unknown only for a batch
+                            -- file reached purely by path).
+                            transcript = Read.find_path(item.target, { cwd = entry.workspace })
+                        end
                         item.status = "ok"
-                        item.output = path and Read.last_assistant_message(path) or ""
+                        item.output = transcript and Read.last_assistant_message(transcript) or ""
                         changed = true
                     elseif entry and entry.run_generation == item.generation and entry.status == "failed" then
                         item.status = "failed"
@@ -1055,7 +1235,7 @@ function M.rebuild()
         end
     end
     if changed then
-        save(batches)
+        M.save_at(batches, path)
     end
 end
 

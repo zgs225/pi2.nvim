@@ -14,6 +14,7 @@ local M = {}
 local Config = require("pi.config")
 local Ft = require("pi.filetypes")
 local Highlights = require("pi.ui.highlights")
+local Notify = require("pi.notify")
 
 local ns = vim.api.nvim_create_namespace("pi-diff-review")
 
@@ -44,6 +45,15 @@ local row_entries = {}
 --- Forward-declared (defined in the Jump section): <CR>/o handlers.
 local jump_to_target
 local list_jump
+
+--- Optional accept handler (`a`), used by review panels whose purpose is an
+--- explicit action (e.g. applying a worktree patch). nil keeps the historic
+--- read-only behavior: no keymap, no hint.
+---@type fun()?
+local accept_fn = nil
+--- Short label shown in the list hint, e.g. "apply patch".
+---@type string?
+local accept_label = nil
 
 ---@class pi.DiffReviewSection
 ---@field path string Display path (relative to the work tree root).
@@ -295,6 +305,22 @@ local function close_shell()
     shell_buf = nil
 end
 
+--- Run the optional accept handler (`a`). The review closes first so the
+--- handler can open dialogs or report errors without fighting the floats for
+--- focus; `M.close()` also clears the accept state, hence the local capture.
+--- A throwing handler must never escape a keymap callback.
+local function accept_review()
+    local fn = accept_fn
+    if type(fn) ~= "function" then
+        return
+    end
+    M.close()
+    local ok, err = pcall(fn)
+    if not ok then
+        Notify.error("diff review accept handler failed: " .. tostring(err))
+    end
+end
+
 -- Rendering -----------------------------------------------------------------
 
 ---@param path string
@@ -354,7 +380,11 @@ end
 ---@return table<integer, { group: integer, section: integer? }>
 local function build_list_layout(groups, sections)
     local count = #sections
-    local hint = string.format("─ %d file%s · <CR> jump · q close", count, count == 1 and "" or "s")
+    local hint = string.format("─ %d file%s · <CR> jump", count, count == 1 and "" or "s")
+    if accept_label then
+        hint = hint .. " · a " .. accept_label
+    end
+    hint = hint .. " · q close"
     if #groups > 1 then
         hint = hint .. string.format(" · %d worktrees", #groups)
     end
@@ -593,16 +623,27 @@ local function open_review_windows()
     vim.keymap.set("n", "q", M.close, { buffer = db, nowait = true, desc = "Close diff review" })
     vim.keymap.set("n", "<CR>", jump_to_target, { buffer = db, nowait = true, desc = "Jump to file" })
     vim.keymap.set("n", "o", jump_to_target, { buffer = db, nowait = true, desc = "Jump to file" })
+    if accept_fn then
+        vim.keymap.set("n", "a", accept_review, {
+            buffer = db,
+            nowait = true,
+            desc = "Accept: " .. (accept_label or "accept"),
+        })
+    end
 end
 
 --- Render the collected sections into the review panel: outer container
 --- float framing the file list and the diff of the first file.
 --- Closes any existing review first.
 ---@param rendered pi.DiffReviewSection[]
----@param opts? { skipped?: integer, groups?: pi.DiffReviewGroup[] } skipped: changed files outside any git work tree; groups: ordered work-tree groups (empty for a flat list)
+---@param opts? { skipped?: integer, groups?: pi.DiffReviewGroup[], on_accept?: fun(), accept_label?: string } skipped: changed files outside any git work tree; groups: ordered work-tree groups (empty for a flat list); on_accept: optional `a` action (e.g. apply a patch); accept_label: short hint text for that action (default "accept")
 function M.render(rendered, opts)
     opts = opts or {}
     M.close()
+    accept_fn = type(opts.on_accept) == "function" and opts.on_accept or nil
+    accept_label = accept_fn
+            and (type(opts.accept_label) == "string" and opts.accept_label ~= "" and opts.accept_label or "accept")
+        or nil
     sections = rendered
     current_idx = 1
     skipped_outside = opts.skipped or 0
@@ -621,6 +662,13 @@ function M.render(rendered, opts)
     vim.keymap.set("n", "q", M.close, { buffer = list_buf, nowait = true, desc = "Close diff review" })
     vim.keymap.set("n", "<CR>", list_jump, { buffer = list_buf, nowait = true, desc = "Jump to file" })
     vim.keymap.set("n", "o", list_jump, { buffer = list_buf, nowait = true, desc = "Jump to file" })
+    if accept_fn then
+        vim.keymap.set("n", "a", accept_review, {
+            buffer = list_buf,
+            nowait = true,
+            desc = "Accept: " .. (accept_label or "accept"),
+        })
+    end
     vim.keymap.set("n", "<C-f>", function()
         M._scroll_diff("<C-f>")
     end, { buffer = list_buf, nowait = true, desc = "Scroll diff forward" })
@@ -683,6 +731,8 @@ function M.close()
     groups = {}
     toplevel_branch = {}
     row_entries = {}
+    accept_fn = nil
+    accept_label = nil
 end
 
 -- Jump ----------------------------------------------------------------------
@@ -1032,6 +1082,17 @@ end
 ---@return table<integer, { group: integer, section: integer? }>
 function M._row_entries()
     return row_entries
+end
+
+--- Test hook: run the optional accept handler (the `a` keymaps call this).
+function M._accept()
+    accept_review()
+end
+
+--- Test hook: current accept hint label (nil when no accept handler is set).
+---@return string?
+function M._accept_label()
+    return accept_label
 end
 
 --- Test hook: close the review windows and clear all state.

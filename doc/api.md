@@ -26,6 +26,19 @@ pi.fork()                     -- new session from a past user message; picks for
                               -- messages, then prefills the prompt for re-asking (:PiFork)
 pi.clone()                    -- duplicate the current branch into a new session (:PiClone)
 pi.sessions()                 -- toggle the live sessions overview (:PiSessions)
+pi.worktree_new(opts?)        -- start a fresh session in a new git worktree (:PiWorktreeNew);
+                              -- opts: { name?, layout? }
+pi.worktree_fork(opts?)       -- fork the current conversation into a new git worktree (:PiWorktreeFork);
+                              -- opts: { name?, layout? }
+pi.worktree_branch(branch)    -- put the current worktree session on `branch`, creating it
+                              -- when it does not exist (:PiWorktreeBranch)
+pi.worktree_apply(opts?)      -- review a worktree's patch in the diff-review panel and apply it to
+                              -- the main checkout's working tree on accept (:PiWorktreeApply);
+                              -- opts: { name? }
+pi.worktree_ship(opts?)       -- prefill a worktree session's prompt with commit/push/PR
+                              -- instructions — never sent (:PiWorktreeShip); opts: { name? }
+pi.worktree_remove(opts?)     -- confirm, snapshot, then remove a worktree (:PiWorktreeRemove);
+                              -- opts: { name? }
 pi.tasks()                    -- toggle the background tasks panel (:PiTasks): the
                               -- background bash tasks reported by the bg-tasks
                               -- extension, with status and durations (see
@@ -115,6 +128,66 @@ pi.toggle_debug()             -- toggle RPC debug logging for the current Neovim
 ```
 
 Most functions are no-ops (or warn) when no session is active in the current tab — safe to bind unconditionally. See [Usage](usage.md) and [Keymaps](keymaps.md) for how these fit into a working setup.
+
+## Worktrees
+
+The six `pi.worktree_*` entry points above mirror the [`:PiWorktree*` commands](worktrees.md) one-to-one and share their rules: a session inside a worktree refuses to create a nested one, `worktree_apply` never commits and never touches the index, `worktree_ship` never sends the prompt, and `worktree_remove` refuses while a live session runs in the checkout.
+
+```lua
+local pi = require("pi")
+
+-- Start a fresh conversation in <repo>/.worktrees/fix-auth, detached at HEAD.
+pi.worktree_new({ name = "fix-auth", layout = "side" })
+
+-- Carry this conversation into a new checkout (parent session left untouched).
+pi.worktree_fork({ name = "spike" })
+
+-- Git side of the current worktree session.
+pi.worktree_branch("feat/auth")
+
+-- These act on the current session's worktree by default, or on a named one.
+pi.worktree_apply({ name = "fix-auth" })
+pi.worktree_ship()
+pi.worktree_remove({ name = "spike" })
+```
+
+Each accepts an optional **second argument** — `fun(ok: boolean, err?: string)` — called on the terminal path (except a user-cancelled review or a cancelled removal, which simply report `false`). `pi.worktree_new` / `pi.worktree_fork` take `fun(session: pi.Session?)` instead, so a script can follow the session they started.
+
+The git layer is a separate module, `require("pi.worktree")`, which is what `pi.worktree_*` and the sub-session spawner call. It never touches buffers, windows or notifications; every function takes a node-style callback `cb(result, err)` and runs git asynchronously:
+
+| Function | Contract |
+| --- | --- |
+| `Worktree.create(opts, cb)` | `opts { cwd, name?, mode?, base? }` → `cb(info, err)`; creates `<repo>/.worktrees/<name>` detached at `base` (default `HEAD`), ensures `/.worktrees/` is in `.gitignore`, writes the metadata, copies `.worktreeinclude` ∩ gitignored files and runs `worktree.setup_cmd`. Refuses nested creation, a missing repository/commit and an invalid or existing name. |
+| `Worktree.detect(cwd?)` | `pi.WorktreeInfo?` — pure filesystem read (no git subprocess, cached with cheap `stat` revalidation), safe on rendering paths. `kind` is `"linked"` or `"main"`. |
+| `Worktree.list(cwd?, cb)` | `cb(entries, err)` — every live linked worktree of the repository containing `cwd` (from `git worktree list --porcelain`), each as its `detect()` info plus `head` / `branch` / `detached` / `prunable`, sorted by path. Bare, prunable and vanished checkouts are skipped. Backs the cross-worktree `:PiResume` rows. |
+| `Worktree.status(info, cb)` | `cb({ dirty, ahead, head }, err)` — uncommitted changes, commits beyond `base_sha`, current `HEAD`. |
+| `Worktree.diff(info, cb, opts?)` | `cb(patch, err)` — `base_sha` → now (untracked files included), or `opts.from` → now for an incremental capture (a reused checkout's new work only). Capture is all-or-nothing: it errors (rather than returning a partial patch) when the worktree has more than 20 000 untracked files or an untracked path a patch cannot represent (a directory holding its own repository). |
+| `Worktree.snapshot(info, cb)` | `cb(path, err)` — writes that patch under `<git common dir>/pi2-worktree-snapshots/<name>/`, with the same all-or-nothing capture rules, so a failed snapshot never yields a truncated patch. A `<patch>.json` sidecar (`WorktreeSnapshotMeta`: name, path, repo_root, base_sha, head, created_at) keeps the snapshot self-describing after the checkout is gone. |
+| `Worktree.latest_snapshot(repo_root, name)` | `{ path, meta? }` — newest snapshot of a worktree (used to restore a missing checkout on resume). |
+| `Worktree.probe(target_dir, patch, cb)` | `cb("clean"\|"already"\|"conflict", err)` — `git apply --check`, then `--reverse --check`; nothing is written. The idempotency check behind automatic integration and retention. |
+| `Worktree.apply_patch(target_dir, patch, cb)` | `cb(ok, err)` — `git apply` into `target_dir`'s **working tree only** (no index, no 3-way, no commit). Atomic: a conflicting hunk aborts the whole patch. |
+| `Worktree.branch(info, branch, cb)` | Attaches `branch` (creating it, or checking out the existing one). |
+| `Worktree.release(info, cb)` | `cb(removed, err)` — removes the checkout **only** when clean and not ahead of base. |
+| `Worktree.remove(info, opts, cb)` | `opts { force?, snapshot? }` → `cb(removed, err, snapshot_path)`; `snapshot` defaults to `worktree.snapshot_before_remove`. |
+| `Worktree.bind(info, fields)` | Synchronous; publishes `{ session_id, session_file }` onto the worktree metadata. |
+
+`WorktreeInfo` is the table every one of these accepts and returns (`kind`, `name`, `path`, `repo_root`, `git_dir`, `common_dir?`, `base_sha?`, `mode?`, `session_id?`, `session_file?`) — persist it (it is JSON-encodable) and hand it back to `status` / `diff` / `remove` later. `validate_name(name)` returns `ok, err` for the directory-name rules; `pi.worktree` also exposes `_reset` / `_set_runner` test hooks. Full guide: [Worktrees](worktrees.md).
+
+### Automatic integration (`pi.worktree_integration`)
+
+The rules — capture, snapshot, safe window, conflict handling, retention — are documented in [Worktrees → Automatic integration](worktrees.md#automatic-integration). The module itself is driven by the sub-session layer and is safe to call directly:
+
+| Function | Contract |
+| --- | --- |
+| `Integration.on_child_settled(child, entry, manifest_cwd, done?)` | Integrate a settled child's checkout. `done(outcome, record)` fires once on the main loop when the integration finished **or** was parked (`queued`); outcomes: `applied`, `applied_kept`, `applying`, `resolving`, `queued`, `needs_attention`, `skipped`, `disabled`, `no_child`, `no_entry`, `no_worktree`, `worktree_missing`, `error`. |
+| `Integration.on_parent_ready(parent)` | A safe window opened (wait started/ended, turn finished, session resumed): drains the target's queue, re-enqueues `queued` rows, promotes retryable `needs_attention` rows (`modified_buffer`, `parent_busy`, `other_session`, `parent_dirty`, `parent_gone`, `no_target`, `probe_unavailable`) and returns how many were promoted. |
+| `Integration.reconcile(done?)` | Startup recovery across every manifest on disk: `applying` → probe (`applied` / `queued` / `needs_attention`), `queued` → enqueue, `resolving` with a dead child → `needs_attention`. `done(summary)` reports `{ checked, applied, queued, needs_attention, skipped }`. |
+| `Integration.enforce_retention(cwd?, done?)` | The soft cap (`worktree.integration.keep_count`). `done(summary)` reports `{ managed, removable, removed, protected, kept }`; only verified `applied` checkouts are candidates. |
+| `Integration.is_waiting(parent)` | Whether the parent is blocked in `wait_subagents` (the preferred apply window). |
+| `Integration.patch_files(patch)` | Repo-relative paths a unified patch touches (both sides of a rename). |
+| `Integration._decide(facts)` | Pure decision function: `apply` / `mark_applied` / `queue` / `resolve` / `needs_attention` / `skip` from a facts table — the whole matrix in one testable place. |
+
+The persisted record lives on the child's manifest row as `entry.integration` (`state`, `patch_sha`, `base_sha`, `head_sha`, `parent_head`, `snapshot_path`, `files`, `attempts`, `applied_at`, `reason`, `error`, `kept_reason`, `pinned`, `archived`, `worktree_removed`, `run_generation`); it is written **before** the first write, which is what makes a crashed Neovim recoverable.
 
 ## Queue modes
 

@@ -54,22 +54,31 @@ local function result_text(result)
     return trimmed ~= "" and trimmed or nil
 end
 
---- Resolve a possibly-relative path against the current working directory,
+--- Resolve a possibly-relative path against the workspace the tool ran in,
 --- mirroring the convention used by the diff review module.
+---
+--- pi reports grep/find hits relative to the session's working directory, which
+--- is not necessarily Neovim's cwd (a worktree session, or a resumed session
+--- started elsewhere). Callers pass the session cwd; omitting it keeps the old
+--- process-cwd behaviour.
 ---@param path string
+---@param base? string workspace cwd (default: Neovim's current cwd)
 ---@return string
-local function abs(path)
+local function abs(path, base)
     if vim.startswith(path, "/") then
         return path
     end
-    return vim.fn.getcwd() .. "/" .. path
+    local dir = (type(base) == "string" and vim.trim(base) ~= "") and vim.trim(base):gsub("[\\/]+$", "")
+        or vim.fn.getcwd()
+    return dir .. "/" .. path
 end
 
 --- Parse ripgrep-style grep output into quickfix items.
 --- Handles `path:line: text`, `path:line:text`, and `path:line:col:text`.
 ---@param text string
+---@param cwd? string workspace cwd the paths are relative to (default: Neovim's current cwd)
 ---@return table[] items quickfix entries ({ filename, lnum, col?, text? })
-function M.parse_grep(text)
+function M.parse_grep(text, cwd)
     ---@type table[]
     local items = {}
     for _, line in ipairs(vim.split(text, "\n", { plain = true })) do
@@ -86,7 +95,7 @@ function M.parse_grep(text)
                 end
             end
             items[#items + 1] = {
-                filename = abs(path),
+                filename = abs(path, cwd),
                 lnum = tonumber(lnum) or 1,
                 col = col,
                 text = vim.trim(rest),
@@ -98,14 +107,15 @@ end
 
 --- Parse find/glob output (one file path per line) into quickfix items.
 ---@param text string
+---@param cwd? string workspace cwd the paths are relative to (default: Neovim's current cwd)
 ---@return table[] items quickfix entries ({ filename, lnum })
-function M.parse_files(text)
+function M.parse_files(text, cwd)
     ---@type table[]
     local items = {}
     for _, line in ipairs(vim.split(text, "\n", { plain = true })) do
         local path = vim.trim(line)
         if path ~= "" then
-            items[#items + 1] = { filename = abs(path), lnum = 1 }
+            items[#items + 1] = { filename = abs(path, cwd), lnum = 1 }
         end
     end
     return items
@@ -153,7 +163,8 @@ end
 ---@param tool_call_id string?
 ---@param result? table
 ---@param is_error? boolean
-function M.on_tool_end(tool_name, tool_call_id, result, is_error)
+---@param cwd? string workspace cwd the result paths are relative to (default: Neovim's current cwd)
+function M.on_tool_end(tool_name, tool_call_id, result, is_error, cwd)
     if not tool_name or is_error then
         return
     end
@@ -177,7 +188,7 @@ function M.on_tool_end(tool_name, tool_call_id, result, is_error)
         return
     end
 
-    local items = tool_name == "grep" and M.parse_grep(text) or M.parse_files(text)
+    local items = tool_name == "grep" and M.parse_grep(text, cwd) or M.parse_files(text, cwd)
     if #items == 0 then
         return
     end

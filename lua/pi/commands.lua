@@ -33,6 +33,48 @@ local function complete_flags(prefix)
     end, candidates)
 end
 
+--- Complete existing worktree names for `:PiWorktreeApply/Ship/Remove`.
+--- Names come from `<repo>/.worktrees/*`, where the repository root is the
+--- current session's worktree root or (falling back) the git checkout its cwd
+--- lives in. Completion is best-effort: no worktree module / not in a repo
+--- simply yields no candidates, never an error.
+---@param prefix string
+---@return string[]
+local function complete_worktree_names(prefix)
+    local ok, Worktree = pcall(require, "pi.worktree")
+    if not ok or type(Worktree) ~= "table" or type(Worktree.detect) ~= "function" then
+        return {}
+    end
+    local session = require("pi.sessions.manager").get()
+    local current = session and type(session.worktree) == "table" and session.worktree or nil
+    local repo_root = current and current.repo_root or nil
+    if type(repo_root) ~= "string" or repo_root == "" then
+        local cwd = (session and session.cwd) or vim.fn.getcwd()
+        local detected = Worktree.detect(cwd)
+        repo_root = type(detected) == "table" and detected.repo_root or nil
+    end
+    if type(repo_root) ~= "string" or repo_root == "" then
+        return {}
+    end
+
+    ---@type string[]
+    local names = {}
+    for _, path in ipairs(vim.fn.glob(repo_root .. "/.worktrees/*", false, true)) do
+        if vim.fn.isdirectory(path) == 1 then
+            local name = vim.fn.fnamemodify(path, ":t")
+            local valid = true
+            if type(Worktree.validate_name) == "function" then
+                valid = Worktree.validate_name(name) == true
+            end
+            if valid and name:find(prefix, 1, true) == 1 then
+                names[#names + 1] = name
+            end
+        end
+    end
+    table.sort(names)
+    return names
+end
+
 --- Handle :PiSteeringMode / :PiFollowUpMode. With a `mode` argument, set it
 --- directly (validated by the public setter); without one, read the backend's
 --- current value via `get_state` and switch to the other mode.
@@ -138,6 +180,42 @@ function M.setup()
     vim.api.nvim_create_user_command("PiClone", function()
         Pi.clone()
     end, { desc = "Duplicate current π session branch into a new session" })
+
+    vim.api.nvim_create_user_command("PiWorktreeNew", function(cmd)
+        Pi.worktree_new({ name = cmd.args ~= "" and cmd.args or nil })
+    end, { nargs = "?", desc = "Start a fresh π session in a new git worktree" })
+
+    vim.api.nvim_create_user_command("PiWorktreeFork", function(cmd)
+        Pi.worktree_fork({ name = cmd.args ~= "" and cmd.args or nil })
+    end, { nargs = "?", desc = "Fork the current π session into a new git worktree" })
+
+    vim.api.nvim_create_user_command("PiWorktreeBranch", function(cmd)
+        Pi.worktree_branch(cmd.args)
+    end, { nargs = 1, desc = "Put the current worktree π session on a branch" })
+
+    vim.api.nvim_create_user_command("PiWorktreeApply", function(cmd)
+        Pi.worktree_apply({ name = cmd.args ~= "" and cmd.args or nil })
+    end, {
+        nargs = "?",
+        complete = complete_worktree_names,
+        desc = "Review a worktree patch and apply it to the main checkout",
+    })
+
+    vim.api.nvim_create_user_command("PiWorktreeShip", function(cmd)
+        Pi.worktree_ship({ name = cmd.args ~= "" and cmd.args or nil })
+    end, {
+        nargs = "?",
+        complete = complete_worktree_names,
+        desc = "Prefill the chat prompt with worktree ship instructions",
+    })
+
+    vim.api.nvim_create_user_command("PiWorktreeRemove", function(cmd)
+        Pi.worktree_remove({ name = cmd.args ~= "" and cmd.args or nil })
+    end, {
+        nargs = "?",
+        complete = complete_worktree_names,
+        desc = "Confirm and remove a worktree (snapshot first)",
+    })
 
     vim.api.nvim_create_user_command("PiSessions", function()
         Pi.sessions()

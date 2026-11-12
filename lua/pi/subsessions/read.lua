@@ -171,10 +171,27 @@ end
 --- session file in the directory and used to make callers like
 --- `rebuild_statuses` (one lookup per manifest entry) block the editor for
 --- tens of seconds on large session dirs.
+---
+--- `opts.session_file` short-circuits the lookup when the caller already knows
+--- the path (a live session's backend-reported file); it is only trusted while
+--- the file is still readable, otherwise the id lookup runs as before.
 ---@param session_id string
+---@param opts? { cwd?: string, session_file?: string }|string `cwd` (or the shorthand
+---   string form) selects the workspace whose session directory to search;
+---   `session_file` is a known path to reuse.
 ---@return string?
-function M.find_path(session_id)
-    local info = require("pi.sessions.history").find_by_id(session_id)
+function M.find_path(session_id, opts)
+    local cwd, session_file
+    if type(opts) == "string" then
+        cwd = opts
+    elseif type(opts) == "table" then
+        cwd = opts.cwd
+        session_file = opts.session_file
+    end
+    if type(session_file) == "string" and session_file ~= "" and vim.fn.filereadable(session_file) == 1 then
+        return session_file
+    end
+    local info = require("pi.sessions.history").find_by_id(session_id, cwd)
     return info and info.path or nil
 end
 
