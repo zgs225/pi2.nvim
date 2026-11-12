@@ -81,9 +81,11 @@ From Lua the same entry point is `pi.worktree_open(opts, callback)`:
 ```lua
 pi.worktree_open({ name = "fix-auth", layout = "side" }, function(session, err) ... end)
 pi.worktree_open({ cwd = "/repo/.worktrees/fix-auth", new_tab = false })
+-- The main checkout (or any project directory) starts an ordinary session there.
+pi.worktree_open({ cwd = "/repo" })
 ```
 
-`new_tab` defaults to `true`; `cwd` wins over `name` and must itself be a linked worktree (the main checkout is refused — open a normal session there). The flag never creates and never removes a checkout: a name that does not exist is an error pointing at `:PiWorktreeNew <name>`, and a failed process start only closes the empty scratch tab — the checkout is left exactly as you left it, because it holds your work. Names complete from the current repository's `<repo>/.worktrees/*` in both commands, and `:PiContinue` / `:PiResume` reject the flag (they pick their own workspace). A worktree's recorded session binding is written only when it has none, so opening a second session there never steals the first one's binding.
+`new_tab` defaults to `true`; `cwd` wins over `name` and may be **any existing directory** — a linked worktree is attached as worktree metadata (chat badge, `:PiWorktree*` target, session binding), while the **main checkout** or a plain project directory starts an **ordinary** session whose cwd is that path, with no worktree metadata and no binding written. That is also the entry point behind `:PiSessions` → `n`, which passes the selected row's checkout as `cwd`. The flag never creates and never removes a checkout: a name that does not exist is an error pointing at `:PiWorktreeNew <name>`, and a failed process start only closes the empty scratch tab — the checkout is left exactly as you left it, because it holds your work. Starting a session is silent (the chat opening in its tab is the feedback); only failures notify. Names complete from the current repository's `<repo>/.worktrees/*` in both commands, and `:PiContinue` / `:PiResume` reject the flag (they pick their own workspace). A worktree's recorded session binding is written only when it has none, so opening a second session there never steals the first one's binding.
 
 ## Repository hygiene
 
