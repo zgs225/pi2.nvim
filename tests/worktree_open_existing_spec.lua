@@ -1,14 +1,17 @@
 -- :Pi worktree=<name> / :PiNewTab worktree=<name> — a fresh session in an
--- EXISTING managed worktree (pi.worktree_session.open_existing):
+-- EXISTING directory (pi.worktree_session.open_existing):
 --   * flag parsing (`worktree=` / `layout=`) and completion in pi.commands,
 --   * refusal of the flag on :PiContinue / :PiResume,
 --   * name resolution (validated name, must exist under <repo>/.worktrees/,
---     must be a linked worktree) and the `cwd` form,
+--     must be a linked worktree) and the `cwd` form — any existing directory:
+--     linked worktree = worktree metadata, main checkout or a plain dir =
+--     ordinary session with no metadata and no bind,
 --   * the occupied-tab refusal of `:Pi worktree=` (new_tab = false),
---   * the success path (get_or_create with the checkout cwd + worktree info),
+--   * the success path (get_or_create with that cwd + worktree info) and its
+--     silence (no notification on success),
 --   * metadata bind only for a checkout that was never bound,
 --   * a failed start closes the scratch tab and never releases the checkout
---     (the worktree existed before the command ran — releasing it would
+--     (the directory existed before the command ran — releasing it would
 --     delete the user's work).
 --
 -- pi.worktree is stubbed through package.loaded and the session manager's
@@ -234,21 +237,57 @@ describe("open_existing target resolution", function()
         assert.are.equal(0, #created)
     end)
 
-    it("errors for a cwd that is not a linked worktree", function()
+    it("starts an ordinary session for the main checkout", function()
+        local wt = install_worktree()
+        local session = fake_session({ cwd = REPO })
+        install_sessions({ session = session })
         local tabs_before = tab_count()
 
         ---@type { session: pi.Session?, err: string? }
         local result = {}
-        WorktreeSession.open_existing({ cwd = REPO }, function(session, err)
-            result.session = session
+        WorktreeSession.open_existing({ cwd = REPO }, function(started, err)
+            result.session = started
             result.err = err
         end)
 
-        assert.is_nil(result.session)
-        assert.is_truthy(result.err:find("Not a managed git worktree", 1, true))
-        assert.is_not_nil(find_note("Not a managed git worktree", vim.log.levels.ERROR))
-        assert.are.equal(tabs_before, tab_count())
-        assert.are.equal(0, #created)
+        assert.is_nil(result.err)
+        assert.are.equal(session, result.session)
+        assert.are.equal(1, #created)
+        assert.are.equal(REPO, created[1].cwd)
+        -- A `kind == "main"` info must never become session metadata: it would
+        -- badge the main checkout as a worktree, refuse `:PiWorktreeNew` as
+        -- "nested" and make `resolve_target(nil)` return it.
+        assert.is_nil(created[1].worktree)
+        assert.are.equal(0, #wt.calls.bind)
+        assert.are.equal(tabs_before + 1, tab_count())
+        -- Success is silent: only failures notify.
+        assert.are.equal(0, #notes)
+    end)
+
+    it("starts an ordinary session outside any git repository", function()
+        local wt = install_worktree({
+            detect = function()
+                return nil
+            end,
+        })
+        local plain = vim.fn.tempname()
+        vim.fn.mkdir(plain, "p")
+        local session = fake_session({ cwd = plain })
+        install_sessions({ session = session })
+
+        ---@type { session: pi.Session?, err: string? }
+        local result = {}
+        WorktreeSession.open_existing({ cwd = plain }, function(started, err)
+            result.session = started
+            result.err = err
+        end)
+
+        assert.is_nil(result.err)
+        assert.are.equal(session, result.session)
+        assert.are.equal(plain, created[1].cwd)
+        assert.is_nil(created[1].worktree)
+        assert.are.equal(0, #wt.calls.bind)
+        assert.are.equal(0, #notes)
     end)
 
     it("errors for a cwd that does not exist", function()
@@ -262,7 +301,8 @@ describe("open_existing target resolution", function()
         assert.are.equal(0, #created)
     end)
 
-    it("prefers cwd over name", function()
+    it("prefers cwd over name and keeps linked metadata", function()
+        local wt = install_worktree()
         install_sessions({ session = fake_session() })
 
         ---@type { session: pi.Session? }
@@ -273,6 +313,10 @@ describe("open_existing target resolution", function()
 
         assert.is_not_nil(result.session)
         assert.are.equal(CHECKOUT, created[1].cwd)
+        -- A linked checkout is attached exactly as before, bind included.
+        assert.are.equal("linked", created[1].worktree.kind)
+        assert.are.equal(CHECKOUT, created[1].worktree.path)
+        assert.are.equal(1, #wt.calls.bind)
     end)
 end)
 
@@ -297,6 +341,7 @@ describe("open_existing tabs", function()
         assert.are.equal(1, #created)
         assert.are.equal(CHECKOUT, created[1].cwd)
         assert.are.equal("float", created[1].layout)
+        assert.are.equal(0, #notes)
     end)
 
     it("opens a new tabpage by default", function()

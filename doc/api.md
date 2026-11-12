@@ -30,8 +30,11 @@ pi.worktree_new(opts?)        -- start a fresh session in a new git worktree (:P
                               -- opts: { name?, layout? }
 pi.worktree_fork(opts?)       -- fork the current conversation into a new git worktree (:PiWorktreeFork);
                               -- opts: { name?, layout? }
-pi.worktree_open(opts?, cb?)  -- start a fresh session in an EXISTING worktree (:Pi worktree=<name> /
-                              -- :PiNewTab worktree=<name>); opts: { name?, cwd?, layout?, new_tab? }
+pi.worktree_open(opts?, cb?)  -- start a fresh session in an EXISTING directory (:Pi worktree=<name> /
+                              -- :PiNewTab worktree=<name>; `:PiSessions` → W); opts: { name?, cwd?,
+                              -- layout?, new_tab? }. `name` must be a managed linked checkout;
+                              -- `cwd` may be any existing directory — a linked worktree (attached as
+                              -- worktree metadata) or the main checkout / plain dir (ordinary session)
 pi.worktree_branch(branch)    -- put the current worktree session on `branch`, creating it
                               -- when it does not exist (:PiWorktreeBranch)
 pi.worktree_apply(opts?)      -- review a worktree's patch in the diff-review panel and apply it to
@@ -133,7 +136,7 @@ Most functions are no-ops (or warn) when no session is active in the current tab
 
 ## Worktrees
 
-The seven `pi.worktree_*` entry points above cover the [`:PiWorktree*` commands](worktrees.md) and the `worktree=<name>` start flag, and share their rules: a session inside a worktree refuses to create a nested one, `worktree_apply` never commits and never touches the index, `worktree_ship` never sends the prompt, `worktree_remove` refuses while a live session runs in the checkout, and `worktree_open` never creates or removes a checkout — an existing one only.
+The seven `pi.worktree_*` entry points above cover the [`:PiWorktree*` commands](worktrees.md) and the `worktree=<name>` start flag, and share their rules: a session inside a worktree refuses to create a nested one, `worktree_apply` never commits and never touches the index, `worktree_ship` never sends the prompt, `worktree_remove` refuses while a live session runs in the checkout, and `worktree_open` never creates or removes a checkout — an existing one only. `worktree_open` is also the entry point behind `:PiSessions` → `W`: its `cwd` may be any existing directory, and only a linked worktree becomes worktree metadata (the main checkout, or a directory outside a repository, starts an ordinary session there).
 
 ```lua
 local pi = require("pi")
@@ -146,6 +149,11 @@ pi.worktree_fork({ name = "spike" })
 
 -- Fresh session in a checkout that already exists (no create, no remove).
 pi.worktree_open({ name = "fix-auth", layout = "side" }, function(session, err) ... end)
+
+-- An existing directory: a linked worktree keeps its metadata, the main
+-- checkout (or a plain project dir) starts an ordinary session there.
+pi.worktree_open({ cwd = "/repo/.worktrees/fix-auth", new_tab = false })
+pi.worktree_open({ cwd = "/repo" })
 
 -- Git side of the current worktree session.
 pi.worktree_branch("feat/auth")
