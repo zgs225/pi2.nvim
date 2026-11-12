@@ -131,7 +131,28 @@ end
 ---@field name? string
 ---@field model? pi.ModelRef
 ---@field thinking_level? string
+---@field tools? string[] Tool allowlist for this child (default: `subagent.tools`, then nil = every tool).
 ---@field agent_spawned? boolean Block completion prompt injection (Agent tool path).
+
+--- Resolve the child tool allowlist: per-spawn override, then subagent.tools, then nil (inherit all).
+---@param opts { tools?: string[] }
+---@return string[]? tools Fresh normalized allowlist, or nil to inherit every tool
+---@return string? err Human-readable reason when either source is invalid
+local function resolve_child_tools(opts)
+    local value = opts.tools
+    if value == nil then
+        local cfg = Config.options.subagent or {}
+        value = cfg.tools
+    end
+    if value == nil then
+        return nil, nil
+    end
+    local tools, err = Manifest.normalize_tools(value)
+    if not tools then
+        return nil, err
+    end
+    return tools, nil
+end
 
 ---@param parent pi.Session
 ---@return pi.PinnedConfig?
@@ -370,6 +391,14 @@ function M.spawn(parent, opts, callback)
     local entry_epoch = M.abort_epoch(entry_lineage)
 
     with_parent_id(parent, function(parent_id)
+        -- Resolve the tool allowlist before anything is reserved or created, so
+        -- a bad `subagent.tools` (or spawn item) fails fast without burning a
+        -- child slot or leaving a half-spawned process behind.
+        local tools, tools_err = resolve_child_tools(opts)
+        if tools_err then
+            callback(nil, tools_err)
+            return
+        end
         if parent_id == "" then
             callback(nil, "parent session id not available")
             return
@@ -412,7 +441,7 @@ function M.spawn(parent, opts, callback)
         end
 
         local tab = parent.attached_tab or vim.api.nvim_get_current_tabpage()
-        local child = Sessions.create_detached(tab, { subagent = false })
+        local child = Sessions.create_detached(tab, { subagent = false, tools = tools })
         if not child then
             unreserve()
             callback(nil, "failed to start sub-session process")
@@ -421,6 +450,18 @@ function M.spawn(parent, opts, callback)
         child.parent_id = parent_id
 
         local config = resolve_child_config(parent, opts)
+        -- The manifest's `config` mirrors the pinned model/thinking and records
+        -- the tool allowlist, so a revived child gets the same restriction
+        -- (`M.revive`). `tools` stays absent rather than empty when the child
+        -- inherits everything, keeping old and new manifests the same shape.
+        local manifest_config = {}
+        if config then
+            manifest_config.model = config.model
+            manifest_config.thinking_level = config.thinking_level
+        end
+        if tools then
+            manifest_config.tools = tools
+        end
         -- An explicitly supplied name is honoured verbatim; otherwise derive one
         -- from the task. `name_source` records which of the two it was so the
         -- child's own auto title can replace a derived name later without ever
@@ -443,10 +484,7 @@ function M.spawn(parent, opts, callback)
                 name = name,
                 name_source = name_source,
                 task_prompt = opts.task,
-                config = config and {
-                    model = config.model,
-                    thinking_level = config.thinking_level,
-                } or {},
+                config = manifest_config,
                 status = "active",
                 reported = false,
                 created_at = Manifest.iso_now(),
@@ -677,6 +715,17 @@ function M.revive(child_id, callback)
         callback(nil, "sub-session parent lineage not found")
         return
     end
+    -- A revived child must keep the tool allowlist it was spawned with.
+    -- Older manifests (and hand-edited/corrupt ones) either omit
+    -- `config.tools` (= inherit every tool, the pre-feature behavior) or carry
+    -- garbage: an invalid value degrades to nil with a warning instead of
+    -- blocking the revival.
+    local stored_tools = type(entry.config) == "table" and entry.config.tools or nil
+    local tools, tools_err = Manifest.normalize_tools(stored_tools)
+    if tools_err then
+        tools = nil
+        Notify.warn("sub-session tool allowlist ignored on revive: " .. tools_err)
+    end
     local subcfg = Config.options.subagent or {}
     if subcfg.enabled == false then
         callback(nil, "subagent disabled")
@@ -702,7 +751,7 @@ function M.revive(child_id, callback)
     end
 
     local tab = vim.api.nvim_get_current_tabpage()
-    local child = Sessions.create_detached(tab, { subagent = false })
+    local child = Sessions.create_detached(tab, { subagent = false, tools = tools })
     if not child then
         unreserve()
         callback(nil, "failed to start process")

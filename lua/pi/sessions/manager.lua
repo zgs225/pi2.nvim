@@ -1308,12 +1308,12 @@ end
 
 --- Create a background session process without binding a tab chat UI.
 ---@param tab pi.TabId RPC job identity (usually the parent's tab).
----@param opts? { subagent?: boolean }
+---@param opts? { subagent?: boolean, tools?: string[] } `tools` is the child's tool allowlist (see `pi.SubagentConfig.tools`); nil inherits every tool.
 ---@return pi.Session?
 function M.create_detached(tab, opts)
     opts = opts or {}
     local rpc = Rpc.new(tab)
-    if not rpc:start({ subagent = opts.subagent }) then
+    if not rpc:start({ subagent = opts.subagent, tools = opts.tools }) then
         return nil
     end
 
