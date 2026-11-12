@@ -2,6 +2,7 @@
 
 local Path = require("pi.path")
 local Render = require("pi.ui.render")
+local Tasks = require("pi.tasks")
 local SubToolUi = require("pi.subsessions.tool_ui")
 local TodoToolUi = require("pi.todo.tool_ui")
 local CodemodeToolUi = require("pi.codemode.tool_ui")
@@ -1102,6 +1103,69 @@ local function codemode_live_rows(msg)
     return lines
 end
 
+--- Display width the command in a `wait_task` body row may take. A command is
+--- an arbitrary shell string and the row has to stay scannable.
+local WAIT_TASK_COMMAND_WIDTH = 80
+
+--- Human-readable label for a `wait_task` call: the command the task runs, then
+--- the id.
+---
+--- The id alone (`bf4f98f`) says nothing about what is being waited on, and the
+--- task that owns it may have been started many turns ago. The command comes
+--- from the task registry, which the extension's `started` event populates — so
+--- it is known for a block rendered live and for one replayed from a session
+--- file (the custom message is in the transcript). A session resumed after pi
+--- itself restarted has no registry record: then the bare id is all there is.
+---@param task_id string
+---@return string
+local function wait_task_label(task_id)
+    local task = Tasks.get(task_id)
+    local command = task and task.command
+    if type(command) ~= "string" then
+        return task_id
+    end
+    command = M.flatten_line(command)
+    if command == "" then
+        return task_id
+    end
+    if vim.fn.strdisplaywidth(command) > WAIT_TASK_COMMAND_WIDTH then
+        command = vim.fn.strcharpart(command, 0, WAIT_TASK_COMMAND_WIDTH - 1) .. "…"
+    end
+    return command .. " · " .. task_id
+end
+
+--- Header status for a `wait_task` block: why the wait returned.
+---
+--- A deadline hit is not a failure (the process keeps running), so the header
+--- says `still running` instead of leaving the block to be read as an error. A
+--- clean exit stays silent — the result body already reports `exited with code
+--- 0` — while a signal or a non-zero exit is what the reader scans the header
+--- for.
+---@param result table?
+---@return string?
+local function wait_task_status(result)
+    local details = result and result.details
+    if type(details) ~= "table" then
+        return nil
+    end
+    if details.status == "still_running" then
+        return "still running"
+    end
+    if details.status == "cancelled" then
+        return "wait cancelled"
+    end
+    if details.status ~= "exited" then
+        return nil
+    end
+    if type(details.signal) == "string" and details.signal ~= "" then
+        return "signal " .. details.signal
+    end
+    if type(details.exitCode) == "number" and details.exitCode ~= 0 then
+        return ("exit %d"):format(details.exitCode)
+    end
+    return nil
+end
+
 ---@type table<string, pi.ToolRenderer>
 local renderers = {
     -- Synthetic block rendered by pi.nvim (not a real tool call): the
@@ -1134,15 +1198,9 @@ local renderers = {
             return insert_at
         end,
     },
-    -- codemode: the input is raw JavaScript, so the block body is the script
-    -- itself; the result body is rebuilt from the parsed wire record (nested
-    -- tool-call rows, then the numbered/console/error output sections) by
-    -- lua/pi/codemode/tool_ui.lua. The first on_end row MUST be the empty
-    -- separator: extract_tool_sections() treats it as render_output()'s blank
-    -- line and uses it to split input from output.
     -- wait_task blocks on a background bash task and returns that task's
-    -- output, so it renders like a bash block with the task id instead of a
-    -- command: the result body is the only place a backgrounded command's
+    -- output, so it renders like a bash block with the command instead of the
+    -- task id: the result body is the only place a backgrounded command's
     -- output reaches the chat, so it must never be hidden on a single line.
     wait_task = {
         input_visible = 1,
@@ -1151,12 +1209,13 @@ local renderers = {
             if not (args and type(args.task_id) == "string") then
                 return
             end
-            local line = args.task_id
+            local line = wait_task_label(args.task_id)
             if type(args.timeout_ms) == "number" and args.timeout_ms > 0 then
                 line = string.format("%s (timeout %ds)", line, math.floor(args.timeout_ms / 1000))
             end
             render_body_line(history, line)
         end,
+        inline_status = wait_task_status,
         on_end = function(history, _, result, _, insert_at)
             local text = extract_result_text(result)
             if text and text ~= "" then
@@ -1165,6 +1224,12 @@ local renderers = {
             return insert_at
         end,
     },
+    -- codemode: the input is raw JavaScript, so the block body is the script
+    -- itself; the result body is rebuilt from the parsed wire record (nested
+    -- tool-call rows, then the numbered/console/error output sections) by
+    -- lua/pi/codemode/tool_ui.lua. The first on_end row MUST be the empty
+    -- separator: extract_tool_sections() treats it as render_output()'s blank
+    -- line and uses it to split input from output.
     codemode = {
         input_visible = 1,
         output_visible = 3,
@@ -1653,13 +1718,10 @@ local renderers = {
             return SubToolUi.display_name("poll_subagents")
         end,
         inline_text = function(_, args)
-            if not args or type(args.batch_id) ~= "string" then
-                return nil
-            end
-            return "batch " .. (SubToolUi.short_id(args.batch_id) or args.batch_id)
+            return SubToolUi.batch_items_text(args and args.batch_id)
         end,
         inline_status = function(result)
-            return SubToolUi.batch_status_text(SubToolUi.result_details(result))
+            return SubToolUi.batch_outcome_text(SubToolUi.result_details(result))
         end,
     },
     wait_subagents = {
@@ -1668,13 +1730,14 @@ local renderers = {
             return SubToolUi.display_name("wait_subagents")
         end,
         inline_text = function(_, args)
-            if not args or type(args.batch_id) ~= "string" then
-                return nil
+            local text = SubToolUi.batch_items_text(args and args.batch_id)
+            if text and type(args.timeout_ms) == "number" and args.timeout_ms > 0 then
+                text = string.format("%s (timeout %ds)", text, math.floor(args.timeout_ms / 1000))
             end
-            return "batch " .. (SubToolUi.short_id(args.batch_id) or args.batch_id)
+            return text
         end,
         inline_status = function(result)
-            return SubToolUi.batch_status_text(SubToolUi.result_details(result))
+            return SubToolUi.batch_outcome_text(SubToolUi.result_details(result))
         end,
     },
     list_batches = {
