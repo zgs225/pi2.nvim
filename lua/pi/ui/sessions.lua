@@ -1478,7 +1478,7 @@ local HELP_ENTRIES = {
     { "t", "Navigate this session's tree (:PiTree)" },
     { "p", "Preview session (read-only viewer)" },
     { "x", "Close sub-session process (:PiSubClose)" },
-    { "W", "New session in this worktree (new tab)" },
+    { "n", "New session in this checkout (new tab)" },
     { "<Tab>, za", "Fold / unfold worktree groups and sub-sessions" },
     { "zM, zR", "Collapse / expand all groups and sub-sessions" },
     { "H", "Toggle hidden / prior-conversation sub-sessions (all sessions)" },
@@ -1837,10 +1837,12 @@ function M.row_checkout(row)
 end
 
 --- Open a fresh π session in a new tab rooted at the checkout under the cursor
---- (the `W` key). Works on a worktree group header, on any row inside a group
---- and on a row of the main-checkout partition alike. The list stays open: a
---- created session refreshes it through the normal session events.
-local function new_session_in_worktree_under_cursor()
+--- (the `n` key). Works on a worktree group header, on any row inside a group
+--- and on a row of the main-checkout partition alike, so the main checkout is
+--- reached through its group id (grouped list) or the row session's cwd (flat
+--- list). The list stays open: a created session refreshes it through the
+--- normal session events.
+local function new_session_in_checkout_under_cursor()
     local row = rows[vim.api.nvim_win_get_cursor(0)[1]]
     if not row then
         return
@@ -1848,20 +1850,21 @@ local function new_session_in_worktree_under_cursor()
     local Notify = require("pi.notify")
     local path = M.row_checkout(row)
     if not path then
-        Notify.warn("Cannot open a session: this row has no checkout")
+        Notify.warn("Cannot open a new session: this row has no checkout")
         return
     end
     if vim.fn.isdirectory(path) == 0 then
-        Notify.warn("Cannot open a session: " .. vim.fn.fnamemodify(path, ":~") .. " no longer exists")
+        Notify.warn("Cannot open a new session: " .. vim.fn.fnamemodify(path, ":~") .. " no longer exists")
         return
     end
     local ok, WorktreeSession = pcall(require, "pi.worktree_session")
     if not ok or type(WorktreeSession) ~= "table" or type(WorktreeSession.open_existing) ~= "function" then
-        Notify.warn("Cannot open a session: worktree session support is unavailable")
+        Notify.warn("Cannot open a new session: checkout support is unavailable")
         return
     end
     -- `open_existing` reports its own failures (bad target, busy tab, spawn
-    -- errors), so no callback is needed here.
+    -- errors), so no callback is needed here. It also accepts the main
+    -- checkout and plain directories, not just linked worktrees.
     WorktreeSession.open_existing({ cwd = path })
 end
 
@@ -2125,9 +2128,9 @@ local function ensure_buf()
     end, vim.tbl_extend("force", map_opts, { desc = "Close sub-session process" }))
     vim.keymap.set(
         "n",
-        "W",
-        new_session_in_worktree_under_cursor,
-        vim.tbl_extend("force", map_opts, { desc = "New session in this worktree (new tab)" })
+        "n",
+        new_session_in_checkout_under_cursor,
+        vim.tbl_extend("force", map_opts, { desc = "New session in this checkout (new tab)" })
     )
     vim.keymap.set(
         "n",

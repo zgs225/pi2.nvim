@@ -1,4 +1,4 @@
--- :PiSessions `W` opens a fresh π session in a new tab rooted at the checkout
+-- :PiSessions `n` opens a fresh π session in a new tab rooted at the checkout
 -- of the row under the cursor: a worktree group header, any row inside a
 -- grouped list (the main-checkout partition included), or a flat row whose
 -- session carries the worktree/cwd. A row whose checkout is gone warns and
@@ -144,14 +144,14 @@ local function buffer_lines()
     return vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(0), 0, -1, false)
 end
 
---- Put the cursor on `lnum` of the open list and press `W`.
+--- Put the cursor on `lnum` of the open list and press `n`.
 ---@param lnum integer
 local function open_under_cursor(lnum)
     vim.api.nvim_win_set_cursor(0, { lnum, 0 })
-    press_key("W")
+    press_key("n")
 end
 
-describe(":PiSessions W (new session in this worktree)", function()
+describe(":PiSessions n (new session in this checkout)", function()
     local real_worktree
     local real_worktree_session
     local orig_children
@@ -349,7 +349,21 @@ describe(":PiSessions W (new session in this worktree)", function()
     end)
 
     describe("keymap", function()
-        it("registers W on the list buffer", function()
+        it("registers n on the list buffer", function()
+            local env = worktree_env()
+            with_manager({ env.main, env.wt }, function()
+                SessionList.open()
+                local b = vim.fn.bufnr("pi://sessions")
+                assert.is_true(b > 0)
+                local map = vim.api.nvim_buf_call(b, function()
+                    return vim.fn.maparg("n", "n", false, true)
+                end)
+                assert.is_truthy(map and not vim.tbl_isempty(map))
+                assert.are.equal("New session in this checkout (new tab)", map.desc)
+            end)
+        end)
+
+        it("leaves W unmapped", function()
             local env = worktree_env()
             with_manager({ env.main, env.wt }, function()
                 SessionList.open()
@@ -358,12 +372,11 @@ describe(":PiSessions W (new session in this worktree)", function()
                 local map = vim.api.nvim_buf_call(b, function()
                     return vim.fn.maparg("W", "n", false, true)
                 end)
-                assert.is_truthy(map and not vim.tbl_isempty(map))
-                assert.are.equal("New session in this worktree (new tab)", map.desc)
+                assert.is_true(vim.tbl_isempty(map))
             end)
         end)
 
-        it("lists W in the help overlay", function()
+        it("lists n in the help overlay", function()
             local env = worktree_env()
             with_manager({ env.main, env.wt }, function()
                 SessionList.open()
@@ -373,7 +386,7 @@ describe(":PiSessions W (new session in this worktree)", function()
                 for _, b in ipairs(vim.api.nvim_list_bufs()) do
                     if vim.api.nvim_buf_is_valid(b) then
                         for _, line in ipairs(vim.api.nvim_buf_get_lines(b, 0, -1, false)) do
-                            if line:find("New session in this worktree", 1, true) then
+                            if line:find("New session in this checkout", 1, true) then
                                 found = true
                             end
                         end
