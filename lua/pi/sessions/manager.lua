@@ -2527,6 +2527,35 @@ local function resume_rows(items, query, repo_name)
     return rows
 end
 
+--- Order-preserving telescope sorter: rows already arrive filtered and ordered
+--- from `pi.sessions.resume_layout`, so telescope must not re-score them.
+---
+--- Telescope versions differ: `config.values.empty_sorter` only exists in newer
+--- builds (the installed ones expose `telescope.sorters.empty()` instead), so
+--- resolve the first API that exists. A re-scoring fallback still beats a
+--- picker that throws on a missing field. Exposed as a test hook so the
+--- resolution is checked against the real plugin, not only a stub.
+---@return table? sorter
+function M._resume_sorter()
+    local ok_conf, conf = pcall(require, "telescope.config")
+    ---@type table?
+    local values = nil
+    if ok_conf and type(conf) == "table" and type(conf.values) == "table" then
+        values = conf.values
+    end
+    if values and type(values.empty_sorter) == "function" then
+        return values.empty_sorter()
+    end
+    local ok_sorters, sorters = pcall(require, "telescope.sorters")
+    if ok_sorters and type(sorters) == "table" and type(sorters.empty) == "function" then
+        return sorters.empty()
+    end
+    if values and type(values.generic_sorter) == "function" then
+        return values.generic_sorter()
+    end
+    return nil
+end
+
 -- Defined below; the pickers reopen themselves from group rows and after a
 -- deletion, so the two backend functions need it in scope.
 ---@type fun(items: pi.SessionSelectItem[], opts: pi.SessionCreateOpts?)
@@ -2555,7 +2584,6 @@ local function open_with_telescope(items, opts)
     local themes = require("telescope.themes")
     local pickers = require("telescope.pickers")
     local finders = require("telescope.finders")
-    local conf = require("telescope.config").values
     local actions = require("telescope.actions")
     local action_state = require("telescope.actions.state")
 
@@ -2571,9 +2599,12 @@ local function open_with_telescope(items, opts)
         local entry = { value = row, ordinal = row.text }
         if row.kind == "group" then
             -- Title row: painted like the :PiSessions worktree header (and
-            -- non-resumable, see below).
+            -- non-resumable, see below). `display` must return the text plus a
+            -- list of `{ {start, end}, hl_group }` blocks — telescope passes the
+            -- second value straight to `hi_display`, which iterates it.
             entry.display = function(e)
-                return e.value.text, "PiSessionsListWorktree"
+                local text = e.value.text
+                return text, { { { 0, #text }, "PiSessionsListWorktree" } }
             end
         else
             entry.display = row.text
@@ -2627,7 +2658,7 @@ local function open_with_telescope(items, opts)
             }),
             {
                 finder = finders.new_dynamic({ entry_maker = entry_maker, fn = rows_for }),
-                sorter = conf.empty_sorter(),
+                sorter = M._resume_sorter(),
                 attach_mappings = function(prompt_bufnr, map)
                     local function open(new_tab)
                         local item = selected_item(prompt_bufnr)

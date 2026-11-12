@@ -230,16 +230,25 @@ local function install_fake_telescope()
             return tbl
         end,
     }
+    -- Mirrors the installed telescope commit: `config.values` has no
+    -- `empty_sorter` (newer builds add it) and order comes from
+    -- `telescope.sorters.empty()`. Modelling the real API here is what would
+    -- have caught the missing `conf.empty_sorter` field.
     package.loaded["telescope.config"] = {
         values = {
             generic_sorter = function()
-                return "sorter"
-            end,
-            -- Rows are already filtered and ordered by resume_layout.
-            empty_sorter = function()
-                return "empty_sorter"
+                return "generic_sorter"
             end,
         },
+    }
+    package.loaded["telescope.sorters"] = {
+        empty = function()
+            return {
+                scoring_function = function()
+                    return 1
+                end,
+            }
+        end,
     }
     package.loaded["telescope.actions"] = {
         -- Called as a method: replace(self, replacement_fn).
@@ -276,6 +285,7 @@ local FAKE_MODULES = {
     "telescope.pickers",
     "telescope.finders",
     "telescope.config",
+    "telescope.sorters",
     "telescope.actions",
     "telescope.actions.state",
 }
@@ -512,11 +522,45 @@ describe("pi resume picker", function()
 
             local cfg = tele.new_cfgs[1]
             assert.equals(false, theme.previewer)
-            assert.equals("empty_sorter", cfg.sorter, "rows arrive pre-filtered and pre-ordered")
+            -- Rows arrive pre-filtered and pre-ordered: the picker must not
+            -- re-score them, and the sorter must resolve on telescope versions
+            -- that only ship `telescope.sorters.empty()`.
+            local sorter = cfg.sorter
+            assert.is_table(sorter)
+            assert.equals("function", type(sorter.scoring_function))
+            assert.equals(1, sorter.scoring_function("", ""))
             local rows = picker_rows(cfg)
             assert.equals(2, #rows)
             assert.equals("session", rows[1].kind)
             assert.equals(T_TARGET, rows[1].item.file)
+        end)
+
+        it("resolves the order-preserving sorter across telescope versions", function()
+            -- Installed builds: only `telescope.sorters.empty()` exists.
+            local sorter = Sessions._resume_sorter()
+            assert.is_table(sorter)
+            assert.equals("function", type(sorter.scoring_function))
+            assert.equals(1, sorter.scoring_function("pi", "pi"))
+
+            -- Newer builds: `config.values.empty_sorter()` wins.
+            local values = require("telescope.config").values
+            values.empty_sorter = function()
+                return {
+                    scoring_function = function()
+                        return 1
+                    end,
+                    origin = "config",
+                }
+            end
+            assert.equals("config", Sessions._resume_sorter().origin)
+            values.empty_sorter = nil
+
+            -- Neither API: degrade to the generic sorter instead of crashing.
+            local sorters = require("telescope.sorters")
+            local real_empty = sorters.empty
+            sorters.empty = nil
+            assert.equals("generic_sorter", Sessions._resume_sorter())
+            sorters.empty = real_empty
         end)
 
         it("maps o/t/<C-t> and opens rows via select_default and <C-t>", function()
@@ -672,5 +716,44 @@ describe("pi resume picker", function()
 
         assert.equals(1, #call.items)
         assert.equals("parent-session-id", call.items[1].item.session.id)
+    end)
+
+    it("resolves a real telescope Sorter when telescope is installed", function()
+        local root = vim.fn.expand("~/.local/share/nvim/lazy/telescope.nvim")
+        if vim.fn.isdirectory(root) == 0 then
+            return -- telescope not installed (CI): nothing to resolve for real
+        end
+
+        -- Load the actual plugin, the way the user's editor does. The stubs
+        -- above mirror the installed commit, but only the real modules can
+        -- prove that the API symbol exists (a stub once hid a missing one).
+        vim.opt.runtimepath:prepend(root)
+        local sorters = require("telescope.sorters")
+        local real_empty = sorters.empty
+        local used_empty = false
+        sorters.empty = function()
+            used_empty = true
+            return real_empty()
+        end
+        local sorter = Sessions._resume_sorter()
+        sorters.empty = real_empty
+
+        assert.is_true(used_empty, "without config.values.empty_sorter the picker must use telescope.sorters.empty")
+        assert.is_table(sorter)
+        assert.equals("function", type(sorter.scoring_function))
+        assert.equals(1, sorter.scoring_function("pi", "pi", {}))
+        assert.equals("function", type(require("telescope.finders").new_dynamic))
+
+        -- Partition titles rely on `display` returning (text, hl_group).
+        local entry_display = require("telescope.pickers.entry_display")
+        local entry = {
+            value = { text = "󰙅 fix-auth" },
+            display = function(e)
+                return e.value.text, "PiSessionsListWorktree"
+            end,
+        }
+        local text, hl = entry_display.resolve({ _increment = function() end }, entry)
+        assert.equals("󰙅 fix-auth", text)
+        assert.equals("PiSessionsListWorktree", hl)
     end)
 end)
