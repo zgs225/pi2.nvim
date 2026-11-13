@@ -1,5 +1,9 @@
 # Changelog
 
+## 2026-11-13
+
+- **ADDED:** `worktree.warn_on_cwd_mismatch` (default `true`) — set it to `false` to drop the `⚠` prefix from the chat-title worktree badge when the session's cwd differs from Neovim's cwd; the badge then stays the plain `󰙅 <name>` (with its dirty/ahead `*`). The prefix exists because the path anchors diverge: `gf`, quickfix, `@` mentions, `:PiDiff` and prompt history resolve against the session cwd, not the editor's. The main checkout still shows no badge, matching the existing rule. See doc/worktrees.md#where-you-see-it and doc/configuration.md.
+
 ## 2026-11-12
 
 - **REMOVED:** The sub-session **worktree integration engine** (`pi.worktree_integration`) and its surface — the `worktree.integration.{auto,auto_resolve,max_attempts,keep_count}` options, the `integration` record on manifest rows, the `:PiSessions` integration glyphs (`⧗`/`…`/`✓`/`!`), the `󰙅 …` integration records in chat history and the `PiWorktreeIntegration*` / `PiSessionsListIntegration*` highlight groups. With sub-sessions running in the parent's checkout there was nothing left to integrate, so this is dead-code removal rather than a behaviour change: nothing a dispatch does today reached the engine. The reaper still releases a leftover `sub-…` checkout that no live session owns; anything it cannot prove safe to delete is an ordinary directory (`git worktree remove`). Every session-level worktree feature is unchanged.

@@ -152,11 +152,14 @@ local function worktree_module()
     return nil
 end
 
---- Title chunks for the worktree badge — pure, so the display matrix is unit
---- testable without a repository:
+--- Title chunks for the worktree badge — pure apart from a config lookup, so
+--- the display matrix is unit testable without a repository:
 ---   main worktree, session cwd == Neovim cwd  → nil (the title stays `π`)
 ---   linked worktree, cwd matches              → `󰙅 name`, `*` when dirty/ahead
 ---   session cwd ≠ Neovim cwd                  → `⚠ 󰙅 name` in the warning color
+---                                              (`worktree.warn_on_cwd_mismatch = false`
+---                                              keeps the plain `󰙅 name` badge; the
+---                                              main checkout shows nothing)
 ---@param info pi.WorktreeInfo?
 ---@param same_cwd boolean
 ---@param status? { dirty?: boolean, ahead?: integer }
@@ -170,7 +173,9 @@ function Chat.worktree_badge(info, same_cwd, status)
         return nil
     end
     local glyph = info.kind == "linked" and "󰙅 " or ""
-    if not same_cwd then
+    local options = Config.options.worktree or {}
+    local warn_on_mismatch = options.warn_on_cwd_mismatch ~= false
+    if not same_cwd and warn_on_mismatch then
         return { { "⚠ " .. glyph .. name, "PiStatusLineWarning" } }
     end
     if info.kind == "main" then

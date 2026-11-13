@@ -202,7 +202,7 @@ A listed checkout can be gone by the time you pick it (retention removed it, or 
 
 ## Where you see it
 
-- **Chat history title** — a session running in a linked worktree shows `󰙅 <name>` next to the panel title (in the side-layout winbar and the float border), with a trailing `*` while the checkout is dirty or has commits ahead of its base commit. When the session's cwd is **not** Neovim's cwd — normally the case for every worktree session, since starting one does not change Neovim's cwd, and also for a session resumed from another directory — the badge is prefixed with `⚠` in the warning color, because paths you open from your own buffers and paths the agent touches may diverge. A session in the repository's main worktree with Neovim's cwd shows no badge.
+- **Chat history title** — a session running in a linked worktree shows `󰙅 <name>` next to the panel title (in the side-layout winbar and the float border), with a trailing `*` while the checkout is dirty or has commits ahead of its base commit. When the session's cwd is **not** Neovim's cwd — normally the case for every worktree session, since starting one does not change Neovim's cwd, and also for a session resumed from another directory — the badge is prefixed with `⚠` in the warning color, because paths you open from your own buffers and paths the agent touches may diverge; `worktree.warn_on_cwd_mismatch = false` drops that prefix and keeps the plain badge. A session in the repository's main worktree with Neovim's cwd shows no badge.
 - **`:PiSessions`** — once the list spans **two or more distinct worktrees**, rows are grouped under a worktree header (`▾ 󰙅 <name> · ~/path`, and `▸ 󰙅 <name> (n) · ~/path` while the group is folded), and `<Tab>` / `za` folds a whole group (`zM` / `zR` collapse or expand everything). The `(n)` is the group's **structural** size — every parent row plus its sub-sessions — and it is displayed while the group is collapsed, does not move when a parent row *inside* the group folds, and only folding the group itself changes what is shown. The header carries the worktree's name for its whole group, and a sub-session row inside it repeats the name in its subtitle (a parent row is already under that header), while a worktree fork carries the `↳ forked from <name>` marker. Sessions whose cwd is not a work tree keep their flat rows, so a single-repository list looks exactly as before. `R` re-detects worktrees along with session names.
 - **Highlight groups** — `PiChatHistoryWorktree` (badge in the history title) and `PiSessionsListWorktree` (worktree group header); see [Highlight groups](highlight-groups.md).
 - **Workspace-scoped features follow the session cwd, not Neovim's**: [`:PiDiff`](diff-review.md#session-diff-review-pidiff) anchors each changed file at the session's directory, [quickfix](usage.md#quickfix) resolves `grep`/`find` paths against it, [`@mentions`](usage.md#mentions) (`@git-diff`, `@git-log`, file existence) and `gf`/buffer reload resolve paths there, and [prompt history](usage.md#prompt-history) / [drafts](usage.md#draft-persistence) are keyed per workspace. A resumed session adopts the cwd recorded in its session file, so a resumed worktree session keeps pointing at its worktree.
@@ -221,6 +221,11 @@ require("pi").setup({
         -- Snapshot a worktree's patch before :PiWorktreeRemove / Worktree.remove
         -- deletes it (default true).
         snapshot_before_remove = true,
+
+        -- Prefix the chat-title badge with ⚠ when the session's cwd differs
+        -- from Neovim's cwd (default true). false keeps the plain 󰙅 <name>
+        -- badge; the editor and the agent may then anchor paths differently.
+        warn_on_cwd_mismatch = true,
 
         -- Retained but DORMANT (no per-child checkout exists to integrate;
         -- see the section above).
