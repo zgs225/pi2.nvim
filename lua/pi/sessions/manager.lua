@@ -2871,6 +2871,23 @@ local function collect_resume_sessions(callback)
         end
     end
 
+    -- Snapshot entries are collected **before** `Worktree.list` hands its reply
+    -- to `apply()`: `snapshot_worktrees` is synchronous while git's list may
+    -- answer later (or, in a spec, immediately), and `apply()` must never run
+    -- against a half-populated candidate set.
+    if has_snapshots then
+        -- `snapshot_worktrees(cwd)` is synchronous: it returns the checkouts
+        -- deleted but still recoverable from a snapshot sidecar.
+        local called, snapshots = pcall(Worktree.snapshot_worktrees, vim.fn.getcwd())
+        if not called then
+            list_err = snapshots
+        elseif type(snapshots) == "table" then
+            for _, entry in ipairs(snapshots) do
+                add_worktree(entry)
+            end
+        end
+    end
+
     if has_list then
         local called, call_err = pcall(Worktree.list, vim.fn.getcwd(), function(list, err)
             if list_done then
@@ -2890,21 +2907,6 @@ local function collect_resume_sessions(callback)
             list_done = true
             list_err = call_err
             apply()
-        end
-    end
-
-    if has_snapshots then
-        -- `snapshot_worktrees(cwd)` is synchronous: it returns the checkouts
-        -- deleted but still recoverable from a snapshot sidecar.
-        local called, snapshots = pcall(Worktree.snapshot_worktrees, vim.fn.getcwd())
-        if not called then
-            if list_err == nil then
-                list_err = snapshots
-            end
-        elseif type(snapshots) == "table" then
-            for _, entry in ipairs(snapshots) do
-                add_worktree(entry)
-            end
         end
     end
 
