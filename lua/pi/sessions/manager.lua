@@ -2438,7 +2438,7 @@ local function open_resume_target(session_path, opts, new_tab, resume)
     end
 
     if resume and (resume.cwd or resume.worktree) then
-        -- Recover a removed worktree (integration metadata / snapshot) before
+        -- Recover a removed worktree (legacy integration record / snapshot) before
         -- touching any process. On failure this reports why and opens nothing -
         -- it never falls back to the main checkout.
         require("pi.worktree_session").prepare_resume_target(resume, function(target)

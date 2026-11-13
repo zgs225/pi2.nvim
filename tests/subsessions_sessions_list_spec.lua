@@ -89,4 +89,23 @@ describe("subagent sessions_list filter", function()
             }
         ))
     end)
+
+    it("ignores a legacy integration record when deciding visibility", function()
+        Config.setup({ subagent = { sessions_list = {} } })
+        -- Manifests written while the (now removed) worktree integration engine
+        -- still ran carry an `integration` record on the row. It used to pin the
+        -- row visible regardless of show_dormant / show_completed / acknowledgement;
+        -- that override is gone, so the config rules decide alone.
+        for _, state in ipairs({ "queued", "resolving", "applying", "applied", "needs_attention" }) do
+            assert.is_false(Filter.child_visible(entry({ status = "dormant", integration = { state = state } })), state)
+            assert.is_false(
+                Filter.child_visible(entry({
+                    status = "completed",
+                    agent_spawned = true,
+                    integration = { state = state },
+                })),
+                state
+            )
+        end
+    end)
 end)

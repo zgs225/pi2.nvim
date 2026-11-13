@@ -226,25 +226,6 @@ require("pi").setup({
         -- from Neovim's cwd (default true). false keeps the plain 󰙅 <name>
         -- badge; the editor and the agent may then anchor paths differently.
         warn_on_cwd_mismatch = true,
-
-        -- Retained but DORMANT (no per-child checkout exists to integrate;
-        -- see the section above).
-
-        integration = {
-            -- Apply automatically at all (default true). false = the patch is
-            -- only ever moved by :PiWorktreeApply.
-            auto = true,
-            -- Ask the (still running) child to rebase/resolve in its own
-            -- checkout once when a patch conflicts or its base drifted
-            -- (default true; max_attempts = 0 disables it).
-            auto_resolve = true,
-            -- Resolving rounds a child gets before integration stops in
-            -- needs_attention (default 1).
-            max_attempts = 1,
-            -- Soft cap on applied child checkouts kept on disk: only verified,
-            -- inactive, unpinned ones are removed, oldest first (default 15).
-            keep_count = 15,
-        },
     },
 })
 ```
@@ -257,4 +238,3 @@ Full annotated reference: [Configuration](configuration.md). The `pi.worktree*` 
 - **No nested worktrees.** A session (or sub-session) that already runs in a worktree never creates another checkout inside it.
 - **No automatic commit.** `:PiWorktreeApply` writes to a **working tree** only (never the index, never a commit), and `:PiWorktreeShip` only prefills a prompt — commits and pushes stay yours (or the agent's, once you send that prompt).
 - **`:PiContinue` is still cwd-scoped.** It means "the most recent session *here*"; the cross-worktree enumeration lives in `:PiResume`.
-- **Retention is not a garbage collector.** The soft cap only removes checkouts it can prove were applied, verified and inactive; snapshots, unintegrated work, parked rows and `needs_attention` rows are never deleted for quota.
