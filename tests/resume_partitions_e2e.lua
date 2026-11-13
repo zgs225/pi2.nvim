@@ -371,6 +371,34 @@ local ok, err = pcall(function()
             return not session.rpc:is_running()
         end, 50)
     end
+
+    -- Re-open from inside a linked checkout. The child's manifest lives in the
+    -- MAIN checkout, so the ghost check has to consult it — Neovim's cwd is not
+    -- the main checkout here, and neither is the dead checkout itself.
+    vim.cmd("cd " .. vim.fn.fnameescape(wt_auth))
+    Sessions.resume_session()
+    local prompt2 = wait_for_prompt()
+    check("picker re-opens from a linked checkout", prompt2 ~= nil)
+    if prompt2 then
+        local status2 = require("telescope.state").get_status(prompt2)
+        local picker2 = status2 and status2.picker or nil
+        local rows2 = {}
+        if picker2 then
+            vim.wait(15000, function()
+                rows2 = row_texts(picker2)
+                return #rows2 >= 5
+            end, 20)
+        end
+        check(
+            "no ghost partition from inside a linked checkout",
+            find_row(rows2, "󰙅 sub-dead") == nil,
+            table.concat(rows2, " | ")
+        )
+        check("no child row from inside a linked checkout", find_row(rows2, "2026-01-05  dead child") == nil)
+        check("the linked checkout itself is a partition", find_row(rows2, "󰙅 fix-auth") ~= nil)
+        pcall(vim.cmd, "silent! bwipeout! " .. prompt2)
+    end
+    vim.cmd("cd " .. vim.fn.fnameescape(repo))
 end)
 
 cleanup()

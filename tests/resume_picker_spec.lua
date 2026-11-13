@@ -1005,6 +1005,37 @@ describe("pi resume picker cross-checkout collection", function()
         assert.same({ "2025-06-01  recovered work", "2025-06-01  main work" }, sessions)
     end)
 
+    it("finds a child recorded only in the main checkout's manifest", function()
+        -- Neovim runs somewhere other than the main checkout (`dir`), so the
+        -- only evidence that this row is a sub-session is the main checkout's
+        -- manifest — not Neovim's cwd, not the dead checkout's own.
+        local dead = dir .. "/.worktrees/sub-dead"
+        Worktree.list = function(_, cb)
+            calls.list = calls.list + 1
+            cb({}, nil)
+        end
+        Worktree.snapshot_worktrees = function()
+            calls.snapshot = calls.snapshot + 1
+            return { recovered(dead, "sub-dead") }
+        end
+        History.list = function(cwd)
+            if cwd == dead then
+                return { session(dead .. "/k.jsonl", "kid", 200, "subagent run") }
+            end
+            return { session(dir .. "/main.jsonl", "main", 100, "main work") }
+        end
+        Manifest.is_child_session = function(id, cwd)
+            return id == "kid" and cwd == dir
+        end
+
+        Sessions.resume_session()
+
+        -- One surviving partition: a flat list, and no `󰙅 sub-dead` title.
+        local titles, sessions = collect_rows()
+        assert.same({}, titles)
+        assert.same({ "2025-06-01  main work" }, sessions)
+    end)
+
     it("never spawns git when the repository has no other checkout", function()
         pcall(vim.fn.delete, dir .. "/.git", "rf")
 

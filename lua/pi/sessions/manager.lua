@@ -2819,6 +2819,30 @@ local function collect_resume_sessions(callback)
     end
     local repo_root = (repo and repo.repo_root) or vim.fn.getcwd()
     local common_dir = (repo and repo.common_dir) or (repo_root .. "/.git")
+    -- Workspaces whose manifests can record a child's parentage: Neovim's cwd,
+    -- plus (per checkout, below) the repository's main checkout. The main
+    -- checkout is what matters while Neovim runs inside a linked worktree or a
+    -- subdirectory: a `sub-*` checkout is created from the workspace its parent
+    -- session runs in — usually the main checkout — so without consulting that
+    -- manifest the dead checkouts come back as one-row partitions.
+    ---@type string[]
+    local child_manifest_cwds = { vim.fn.getcwd() }
+    if type(repo_root) == "string" and repo_root ~= "" and repo_root ~= child_manifest_cwds[1] then
+        child_manifest_cwds[#child_manifest_cwds + 1] = repo_root
+    end
+
+    --- Child-manifest scopes for one checkout: the shared workspaces plus the
+    --- checkout itself (duplicates are harmless — `Manifest.load` caches).
+    ---@param checkout string
+    ---@return string[]
+    local function child_manifest_scopes(checkout)
+        local cwds = {}
+        for _, cwd in ipairs(child_manifest_cwds) do
+            cwds[#cwds + 1] = cwd
+        end
+        cwds[#cwds + 1] = checkout
+        return cwds
+    end
     local has_worktrees_dir = vim.fn.isdirectory(repo_root .. "/.worktrees") == 1
     local has_snapshot_dir = vim.fn.isdirectory(common_dir .. "/pi2-worktree-snapshots") == 1
     -- git's registry of linked worktrees (`<git common dir>/worktrees/<name>`).
@@ -2878,7 +2902,6 @@ local function collect_resume_sessions(callback)
             if list_err ~= nil and list_err ~= "" then
                 Notify.warn("Could not list repository worktrees: " .. tostring(list_err))
             end
-            local cwd = vim.fn.getcwd()
             for _, worktree in ipairs(sorted) do
                 -- Missing/prunable checkouts have no directory, but their
                 -- session files still live in the per-cwd agent directory;
@@ -2887,8 +2910,11 @@ local function collect_resume_sessions(callback)
                 -- Children are dropped here as well as in the cwd list: a
                 -- subagent's transcript belongs to `:PiSubSwitch`, and a dead
                 -- `sub-*` checkout holding one must not turn into a picker
-                -- partition of its own.
-                local listed = filter_top_level_sessions(History.list(worktree.path), { cwd, worktree.path })
+                -- partition of its own. The scopes cover the case where Neovim
+                -- itself runs in a linked checkout or a subdirectory, so the
+                -- child row is only recorded in the main checkout's manifest.
+                local listed =
+                    filter_top_level_sessions(History.list(worktree.path), child_manifest_scopes(worktree.path))
                 for _, info in ipairs(listed) do
                     add(info, worktree)
                 end
