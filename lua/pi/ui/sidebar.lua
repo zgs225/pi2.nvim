@@ -258,6 +258,27 @@ function M.release(tab, key)
     end
 end
 
+--- Whether `win` is a registered side-panel window (sessions list, todo or
+--- tasks panel) in any tab. The chat's side layout uses it to keep its own
+--- column out of a panel frame — see `pi.ui.chat.layout.resolve_side_split`.
+---@param win integer?
+---@return boolean
+function M.is_panel(win)
+    if not win or not vim.api.nvim_win_is_valid(win) then
+        return false
+    end
+    for _, by_edge in pairs(registry) do
+        for _, panels in pairs(by_edge) do
+            for _, p in ipairs(panels) do
+                if p.win == win and vim.api.nvim_win_is_valid(p.win) then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
 --- Registered panels at tab+edge, in stacking order. Test/introspection use.
 ---@param tab integer
 ---@param edge pi.SidebarEdge

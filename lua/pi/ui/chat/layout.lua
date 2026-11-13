@@ -523,6 +523,40 @@ local function resolve_side_width()
     return resolve_dimension(side_cfg.width, vim.o.columns)
 end
 
+--- Window the side column is carved out of, plus the split prefix that keeps
+--- the new column adjacent to it.
+---
+--- Side panels (sessions list, todo, tasks) are tab-level and outlive a
+--- session: after a cross-checkout `:PiResume` — or any hide/show of the chat
+--- while a panel is focused — the chat reopens while the previous session's
+--- panels still hold the configured edge. `:topleft`/`:botright` then put the
+--- new column at the *outer* edge of the tab (outside the panel column,
+--- flipping the layout), and splitting a narrow panel window squeezes that
+--- column to a single cell. Inserting next to the outermost regular window
+--- with `:leftabove`/`:rightbelow` keeps the column inside the panel edge;
+--- with no panel open that is the same outer position as before.
+---@param position "left"|"right"
+---@return integer? win window to split (nil: keep the current window)
+---@return string prefix split command prefix
+local function resolve_side_split(position)
+    local Sidebar = require("pi.ui.sidebar")
+    local fallback = position == "left" and "topleft" or "botright"
+    local best, best_col = nil, nil
+    for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
+        -- Floats are not part of the frame tree and panels hold their own edge.
+        if vim.api.nvim_win_get_config(win).relative == "" and not Sidebar.is_panel(win) then
+            local col = vim.fn.win_screenpos(win)[2]
+            if not best_col or (position == "left" and col < best_col) or (position == "right" and col > best_col) then
+                best, best_col = win, col
+            end
+        end
+    end
+    if not best then
+        return nil, fallback
+    end
+    return best, (position == "left" and "leftabove" or "rightbelow")
+end
+
 --- Resolve float dimensions in pixels from config.
 ---@param float_cfg? pi.FloatLayout Pre-resolved config; resolved internally if omitted.
 ---@return integer width, integer total_height
@@ -537,8 +571,12 @@ function Layout:_open_in_side_layout()
     local side_cfg = Config.resolve_side_layout()
     local panels = side_cfg.panels
     local w = resolve_side_width()
-    local vsplit_cmd = side_cfg.position == "left" and "topleft" or "botright"
-    vim.cmd(vsplit_cmd .. " " .. w .. "vsplit")
+    local position = side_cfg.position == "left" and "left" or "right"
+    local target, split_prefix = resolve_side_split(position)
+    if target and vim.api.nvim_get_current_win() ~= target then
+        vim.api.nvim_set_current_win(target)
+    end
+    vim.cmd(split_prefix .. " " .. w .. "vsplit")
 
     self._history_win = vim.api.nvim_get_current_win()
     vim.api.nvim_win_set_buf(self._history_win, self._history:buf())
