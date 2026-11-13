@@ -103,6 +103,10 @@ local ok, err = pcall(function()
     git(repo, "commit", "-q", "-m", "fixture")
     git(repo, "worktree", "add", "--detach", wt_auth, "HEAD")
     git(repo, "worktree", "add", "--detach", wt_polish, "HEAD")
+    -- A checkout created outside the repository and outside `.worktrees/`: git
+    -- reports it, so the picker must enumerate it like a π-managed one.
+    local wt_ext = tmp .. "/external-checkout"
+    git(repo, "worktree", "add", "--detach", wt_ext, "HEAD")
 
     local agent_dir = tmp .. "/agent"
     -- Pickup-side config plus the child process: pi has no --agent-dir flag, so
@@ -138,6 +142,33 @@ local ok, err = pcall(function()
         make_session(wt_auth, "e2e-auth", "2026-01-02T10:00:00.000Z", "auth session", "auth ask", now - 200)
     make_session(wt_polish, "e2e-polish", "2026-01-03T10:00:00.000Z", "deploy notes", "polish ask", now - 100)
     make_session(repo, "e2e-main", "2026-01-01T10:00:00.000Z", "main session", "main ask", now - 300)
+    make_session(wt_ext, "e2e-ext", "2026-01-04T10:00:00.000Z", "external session", "ext ask", now - 50)
+
+    -- A checkout deleted but recoverable from a snapshot store, holding nothing
+    -- but a SUB-SESSION transcript: it must not become a partition of its own.
+    -- The child linkage lives in the parent's workspace manifest, which is what
+    -- the collection consults — nothing here is stubbed.
+    local dead = repo .. "/.worktrees/sub-dead"
+    make_session(dead, "e2e-dead-child", "2026-01-05T10:00:00.000Z", "dead child", "dead ask", now)
+    write(
+        History.get_sessions_dir(repo) .. "/.pi2-subsessions.json",
+        vim.json.encode({ ["e2e-dead-child"] = { parent_id = "e2e-main", status = "completed" } })
+    )
+    local snap = repo .. "/.git/pi2-worktree-snapshots/sub-dead"
+    vim.fn.mkdir(snap, "p")
+    write(snap .. "/20260105-100000.patch", "")
+    local head = git(repo, "rev-parse", "HEAD")
+    write(
+        snap .. "/20260105-100000.patch.json",
+        vim.json.encode({
+            name = "sub-dead",
+            path = dead,
+            repo_root = repo,
+            base_sha = head,
+            head = head,
+            created_at = now,
+        })
+    )
 
     vim.cmd("cd " .. vim.fn.fnameescape(repo))
 
@@ -196,26 +227,44 @@ local ok, err = pcall(function()
     end
 
     local ok_rows = vim.wait(15000, function()
-        return #row_texts(picker) >= 6
+        return #row_texts(picker) >= 8
     end, 20)
     local rows = row_texts(picker)
     check("unfiltered list shows every partition", ok_rows)
 
     local title_auth = find_row(rows, "󰙅 fix-auth")
     local title_polish = find_row(rows, "󰙅 polish")
+    local title_ext = find_row(rows, "󰙅 external-checkout")
     local title_main = find_row(rows, "demo-repo")
     check("fix-auth title row", title_auth ~= nil, table.concat(rows, " | "))
     check("polish title row", title_polish ~= nil)
+    check("externally created checkout gets a title row", title_ext ~= nil, table.concat(rows, " | "))
     check("main checkout title row", title_main ~= nil)
 
-    -- Ordering: polish (newest) → fix-auth → main.
+    -- Ordering: external (newest) → polish → fix-auth → main.
     check(
         "partitions ordered by newest session",
-        title_polish ~= nil
+        title_ext ~= nil
+            and title_polish ~= nil
             and title_auth ~= nil
             and title_main ~= nil
+            and title_ext < title_polish
             and title_polish < title_auth
             and title_auth < title_main
+    )
+
+    -- A snapshot-recoverable checkout whose only transcript is a child row is
+    -- not a partition: no ghost title, no ghost row.
+    check(
+        "no ghost partition for a child-only checkout",
+        find_row(rows, "󰙅 sub-dead") == nil,
+        table.concat(rows, " | ")
+    )
+    check("no row for its sub-session transcript", find_row(rows, "2026-01-05  dead child") == nil)
+    check(
+        "the externally created checkout's session is listed",
+        find_row(rows, "2026-01-04  external session") ~= nil,
+        table.concat(rows, " | ")
     )
 
     -- R3: session rows never carry checkout information.

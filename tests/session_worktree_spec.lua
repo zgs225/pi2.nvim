@@ -1235,8 +1235,9 @@ describe("worktree discovery and continue for resume", function()
                 cb({
                     { name = "gone", path = gone, repo_root = repo, prunable = true },
                     { name = "snapshot-only", path = snap, repo_root = repo },
-                    -- Not under `<repo>/.worktrees/`: a developer checkout, not
-                    -- a pi-managed worktree. Must stay out of the picker.
+                    -- A checkout created outside `<repo>/.worktrees/` (a
+                    -- developer's own `git worktree add`). git reports it, so
+                    -- it is as resumable as a pi-managed checkout.
                     { name = "dev-wt", path = unmanaged, repo_root = repo },
                 }, nil)
             end,
@@ -1292,22 +1293,29 @@ describe("worktree discovery and continue for resume", function()
         assert.equals(1, snapshot_calls)
         assert.equals(1, calls[gone])
         assert.equals(1, calls[snap]) -- both sources deduped to one listing
-        -- Two checkouts => one title row per checkout, each followed by its
+        assert.equals(1, calls[unmanaged]) -- an external checkout is resumed too
+        -- Three checkouts => one title row per checkout, each followed by its
         -- session row; row text never carries the worktree name.
-        assert.equals(4, #picked.items)
-        assert.is_nil(calls[unmanaged]) -- unmanaged linked checkout not listed
+        assert.equals(6, #picked.items)
+        assert.is_nil(calls[repo]) -- the main checkout contributes no row here
         assert.equals("group", picked.items[1].kind)
-        assert.equals("󰙅 gone", picked.items[1].text)
-        assert.equals("󰙅 gone", picked.opts.format_item(picked.items[1]))
+        assert.equals("󰙅 dev-wt", picked.items[1].text)
+        assert.equals("󰙅 dev-wt", picked.opts.format_item(picked.items[1]))
         assert.equals("session", picked.items[2].kind)
-        assert.equals("gone", picked.items[2].item.session.worktree)
-        assert.equals("2025-01-01  gone work", picked.opts.format_item(picked.items[2]))
+        assert.equals("dev-wt", picked.items[2].item.session.worktree)
+        assert.equals("2025-01-03  unmanaged", picked.opts.format_item(picked.items[2]))
         assert.equals("group", picked.items[3].kind)
-        assert.equals("󰙅 snapshot-only", picked.items[3].text)
-        assert.equals("󰙅 snapshot-only", picked.opts.format_item(picked.items[3]))
+        assert.equals("󰙅 gone", picked.items[3].text)
+        assert.equals("󰙅 gone", picked.opts.format_item(picked.items[3]))
         assert.equals("session", picked.items[4].kind)
-        assert.equals("snapshot-only", picked.items[4].item.session.worktree)
-        assert.equals("2025-01-02  snapshot work", picked.opts.format_item(picked.items[4]))
+        assert.equals("gone", picked.items[4].item.session.worktree)
+        assert.equals("2025-01-01  gone work", picked.opts.format_item(picked.items[4]))
+        assert.equals("group", picked.items[5].kind)
+        assert.equals("󰙅 snapshot-only", picked.items[5].text)
+        assert.equals("󰙅 snapshot-only", picked.opts.format_item(picked.items[5]))
+        assert.equals("session", picked.items[6].kind)
+        assert.equals("snapshot-only", picked.items[6].item.session.worktree)
+        assert.equals("2025-01-02  snapshot work", picked.opts.format_item(picked.items[6]))
     end)
 
     it("recovers a deleted worktree from its snapshot and restarts there", function()

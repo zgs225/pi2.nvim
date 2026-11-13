@@ -2697,24 +2697,53 @@ local function open_with_telescope(items, opts)
     return true
 end
 
----@param sessions pi.SessionInfo[]
----@return pi.SessionInfo[]
-local function filter_top_level_sessions(sessions)
+--- Predicate answering "is this session id somebody's sub-session?".
+---
+--- Child bookkeeping lives in the **parent's** workspace manifest, so a row's
+--- parentage is only decidable against the workspace(s) it could belong to:
+--- Neovim's cwd for a child spawned from the main checkout into a `sub-*`
+--- worktree, the checkout itself when the parent ran there.
+---@param cwds string[] Workspaces whose manifests record the children
+---@return fun(id: string?): boolean
+local function child_session_check(cwds)
     local Manifest = require("pi.subsessions.manifest")
+    return function(id)
+        if type(id) ~= "string" or id == "" then
+            return false
+        end
+        for _, cwd in ipairs(cwds) do
+            local ok, child = pcall(Manifest.is_child_session, id, cwd)
+            if ok and child then
+                return true
+            end
+        end
+        return false
+    end
+end
+
+--- Drop sub-session transcripts: they are reopened through `:PiSubSwitch`, not
+--- the resume picker.
+---@param sessions pi.SessionInfo[]
+---@param cwds string[] Workspaces whose manifests record the children
+---@return pi.SessionInfo[]
+local function filter_top_level_sessions(sessions, cwds)
+    local is_child = child_session_check(cwds)
     ---@type pi.SessionInfo[]
     local out = {}
     for _, session in ipairs(sessions) do
-        if not Manifest.is_child_session(session.id) then
+        if not is_child(session.id) then
             out[#out + 1] = session
         end
     end
     return out
 end
 
---- Collect resume entries: sessions of Neovim's cwd plus those of every
---- managed worktree of the same repository — including checkouts git reports as
---- missing/prunable and checkouts deleted but still recoverable from a snapshot
---- (`Worktree.snapshot_worktrees`).
+--- Collect resume entries: sessions of Neovim's cwd plus those of every linked
+--- worktree of the same repository — git's own view, so a checkout created
+--- outside pi (`git worktree add ../x`) is included too. Checkouts git still
+--- reports as missing/prunable and checkouts deleted but recoverable from a
+--- snapshot (`Worktree.snapshot_worktrees`) are enumerated as well; they only
+--- surface in the picker when a resumable (top-level) session lives there.
 ---
 --- Cross-worktree resume must not require `:cd` into the checkout: candidate
 --- worktrees are enumerated through the git-side module and each checkout's
@@ -2725,8 +2754,8 @@ end
 ---
 --- Falls back to the historical single-workspace list when there is nothing to
 --- discover (no worktree module, no `list`/`snapshot_worktrees`, and neither a
---- `.worktrees` nor a snapshot directory) — plain sessions keep their exact old
---- behaviour and ordering.
+--- `.worktrees`, a snapshot store, nor git's linked-worktree registry) — plain
+--- sessions keep their exact old behaviour and ordering.
 ---@param callback fun(items: pi.ResumeSessionInfo[])
 local function collect_resume_sessions(callback)
     local History = require("pi.sessions.history")
@@ -2746,7 +2775,7 @@ local function collect_resume_sessions(callback)
         if existing then
             -- The current cwd's list was added first and saw no worktree; a
             -- per-worktree listing can still name it (Neovim may run inside a
-            -- managed checkout).
+            -- linked checkout).
             if type(worktree) == "table" and not existing.worktree_info then
                 existing.worktree = worktree.name
                 existing.worktree_info = worktree
@@ -2765,7 +2794,7 @@ local function collect_resume_sessions(callback)
         items[#items + 1] = entry
     end
 
-    for _, info in ipairs(filter_top_level_sessions(History.list())) do
+    for _, info in ipairs(filter_top_level_sessions(History.list(), { vim.fn.getcwd() })) do
         add(info)
     end
 
@@ -2792,19 +2821,27 @@ local function collect_resume_sessions(callback)
     local common_dir = (repo and repo.common_dir) or (repo_root .. "/.git")
     local has_worktrees_dir = vim.fn.isdirectory(repo_root .. "/.worktrees") == 1
     local has_snapshot_dir = vim.fn.isdirectory(common_dir .. "/pi2-worktree-snapshots") == 1
-    if not has_worktrees_dir and not has_snapshot_dir then
-        -- Nothing managed or snapshot-recoverable here: keep the historical
-        -- synchronous single-workspace picker and never spawn git for it.
+    -- git's registry of linked worktrees (`<git common dir>/worktrees/<name>`).
+    -- A directory probe, so "does this repository have other checkouts?" is
+    -- answered without spawning git; it keeps cross-checkout resume working for
+    -- repositories whose checkouts were created outside pi.
+    local has_linked_registry = vim.fn.isdirectory(common_dir .. "/worktrees") == 1
+    if not has_worktrees_dir and not has_snapshot_dir and not has_linked_registry then
+        -- Nothing to discover here: keep the historical synchronous
+        -- single-workspace picker and never spawn git for it.
         callback(items)
         return
     end
 
     ---@type table<string, table>
     local worktrees = {}
-    -- `Worktree.list` also reports every *linked* worktree of the repository
-    -- (e.g. a developer's own checkouts outside `.worktrees/`). Only pi-managed
-    -- checkouts belong in the resume picker.
-    local managed_root = vim.fs.normalize(repo_root .. "/.worktrees")
+    --- Every linked worktree git reports is a resume candidate, wherever it
+    --- lives: a checkout the user created themselves (`git worktree add ../x`)
+    --- is as resumable as a pi-managed one. `Worktree.list` already skips
+    --- checkouts whose directory is gone, except prunable pi-managed ones whose
+    --- transcripts are still worth locating. Managed-ness stays in the info
+    --- table (name, base_sha, mode) for the badge, `Ship`/`Apply` and the
+    --- session binding — it never decides visibility.
     ---@param entry any
     local function add_worktree(entry)
         if type(entry) ~= "table" then
@@ -2815,18 +2852,10 @@ local function collect_resume_sessions(callback)
             info[k] = v
         end
         local path = type(info.path) == "string" and info.path or nil
-        if (not path or path == "") and type(info.name) == "string" and info.name ~= "" then
-            local root = type(info.repo_root) == "string" and info.repo_root or repo_root
-            path = root .. "/.worktrees/" .. info.name
-        end
         if type(path) ~= "string" or path == "" then
             return
         end
-        path = vim.fs.normalize(path)
-        if path ~= managed_root and not vim.startswith(path, managed_root .. "/") then
-            return
-        end
-        info.path = path
+        info.path = vim.fs.normalize(path)
         local prev = worktrees[path]
         -- Keep the richer record (snapshot-only rows and prunable git records
         -- may describe the same checkout).
@@ -2849,11 +2878,18 @@ local function collect_resume_sessions(callback)
             if list_err ~= nil and list_err ~= "" then
                 Notify.warn("Could not list repository worktrees: " .. tostring(list_err))
             end
+            local cwd = vim.fn.getcwd()
             for _, worktree in ipairs(sorted) do
                 -- Missing/prunable checkouts have no directory, but their
                 -- session files still live in the per-cwd agent directory;
                 -- History.list() only encodes the path, so this works.
-                for _, info in ipairs(History.list(worktree.path)) do
+                --
+                -- Children are dropped here as well as in the cwd list: a
+                -- subagent's transcript belongs to `:PiSubSwitch`, and a dead
+                -- `sub-*` checkout holding one must not turn into a picker
+                -- partition of its own.
+                local listed = filter_top_level_sessions(History.list(worktree.path), { cwd, worktree.path })
+                for _, info in ipairs(listed) do
                     add(info, worktree)
                 end
             end
@@ -2922,7 +2958,7 @@ end
 ---@return string?
 local function find_continue_session_path(current_session_file, cwd)
     local History = require("pi.sessions.history")
-    local sessions_list = filter_top_level_sessions(History.list(cwd))
+    local sessions_list = filter_top_level_sessions(History.list(cwd), { cwd or vim.fn.getcwd() })
     for _, session in ipairs(sessions_list) do
         if session.path ~= current_session_file then
             return session.path
@@ -3159,7 +3195,7 @@ function show_resume_picker(items, opts)
 end
 
 --- Show a picker to resume a past session: this cwd's sessions plus the
---- sessions of every managed worktree of the same repository.
+--- sessions of every linked worktree of the same repository.
 ---
 --- Worktree rows carry their checkout metadata, so opening one restarts the
 --- process in that cwd instead of resuming the transcript in the main checkout.

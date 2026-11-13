@@ -813,3 +813,207 @@ describe("pi resume picker", function()
         assert.equals("PiSessionsListWorktree", hl)
     end)
 end)
+
+-- Cross-checkout collection (`resume_session` → `collect_resume_sessions`).
+--
+-- Which checkouts the picker enumerates is a collection question, so these
+-- specs assert the rows the collection produces (through the `vim.ui.select`
+-- fallback, which receives the final row list) rather than the layout rules —
+-- those live in `tests/resume_layout_spec.lua`.
+describe("pi resume picker cross-checkout collection", function()
+    local Manifest = require("pi.subsessions.manifest")
+    local real_is_child = Manifest.is_child_session
+
+    local dir
+    local ext
+    local calls
+    local first_tab
+    local tele
+
+    --- A row as `History.list` returns it.
+    ---@param path string
+    ---@param id string
+    ---@param modified integer
+    ---@param name string
+    ---@return pi.SessionInfo
+    local function session(path, id, modified, name)
+        return {
+            path = path,
+            id = id,
+            name = name,
+            timestamp = "2025-06-01T10:00:00.000Z",
+            first_message = "",
+            modified = modified,
+        }
+    end
+
+    --- A checkout `snapshot_worktrees` reports: gone from disk, patch on hand.
+    ---@param path string
+    ---@param name string
+    ---@return table
+    local function recovered(path, name)
+        return {
+            kind = "linked",
+            name = name,
+            path = path,
+            repo_root = dir,
+            git_dir = dir .. "/.git/worktrees/" .. name,
+            common_dir = dir .. "/.git",
+            missing = true,
+            prunable = true,
+        }
+    end
+
+    --- Group titles / session texts of the final rows, in display order.
+    ---
+    --- Rows come from the telescope picker's dynamic finder (the fake
+    --- telescope module records it), so a real telescope left on the
+    --- runtimepath by another spec cannot change the path under test.
+    ---@return string[] titles
+    ---@return string[] sessions
+    local function collect_rows()
+        local cfg = tele.new_cfgs[#tele.new_cfgs]
+        local rows = cfg.finder.fn("")
+        local titles, sessions = {}, {}
+        for _, row in ipairs(rows) do
+            if row.kind == "group" then
+                if row.worktree then
+                    titles[#titles + 1] = row.text
+                end
+            else
+                sessions[#sessions + 1] = row.text
+            end
+        end
+        return titles, sessions
+    end
+
+    before_each(function()
+        install_stub()
+        tele = install_fake_telescope()
+        first_tab = vim.api.nvim_get_current_tabpage()
+        calls = { list = 0, snapshot = 0 }
+        -- A repository whose only trace of other checkouts is git's own
+        -- registry: no `<repo>/.worktrees`, no snapshot store.
+        dir = vim.fn.tempname()
+        vim.fn.mkdir(dir .. "/.git/worktrees", "p")
+        ext = dir .. "/external"
+        vim.fn.mkdir(ext, "p")
+        Worktree.detect = function()
+            return { kind = "main", path = dir, repo_root = dir, common_dir = dir .. "/.git" }
+        end
+        Worktree.list = function(_, cb)
+            calls.list = calls.list + 1
+            cb({
+                {
+                    kind = "linked",
+                    name = "external",
+                    path = ext,
+                    repo_root = dir,
+                    git_dir = dir .. "/.git/worktrees/external",
+                    common_dir = dir .. "/.git",
+                    head = "",
+                    detached = true,
+                },
+            }, nil)
+        end
+        Worktree.snapshot_worktrees = function()
+            calls.snapshot = calls.snapshot + 1
+            return {}
+        end
+        History.list = function()
+            return { session(dir .. "/main.jsonl", "main", 100, "main work") }
+        end
+    end)
+
+    after_each(function()
+        Manifest.is_child_session = real_is_child
+        pcall(vim.fn.delete, dir, "rf")
+        remove_fake_telescope()
+        restore_stub(first_tab)
+    end)
+
+    it("enumerates a linked worktree created outside pi", function()
+        History.list = function(cwd)
+            if cwd == ext then
+                return { session(ext .. "/top.jsonl", "top", 200, "external work") }
+            end
+            return { session(dir .. "/main.jsonl", "main", 100, "main work") }
+        end
+
+        Sessions.resume_session()
+
+        assert.equals(1, calls.list, "git enumeration must not be limited to pi-managed checkouts")
+        local titles, sessions = collect_rows()
+        assert.same({ "󰙅 external" }, titles)
+        assert.same({ "2025-06-01  external work", "2025-06-01  main work" }, sessions)
+    end)
+
+    it("drops sub-session transcripts from a per-checkout listing", function()
+        History.list = function(cwd)
+            if cwd == ext then
+                return {
+                    session(ext .. "/top.jsonl", "top", 200, "external work"),
+                    session(ext .. "/kid.jsonl", "kid", 300, "subagent run"),
+                }
+            end
+            return { session(dir .. "/main.jsonl", "main", 100, "main work") }
+        end
+        Manifest.is_child_session = function(id)
+            return id == "kid"
+        end
+
+        Sessions.resume_session()
+
+        local titles, sessions = collect_rows()
+        assert.same({ "󰙅 external" }, titles)
+        assert.same({ "2025-06-01  external work", "2025-06-01  main work" }, sessions)
+        for _, text in ipairs(sessions) do
+            assert.is_nil(text:find("subagent run", 1, true), "a child transcript must not be a resumable row")
+        end
+    end)
+
+    it("keeps a snapshot-recoverable checkout only while it holds a top-level session", function()
+        local recovered_top = dir .. "/.worktrees/recovered"
+        local recovered_child = dir .. "/.worktrees/dead-kid"
+        Worktree.list = function(_, cb)
+            calls.list = calls.list + 1
+            cb({}, nil)
+        end
+        Worktree.snapshot_worktrees = function()
+            calls.snapshot = calls.snapshot + 1
+            return { recovered(recovered_top, "recovered"), recovered(recovered_child, "dead-kid") }
+        end
+        History.list = function(cwd)
+            if cwd == recovered_top then
+                return { session(recovered_top .. "/t.jsonl", "t", 200, "recovered work") }
+            end
+            if cwd == recovered_child then
+                return { session(recovered_child .. "/k.jsonl", "k", 400, "subagent run") }
+            end
+            return { session(dir .. "/main.jsonl", "main", 100, "main work") }
+        end
+        Manifest.is_child_session = function(id)
+            return id == "k"
+        end
+
+        Sessions.resume_session()
+
+        local titles, sessions = collect_rows()
+        -- The dead `sub-*` checkout holds only a child transcript, so it
+        -- contributes neither a title nor a row: no ghost partition.
+        assert.same({ "󰙅 recovered" }, titles)
+        assert.same({ "2025-06-01  recovered work", "2025-06-01  main work" }, sessions)
+    end)
+
+    it("never spawns git when the repository has no other checkout", function()
+        pcall(vim.fn.delete, dir .. "/.git", "rf")
+
+        Sessions.resume_session()
+
+        assert.equals(0, calls.list, "a single-checkout repository keeps the historical flat list")
+        assert.equals(0, calls.snapshot)
+        local titles, sessions = collect_rows()
+        assert.same({}, titles)
+        assert.same({ "2025-06-01  main work" }, sessions)
+    end)
+end)
