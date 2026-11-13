@@ -202,12 +202,23 @@ local ok, err = pcall(function()
     end
 
     Sessions.resume_session()
+    -- The git-side enumeration is asynchronous (`worktree list --porcelain`), so
+    -- the picker can arrive after `resume_session` returns; the stubs must stay
+    -- installed until it does, or the late callback would read the real
+    -- `History.list`.
+    local opened = vim.wait(5000, function()
+        return captured_items ~= nil
+    end, 20)
     History.list = orig_list
     vim.ui.select = orig_select
 
-    assert(type(captured_items) == "table", "resume_session should open picker")
+    assert(opened and type(captured_items) == "table", "resume_session should open picker")
     assert(#captured_items == 1, "resume picker should exclude sub-sessions")
-    assert(captured_items[1].session.id == "parent-resume-id", "only parent session remains")
+    -- The fallback backend receives the picker ROWS (`pi.sessions.resume_layout`),
+    -- so the session hangs off `row.item` — a single checkout stays flat, no title
+    -- row.
+    assert(captured_items[1].kind == "session", "a single checkout keeps a flat list")
+    assert(captured_items[1].item.session.id == "parent-resume-id", "only parent session remains")
     assert(Manifest.is_child_session("child-resume-id"), "child still in manifest for reuse")
 end)
 
