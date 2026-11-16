@@ -65,6 +65,13 @@ local function tab_count()
     return #vim.api.nvim_list_tabpages()
 end
 
+--- Wait for an asynchronous continuation (creation schedules its callback).
+---@param pred fun(): boolean
+---@return boolean
+local function wait_for(pred)
+    return vim.wait(500, pred, 10)
+end
+
 --- The managed checkout every test opens, plus the repository's main checkout
 --- (a directory inside the same repo that is *not* a worktree).
 local MAIN = { kind = "main", name = "repo", path = REPO, repo_root = REPO }
@@ -229,9 +236,9 @@ describe("open_existing target resolution", function()
         assert.is_nil(result.session)
         assert.is_string(result.err)
         assert.is_truthy(result.err:find("not found", 1, true))
-        -- A missing checkout points at the creating command, never at an
+        -- A missing checkout points at how to create one, never at an
         -- implicit create.
-        assert.is_truthy(result.err:find(":PiWorktreeNew missing", 1, true))
+        assert.is_truthy(result.err:find("create it with `git worktree add missing`", 1, true))
         assert.is_not_nil(find_note("not found", vim.log.levels.ERROR))
         assert.are.equal(tabs_before, tab_count())
         assert.are.equal(0, #created)
@@ -255,7 +262,7 @@ describe("open_existing target resolution", function()
         assert.are.equal(1, #created)
         assert.are.equal(REPO, created[1].cwd)
         -- A `kind == "main"` info must never become session metadata: it would
-        -- badge the main checkout as a worktree, refuse `:PiWorktreeNew` as
+        -- badge the main checkout as a worktree, refuse a nested create as
         -- "nested" and make `resolve_target(nil)` return it.
         assert.is_nil(created[1].worktree)
         assert.are.equal(0, #wt.calls.bind)
@@ -395,6 +402,127 @@ describe("open_existing tabs", function()
         -- The checkout predates the command: releasing it would delete the
         -- user's work.
         assert.are.equal(0, #wt.calls.release)
+    end)
+end)
+
+describe("create on a missing worktree name", function()
+    before_each(setup)
+    after_each(restore)
+
+    --- The checkout `brand-new` does not exist, so `create = true` must make it
+    --- and then open a session in the path the stub reports.
+    local NEW_PATH = REPO .. "/.worktrees/brand-new"
+
+    ---@param requests table[]
+    ---@return pi.TestWorktreeStub
+    local function install_create(requests)
+        return install_worktree({
+            create = function(opts, cb)
+                requests[#requests + 1] = opts
+                cb(fake_info({ name = opts.name, path = NEW_PATH }), nil)
+            end,
+        })
+    end
+
+    it("creates the named checkout and opens a session in it", function()
+        ---@type table[]
+        local requests = {}
+        install_create(requests)
+        local session = fake_session({ cwd = NEW_PATH })
+        install_sessions({ session = session })
+        local tabs_before = tab_count()
+
+        ---@type { session: pi.Session? }
+        local result = {}
+        WorktreeSession.open_existing({ name = "brand-new", create = true }, function(started)
+            result.session = started
+        end)
+        wait_for(function()
+            return result.session ~= nil
+        end)
+
+        assert.are.equal(1, #requests)
+        assert.are.equal("brand-new", requests[1].name)
+        assert.are.equal("new", requests[1].mode)
+        -- Base repository: no session in this tab, so Neovim's cwd.
+        assert.are.equal(vim.fs.normalize(vim.fn.getcwd()), vim.fs.normalize(requests[1].cwd))
+        assert.are.equal(session, result.session)
+        assert.are.equal(tabs_before + 1, tab_count())
+        assert.are.equal(1, #created)
+        assert.are.equal(NEW_PATH, created[1].cwd)
+        assert.are.equal("brand-new", created[1].worktree.name)
+        -- A created checkout is never released on the success path, and the
+        -- start is silent like every other `worktree=` open.
+        assert.are.equal(0, #notes)
+    end)
+
+    it(":Pi worktree=<new name> creates and reuses the current tab", function()
+        ---@type table[]
+        local requests = {}
+        install_create(requests)
+        install_sessions({ session = fake_session({ cwd = NEW_PATH }) })
+        local tabs_before = tab_count()
+
+        vim.cmd("Pi worktree=brand-new")
+        wait_for(function()
+            return #created > 0
+        end)
+
+        assert.are.equal(1, #requests)
+        assert.are.equal(tabs_before, tab_count())
+        assert.are.equal(NEW_PATH, created[1].cwd)
+        assert.are.equal(0, #notes)
+    end)
+
+    it("refuses a taken tab before creating anything", function()
+        ---@type table[]
+        local requests = {}
+        install_create(requests)
+        install_sessions({ current = fake_session({ worktree = fake_info() }) })
+        local tabs_before = tab_count()
+
+        vim.cmd("Pi worktree=brand-new")
+
+        assert.is_not_nil(find_note("already runs a session", vim.log.levels.ERROR))
+        -- The tab is checked first: a taken tab must not leave an empty
+        -- checkout on disk that cannot be opened.
+        assert.are.equal(0, #requests)
+        assert.are.equal(0, #created)
+        assert.are.equal(tabs_before, tab_count())
+    end)
+
+    it("refuses to create a nested worktree", function()
+        ---@type table[]
+        local requests = {}
+        install_create(requests)
+        install_sessions({ current = fake_session({ worktree = fake_info() }) })
+
+        vim.cmd("PiNewTab worktree=brand-new")
+
+        assert.is_not_nil(find_note("Nested worktrees are not supported", vim.log.levels.ERROR))
+        assert.are.equal(0, #requests)
+        assert.are.equal(0, #created)
+    end)
+
+    it("releases the fresh checkout when the session fails to start", function()
+        ---@type table[]
+        local requests = {}
+        local wt = install_create(requests)
+        install_sessions({ session = nil })
+        local tabs_before = tab_count()
+
+        vim.cmd("PiNewTab worktree=brand-new")
+        wait_for(function()
+            return #wt.calls.release > 0
+        end)
+
+        assert.are.equal(1, #requests)
+        assert.is_not_nil(find_note("Failed to start a session", vim.log.levels.ERROR))
+        -- The setup_cmd/includes already ran and the directory was created by
+        -- this call, so nothing of the user's is in it: release it.
+        assert.are.equal(1, #wt.calls.release)
+        assert.are.equal(NEW_PATH, wt.calls.release[1].info.path)
+        assert.are.equal(tabs_before, tab_count())
     end)
 end)
 

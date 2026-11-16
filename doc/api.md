@@ -26,24 +26,22 @@ pi.fork()                     -- new session from a past user message; picks for
                               -- messages, then prefills the prompt for re-asking (:PiFork)
 pi.clone()                    -- duplicate the current branch into a new session (:PiClone)
 pi.sessions()                 -- toggle the live sessions overview (:PiSessions)
-pi.worktree_new(opts?)        -- start a fresh session in a new git worktree (:PiWorktreeNew);
-                              -- opts: { name?, layout? }
-pi.worktree_fork(opts?)       -- fork the current conversation into a new git worktree (:PiWorktreeFork);
+pi.worktree_new(opts?)        -- start a fresh session in a new git worktree; opts: { name?, layout? }
+pi.worktree_fork(opts?)       -- fork the current conversation into a new git worktree;
                               -- opts: { name?, layout? }
 pi.worktree_open(opts?, cb?)  -- start a fresh session in an EXISTING directory (:Pi worktree=<name> /
                               -- :PiNewTab worktree=<name>; `:PiSessions` → W); opts: { name?, cwd?,
-                              -- layout?, new_tab? }. `name` must be a managed linked checkout;
-                              -- `cwd` may be any existing directory — a linked worktree (attached as
-                              -- worktree metadata) or the main checkout / plain dir (ordinary session)
+                              -- layout?, new_tab?, create? }. `name` is a managed linked checkout;
+                              -- `create = true` makes it first when it does not exist (the :Pi* commands
+                              -- pass it); `cwd` may be any existing directory — a linked worktree
+                              -- (attached as worktree metadata) or the main checkout / plain dir
 pi.worktree_branch(branch)    -- put the current worktree session on `branch`, creating it
-                              -- when it does not exist (:PiWorktreeBranch)
+                              -- when it does not exist
 pi.worktree_apply(opts?)      -- review a worktree's patch in the diff-review panel and apply it to
-                              -- the main checkout's working tree on accept (:PiWorktreeApply);
-                              -- opts: { name? }
+                              -- the main checkout's working tree on accept; opts: { name? }
 pi.worktree_ship(opts?)       -- prefill a worktree session's prompt with commit/push/PR
-                              -- instructions — never sent (:PiWorktreeShip); opts: { name? }
-pi.worktree_remove(opts?)     -- confirm, snapshot, then remove a worktree (:PiWorktreeRemove);
-                              -- opts: { name? }
+                              -- instructions — never sent; opts: { name? }
+pi.worktree_remove(opts?)     -- confirm, snapshot, then remove a worktree; opts: { name? }
 pi.tasks()                    -- toggle the background tasks panel (:PiTasks): the
                               -- background bash tasks reported by the bg-tasks
                               -- extension, with status and durations (see
@@ -136,7 +134,7 @@ Most functions are no-ops (or warn) when no session is active in the current tab
 
 ## Worktrees
 
-The seven `pi.worktree_*` entry points above cover the [`:PiWorktree*` commands](worktrees.md) and the `worktree=<name>` start flag, and share their rules: a session inside a worktree refuses to create a nested one, `worktree_apply` never commits and never touches the index, `worktree_ship` never sends the prompt, `worktree_remove` refuses while a live session runs in the checkout, and `worktree_open` never creates or removes a checkout — an existing one only. `worktree_open` is also the entry point behind `:PiSessions` → `W`: its `cwd` may be any existing directory, and only a linked worktree becomes worktree metadata (the main checkout, or a directory outside a repository, starts an ordinary session there).
+The seven `pi.worktree_*` entry points above are the **only** worktree surface — pi2.nvim ships no `:PiWorktree*` command, and the user-facing entry point for the first four is the `worktree=<name>` start flag (`:Pi` / `:PiNewTab`). They share their rules: a session inside a worktree refuses to create a nested one, creation releases the fresh checkout again when the session fails to start, `worktree_apply` never commits and never touches the index, `worktree_ship` never sends the prompt, `worktree_remove` refuses while a live session runs in the checkout, and `worktree_open` removes nothing — it opens an existing checkout, or creates one when `create = true` and the name is new. `worktree_open` is also the entry point behind `:PiSessions` → `W`: its `cwd` may be any existing directory, and only a linked worktree becomes worktree metadata (the main checkout, or a directory outside a repository, starts an ordinary session there).
 
 ```lua
 local pi = require("pi")
@@ -149,6 +147,10 @@ pi.worktree_fork({ name = "spike" })
 
 -- Fresh session in a checkout that already exists (no create, no remove).
 pi.worktree_open({ name = "fix-auth", layout = "side" }, function(session, err) ... end)
+
+-- Same, creating the checkout first when it does not exist (what the :Pi*
+-- commands pass) — a taken tab is refused before anything is created.
+pi.worktree_open({ name = "fix-auth", create = true, new_tab = false })
 
 -- An existing directory: a linked worktree keeps its metadata, the main
 -- checkout (or a plain project dir) starts an ordinary session there.
@@ -177,7 +179,7 @@ The git layer is a separate module, `require("pi.worktree")`, which is what `pi.
 | `Worktree.diff(info, cb, opts?)` | `cb(patch, err)` — `base_sha` → now (untracked files included), or `opts.from` → now for an incremental capture (a reused checkout's new work only). Capture is all-or-nothing: it errors (rather than returning a partial patch) when the worktree has more than 20 000 untracked files or an untracked path a patch cannot represent (a directory holding its own repository). |
 | `Worktree.snapshot(info, cb)` | `cb(path, err)` — writes that patch under `<git common dir>/pi2-worktree-snapshots/<name>/`, with the same all-or-nothing capture rules, so a failed snapshot never yields a truncated patch. A `<patch>.json` sidecar (`WorktreeSnapshotMeta`: name, path, repo_root, base_sha, head, created_at) keeps the snapshot self-describing after the checkout is gone. |
 | `Worktree.latest_snapshot(repo_root, name)` | `{ path, meta? }` — newest snapshot of a worktree (used to restore a missing checkout on resume). |
-| `Worktree.probe(target_dir, patch, cb)` | `cb("clean"\|"already"\|"conflict", err)` — `git apply --check`, then `--reverse --check`; nothing is written. Backs `:PiWorktreeApply`'s checked apply. |
+| `Worktree.probe(target_dir, patch, cb)` | `cb("clean"\|"already"\|"conflict", err)` — `git apply --check`, then `--reverse --check`; nothing is written. Backs `pi.worktree_apply`'s checked apply. |
 | `Worktree.apply_patch(target_dir, patch, cb)` | `cb(ok, err)` — `git apply` into `target_dir`'s **working tree only** (no index, no 3-way, no commit). Atomic: a conflicting hunk aborts the whole patch. |
 | `Worktree.branch(info, branch, cb)` | Attaches `branch` (creating it, or checking out the existing one). |
 | `Worktree.release(info, cb)` | `cb(removed, err)` — removes the checkout **only** when clean and not ahead of base. |

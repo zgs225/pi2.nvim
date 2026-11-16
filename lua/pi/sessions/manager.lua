@@ -176,7 +176,7 @@ end
 --- A session object loses its process-only metadata when its conversation is
 --- replaced by a resumed file; if the resolved cwd is a linked worktree, the
 --- worktree info must be re-detected (pure filesystem read) so that later
---- close/release and `:PiWorktreeShip` still resolve their target. Without it
+--- close/release and `pi.worktree_ship` still resolve their target. Without it
 --- a resumed worktree session looked like an ordinary session (`worktree=nil`)
 --- and was never released or shipped.
 ---@param session pi.Session
@@ -194,7 +194,7 @@ local function rebind_resumed_worktree(session, cwd)
     if type(detected) ~= "table" or detected.kind ~= "linked" then
         -- The resumed cwd is not a managed checkout (e.g. worktree → main):
         -- a worktree field left from the previous conversation would make
-        -- release/Ship point at an unrelated checkout.
+        -- release/`pi.worktree_ship` point at an unrelated checkout.
         session.worktree = nil
         return nil
     end
@@ -204,7 +204,7 @@ end
 
 --- Publish the backend-assigned session id/file onto the session's worktree
 --- metadata, so the worktree index can map worktree <-> session (for
---- `:PiWorktree*`, revive and the sessions list).
+--- `pi.worktree_*`, revive and the sessions list).
 ---
 --- No-op for ordinary sessions and until both id and file are known. Lazy
 --- pcall'd require keeps the manager independent of the worktree module's

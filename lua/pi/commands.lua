@@ -129,15 +129,6 @@ local function reject_worktree_flag(flags, command)
     return false
 end
 
---- Complete existing worktree names for `:PiWorktreeApply/Ship/Remove`.
----@param prefix string
----@return string[]
-local function complete_worktree_names(prefix)
-    return vim.tbl_filter(function(name)
-        return name:find(prefix, 1, true) == 1
-    end, worktree_names())
-end
-
 --- Handle :PiSteeringMode / :PiFollowUpMode. With a `mode` argument, set it
 --- directly (validated by the public setter); without one, read the backend's
 --- current value via `get_state` and switch to the other mode.
@@ -187,8 +178,9 @@ function M.setup()
         end
         if flags.worktree then
             -- Current tabpage: `open_existing` refuses when it already runs a
-            -- session, instead of silently stealing the tab.
-            Pi.worktree_open({ name = flags.worktree, layout = flags.opts.layout, new_tab = false })
+            -- session, instead of silently stealing the tab. A name that does
+            -- not exist yet is created (a fresh conversation, like `:PiNewTab`).
+            Pi.worktree_open({ name = flags.worktree, layout = flags.opts.layout, new_tab = false, create = true })
             return
         end
         Pi.toggle(flags.opts)
@@ -200,7 +192,7 @@ function M.setup()
             return
         end
         if flags.worktree then
-            Pi.worktree_open({ name = flags.worktree, layout = flags.opts.layout, new_tab = true })
+            Pi.worktree_open({ name = flags.worktree, layout = flags.opts.layout, new_tab = true, create = true })
             return
         end
         Pi.new_tab()
@@ -269,42 +261,6 @@ function M.setup()
     vim.api.nvim_create_user_command("PiClone", function()
         Pi.clone()
     end, { desc = "Duplicate current π session branch into a new session" })
-
-    vim.api.nvim_create_user_command("PiWorktreeNew", function(cmd)
-        Pi.worktree_new({ name = cmd.args ~= "" and cmd.args or nil })
-    end, { nargs = "?", desc = "Start a fresh π session in a new git worktree" })
-
-    vim.api.nvim_create_user_command("PiWorktreeFork", function(cmd)
-        Pi.worktree_fork({ name = cmd.args ~= "" and cmd.args or nil })
-    end, { nargs = "?", desc = "Fork the current π session into a new git worktree" })
-
-    vim.api.nvim_create_user_command("PiWorktreeBranch", function(cmd)
-        Pi.worktree_branch(cmd.args)
-    end, { nargs = 1, desc = "Put the current worktree π session on a branch" })
-
-    vim.api.nvim_create_user_command("PiWorktreeApply", function(cmd)
-        Pi.worktree_apply({ name = cmd.args ~= "" and cmd.args or nil })
-    end, {
-        nargs = "?",
-        complete = complete_worktree_names,
-        desc = "Review a worktree patch and apply it to the main checkout",
-    })
-
-    vim.api.nvim_create_user_command("PiWorktreeShip", function(cmd)
-        Pi.worktree_ship({ name = cmd.args ~= "" and cmd.args or nil })
-    end, {
-        nargs = "?",
-        complete = complete_worktree_names,
-        desc = "Prefill the chat prompt with worktree ship instructions",
-    })
-
-    vim.api.nvim_create_user_command("PiWorktreeRemove", function(cmd)
-        Pi.worktree_remove({ name = cmd.args ~= "" and cmd.args or nil })
-    end, {
-        nargs = "?",
-        complete = complete_worktree_names,
-        desc = "Confirm and remove a worktree (snapshot first)",
-    })
 
     vim.api.nvim_create_user_command("PiSessions", function()
         Pi.sessions()

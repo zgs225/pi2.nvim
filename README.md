@@ -245,8 +245,8 @@ require("pi").setup({
 
 | Command | Description |
 | --- | --- |
-| `:Pi [layout=side\|float] [worktree=<name>]` | Open or toggle the chat in the current tab (optionally in an existing worktree) |
-| `:PiNewTab [worktree=<name>]` | Open a fresh session in a new tabpage (optionally in an existing worktree) |
+| `:Pi [layout=side\|float] [worktree=<name>]` | Open or toggle the chat in the current tab (optionally in a worktree — created when the name does not exist) |
+| `:PiNewTab [worktree=<name>]` | Open a fresh session in a new tabpage (optionally in a worktree — created when the name does not exist) |
 | `:PiContinue [layout=side\|float]` | Continue the most recent session for the current working directory |
 | `:PiResume [layout=side\|float]` | Pick and resume a past session for the current working directory, grouped per checkout — with Telescope: `<CR>`/`o` here, `t`/`<C-t>` in a new tab |
 | `:PiToggleChat` | Toggle chat visibility |
@@ -261,12 +261,6 @@ require("pi").setup({
 | `:PiTree` | Navigate the session tree: jump back to any past conversation point |
 | `:PiFork` | Start a new session from a past user message (rewind and re-ask) |
 | `:PiClone` | Duplicate the current session branch into a new session file |
-| `:PiWorktreeNew [name]` | Start a fresh session in a new git worktree (`<repo>/.worktrees/<name>`, detached HEAD) — see [Worktrees](doc/worktrees.md) |
-| `:PiWorktreeFork [name]` | Fork this conversation into a new git worktree (parent session untouched) |
-| `:PiWorktreeBranch <branch>` | Put the current worktree session on a branch (creates it, or attaches the existing one) |
-| `:PiWorktreeApply [name]` | Review the worktree's patch and apply it to the main checkout's working tree on `a` (never commits) |
-| `:PiWorktreeShip [name]` | Prefill the worktree session's prompt with commit/push/PR instructions (not sent) |
-| `:PiWorktreeRemove [name]` | Confirm, snapshot, then remove a worktree (refused while a session runs in it) |
 | `:PiSessions` | Toggle the live sessions overview (all active sessions: name + busy/idle/attention) |
 | `:PiTasks` | Toggle the background tasks panel: background bash tasks (dev servers, long builds) with status, output viewer, and stop — requires the `bg-tasks` extension loaded (see [doc/usage.md](doc/usage.md#background-tasks)) |
 | `:PiSessionStats` | Show the session stats dashboard: messages, tokens (with cache split), per-model cost breakdown, cache re-billed waste, context usage — plus the vision extension's own usage (`Extensions` section) |
@@ -302,7 +296,7 @@ Detailed guides live in [`doc/`](doc/):
 | --- | --- |
 | [doc/usage.md](doc/usage.md) | Chat & layouts, prompt (submit/queue/abort), direct bash mode (`!`), background tasks (`:PiTasks`), prompt history & drafts, `@mentions`, slash commands, completion, attachments, zen mode, statusline, navigation, quickfix, tool blocks, todo list, models, thinking, markdown rendering, buffer reload, startup block |
 | [doc/sessions.md](doc/sessions.md) | One session per tab, storage & cwd scoping, continue/resume, sub-sessions (`:PiSub*`), session tree (`:PiTree`), fork/clone (`:PiFork`/`:PiClone`), sessions overview (`:PiSessions`), compaction |
-| [doc/worktrees.md](doc/worktrees.md) | Git worktree isolation: `:PiWorktreeNew`/`Fork`/`Branch`/`Apply`/`Ship`/`Remove`, `.worktreeinclude`, `setup_cmd`, detached HEAD, cleanup & snapshots, cross-worktree resume |
+| [doc/worktrees.md](doc/worktrees.md) | Git worktree isolation: creating and opening a checkout (`:PiNewTab worktree=<name>`, `pi.worktree_new`/`_fork`), `.worktreeinclude`, `setup_cmd`, detached HEAD, cleanup & snapshots, cross-worktree resume |
 | [doc/diff-review.md](doc/diff-review.md) | Two-way diff review of agent edits, review notes, permission-extension protocol reference, session diff review (`:PiDiff`) |
 | [doc/attention.md](doc/attention.md) | Attention queue, dialogs, notifications, queue inspection API |
 | [doc/extensions.md](doc/extensions.md) | Extension UI routing, startup announcements, `on_widget` custom blocks, adapting non-upstream RPC backends, bundled extensions (sub-agent, todo, background tasks) |
@@ -355,7 +349,7 @@ Everything below is present in `pi2.nvim` and **not** in upstream `alex35mil/pi.
 
 - [Sub-sessions & sub-agent orchestration](doc/sessions.md#sub-sessions) — run parallel background sub-sessions (`:PiSubNew`), switch between parent and children (`:PiSubSwitch`/`:PiSubParent`), inspect live streaming in a read-only float viewer (`:PiSubView`), with automatic manifest bookkeeping (`.pi2-subsessions.json`) and Agent tool integration.
 - [Sessions overview (`:PiSessions`)](doc/sessions.md#sessions-overview-pisessions) — a live, shared dashboard of every active session with animated status dots.
-- [Git worktree isolation](doc/worktrees.md) — run a session in its own checkout (`:PiWorktreeNew` / `:PiWorktreeFork`), review-and-apply its patch to the main checkout (`:PiWorktreeApply`), prefill a ship prompt (`:PiWorktreeShip`), snapshot-and-remove (`:PiWorktreeRemove`), with a worktree badge in the chat title and worktree groups in `:PiSessions`. Sub-agents run in the parent session's checkout, and `:PiResume` lists and reopens sessions in every linked worktree of the repository (git's view, so checkouts you created yourself are included).
+- [Git worktree isolation](doc/worktrees.md) — run a session in its own checkout (`:PiNewTab worktree=<name>` creates one, `pi.worktree_new` / `pi.worktree_fork` from Lua), review-and-apply its patch to the main checkout (`pi.worktree_apply`), prefill a ship prompt (`pi.worktree_ship`), snapshot-and-remove (`pi.worktree_remove`), with a worktree badge in the chat title and worktree groups in `:PiSessions`. Sub-agents run in the parent session's checkout, and `:PiResume` lists and reopens sessions in every linked worktree of the repository (git's view, so checkouts you created yourself are included).
 - [Session tree navigation (`:PiTree`)](doc/sessions.md#session-tree-navigation-pitree) — jump back to any past conversation point, optionally summarizing the abandoned branch.
 - [Fork and clone (`:PiFork` / `:PiClone`)](doc/sessions.md#fork-and-clone) — rewind to a past user message and re-ask in a new session, or duplicate the whole current branch into a new session file, mirroring the TUI's `/fork` and `/clone`.
 - [Per-tab model pinning](doc/usage.md#per-tab-model-pinning) — model switches in one tab don't leak into other tabs' new sessions.

@@ -253,7 +253,7 @@
 
 ---@class pi.WorktreeConfig
 ---@field setup_cmd? string[] Command run inside a freshly created worktree before the creation callback fires. Executed directly (no shell) with the worktree root as cwd; a non-zero exit keeps the worktree in place and fails the creation.
----@field snapshot_before_remove? boolean Write a patch snapshot before removing a worktree (`Worktree.remove`, `:PiWorktreeRemove`) (default true)
+---@field snapshot_before_remove? boolean Write a patch snapshot before removing a worktree (`Worktree.remove`, `pi.worktree_remove`) (default true)
 ---@field warn_on_cwd_mismatch? boolean Prefix the chat-title worktree badge with `⚠` when the session's cwd differs from Neovim's cwd (default true). false keeps the plain `󰙅 <name>` badge instead
 
 ---@class pi.DialogKeys

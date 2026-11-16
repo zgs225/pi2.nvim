@@ -208,8 +208,8 @@ require("pi").setup({
         enabled = true,
     },
 
-    -- Git worktree isolation (:PiWorktreeNew / Fork / Branch / Apply / Ship /
-    -- Remove). A worktree session runs its pi process with a linked checkout
+    -- Git worktree isolation (`pi.worktree_*`; no :Pi command). A worktree
+    -- session runs its pi process with a linked checkout
     -- under <repo>/.worktrees/<name> (detached HEAD) as cwd. See
     -- doc/worktrees.md.
     worktree = {
@@ -219,7 +219,7 @@ require("pi").setup({
         -- the checkout on disk but fails the creation (no session starts).
         setup_cmd = nil, -- e.g. { "mise", "install" }
         -- Snapshot a worktree's patch (base commit → now, untracked files
-        -- included) before :PiWorktreeRemove / Worktree.remove deletes it.
+        -- included) before pi.worktree_remove / Worktree.remove deletes it.
         -- When false, the confirmation warns that the work is lost.
         snapshot_before_remove = true,
         -- Prefix the chat-title worktree badge with ⚠ when the session's cwd

@@ -1,10 +1,10 @@
--- Worktree operations owned by pi.worktree_session + the commands/API layer:
---   * :PiWorktreeApply — review the worktree patch (diff-review panel), apply
+-- Worktree operations owned by pi.worktree_session + the `pi.worktree_*` API:
+--   * pi.worktree_apply — review the worktree patch (diff-review panel), apply
 --     to the main checkout only after explicit accept, empty/conflict/failure
 --     handling, never auto-apply.
---   * :PiWorktreeShip — prefill the target session's prompt with shipping
+--   * pi.worktree_ship — prefill the target session's prompt with shipping
 --     instructions, never send, switch tabs to an attached target.
---   * :PiWorktreeRemove — live-session refusal, dirty/ahead warning, snapshot
+--   * pi.worktree_remove — live-session refusal, dirty/ahead warning, snapshot
 --     before removal (failure blocks the delete), force remove.
 --   * release_orphan regression (release must receive a callback).
 -- All pi.worktree git operations are stubbed: no git checkout, no pi process.
@@ -312,7 +312,7 @@ describe("worktree target resolution", function()
     end)
 end)
 
-describe(":PiWorktreeApply", function()
+describe("pi.worktree_apply", function()
     local wt
     local info
     local apply_calls
@@ -536,7 +536,7 @@ describe(":PiWorktreeApply", function()
     end)
 end)
 
-describe(":PiWorktreeShip", function()
+describe("pi.worktree_ship", function()
     local wt
     local info
 
@@ -674,7 +674,7 @@ describe(":PiWorktreeShip", function()
     end)
 end)
 
-describe(":PiWorktreeRemove", function()
+describe("pi.worktree_remove", function()
     local wt
     local info
 
@@ -918,7 +918,7 @@ describe(":PiWorktreeRemove", function()
     end)
 end)
 
-describe("worktree command completion and public API", function()
+describe("worktree start-flag completion and public API", function()
     local wt
     local repo
 
@@ -936,19 +936,26 @@ describe("worktree command completion and public API", function()
 
     after_each(restore)
 
-    it("registers the phase-2 commands and public API", function()
+    it("exposes the public API without the removed user commands", function()
         local cmds = vim.api.nvim_get_commands({})
-        assert.is_not_nil(cmds["PiWorktreeApply"])
-        assert.is_not_nil(cmds["PiWorktreeShip"])
-        assert.is_not_nil(cmds["PiWorktreeRemove"])
+        for _, name in ipairs({
+            "PiWorktreeNew",
+            "PiWorktreeFork",
+            "PiWorktreeBranch",
+            "PiWorktreeApply",
+            "PiWorktreeShip",
+            "PiWorktreeRemove",
+        }) do
+            assert.is_nil(cmds[name])
+        end
         assert.is_function(Pi.worktree_apply)
         assert.is_function(Pi.worktree_ship)
         assert.is_function(Pi.worktree_remove)
     end)
 
-    it("completes existing worktree names and filters hidden entries", function()
-        local completions = vim.fn.getcompletion("PiWorktreeApply w", "cmdline")
-        assert.same({ "wt1", "wt2" }, completions)
+    it("completes existing worktree names for the worktree= start flag", function()
+        local completions = vim.fn.getcompletion("PiNewTab worktree=w", "cmdline")
+        assert.same({ "worktree=wt1", "worktree=wt2" }, completions)
     end)
 
     it("public API tolerates a nil opts table", function()

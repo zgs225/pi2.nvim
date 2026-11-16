@@ -5,8 +5,8 @@
 --     session.cwd/worktree, follow cwd on view switches and session loads,
 --   * close_session / stop / _process_exit release a worktree exactly once,
 --     after the process stopped,
---   * pi.worktree_session orchestrates :PiWorktreeNew / :PiWorktreeFork /
---     :PiWorktreeBranch and surfaces failures through Notify.
+--   * pi.worktree_session orchestrates pi.worktree_new / worktree_fork /
+--     worktree_branch and surfaces failures through Notify.
 --
 -- The specs drive real manager code against stubbed Rpc + a stubbed
 -- pi.worktree module: no pi process and no git checkouts.
@@ -965,17 +965,17 @@ describe("worktree session orchestration", function()
         restore()
     end)
 
-    it("registers the :PiWorktree* commands and public API", function()
+    it("exposes the public API without user commands", function()
         local cmds = vim.api.nvim_get_commands({})
-        assert.is_not_nil(cmds["PiWorktreeNew"])
-        assert.is_not_nil(cmds["PiWorktreeFork"])
-        assert.is_not_nil(cmds["PiWorktreeBranch"])
+        assert.is_nil(cmds["PiWorktreeNew"])
+        assert.is_nil(cmds["PiWorktreeFork"])
+        assert.is_nil(cmds["PiWorktreeBranch"])
         assert.is_function(Pi.worktree_new)
         assert.is_function(Pi.worktree_fork)
         assert.is_function(Pi.worktree_branch)
     end)
 
-    it(":PiWorktreeNew creates a worktree and starts a fresh session in it", function()
+    it("pi.worktree_new creates a worktree and starts a fresh session in it", function()
         Sessions.get = function()
             return fake_session()
         end
@@ -995,7 +995,7 @@ describe("worktree session orchestration", function()
         assert.equals(1, fake_child.chat.shown)
     end)
 
-    it(":PiWorktreeNew surfaces create failures", function()
+    it("pi.worktree_new surfaces create failures", function()
         worktree_stub.create = function(_, cb)
             cb(nil, "not a git repository")
         end
@@ -1040,7 +1040,7 @@ describe("worktree session orchestration", function()
         assert.is_not_nil(find_note("Failed to start a session in the worktree"))
     end)
 
-    it(":PiWorktreeFork bootstraps the child with --fork and keeps the parent untouched", function()
+    it("pi.worktree_fork bootstraps the child with --fork and keeps the parent untouched", function()
         local parent = fake_session()
         Sessions.get = function()
             return parent
@@ -1105,7 +1105,7 @@ describe("worktree session orchestration", function()
         assert.equals("forked question", fake_child.chat.user_messages[1].text)
     end)
 
-    it(":PiWorktreeNew does not replay the parent's history into the child", function()
+    it("pi.worktree_new does not replay the parent's history into the child", function()
         Sessions.get = function()
             return fake_session()
         end
@@ -1121,7 +1121,7 @@ describe("worktree session orchestration", function()
         assert.same({}, fake_child.chat.calls)
     end)
 
-    it(":PiWorktreeFork refuses while the source is streaming", function()
+    it("pi.worktree_fork refuses while the source is streaming", function()
         local parent = fake_session()
         parent.chat.stream = true
         Sessions.get = function()
@@ -1132,7 +1132,7 @@ describe("worktree session orchestration", function()
         assert.equals(0, #created)
     end)
 
-    it(":PiWorktreeFork refuses an empty conversation", function()
+    it("pi.worktree_fork refuses an empty conversation", function()
         local parent = fake_session({ session_file = nil })
         parent.rpc.send = function(_, cmd, cb)
             cb({
@@ -1152,7 +1152,7 @@ describe("worktree session orchestration", function()
         assert.equals(0, #created)
     end)
 
-    it(":PiWorktreeFork refuses when cli.args already selects a session", function()
+    it("pi.worktree_fork refuses when cli.args already selects a session", function()
         Sessions.get = function()
             return fake_session()
         end
@@ -1162,7 +1162,7 @@ describe("worktree session orchestration", function()
         assert.equals(0, #created)
     end)
 
-    it(":PiWorktreeBranch attaches the current worktree to a branch", function()
+    it("pi.worktree_branch attaches the current worktree to a branch", function()
         local calls = {}
         worktree_stub.branch = function(info, branch, cb)
             calls[#calls + 1] = { info = info, branch = branch }
@@ -1182,7 +1182,7 @@ describe("worktree session orchestration", function()
         assert.equals("feat/isolation", calls[1].branch)
     end)
 
-    it(":PiWorktreeBranch warns outside a worktree session", function()
+    it("pi.worktree_branch warns outside a worktree session", function()
         Sessions.get = function()
             return fake_session()
         end

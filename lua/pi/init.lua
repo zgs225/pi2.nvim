@@ -446,7 +446,7 @@ function M.clone()
     require("pi.fork").clone()
 end
 
---- Start a fresh conversation in a new git worktree (:PiWorktreeNew): the
+--- Start a fresh conversation in a new git worktree (`pi.worktree_new`): the
 --- worktree is created under `<repo>/.worktrees/<name>` on a detached HEAD and
 --- a new tab runs its pi process with that directory as cwd. The current tab's
 --- session is left untouched. Refused when the current session already runs in
@@ -456,7 +456,7 @@ function M.worktree_new(opts)
     require("pi.worktree_session").new(opts)
 end
 
---- Fork the current conversation into a new git worktree (:PiWorktreeFork):
+--- Fork the current conversation into a new git worktree (`pi.worktree_fork`):
 --- a new tab runs a fresh pi process in the worktree, bootstrapped from this
 --- session's active branch via `--fork <session file>`. The parent session and
 --- its file are left untouched. Refused while streaming, for an empty
@@ -468,15 +468,17 @@ end
 
 --- Open a fresh session in an **existing** directory
 --- (`:Pi worktree=<name>` / `:PiNewTab worktree=<name>`, `:PiSessions` → `W`):
---- nothing is created and nothing is ever removed, so a failure leaves the
---- user's work alone. `name` resolves to `<repo>/.worktrees/<name>` — a managed
---- linked checkout, or an error pointing at `:PiWorktreeNew`. `cwd` wins over
---- `name` and may be any existing directory: a linked worktree is attached as
---- worktree metadata (e.g. chat badge, `:PiWorktree*` targets), while the main
---- checkout or a plain project dir starts an ordinary session there. The current
---- tabpage is used when `new_tab = false` (refused while it already runs a
---- session), a new tab otherwise (default). Starting a session is silent;
---- failures notify.
+--- nothing is ever removed, so a failure leaves the user's work alone. `name`
+--- resolves to `<repo>/.worktrees/<name>` — a managed linked checkout, or an
+--- error naming how to create one (the `:Pi*` commands pass `create = true`,
+--- which creates the checkout first; the Lua default is an existing checkout
+--- only). `cwd` wins over `name` and may be any existing directory: a linked
+--- worktree is attached as worktree metadata (e.g. chat badge, `pi.worktree_*`
+--- targets), while the main checkout or a plain project dir starts an ordinary
+--- session there. The current tabpage is used when `new_tab = false` (refused
+--- while it already runs a session, before anything is created), a new tab
+--- otherwise (default). A checkout created by this call is released again when
+--- the session fails to start. Starting a session is silent; failures notify.
 ---@param opts pi.WorktreeOpenOpts
 ---@param callback? fun(session: pi.Session?, err?: string)
 function M.worktree_open(opts, callback)
@@ -484,14 +486,14 @@ function M.worktree_open(opts, callback)
 end
 
 --- Move the current worktree session onto an explicit branch
---- (:PiWorktreeBranch), since worktrees start on a detached HEAD.
+--- (`pi.worktree_branch`), since worktrees start on a detached HEAD.
 ---@param branch string
 function M.worktree_branch(branch)
     require("pi.worktree_session").branch(branch)
 end
 
 --- Review a worktree's patch in the diff-review panel and apply it to the
---- main checkout's working tree on explicit accept (:PiWorktreeApply).
+--- main checkout's working tree on explicit accept (`pi.worktree_apply`).
 --- Never commits, never touches the index, and never applies automatically.
 --- The patch includes untracked files, relative to the worktree's base
 --- commit. Refused when the diff is empty; a conflicting apply leaves both
@@ -502,7 +504,7 @@ function M.worktree_apply(opts)
 end
 
 --- Prefill the worktree session's chat prompt with ship instructions
---- (:PiWorktreeShip): absolute worktree path, detached HEAD/base commit, and
+--- (`pi.worktree_ship`): absolute worktree path, detached HEAD/base commit, and
 --- commit/push/PR/conflict requirements. The prompt is not sent and nothing
 --- is committed on the user's behalf. Switches to the target session's tab
 --- when it is a different (attached) session, otherwise reports why it cannot.
@@ -511,7 +513,7 @@ function M.worktree_ship(opts)
     require("pi.worktree_session").ship(opts)
 end
 
---- Remove a worktree after an explicit confirmation (:PiWorktreeRemove):
+--- Remove a worktree after an explicit confirmation (`pi.worktree_remove`):
 --- refuses while a session process still runs in it, warns about dirty/ahead
 --- work, snapshots the patch first (when `worktree.snapshot_before_remove` is
 --- enabled) and refuses to delete when the snapshot fails.

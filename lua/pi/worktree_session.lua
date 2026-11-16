@@ -1,7 +1,7 @@
---- Worktree session orchestration: `:PiWorktreeNew` / `:PiWorktreeFork` /
---- `:PiWorktreeBranch` / `:PiWorktreeApply` / `:PiWorktreeShip` /
---- `:PiWorktreeRemove`, plus the `worktree=<name>` start flag (`:Pi` /
---- `:PiNewTab`) that opens a session in an *existing* checkout.
+--- Worktree session orchestration behind the `pi.worktree_*` API
+--- (`pi.worktree_new` / `_fork` / `_branch` / `_apply` / `_ship` / `_remove`),
+--- plus the `worktree=<name>` start flag (`:Pi` / `:PiNewTab`) that opens a
+--- session in an *existing* checkout.
 ---
 --- The git side lives in `pi.worktree` (create/bind/release/branch/diff/snapshot/
 --- remove...); this module only sequences it with the session manager and the
@@ -27,7 +27,7 @@ local DiffReview = require("pi.ui.diff_review")
 ---@field layout? pi.LayoutMode Chat layout for the new tab.
 
 --- Target of the worktree operations that act on an existing checkout
---- (`:PiWorktreeApply/Ship/Remove`).
+--- (`pi.worktree_apply/ship/remove`).
 ---@class pi.WorktreeTargetOpts
 ---@field name? string Worktree name under `<repo>/.worktrees/` (default: the current session's worktree).
 
@@ -40,6 +40,8 @@ local DiffReview = require("pi.ui.diff_review")
 --- starts an ordinary session.
 ---@field layout? pi.LayoutMode Chat layout for the new session.
 ---@field new_tab? boolean Default true; false = current tabpage (refuses when it already runs a session).
+---@field create? boolean Create the checkout when `name` does not exist yet (default false = an existing
+--- checkout only). Never applies to `cwd`, and always starts a **fresh** conversation in the new checkout.
 
 --- Startup flags in `cli.args` that select/own a session. Combining them with
 --- the `--fork` we append makes pi exit before RPC starts, so the fork command
@@ -82,7 +84,7 @@ local function conflicting_session_flag(args)
 end
 
 --- Release a worktree that was created but could not get a session attached
---- (process start failed), so a failed `:PiWorktree*` does not leak an empty
+--- (process start failed), so a failed worktree start does not leak an empty
 --- checkout. Contract: `Worktree.release(info, cb)`.
 ---@param Worktree table
 ---@param info table
@@ -144,6 +146,7 @@ end
 ---@param name string?
 ---@return table? info
 ---@return string? err
+---@return "missing"? code Set when `err` only means "no checkout of that name exists yet".
 local function resolve_target(name)
     local Worktree = worktree_module()
     if not Worktree then
@@ -194,7 +197,7 @@ local function resolve_target(name)
 
     local path = repo_root .. "/.worktrees/" .. wanted
     if vim.fn.isdirectory(path) == 0 then
-        return nil, string.format("Worktree '%s' not found under %s/.worktrees", wanted, repo_root)
+        return nil, string.format("Worktree '%s' not found under %s/.worktrees", wanted, repo_root), "missing"
     end
     local info = type(Worktree.detect) == "function" and Worktree.detect(path) or nil
     if type(info) ~= "table" or info.kind ~= "linked" then
@@ -469,11 +472,13 @@ end
 --- metadata, while the main checkout — or a directory outside any repository —
 --- starts an ordinary session whose cwd is that path. A `name` reuses
 --- `resolve_target`, so it still has to be a managed linked checkout under
---- `<repo>/.worktrees/<name>`; a missing one is an error that points at
---- `:PiWorktreeNew`, never a creation.
+--- `<repo>/.worktrees/<name>`; a missing one is an error (the `"missing"` code
+--- lets `open_existing` create it when asked) that points at the two ways to
+--- create it, never an implicit create.
 ---@param opts pi.WorktreeOpenOpts
 ---@return pi.OpenTarget? target
 ---@return string? err
+---@return "missing"? code See `resolve_target`.
 local function resolve_open_target(opts)
     local Worktree = worktree_module()
     local cwd = type(opts.cwd) == "string" and vim.trim(opts.cwd) or ""
@@ -488,7 +493,7 @@ local function resolve_open_target(opts)
         -- Main checkout (`kind == "main"`) or no repository at all: an
         -- ordinary session. A main-kind info must *not* be attached as
         -- worktree metadata — `nesting_error` would then refuse
-        -- `:PiWorktreeNew` from this session, `resolve_target(nil)` would
+        -- `pi.worktree_new()` from this session, `resolve_target(nil)` would
         -- return the main checkout, and the chat would badge it as a worktree.
         return { cwd = cwd }
     end
@@ -499,18 +504,18 @@ local function resolve_open_target(opts)
 
     -- A `name` resolves through `resolve_target`; with neither given it falls
     -- back to the current session's worktree, the default
-    -- `:PiWorktreeShip` / `:PiWorktreeRemove` use.
+    -- `pi.worktree_ship` / `pi.worktree_remove` use.
     local name = type(opts.name) == "string" and vim.trim(opts.name) or ""
-    local info, err = resolve_target(name ~= "" and name or nil)
+    local info, err, code = resolve_target(name ~= "" and name or nil)
     if type(info) ~= "table" then
         local message = err or "No worktree target"
-        -- `resolve_target` reports a missing checkout by name; whoever typed
-        -- `worktree=<name>` most likely meant to create one, so point at the
-        -- command that does (this function never creates anything).
-        if name ~= "" and message:find("not found", 1, true) then
-            message = message .. "; use :PiWorktreeNew " .. name .. " to create it"
+        -- Whoever typed `worktree=<name>` most likely meant to create one, so
+        -- point at the two ways to create it (this function never creates
+        -- anything on its own; `open_existing` does, when `create` is set).
+        if code == "missing" then
+            message = message .. "; create it with `git worktree add " .. name .. "` or pi.worktree_new()"
         end
-        return nil, message
+        return nil, message, code
     end
     return { cwd = info.path, worktree = info }
 end
@@ -581,7 +586,7 @@ local function open_existing_session(target, opts)
         cwd = target.cwd,
         layout = opts.layout,
         -- nil = ordinary session: the manager must not badge the main checkout
-        -- as a worktree or treat it as one for `:PiWorktreeNew`.
+        -- as a worktree or treat it as one for `pi.worktree_new()`.
         worktree = target.worktree,
     })
     if not session then
@@ -662,7 +667,7 @@ local function nesting_error(session)
     return nil
 end
 
---- Create a worktree and open a fresh session in it (`:PiWorktreeNew`).
+--- Create a worktree and open a fresh session in it (`pi.worktree_new`).
 ---@param opts? pi.WorktreeOpts
 ---@param callback? fun(session: pi.Session?)
 function M.new(opts, callback)
@@ -695,7 +700,7 @@ function M.new(opts, callback)
     end)
 end
 
---- Fork the current conversation into a new worktree (`:PiWorktreeFork`).
+--- Fork the current conversation into a new worktree (`pi.worktree_fork`).
 ---
 --- The child process is bootstrapped with `--fork <source session file>`: the
 --- backend creates a new session (in the worktree's cwd) from the source
@@ -759,20 +764,90 @@ function M.fork(opts, callback)
     end)
 end
 
---- Open a fresh session in an **existing** directory (`:Pi worktree=<name>` /
---- `:PiNewTab worktree=<name>`, and `:PiSessions` → `W`).
+--- Refuse `new_tab = false` when the current tabpage already owns a session:
+--- two processes cannot share one tab's chat.
 ---
---- Nothing is created and nothing is removed. `name` must be a managed linked
---- checkout under `<repo>/.worktrees/<name>`; `cwd` may be any existing
---- directory — a linked worktree (attached as worktree metadata), the main
---- checkout or a plain project dir (both ordinary sessions). Only the *session*
---- is new — the directory keeps whatever state the user left in it, so a failed
---- start closes the scratch tab and leaves it untouched. Success is silent; only
---- failures notify.
+--- Checked before anything is resolved or created, so a taken tab never leaves
+--- an empty checkout behind.
+---@param opts pi.WorktreeOpenOpts
+---@param name? string Worktree name, for the `:PiNewTab worktree=…` hint.
+---@return string? err
+local function occupied_tab_error(opts, name)
+    if opts.new_tab ~= false then
+        return nil
+    end
+    local current = Sessions.get()
+    if not (current and current.rpc and current.rpc:is_running()) then
+        return nil
+    end
+    local hint = ":PiNewTab"
+    if type(name) == "string" and name ~= "" then
+        hint = hint .. " worktree=" .. name
+    end
+    return "This tab already runs a session; use " .. hint
+end
+
+--- Create the checkout a `worktree=<name>` start flag named, then open a
+--- session in it (`opts.create`).
+---
+--- The checkout is **brand new**, so a failed process start releases it again
+--- instead of leaving an empty directory behind — the opposite of
+--- `open_existing_session`, which must never delete a directory that predates
+--- the call. Nesting is refused like every other creation: a session already
+--- running in a worktree never spawns another checkout inside it.
+---@param opts pi.WorktreeOpenOpts
+---@param fail fun(message: string)
+---@param callback? fun(session: pi.Session?, err?: string)
+local function create_and_open(opts, fail, callback)
+    local Worktree = worktree_module()
+    if not Worktree or type(Worktree.create) ~= "function" then
+        fail("Worktree support is unavailable (pi.worktree module missing)")
+        return
+    end
+
+    local current = Sessions.get()
+    local nested = nesting_error(current)
+    if nested then
+        fail(nested)
+        return
+    end
+
+    local base_cwd = (current and current.cwd) or vim.fn.getcwd()
+    Worktree.create({ cwd = base_cwd, mode = "new", name = opts.name }, function(info, err)
+        vim.schedule(function()
+            if not valid_info(info) then
+                fail("Failed to create worktree: " .. tostring(err or "unknown error"))
+                return
+            end
+            local started, start_err = open_existing_session({ cwd = info.path, worktree = info }, opts)
+            if not started then
+                release_orphan(Worktree, info)
+                fail(start_err or ("Failed to start a session in " .. info.path))
+                return
+            end
+            if callback then
+                callback(started)
+            end
+        end)
+    end)
+end
+
+--- Open a fresh session in an existing directory (`:Pi worktree=<name>` /
+--- `:PiNewTab worktree=<name>`, and `:PiSessions` → `W`), creating the
+--- checkout first when `opts.create` is set and the name does not exist yet.
+---
+--- Without `create` nothing is created and nothing is removed. `name` must be
+--- a managed linked checkout under `<repo>/.worktrees/<name>`; `cwd` may be any
+--- existing directory — a linked worktree (attached as worktree metadata), the
+--- main checkout or a plain project dir (both ordinary sessions). Only the
+--- *session* is new — the directory keeps whatever state the user left in it,
+--- so a failed start closes the scratch tab and leaves it untouched. With
+--- `create` the checkout came from this call, so a failed start releases it.
+--- Success is silent; only failures notify.
 ---
 --- `new_tab = false` (= `:Pi worktree=`) refuses when the current tabpage
---- already runs a session: two processes owning one tab has no defined owner.
---- `new_tab = true` (= `:PiNewTab worktree=`) always opens a tab.
+--- already runs a session — before creating anything. `new_tab = true`
+--- (= `:PiNewTab worktree=`) always opens a tab.
 ---@param opts pi.WorktreeOpenOpts
 ---@param callback? fun(session: pi.Session?, err?: string)
 function M.open_existing(opts, callback)
@@ -786,24 +861,21 @@ function M.open_existing(opts, callback)
         end
     end
 
-    local target, err = resolve_open_target(opts)
-    if not target then
-        fail(err or "No session target")
+    local wanted = type(opts.name) == "string" and vim.trim(opts.name) or ""
+    local busy = occupied_tab_error(opts, wanted ~= "" and wanted or nil)
+    if busy then
+        fail(busy)
         return
     end
 
-    if opts.new_tab == false then
-        local current = Sessions.get()
-        if current and current.rpc and current.rpc:is_running() then
-            -- Touch nothing: the existing session (and its directory) stays as
-            -- it is; a second conversation belongs in its own tab.
-            local hint = ":PiNewTab"
-            if target.worktree then
-                hint = hint .. " worktree=" .. tostring(target.worktree.name or "<name>")
-            end
-            fail("This tab already runs a session; use " .. hint)
+    local target, err, code = resolve_open_target(opts)
+    if not target then
+        if opts.create == true and code == "missing" then
+            create_and_open(opts, fail, callback)
             return
         end
+        fail(err or "No session target")
+        return
     end
 
     local session, start_err = open_existing_session(target, opts)
@@ -820,7 +892,7 @@ function M.open_existing(opts, callback)
 end
 
 --- Move the current worktree session onto an explicit branch
---- (`:PiWorktreeBranch <branch>`): worktrees start on a detached HEAD, so
+--- (`pi.worktree_branch`): worktrees start on a detached HEAD, so
 --- there is otherwise no branch name for the work to land on.
 ---
 --- Tolerates both a synchronous `Worktree.branch(info, branch)` that returns
@@ -1084,7 +1156,7 @@ local function ship_template(info, status)
 end
 
 --- Prefill the target session's prompt with the ship template
---- (`:PiWorktreeShip`). Never sends: the user reviews and submits it.
+--- (`pi.worktree_ship`). Never sends: the user reviews and submits it.
 ---@param opts? pi.WorktreeTargetOpts
 ---@param callback? fun(ok: boolean, err?: string)
 function M.ship(opts, callback)
@@ -1181,7 +1253,7 @@ function M.ship(opts, callback)
     end
 end
 
---- Remove a worktree (`:PiWorktreeRemove`) after confirmation.
+--- Remove a worktree (`pi.worktree_remove`) after confirmation.
 ---
 --- Safety rules: a live session process refuses the removal outright (never
 --- delete a live cwd); a dirty/ahead checkout is flagged in the confirmation;
@@ -1500,7 +1572,7 @@ local function entry_integrated(entry)
 end
 
 --- Recreate a managed worktree that was removed (clean auto-release or
---- `:PiWorktreeRemove`) so a saved session can be resumed in its workspace.
+--- `pi.worktree_remove`) so a saved session can be resumed in its workspace.
 ---
 --- Recovery sources, in order: integration metadata on the session's manifest
 --- row (`Manifest.locate`), then the latest snapshot sidecar

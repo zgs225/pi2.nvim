@@ -28,7 +28,7 @@ Where the two-way review above intercepts a single edit _before_ it lands, `:PiD
 
 ### Accepting a patch in the panel
 
-The same panel renders one review that is not read-only: [`:PiWorktreeApply`](worktrees.md#applying-a-patch-piworktreeapply) opens a worktree's patch (base commit → now, untracked files included) with an **`a`** action whose hint names the destination (`a apply to <repo>`, the main checkout's directory name). Pressing `a` closes the panel and applies the whole patch to the main checkout's working tree with `git apply` — no index changes, no commit, and nothing applied if you just close the panel. A conflicting apply is atomic: both checkouts stay untouched.
+The same panel renders one review that is not read-only: [`pi.worktree_apply`](worktrees.md#applying-a-patch) opens a worktree's patch (base commit → now, untracked files included) with an **`a`** action whose hint names the destination (`a apply to <repo>`, the main checkout's directory name). Pressing `a` closes the panel and applies the whole patch to the main checkout's working tree with `git apply` — no index changes, no commit, and nothing applied if you just close the panel. A conflicting apply is atomic: both checkouts stay untouched.
 
 `a` only exists in a panel that was opened with an accept action (`diff_review.render(..., { on_accept = fn, accept_label = "apply to …" })`); the ordinary `:PiDiff` and pre-execution reviews bind nothing there, and `a` is not part of `diff.keys`.
 
