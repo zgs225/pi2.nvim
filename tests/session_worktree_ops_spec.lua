@@ -674,6 +674,110 @@ describe("pi.worktree_ship", function()
     end)
 end)
 
+-- A sub-agent that was *assigned* a worktree runs in a checkout it does not
+-- own. apply/ship may target it; remove/release keep resolving only owned
+-- checkouts (`session.worktree`), so an assignment can never be deleted by a
+-- command that assumed ownership.
+describe("assigned worktree targets", function()
+    local wt
+    local info
+
+    before_each(function()
+        install_spies()
+        info = fake_info()
+        wt = install_worktree()
+    end)
+
+    after_each(restore)
+
+    it("is not a target unless the command opts in", function()
+        Sessions.get = function()
+            return fake_session({ assigned_worktree = info, cwd = "/tmp/elsewhere" })
+        end
+        Sessions.list_all = function()
+            return {}
+        end
+
+        local resolved, err = WorktreeSession._resolve_target(nil)
+        assert.is_nil(resolved)
+        assert.is_truthy(err:find("not running in a worktree", 1, true))
+
+        local allowed, allowed_err = WorktreeSession._resolve_target(nil, nil, { assigned = true })
+        assert.is_nil(allowed_err)
+        assert.equals(info, allowed)
+    end)
+
+    it("ships to the session that was assigned the checkout", function()
+        local session = fake_session({ assigned_worktree = info, cwd = "/tmp/elsewhere" })
+        Sessions.get = function()
+            return session
+        end
+        Sessions.get_by_id = function()
+            return session
+        end
+        Sessions.list_all = function()
+            return { session }
+        end
+
+        local finished
+        WorktreeSession.ship({}, function(ok)
+            finished = ok
+        end)
+        wait_for(function()
+            return #session.drafts == 1 and finished == true
+        end)
+
+        assert.is_truthy(session.drafts[1]:find("/repo/.worktrees/wt1", 1, true))
+        assert.equals(0, session.sent)
+    end)
+
+    it("applies the assigned checkout's diff into its repository", function()
+        local apply_calls = {}
+        WorktreeSession._set_apply_runner(function(repo_root, patch, cb)
+            apply_calls[#apply_calls + 1] = { repo_root = repo_root, patch = patch }
+            cb(true)
+        end)
+        local session = fake_session({ assigned_worktree = info, cwd = "/tmp/elsewhere" })
+        Sessions.get = function()
+            return session
+        end
+        Sessions.list_all = function()
+            return { session }
+        end
+
+        local finished
+        WorktreeSession.apply({}, function(ok)
+            finished = ok
+        end)
+        wait_for(function()
+            return DiffReview.is_open()
+        end)
+        DiffReview._accept()
+        wait_for(function()
+            return #apply_calls == 1 and finished == true
+        end)
+        assert.equals("/repo", apply_calls[1].repo_root)
+        assert.equals(SAMPLE, apply_calls[1].patch)
+    end)
+
+    it("never removes an assigned checkout through a nameless target", function()
+        Sessions.get = function()
+            return fake_session({ assigned_worktree = info, cwd = "/tmp/elsewhere" })
+        end
+        Sessions.list_all = function()
+            return {}
+        end
+
+        WorktreeSession.remove({})
+        wait_for(function()
+            return find_note("No worktree target", vim.log.levels.ERROR) ~= nil
+        end)
+        assert.equals(0, #wt.calls.snapshot)
+        assert.equals(0, #wt.calls.remove)
+        assert.equals(0, #dialogs)
+    end)
+end)
+
 describe("pi.worktree_remove", function()
     local wt
     local info

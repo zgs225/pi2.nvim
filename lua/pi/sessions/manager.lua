@@ -45,6 +45,7 @@
 ---@field cwd string Working directory the session runs in (anchor for changed_files paths, prompt history and diffs). A worktree session's cwd is its worktree path.
 ---@field _process_cwd? string Working directory the process was *deliberately* started in (explicit `opts.cwd`: worktree or sub-session). Distinct from `cwd`, which a resume may adopt from the session file when the process cwd is not fixed.
 ---@field worktree? { name: string, path: string, repo_root?: string, base_sha?: string, mode?: string, forked_from?: table, [string]: any } Worktree metadata when this session runs in an isolated git worktree (managed by `pi.worktree`).
+---@field assigned_worktree? { kind: "linked", path: string, name?: string, repo_root?: string, git_dir?: string, common_dir?: string, base_sha?: string } Pre-existing linked worktree explicitly assigned to this child by its parent. Never owned by this session: no release, no bind, no resume rebind.
 ---@field forked_from? { session_id?: string, session_file?: string, worktree?: string } Source conversation for a worktree fork; surfaced by the sessions UI.
 ---@field _worktree_released? boolean True once release was dispatched for this session's worktree (guards close_session + process-exit double release).
 ---@field changed_files table<string, true> Set of file paths modified by edit/write tools during the current session.
@@ -60,6 +61,7 @@
 ---@field cwd? string Working directory for the new pi process (default: Neovim's cwd; a worktree path for worktree sessions).
 ---@field args? string[] Extra CLI args forwarded to the process (e.g. `{ "--fork", session_file }`).
 ---@field worktree? table Worktree metadata this session runs in (stored on `session.worktree`).
+---@field assigned_worktree? table Pre-existing linked worktree assigned by the parent (stored on `session.assigned_worktree`; never released or bound).
 ---@field subagent? boolean false marks a child (sub-session) process for `create_detached`.
 ---@field tools? string[] Child tool allowlist (see `pi.SubagentConfig.tools`); nil inherits every tool.
 
@@ -107,6 +109,59 @@ local registry = {}
 --- Chat UI instance per Neovim tabpage (view layer; rebindable across sessions).
 ---@type table<pi.TabId, pi.Chat>
 local tab_chats = {}
+
+--- Lightweight canonical-cwd reservation counts, held across the synchronous
+--- window in which a child process is being started. Not an exclusive lock:
+--- several children may share one worktree. Its only job is the release guard
+--- (see `release_session_worktree`): an owner closing right as a spawn starts
+--- must not delete the checkout before the new process is registered.
+---@type table<string, integer>
+local cwd_reservations = {}
+
+--- Canonical form used by the reservation counter and its release guard.
+---@param path string?
+---@return string?
+local function canonical_cwd_path(path)
+    if type(path) ~= "string" or path == "" then
+        return nil
+    end
+    return vim.fn.resolve(path)
+end
+
+--- Hold a canonical cwd while a child process is being registered.
+---@param path string?
+---@return string? key Canonical key (nil when the path was unusable).
+function M.reserve_cwd(path)
+    local key = canonical_cwd_path(path)
+    if not key then
+        return nil
+    end
+    cwd_reservations[key] = (cwd_reservations[key] or 0) + 1
+    return key
+end
+
+--- Drop one reservation taken by `M.reserve_cwd`.
+---@param path string?
+function M.release_cwd(path)
+    local key = canonical_cwd_path(path)
+    if not key then
+        return
+    end
+    local count = (cwd_reservations[key] or 0) - 1
+    if count > 0 then
+        cwd_reservations[key] = count
+    else
+        cwd_reservations[key] = nil
+    end
+end
+
+--- True while `path` has an in-flight spawn/revive reservation.
+---@param path string?
+---@return boolean
+function M.cwd_reserved(path)
+    local key = canonical_cwd_path(path)
+    return key ~= nil and (cwd_reservations[key] or 0) > 0
+end
 
 --- Which session id each tab's chat is currently bound to.
 ---@type table<pi.TabId, string>
@@ -158,6 +213,10 @@ local function resumed_session_cwd(session, session_path)
     if type(process_cwd) ~= "string" or process_cwd == "" then
         local worktree = session.worktree
         process_cwd = type(worktree) == "table" and worktree.path or nil
+    end
+    if type(process_cwd) ~= "string" or process_cwd == "" then
+        local assigned = session.assigned_worktree
+        process_cwd = type(assigned) == "table" and assigned.path or nil
     end
     if type(process_cwd) == "string" and process_cwd ~= "" then
         return vim.fn.isdirectory(process_cwd) == 1 and process_cwd or nil
@@ -212,6 +271,11 @@ end
 --- `Worktree.bind(info, { session_id, session_file }) -> ok, err`.
 ---@param session pi.Session
 local function bind_session_worktree(session)
+    -- An assigned worktree belongs to whoever created it: this child must never
+    -- publish a session binding into its metadata (no bind, no release).
+    if type(session.assigned_worktree) == "table" then
+        return
+    end
     local worktree = session.worktree
     if type(worktree) ~= "table" then
         return
@@ -267,10 +331,12 @@ local function session_using_cwd(session, path)
     for _, other in pairs(registry) do
         if other ~= session and other.rpc and other.rpc:is_running() then
             local worktree = other.worktree
+            local assigned = other.assigned_worktree
             if
                 same_path(other.cwd, path)
                 or same_path(other._process_cwd, path)
                 or (type(worktree) == "table" and same_path(worktree.path, path))
+                or (type(assigned) == "table" and same_path(assigned.path, path))
             then
                 return other
             end
@@ -294,6 +360,12 @@ end
 --- Contract: `Worktree.release(info, cb)` with `cb(removed, err)`.
 ---@param session pi.Session
 local function release_session_worktree(session)
+    -- Only an *owned* worktree is ever released. An explicitly assigned
+    -- checkout belongs to the user/owner: stop, close, crash and the reaper
+    -- must all leave it alone.
+    if type(session.assigned_worktree) == "table" then
+        return
+    end
     local worktree = session.worktree
     if type(worktree) ~= "table" then
         return
@@ -308,6 +380,11 @@ local function release_session_worktree(session)
         -- instance) may already have removed the checkout: nothing left to do,
         -- and calling release would only report a spurious "kept" error.
         if path and vim.fn.isdirectory(path) == 0 then
+            return
+        end
+        if path and M.cwd_reserved(path) then
+            -- A spawn/revive is registering a child in this checkout right now
+            -- (the live-session check cannot see it yet): keep it.
             return
         end
         if path and session_using_cwd(session, path) then
@@ -1570,13 +1647,18 @@ function M.create_detached(tab, opts)
     local cwd = resolve_session_cwd(opts)
     local explicit_cwd = type(opts.cwd) == "string" and opts.cwd ~= ""
     local worktree = opts.worktree
+    local assigned_worktree = opts.assigned_worktree
     local rpc = Rpc.new(tab)
     if
         not rpc:start({
             subagent = opts.subagent,
             tools = opts.tools,
             cwd = cwd,
-            worktree_path = type(worktree) == "table" and worktree.path or nil,
+            -- The extension channel only needs the directory the child runs
+            -- in: an owned worktree or an explicitly assigned one.
+            worktree_path = (type(worktree) == "table" and worktree.path)
+                or (type(assigned_worktree) == "table" and assigned_worktree.path)
+                or nil,
             extra_args = opts.args,
         })
     then
@@ -1593,6 +1675,7 @@ function M.create_detached(tab, opts)
         cwd = cwd,
         _process_cwd = explicit_cwd and cwd or nil,
         worktree = worktree,
+        assigned_worktree = assigned_worktree,
         changed_files = {},
     }
 
@@ -2208,8 +2291,13 @@ function load_session(session, session_path, opts, callback)
             end)
         end
         -- The loaded file does not carry worktree metadata; re-detect it from
-        -- the resolved cwd so release/Ship keep finding their target.
-        rebind_resumed_worktree(session, session.cwd)
+        -- the resolved cwd so release/Ship keep finding their target. An
+        -- assigned worktree is the parent's, not this session's: never turn it
+        -- into an owned one (that would make close release someone else's
+        -- checkout).
+        if type(session.assigned_worktree) ~= "table" then
+            rebind_resumed_worktree(session, session.cwd)
+        end
         bind_session_worktree(session)
         if opts.rebind_parent_context ~= false then
             require("pi.subsessions").on_parent_resumed(session, session_path)
@@ -3399,6 +3487,7 @@ function M._reset()
     end
     mirror_shims = {}
     detached_shim = nil
+    cwd_reservations = {}
     next_temp_id = 0
 end
 

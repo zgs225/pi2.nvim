@@ -25,6 +25,7 @@ local MANIFEST_FILE = ".pi2-subsessions.json"
 ---@field workspace? string Workspace cwd that owns this row (the parent session's cwd). Recorded so a row found on disk — whose workspace directory name cannot be decoded — still yields a usable base for revive/rebuild.
 ---@field session_file? string pi session transcript file reported by the backend at spawn/revive. Authoritative for a child whose JSONL lives in another workspace (its own worktree).
 ---@field worktree? table Worktree metadata when the child runs in an isolated checkout (recorded by `pi.subsessions.spawn`).
+---@field assigned_worktree? table Pre-existing linked worktree explicitly assigned to this child. Never owned: close/crash/reaper never release it, and a revive revalidates it instead of falling back.
 
 local LINEAGE_KEY = "__lineage__"
 

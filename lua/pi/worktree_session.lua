@@ -199,6 +199,25 @@ local function repo_scope_root(Worktree, repo_cwd)
     return root
 end
 
+--- The checkout a session was *assigned* (sub-agent worktree isolation): a
+--- linked worktree the session was handed but does not own, so nothing here may
+--- release or remove it. Ownership keeps reading `session.worktree`.
+---@param session pi.Session?
+---@return table?
+local function assigned_worktree(session)
+    local assigned = session and session.assigned_worktree
+    if type(assigned) ~= "table" then
+        return nil
+    end
+    if type(assigned.path) ~= "string" or assigned.path == "" then
+        return nil
+    end
+    if assigned.kind ~= nil and assigned.kind ~= "linked" then
+        return nil
+    end
+    return assigned
+end
+
 --- Resolve the worktree a command targets.
 ---
 --- Without a name this is the current session's worktree (falling back to the
@@ -212,12 +231,19 @@ end
 --- only scopes a *name*, so an explicit scope without a name is an error: the
 --- nameless fallback (this tab's worktree) would resolve in another repository,
 --- and a later create would produce an unnamed checkout.
+---
+--- `opts.assigned` (apply/ship only) lets the resolution fall back to the
+--- checkout this session was *assigned* as a sub-agent. Removal never passes it:
+--- an assigned checkout is not owned by this session, so `pi.worktree_remove`
+--- must keep resolving exactly the checkouts it did before.
 ---@param name string?
 ---@param repo_cwd string? Explicit repository scope; nil = the current session's repository.
+---@param opts? { assigned?: boolean } Allow the session's assigned worktree as the target.
 ---@return table? info
 ---@return string? err
 ---@return "missing"? code Set when `err` only means "no checkout of that name exists yet".
-local function resolve_target(name, repo_cwd)
+local function resolve_target(name, repo_cwd, opts)
+    opts = opts or {}
     local Worktree = worktree_module()
     if not Worktree then
         return nil, "Worktree support is unavailable (pi.worktree module missing)"
@@ -235,6 +261,9 @@ local function resolve_target(name, repo_cwd)
 
     local session = Sessions.get()
     local current = session and type(session.worktree) == "table" and session.worktree or nil
+    -- Only when this session owns no checkout: an assigned one is a read/apply
+    -- target, never an ownership claim.
+    local assigned = (not current) and opts.assigned and assigned_worktree(session) or nil
     local wanted = type(name) == "string" and vim.trim(name) or ""
 
     if wanted == "" then
@@ -243,6 +272,9 @@ local function resolve_target(name, repo_cwd)
         end
         if current then
             return current
+        end
+        if assigned then
+            return assigned
         end
         local cwd = (session and session.cwd) or vim.fn.getcwd()
         local detected = type(Worktree.detect) == "function" and Worktree.detect(cwd) or nil
@@ -268,6 +300,13 @@ local function resolve_target(name, repo_cwd)
         -- happens to run in.
         if not scope_root or same_path(current.repo_root, scope_root) then
             return current
+        end
+    end
+    -- An assigned checkout can also be addressed by name; the same repository
+    -- scoping applies.
+    if assigned and assigned.name == wanted then
+        if not scope_root or same_path(assigned.repo_root, scope_root) then
+            return assigned
         end
     end
 
@@ -342,21 +381,31 @@ local function live_session_for(info)
 end
 
 --- Registered session bound to a worktree, current tab first.
+---
+--- A session that was *assigned* the checkout (sub-agent isolation) counts: the
+--- checkout is where its chat and prompt live, even though it owns nothing and
+--- must never be released or removed through it.
 ---@param info table
 ---@return pi.Session?
 local function session_for_worktree(info)
+    ---@param session pi.Session?
+    ---@return boolean
+    local function bound(session)
+        return session ~= nil
+            and (same_worktree(session.worktree, info) or same_worktree(assigned_worktree(session), info))
+    end
     local current = Sessions.get()
-    if current and same_worktree(current.worktree, info) then
+    if bound(current) then
         return current
     end
     if type(info.session_id) == "string" and info.session_id ~= "" then
         local by_id = Sessions.get_by_id(info.session_id)
-        if by_id and same_worktree(by_id.worktree, info) then
+        if bound(by_id) then
             return by_id
         end
     end
     for _, session in ipairs(Sessions.list_all()) do
-        if same_worktree(session.worktree, info) then
+        if bound(session) then
             return session
         end
     end
@@ -431,10 +480,11 @@ end
 --- Test hook: resolve a target worktree the way the commands do.
 ---@param name string?
 ---@param repo_cwd string? Explicit repository scope (default: the current session's repository).
+---@param opts? { assigned?: boolean } Allow the session's assigned worktree (apply/ship do).
 ---@return table? info
 ---@return string? err
-function M._resolve_target(name, repo_cwd)
-    return resolve_target(name, repo_cwd)
+function M._resolve_target(name, repo_cwd, opts)
+    return resolve_target(name, repo_cwd, opts)
 end
 
 --- Close the tabpage `open_worktree_session` just created after a session
@@ -1078,7 +1128,7 @@ function M.apply(opts, callback)
         end
         return
     end
-    local info, err = resolve_target(opts.name)
+    local info, err = resolve_target(opts.name, nil, { assigned = true })
     if type(info) ~= "table" then
         Notify.error(err or "No worktree target")
         if callback then
@@ -1270,7 +1320,7 @@ end
 ---@param callback? fun(ok: boolean, err?: string)
 function M.ship(opts, callback)
     opts = opts or {}
-    local info, err = resolve_target(opts.name)
+    local info, err = resolve_target(opts.name, nil, { assigned = true })
     if type(info) ~= "table" then
         Notify.error(err or "No worktree target")
         if callback then

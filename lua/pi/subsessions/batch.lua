@@ -37,6 +37,7 @@ local waiters = {}
 ---@field model? pi.ModelRef
 ---@field thinking_level? string
 ---@field tools? string[] Child tool allowlist (spawn items only; nil = inherit every tool)
+---@field worktree? { path: string, name?: string } Explicit linked worktree assignment: the request `{ path }` before launch, the canonical `{ path, name? }` result after a successful spawn/revive.
 ---@field status "queued"|"spawning"|"running"|"ok"|"failed"|"cancelled"
 ---@field generation? integer Run generation the item was dispatched against.
 ---@field output? string
@@ -517,7 +518,7 @@ local function normalize_item(raw, index)
     if is_reuse then
         -- Spawn-only fields are rejected rather than silently dropped: a reused
         -- child keeps its own model/thinking level, name and tool allowlist.
-        for _, field in ipairs({ "name", "model", "thinking_level", "tools" }) do
+        for _, field in ipairs({ "name", "model", "thinking_level", "tools", "worktree" }) do
             if present(raw[field]) then
                 return nil, ("item %d: `%s` is not accepted on a reuse item ({ target, message })"):format(index, field)
             end
@@ -540,6 +541,9 @@ local function normalize_item(raw, index)
         if tools_err then
             return nil, ("item %d: %s"):format(index, tools_err)
         end
+        -- Preserved verbatim here and validated by `Subsessions.spawn` (which
+        -- owns the linked-worktree/repo rules); batch only carries the request.
+        local worktree = present(raw.worktree) and raw.worktree or nil
         return {
             ref = ref,
             task = raw.task,
@@ -547,6 +551,7 @@ local function normalize_item(raw, index)
             model = present(raw.model) and raw.model or nil,
             thinking_level = present(raw.thinking_level) and raw.thinking_level or nil,
             tools = tools,
+            worktree = worktree,
             status = "queued",
         },
             nil
@@ -558,9 +563,10 @@ end
 ---@param parent pi.Session
 local function run_batch(batch, parent)
     local Subsessions = require("pi.subsessions")
-    -- The batch belongs to the parent session's workspace: every manifest /
-    -- batch lookup in this closure must resolve against it, not Neovim's cwd.
-    local cwd = parent and parent.cwd or batch.cwd
+    -- The batch belongs to the parent session's **manifest workspace**, not its
+    -- process cwd: an assigned child runs in a shared worktree while its rows
+    -- (and any nested dispatch) stay in the original owner workspace.
+    local cwd = Manifest.workspace(parent) or batch.cwd
 
     ---@param item pi.SubsessionBatchItem
     local function start_item(item)
@@ -597,6 +603,7 @@ local function run_batch(batch, parent)
                 model = item.model,
                 thinking_level = item.thinking_level,
                 tools = item.tools,
+                worktree = item.worktree,
                 agent_spawned = true,
             }, function(child, err)
                 local b, live = live_item("spawning")
@@ -623,6 +630,12 @@ local function run_batch(batch, parent)
                 local entry = Manifest.load(cwd)[child.id]
                 live.target = child.id
                 live.generation = entry and entry.run_generation
+                -- After a successful launch the item reports the canonical
+                -- assignment the child actually runs in (name optional).
+                local assigned = child.assigned_worktree
+                if type(assigned) == "table" and type(assigned.path) == "string" then
+                    live.worktree = { path = assigned.path, name = assigned.name }
+                end
                 live.status = "running"
                 persist(b, cwd)
             end)
@@ -648,6 +661,12 @@ local function run_batch(batch, parent)
             end
             local gen = M.bump_generation(target, parent.conversation_epoch, cwd)
             live.generation = gen
+            -- A revived child keeps its spawn-time assignment; surface the
+            -- canonical root on the item as well.
+            local assigned = child.assigned_worktree
+            if type(assigned) == "table" and type(assigned.path) == "string" then
+                live.worktree = { path = assigned.path, name = assigned.name }
+            end
             live.status = "running"
             persist(b, cwd)
             child.rpc:send({ type = "prompt", message = item.message }, function(res)
@@ -707,9 +726,10 @@ end
 ---@param callback fun(result: table)
 function M.dispatch(parent, opts, callback)
     local subcfg = Config.options.subagent or {}
-    -- The batch and its manifest rows belong to the parent session's workspace
-    -- (a worktree session keeps them in the worktree's session directory).
-    local cwd = type(parent.cwd) == "string" and parent.cwd or nil
+    -- The batch and its manifest rows belong to the parent session's manifest
+    -- workspace, not its process cwd (an assigned child's cwd is its shared
+    -- worktree). This keeps nested dispatch / poll / wait in one scope.
+    local cwd = Manifest.workspace(parent)
     if subcfg.enabled == false then
         callback({ error = "subagent disabled" })
         return
