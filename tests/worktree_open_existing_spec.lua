@@ -526,6 +526,386 @@ describe("create on a missing worktree name", function()
     end)
 end)
 
+describe("repo_cwd repository scope", function()
+    before_each(setup)
+    after_each(restore)
+
+    -- A second repository whose managed checkout carries the *same* name as the
+    -- one in REPO: the case a cross-repo `current.name == wanted` shortcut
+    -- would silently get wrong.
+    local REPO_B = vim.fn.tempname()
+    local CHECKOUT_B = REPO_B .. "/.worktrees/wt1"
+    local NEW_B = REPO_B .. "/.worktrees/brand-new"
+    vim.fn.mkdir(CHECKOUT_B, "p")
+
+    local MAIN_B = { kind = "main", name = "repo-b", path = REPO_B, repo_root = REPO_B }
+
+    --- Detect stub covering both repositories: each `.worktrees/<name>` is a
+    --- linked checkout of its own repo, each repo root is that repo's main
+    --- checkout, anything else is unknown (not a git repository).
+    ---@param overrides? table
+    ---@return pi.TestWorktreeStub
+    local function install_two_repos(overrides)
+        local extra = vim.deepcopy(overrides or {})
+        extra.detect = function(dir)
+            if type(dir) ~= "string" then
+                return nil
+            end
+            local norm = vim.fs.normalize(dir)
+            if norm == vim.fs.normalize(CHECKOUT) then
+                return fake_info()
+            end
+            if norm == vim.fs.normalize(CHECKOUT_B) then
+                return fake_info({ path = CHECKOUT_B, repo_root = REPO_B })
+            end
+            if norm == vim.fs.normalize(REPO) then
+                return MAIN
+            end
+            if norm == vim.fs.normalize(REPO_B) then
+                return MAIN_B
+            end
+            return nil
+        end
+        return install_worktree(extra)
+    end
+
+    --- `Worktree.create` stub that records its requests.
+    ---@param requests table[]
+    ---@param result fun(opts: table): table?, string?
+    local function install_create(requests, result)
+        return install_two_repos({
+            create = function(opts, cb)
+                requests[#requests + 1] = opts
+                local info, err = result(opts)
+                cb(info, err)
+            end,
+        })
+    end
+
+    it("resolves a name in the explicit repository, not the tab's checkout", function()
+        local wt = install_two_repos()
+        -- The current tab runs in REPO's worktree, also called `wt1`.
+        local current = fake_session({ worktree = fake_info(), cwd = CHECKOUT })
+        install_sessions({ current = current, session = fake_session({ cwd = CHECKOUT_B }) })
+
+        ---@type { session: pi.Session?, err: string? }
+        local result = {}
+        WorktreeSession.open_existing({ name = "wt1", repo_cwd = REPO_B }, function(session, err)
+            result.session = session
+            result.err = err
+        end)
+
+        assert.is_nil(result.err)
+        assert.is_not_nil(result.session)
+        -- The identical name in the other repository must resolve there: the
+        -- `current.name == wanted` shortcut may not cross repositories.
+        assert.are.equal(CHECKOUT_B, created[1].cwd)
+        assert.are.equal(CHECKOUT_B, created[1].worktree.path)
+        assert.are.equal(REPO_B, created[1].worktree.repo_root)
+        assert.are.equal(1, #wt.calls.bind)
+        assert.are.equal(0, #notes)
+    end)
+
+    it("reports a missing name against the explicit repository", function()
+        install_two_repos()
+        install_sessions({ current = fake_session({ worktree = fake_info(), cwd = CHECKOUT }) })
+
+        ---@type { err: string? }
+        local result = {}
+        WorktreeSession.open_existing({ name = "nope", repo_cwd = REPO_B }, function(_, err)
+            result.err = err
+        end)
+
+        assert.is_string(result.err)
+        assert.is_truthy(result.err:find(REPO_B .. "/.worktrees", 1, true))
+        assert.are.equal(0, #created)
+    end)
+
+    it("creates in the explicit repository, not from the tab's cwd", function()
+        ---@type table[]
+        local requests = {}
+        install_create(requests, function(opts)
+            return fake_info({ name = opts.name, path = NEW_B, repo_root = REPO_B }), nil
+        end)
+        -- A session elsewhere must not become the creation base.
+        install_sessions({ session = fake_session({ cwd = NEW_B }) })
+
+        ---@type { session: pi.Session?, err: string? }
+        local result = {}
+        WorktreeSession.open_existing({ name = "brand-new", repo_cwd = REPO_B, create = true }, function(s, err)
+            result.session = s
+            result.err = err
+        end)
+        wait_for(function()
+            return result.session ~= nil or result.err ~= nil
+        end)
+
+        assert.is_nil(result.err)
+        assert.are.equal(1, #requests)
+        assert.are.equal("brand-new", requests[1].name)
+        assert.are.equal(vim.fs.normalize(REPO_B), vim.fs.normalize(requests[1].cwd))
+        assert.are.equal(NEW_B, created[1].cwd)
+        assert.are.equal(0, #notes)
+    end)
+
+    it("creates from an explicit main root while the tab runs in a worktree", function()
+        ---@type table[]
+        local requests = {}
+        local new_path = REPO .. "/.worktrees/from-main"
+        install_create(requests, function(opts)
+            return fake_info({ name = opts.name, path = new_path }), nil
+        end)
+        local current = fake_session({ worktree = fake_info(), cwd = CHECKOUT })
+        install_sessions({ current = current, session = fake_session({ cwd = new_path }) })
+
+        ---@type { session: pi.Session?, err: string? }
+        local result = {}
+        WorktreeSession.open_existing({ name = "from-main", repo_cwd = REPO, create = true }, function(s, err)
+            result.session = s
+            result.err = err
+        end)
+        wait_for(function()
+            return result.session ~= nil or result.err ~= nil
+        end)
+
+        -- An explicit repository scope makes the tab's own worktree irrelevant:
+        -- the checkout is requested in the named repository, not nested in the
+        -- worktree this tab runs in.
+        assert.is_nil(find_note("Nested worktrees are not supported"))
+        assert.is_nil(result.err)
+        assert.are.equal(1, #requests)
+        assert.are.equal(vim.fs.normalize(REPO), vim.fs.normalize(requests[1].cwd))
+        assert.are.equal(new_path, created[1].cwd)
+    end)
+
+    it("still leaves a linked repo_cwd to Worktree.create to refuse", function()
+        ---@type table[]
+        local requests = {}
+        install_create(requests, function()
+            return nil, "worktree: cannot create a worktree from a linked worktree"
+        end)
+        install_sessions({})
+
+        ---@type { session: pi.Session?, err: string? }
+        local result = {}
+        WorktreeSession.open_existing({ name = "brand-new", repo_cwd = CHECKOUT, create = true }, function(s, err)
+            result.session = s
+            result.err = err
+        end)
+        wait_for(function()
+            return result.session ~= nil or result.err ~= nil
+        end)
+
+        assert.is_nil(result.session)
+        -- The scope is handed to the git side as-is (a real linked cwd is
+        -- rejected there), and nothing is opened on failure.
+        assert.are.equal(1, #requests)
+        assert.are.equal(vim.fs.normalize(CHECKOUT), vim.fs.normalize(requests[1].cwd))
+        assert.is_not_nil(find_note("Failed to create worktree", vim.log.levels.ERROR))
+        assert.are.equal(0, #created)
+    end)
+
+    it("fails clearly for a repo_cwd that does not exist and writes nothing", function()
+        ---@type table[]
+        local requests = {}
+        install_create(requests, function()
+            return fake_info(), nil
+        end)
+        install_sessions({ current = fake_session({ worktree = fake_info(), cwd = CHECKOUT }) })
+        local tabs_before = tab_count()
+
+        ---@type { session: pi.Session?, err: string? }
+        local result = {}
+        WorktreeSession.open_existing({ name = "wt1", repo_cwd = REPO_B .. "/nope", create = true }, function(s, err)
+            result.session = s
+            result.err = err
+        end)
+
+        assert.is_nil(result.session)
+        assert.is_string(result.err)
+        assert.is_truthy(result.err:find("Directory not found", 1, true))
+        assert.is_not_nil(find_note("Directory not found", vim.log.levels.ERROR))
+        -- A bad scope never falls back to the tab's repository and never
+        -- creates anything.
+        assert.are.equal(0, #requests)
+        assert.are.equal(0, #created)
+        assert.are.equal(tabs_before, tab_count())
+    end)
+
+    it("fails clearly for a repo_cwd outside any git repository and writes nothing", function()
+        local plain = vim.fn.tempname()
+        vim.fn.mkdir(plain, "p")
+        ---@type table[]
+        local requests = {}
+        install_create(requests, function()
+            return fake_info(), nil
+        end)
+        install_sessions({})
+
+        ---@type { session: pi.Session?, err: string? }
+        local result = {}
+        WorktreeSession.open_existing({ name = "wt1", repo_cwd = plain, create = true }, function(s, err)
+            result.session = s
+            result.err = err
+        end)
+
+        assert.is_nil(result.session)
+        assert.is_string(result.err)
+        assert.is_truthy(result.err:find("Not inside a git repository", 1, true))
+        assert.is_not_nil(find_note("Not inside a git repository", vim.log.levels.ERROR))
+        assert.are.equal(0, #requests)
+        assert.are.equal(0, #created)
+    end)
+
+    it("refuses an explicit scope without a name instead of using the tab's worktree", function()
+        ---@type table[]
+        local requests = {}
+        install_create(requests, function()
+            return fake_info(), nil
+        end)
+        -- The tab runs in REPO's worktree: the nameless fallback would resolve
+        -- *there*, crossing the repository the caller named.
+        local current = fake_session({ worktree = fake_info(), cwd = CHECKOUT })
+        install_sessions({ current = current })
+
+        ---@type table[]
+        local open_opts =
+            { { repo_cwd = REPO_B }, { repo_cwd = REPO_B, name = "" }, { repo_cwd = REPO_B, name = "   " } }
+        for i, opts in ipairs(open_opts) do
+            local tabs_before = tab_count()
+            ---@type { session: pi.Session?, err: string? }
+            local result = {}
+            WorktreeSession.open_existing(opts, function(session, err)
+                result.session = session
+                result.err = err
+            end)
+
+            assert.is_nil(result.session, "case " .. i)
+            assert.is_string(result.err, "case " .. i)
+            assert.is_truthy(result.err:find("repo_cwd requires a worktree name", 1, true), "case " .. i)
+            assert.is_not_nil(find_note("repo_cwd requires a worktree name", vim.log.levels.ERROR))
+            assert.are.equal(tabs_before, tab_count(), "case " .. i)
+        end
+        -- repo_cwd only scopes a name: no resolution in any repository, no
+        -- session, no bind, and nothing created.
+        assert.are.equal(0, #requests)
+        assert.are.equal(0, #created)
+    end)
+
+    it("does not create an unnamed checkout for a scopeless create", function()
+        ---@type table[]
+        local requests = {}
+        install_create(requests, function(opts)
+            return fake_info({ name = opts.name, path = NEW_B, repo_root = REPO_B }), nil
+        end)
+        install_sessions({ current = fake_session({ worktree = fake_info(), cwd = CHECKOUT }) })
+        local tabs_before = tab_count()
+
+        ---@type { session: pi.Session?, err: string? }
+        local result = {}
+        WorktreeSession.open_existing({ repo_cwd = REPO_B, create = true }, function(session, err)
+            result.session = session
+            result.err = err
+        end)
+
+        assert.is_nil(result.session)
+        assert.is_string(result.err)
+        assert.is_truthy(result.err:find("repo_cwd requires a worktree name", 1, true))
+        -- `create` must never turn a missing name into a generated one.
+        assert.are.equal(0, #requests)
+        assert.are.equal(0, #created)
+        assert.are.equal(tabs_before, tab_count())
+    end)
+
+    it("rejects a non-string or blank repo_cwd on the name path instead of treating it as unscoped", function()
+        ---@type table[]
+        local requests = {}
+        install_create(requests, function()
+            return fake_info(), nil
+        end)
+        install_sessions({ current = fake_session({ worktree = fake_info(), cwd = CHECKOUT }) })
+        local tabs_before = tab_count()
+
+        ---@type table[]
+        local cases = {
+            { opts = { name = "wt1", repo_cwd = 42 }, err = "repo_cwd must be a string" },
+            { opts = { name = "wt1", repo_cwd = "   " }, err = "repo_cwd must not be blank" },
+            -- The shape error outranks a name that is not there either.
+            { opts = { repo_cwd = 42 }, err = "repo_cwd must be a string" },
+        }
+        for i, case in ipairs(cases) do
+            ---@type { session: pi.Session?, err: string? }
+            local result = {}
+            WorktreeSession.open_existing(case.opts, function(session, err)
+                result.session = session
+                result.err = err
+            end)
+
+            assert.is_nil(result.session, "case " .. i)
+            assert.is_string(result.err, "case " .. i)
+            assert.is_truthy(result.err:find(case.err, 1, true), "case " .. i)
+            assert.is_not_nil(find_note(case.err, vim.log.levels.ERROR))
+        end
+        assert.are.equal(0, #requests)
+        assert.are.equal(0, #created)
+        assert.are.equal(tabs_before, tab_count())
+    end)
+
+    it("ignores repo_cwd entirely when cwd is given, even a malformed one", function()
+        local wt = install_two_repos()
+        local session = fake_session({ cwd = CHECKOUT })
+        install_sessions({ session = session })
+
+        ---@type table[]
+        local cases = {
+            { name = "does-not-exist", repo_cwd = 42 },
+            { name = "does-not-exist", repo_cwd = "   " },
+            { name = "does-not-exist", repo_cwd = REPO_B .. "/nope" },
+            { repo_cwd = 42 },
+        }
+        for i, opts in ipairs(cases) do
+            opts.cwd = CHECKOUT
+            ---@type { session: pi.Session?, err: string? }
+            local result = {}
+            WorktreeSession.open_existing(opts, function(started, err)
+                result.session = started
+                result.err = err
+            end)
+
+            -- "cwd wins": repo_cwd is not consulted at all on the cwd path, so
+            -- even a non-string/blank/nonexistent scope cannot reject a valid
+            -- directory, and no name resolution happens for it.
+            assert.is_nil(result.err, "case " .. i)
+            assert.are.equal(session, result.session, "case " .. i)
+            assert.are.equal(CHECKOUT, created[i].cwd, "case " .. i)
+            assert.are.equal("linked", created[i].worktree.kind, "case " .. i)
+        end
+        assert.are.equal(0, #notes)
+        -- One bind per opened checkout; none of them went through resolution.
+        assert.are.equal(#cases, #wt.calls.bind)
+    end)
+
+    it("leaves the unscoped nameless fallback unchanged", function()
+        install_two_repos()
+        local current = fake_session({ worktree = fake_info(), cwd = CHECKOUT })
+        local session = fake_session({ cwd = CHECKOUT })
+        install_sessions({ current = current, session = session })
+
+        ---@type { session: pi.Session?, err: string? }
+        local result = {}
+        WorktreeSession.open_existing({}, function(started, err)
+            result.session = started
+            result.err = err
+        end)
+
+        assert.is_nil(result.err)
+        assert.are.equal(session, result.session)
+        -- Without `repo_cwd` the tab's own worktree is still the target.
+        assert.are.equal(CHECKOUT, created[1].cwd)
+        assert.are.equal("linked", created[1].worktree.kind)
+    end)
+end)
+
 describe("open_existing metadata", function()
     before_each(setup)
     after_each(restore)

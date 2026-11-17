@@ -467,7 +467,7 @@ function M.worktree_fork(opts)
 end
 
 --- Open a fresh session in an **existing** directory
---- (`:Pi worktree=<name>` / `:PiNewTab worktree=<name>`, `:PiSessions` → `W`):
+--- (`:Pi worktree=<name>` / `:PiNewTab worktree=<name>`, `:PiSessions` → `n` / `N`):
 --- nothing is ever removed, so a failure leaves the user's work alone. `name`
 --- resolves to `<repo>/.worktrees/<name>` — a managed linked checkout, or an
 --- error naming how to create one (the `:Pi*` commands pass `create = true`,
@@ -475,7 +475,9 @@ end
 --- only). `cwd` wins over `name` and may be any existing directory: a linked
 --- worktree is attached as worktree metadata (e.g. chat badge, `pi.worktree_*`
 --- targets), while the main checkout or a plain project dir starts an ordinary
---- session there. The current tabpage is used when `new_tab = false` (refused
+--- session there. `repo_cwd` scopes `name` resolution and creation to an
+--- explicit repository instead of the current tab's repository. The current
+--- tabpage is used when `new_tab = false` (refused
 --- while it already runs a session, before anything is created), a new tab
 --- otherwise (default). A checkout created by this call is released again when
 --- the session fails to start. Starting a session is silent; failures notify.

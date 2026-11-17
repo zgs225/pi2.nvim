@@ -35,6 +35,12 @@ local DiffReview = require("pi.ui.diff_review")
 --- (`:Pi worktree=<name>` / `:PiNewTab worktree=<name>`).
 ---@class pi.WorktreeOpenOpts
 ---@field name? string Existing worktree name under `<repo>/.worktrees/`.
+---@field repo_cwd? string Repository scope for `name`: the repository `<repo>/.worktrees/<name>` is
+--- resolved in and, with `create`, the cwd the checkout is created from. It wins over the repository the
+--- current tab happens to run in (another repo's identical name never resolves to, nor is refused by, this
+--- tab's checkout), must be a git checkout, and is ignored when `cwd` is given. Because it only *scopes a
+--- name*, a non-string or blank value is an error, and so is a call that passes it without a name. Unset
+--- keeps the old resolution: the current session's worktree, then its cwd's repository.
 ---@field cwd? string Session directory; wins over `name`. Any existing directory: a linked worktree
 --- (or anything inside one) is attached as worktree metadata, the main checkout or a plain directory
 --- starts an ordinary session.
@@ -136,6 +142,63 @@ local function same_worktree(a, b)
     return same_path(a.path, b.path)
 end
 
+--- Validate the shape of `repo_cwd` (nil = no scope at all).
+---
+--- A passed value must be a usable repository path: silently treating a
+--- non-string or blank `repo_cwd` as "no scope" would resolve in the current
+--- tab's repository, which is exactly the cross-repository mix-up the option
+--- exists to prevent.
+---@param repo_cwd any
+---@return string? err
+local function repo_scope_shape_error(repo_cwd)
+    if repo_cwd == nil then
+        return nil
+    end
+    if type(repo_cwd) ~= "string" then
+        return "repo_cwd must be a string"
+    end
+    if vim.trim(repo_cwd) == "" then
+        return "repo_cwd must not be blank"
+    end
+    return nil
+end
+
+--- Resolve the repository scope of an explicit `repo_cwd`.
+---
+--- No scope (`nil` for both returns) means the caller keeps the old resolution
+--- path. A scoped call must fail clearly instead of resolving in some other
+--- repository, so a non-string/blank scope, a missing directory or a non-git
+--- directory is an error and nothing downstream creates anything.
+---@param Worktree table
+---@param repo_cwd string? Explicit repository scope as given by the caller.
+---@return string? repo_root Repository root of the scope (the main checkout, or the repository a linked cwd belongs to).
+---@return string? err
+local function repo_scope_root(Worktree, repo_cwd)
+    local shape_err = repo_scope_shape_error(repo_cwd)
+    if shape_err then
+        return nil, shape_err
+    end
+    if repo_cwd == nil then
+        return nil
+    end
+    local dir = vim.trim(repo_cwd)
+    if vim.fn.isdirectory(dir) == 0 then
+        return nil, "Directory not found: " .. dir
+    end
+    local info = type(Worktree.detect) == "function" and Worktree.detect(dir) or nil
+    if type(info) ~= "table" or (info.kind ~= "main" and info.kind ~= "linked") then
+        return nil, "Not inside a git repository: " .. dir
+    end
+    local root = info.repo_root
+    if type(root) ~= "string" or root == "" then
+        root = info.kind == "main" and info.path or nil
+    end
+    if type(root) ~= "string" or root == "" then
+        return nil, "Cannot determine the repository root of " .. dir
+    end
+    return root
+end
+
 --- Resolve the worktree a command targets.
 ---
 --- Without a name this is the current session's worktree (falling back to the
@@ -143,11 +206,18 @@ end
 --- validated and then joined under `<repo>/.worktrees/<name>`, so it can never
 --- escape the checkout directory; the resolved directory must be a linked git
 --- worktree (`Worktree.detect`).
+---
+--- `repo_cwd` scopes the name to that repository (see `repo_scope_root`);
+--- without it the repository is the current session's, exactly as before. It
+--- only scopes a *name*, so an explicit scope without a name is an error: the
+--- nameless fallback (this tab's worktree) would resolve in another repository,
+--- and a later create would produce an unnamed checkout.
 ---@param name string?
+---@param repo_cwd string? Explicit repository scope; nil = the current session's repository.
 ---@return table? info
 ---@return string? err
 ---@return "missing"? code Set when `err` only means "no checkout of that name exists yet".
-local function resolve_target(name)
+local function resolve_target(name, repo_cwd)
     local Worktree = worktree_module()
     if not Worktree then
         return nil, "Worktree support is unavailable (pi.worktree module missing)"
@@ -156,11 +226,21 @@ local function resolve_target(name)
         return nil, "Worktree name must be a string"
     end
 
+    -- Resolved before anything else, so a bad scope is a clear error rather
+    -- than a silent resolution in whatever repository this tab runs in.
+    local scope_root, scope_err = repo_scope_root(Worktree, repo_cwd)
+    if scope_err then
+        return nil, scope_err
+    end
+
     local session = Sessions.get()
     local current = session and type(session.worktree) == "table" and session.worktree or nil
     local wanted = type(name) == "string" and vim.trim(name) or ""
 
     if wanted == "" then
+        if scope_root then
+            return nil, "repo_cwd requires a worktree name: it only scopes name resolution and creation"
+        end
         if current then
             return current
         end
@@ -182,10 +262,16 @@ local function resolve_target(name)
     end
 
     if current and current.name == wanted then
-        return current
+        -- Without a scope the current checkout *is* the target. With one, the
+        -- shortcut only holds inside the same repository: another repo's
+        -- identical name must resolve there, never to the checkout this tab
+        -- happens to run in.
+        if not scope_root or same_path(current.repo_root, scope_root) then
+            return current
+        end
     end
 
-    local repo_root = type(current) == "table" and current.repo_root or nil
+    local repo_root = scope_root or (type(current) == "table" and current.repo_root or nil)
     local cwd = (session and session.cwd) or vim.fn.getcwd()
     if type(repo_root) ~= "string" or repo_root == "" then
         local detected = type(Worktree.detect) == "function" and Worktree.detect(cwd) or nil
@@ -344,10 +430,11 @@ end
 
 --- Test hook: resolve a target worktree the way the commands do.
 ---@param name string?
+---@param repo_cwd string? Explicit repository scope (default: the current session's repository).
 ---@return table? info
 ---@return string? err
-function M._resolve_target(name)
-    return resolve_target(name)
+function M._resolve_target(name, repo_cwd)
+    return resolve_target(name, repo_cwd)
 end
 
 --- Close the tabpage `open_worktree_session` just created after a session
@@ -475,6 +562,13 @@ end
 --- `<repo>/.worktrees/<name>`; a missing one is an error (the `"missing"` code
 --- lets `open_existing` create it when asked) that points at the two ways to
 --- create it, never an implicit create.
+---
+--- `opts.repo_cwd` scopes `name` to an explicit repository: the name resolves
+--- under *that* repository's `.worktrees/`, and a bad scope (non-string, blank,
+--- missing directory, not a git checkout) is a clear error — never a resolution
+--- in the repository this tab runs in. It is only consulted on the `name` path:
+--- a non-empty `cwd` wins outright and ignores `repo_cwd` entirely, valid or not
+--- (the documented "cwd wins" contract).
 ---@param opts pi.WorktreeOpenOpts
 ---@return pi.OpenTarget? target
 ---@return string? err
@@ -502,11 +596,12 @@ local function resolve_open_target(opts)
         return nil, "Worktree support is unavailable (pi.worktree module missing)"
     end
 
-    -- A `name` resolves through `resolve_target`; with neither given it falls
-    -- back to the current session's worktree, the default
+    -- A `name` resolves through `resolve_target`, which validates `repo_cwd`
+    -- (only reached here: the `cwd` branch above returns first); with neither
+    -- given it falls back to the current session's worktree, the default
     -- `pi.worktree_ship` / `pi.worktree_remove` use.
     local name = type(opts.name) == "string" and vim.trim(opts.name) or ""
-    local info, err, code = resolve_target(name ~= "" and name or nil)
+    local info, err, code = resolve_target(name ~= "" and name or nil, opts.repo_cwd)
     if type(info) ~= "table" then
         local message = err or "No worktree target"
         -- Whoever typed `worktree=<name>` most likely meant to create one, so
@@ -795,6 +890,12 @@ end
 --- `open_existing_session`, which must never delete a directory that predates
 --- the call. Nesting is refused like every other creation: a session already
 --- running in a worktree never spawns another checkout inside it.
+---
+--- `opts.repo_cwd` (when set) is the creation cwd and the repository that owns
+--- the new checkout, so the tab's own worktree is irrelevant for both: the tab
+--- may run in a worktree while the caller asks for a checkout in the main
+--- repository. Only the nesting *guard* is skipped that way — a `repo_cwd` that
+--- is itself a linked checkout is still refused, by `Worktree.create`.
 ---@param opts pi.WorktreeOpenOpts
 ---@param fail fun(message: string)
 ---@param callback? fun(session: pi.Session?, err?: string)
@@ -805,14 +906,17 @@ local function create_and_open(opts, fail, callback)
         return
     end
 
+    local scope = type(opts.repo_cwd) == "string" and vim.trim(opts.repo_cwd) or ""
     local current = Sessions.get()
-    local nested = nesting_error(current)
-    if nested then
-        fail(nested)
-        return
+    if scope == "" then
+        local nested = nesting_error(current)
+        if nested then
+            fail(nested)
+            return
+        end
     end
 
-    local base_cwd = (current and current.cwd) or vim.fn.getcwd()
+    local base_cwd = scope ~= "" and scope or ((current and current.cwd) or vim.fn.getcwd())
     Worktree.create({ cwd = base_cwd, mode = "new", name = opts.name }, function(info, err)
         vim.schedule(function()
             if not valid_info(info) then
@@ -833,7 +937,7 @@ local function create_and_open(opts, fail, callback)
 end
 
 --- Open a fresh session in an existing directory (`:Pi worktree=<name>` /
---- `:PiNewTab worktree=<name>`, and `:PiSessions` → `W`), creating the
+--- `:PiNewTab worktree=<name>`, and `:PiSessions` → `n` / `N`), creating the
 --- checkout first when `opts.create` is set and the name does not exist yet.
 ---
 --- Without `create` nothing is created and nothing is removed. `name` must be
@@ -848,6 +952,11 @@ end
 --- `new_tab = false` (= `:Pi worktree=`) refuses when the current tabpage
 --- already runs a session — before creating anything. `new_tab = true`
 --- (= `:PiNewTab worktree=`) always opens a tab.
+---
+--- `repo_cwd` scopes `name` to an explicit repository (see
+--- `pi.WorktreeOpenOpts.repo_cwd`): resolution and creation both use it, so a
+--- caller that passes the main checkout gets that repository's checkout even
+--- when the current tab runs in a worktree of another repo.
 ---@param opts pi.WorktreeOpenOpts
 ---@param callback? fun(session: pi.Session?, err?: string)
 function M.open_existing(opts, callback)
