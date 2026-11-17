@@ -30,8 +30,9 @@ pi.worktree_new(opts?)        -- start a fresh session in a new git worktree; op
 pi.worktree_fork(opts?)       -- fork the current conversation into a new git worktree;
                               -- opts: { name?, layout? }
 pi.worktree_open(opts?, cb?)  -- start a fresh session in an EXISTING directory (:Pi worktree=<name> /
-                              -- :PiNewTab worktree=<name>; `:PiSessions` → W); opts: { name?, cwd?,
-                              -- layout?, new_tab?, create? }. `name` is a managed linked checkout;
+                              -- :PiNewTab worktree=<name>; `:PiSessions` → n / N); opts:
+                              -- { name?, cwd?, repo_cwd?, layout?, new_tab?, create? }. `name` is a managed
+                              -- linked checkout; `repo_cwd` scopes it to an explicit repository;
                               -- `create = true` makes it first when it does not exist (the :Pi* commands
                               -- pass it); `cwd` may be any existing directory — a linked worktree
                               -- (attached as worktree metadata) or the main checkout / plain dir
@@ -134,7 +135,7 @@ Most functions are no-ops (or warn) when no session is active in the current tab
 
 ## Worktrees
 
-The seven `pi.worktree_*` entry points above are the **only** worktree surface — pi2.nvim ships no `:PiWorktree*` command, and the user-facing entry point for the first four is the `worktree=<name>` start flag (`:Pi` / `:PiNewTab`). They share their rules: a session inside a worktree refuses to create a nested one, creation releases the fresh checkout again when the session fails to start, `worktree_apply` never commits and never touches the index, `worktree_ship` never sends the prompt, `worktree_remove` refuses while a live session runs in the checkout, and `worktree_open` removes nothing — it opens an existing checkout, or creates one when `create = true` and the name is new. `worktree_open` is also the entry point behind `:PiSessions` → `W`: its `cwd` may be any existing directory, and only a linked worktree becomes worktree metadata (the main checkout, or a directory outside a repository, starts an ordinary session there).
+The seven `pi.worktree_*` entry points above are the **only** worktree surface — pi2.nvim ships no `:PiWorktree*` command, and the user-facing entry point for the first four is the `worktree=<name>` start flag (`:Pi` / `:PiNewTab`). They share their rules: a session inside a worktree refuses to create a nested one, creation releases the fresh checkout again when the session fails to start, `worktree_apply` never commits and never touches the index, `worktree_ship` never sends the prompt, `worktree_remove` refuses while a live session runs in the checkout, and `worktree_open` removes nothing — it opens an existing checkout, or creates one when `create = true` and the name is new. `worktree_open` is also the entry point behind `:PiSessions` → `n` / `N`: its `cwd` may be any existing directory, and only a linked worktree becomes worktree metadata (the main checkout, or a directory outside a repository, starts an ordinary session there). With `repo_cwd`, `name` resolution and creation use that explicit repository rather than the current tab's repository; this lets `N` create a sibling from the row's main checkout without treating the current tab's worktree as nested. A linked `repo_cwd` is still refused by `Worktree.create`.
 
 ```lua
 local pi = require("pi")
@@ -151,6 +152,9 @@ pi.worktree_open({ name = "fix-auth", layout = "side" }, function(session, err) 
 -- Same, creating the checkout first when it does not exist (what the :Pi*
 -- commands pass) — a taken tab is refused before anything is created.
 pi.worktree_open({ name = "fix-auth", create = true, new_tab = false })
+
+-- Resolve/create in an explicit repository, independent of the current tab.
+pi.worktree_open({ name = "fix-auth", repo_cwd = "/repo", create = true })
 
 -- An existing directory: a linked worktree keeps its metadata, the main
 -- checkout (or a plain project dir) starts an ordinary session there.
