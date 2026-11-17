@@ -72,6 +72,14 @@ describe("session list help overlay", function()
         for _, key in ipairs({ "<CR>, o", "a, i", "r", "s", "c", "d", "f", "C", "t", "R", "q", "?" }) do
             assert.is_truthy(text:find(key, 1, true), "help should list " .. key)
         end
+        assert.is_truthy(
+            text:find("New session in this checkout (new tab)", 1, true),
+            "help should describe the new-session key"
+        )
+        assert.is_truthy(
+            text:find("New worktree of this checkout (new tab)", 1, true),
+            "help should describe the new-worktree key"
+        )
         assert.is_truthy(text:find("Rename the session under the cursor", 1, true), "help should describe rename")
         assert.is_truthy(text:find("Show this session's stats", 1, true), "help should describe stats")
         assert.is_truthy(text:find("Compact this session in the background", 1, true), "help should describe compact")
@@ -85,6 +93,12 @@ describe("session list help overlay", function()
             "help should describe the read-only preview"
         )
         assert.is_truthy(text:find("Close sub-session process", 1, true), "help should describe sub-session close")
+    end)
+
+    it("binds N to the new-worktree action in the list buffer", function()
+        local map = vim.fn.maparg("N", "n", false, true)
+        assert.equals(1, map.buffer)
+        assert.equals("New worktree of this checkout (new tab)", map.desc)
     end)
 
     it("binds r to rename and R to refresh in the list buffer", function()

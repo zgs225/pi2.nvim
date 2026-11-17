@@ -1441,6 +1441,7 @@ local HELP_ENTRIES = {
     { "p", "Preview session (read-only viewer)" },
     { "x", "Close sub-session process (:PiSubClose)" },
     { "n", "New session in this checkout (new tab)" },
+    { "N", "New worktree of this checkout (new tab)" },
     { "<Tab>, za", "Fold / unfold worktree groups and sub-sessions" },
     { "zM, zR", "Collapse / expand all groups and sub-sessions" },
     { "H", "Toggle hidden / prior-conversation sub-sessions (all sessions)" },
@@ -1830,6 +1831,159 @@ local function new_session_in_checkout_under_cursor()
     WorktreeSession.open_existing({ cwd = path })
 end
 
+--- Label the `N` picker shows for one existing worktree: name · ~/path ·
+--- branch (or `detached`). The label is display only — the entry's own `path`
+--- is what the picker opens, so a worktree git manages outside
+--- `<repo>/.worktrees/` is reachable just like a pi-created one.
+---@param entry pi.WorktreeListEntry
+---@return string
+local function worktree_pick_label(entry)
+    local name = type(entry.name) == "string" and entry.name ~= "" and entry.name or vim.fs.basename(entry.path)
+    local parts = { name }
+    if type(entry.path) == "string" and entry.path ~= "" then
+        parts[#parts + 1] = vim.fn.fnamemodify(entry.path, ":~")
+    end
+    local branch = type(entry.branch) == "string" and entry.branch or ""
+    if branch ~= "" then
+        parts[#parts + 1] = branch
+    elseif entry.detached then
+        parts[#parts + 1] = "detached"
+    end
+    return table.concat(parts, " · ")
+end
+
+--- Picker entry that switches from an existing checkout to the name input.
+local NEW_WORKTREE_CHOICE = "New worktree…"
+
+--- Start a session in an already existing directory through
+--- `pi.worktree_session.open_existing` (a linked worktree becomes worktree
+--- metadata, the main checkout an ordinary session there). Reports its own
+--- failures, so no callback is needed here.
+---@param opts pi.WorktreeOpenOpts
+---@return boolean started false when checkout support is unavailable (warned)
+local function open_checkout(opts)
+    local Notify = require("pi.notify")
+    local ok, WorktreeSession = pcall(require, "pi.worktree_session")
+    if not ok or type(WorktreeSession) ~= "table" or type(WorktreeSession.open_existing) ~= "function" then
+        Notify.warn("Cannot open a session: checkout support is unavailable")
+        return false
+    end
+    WorktreeSession.open_existing(opts)
+    return true
+end
+
+--- Open a fresh π session in a new worktree of the repository the row under
+--- the cursor belongs to (the `N` key): pick an existing worktree of that
+--- repository or create a new one by name. The row's checkout and its
+--- repository root are snapshotted at keypress, before the asynchronous
+--- enumeration, so a cursor move (or a tab switch) while git runs cannot
+--- retarget the session to another repository.
+local function new_worktree_under_cursor()
+    local row = rows[vim.api.nvim_win_get_cursor(0)[1]]
+    local Notify = require("pi.notify")
+    local checkout = M.row_checkout(row)
+    if not checkout then
+        Notify.warn("Cannot create a worktree: this row has no checkout")
+        return
+    end
+    if vim.fn.isdirectory(checkout) == 0 then
+        Notify.warn("Cannot create a worktree: " .. vim.fn.fnamemodify(checkout, ":~") .. " no longer exists")
+        return
+    end
+    local loaded, Worktree = pcall(require, "pi.worktree")
+    if not loaded or type(Worktree) ~= "table" or type(Worktree.detect) ~= "function" then
+        Notify.warn("Cannot create a worktree: worktree support is unavailable")
+        return
+    end
+    local info = Worktree.detect(checkout)
+    local repo_root = type(info) == "table" and info.repo_root or nil
+    if type(repo_root) ~= "string" or repo_root == "" then
+        Notify.warn(
+            "Cannot create a worktree: " .. vim.fn.fnamemodify(checkout, ":~") .. " is not inside a git repository"
+        )
+        return
+    end
+
+    --- Create `name` in the snapshotted repository; nil / blank cancels.
+    ---@param name string?
+    local function create(name)
+        name = type(name) == "string" and vim.trim(name) or ""
+        if name == "" then
+            return
+        end
+        if type(Worktree.validate_name) == "function" then
+            local valid, err = Worktree.validate_name(name)
+            if not valid then
+                Notify.warn(err or ("Cannot create a worktree: invalid name " .. name))
+                return
+            end
+        end
+        open_checkout({ name = name, repo_cwd = repo_root, create = true })
+    end
+
+    local function ask_name()
+        require("pi.ui.dialog").input({
+            title = "New worktree in " .. vim.fn.fnamemodify(repo_root, ":~"),
+        }, create)
+    end
+
+    -- Without an enumerator there is nothing to pick from: straight to the
+    -- name input. Enumeration failures (not a repository, git error) warn
+    -- instead of falling back to the input, so an unusable repository does
+    -- not invite a doomed create.
+    if type(Worktree.list) ~= "function" then
+        ask_name()
+        return
+    end
+    Worktree.list(repo_root, function(entries, err)
+        vim.schedule(function()
+            if err or type(entries) ~= "table" then
+                Notify.warn("Cannot list worktrees: " .. tostring(err or "unknown error"))
+                return
+            end
+            ---@type table<string, pi.WorktreeListEntry>
+            local by_label = {}
+            ---@type string[]
+            local options = {}
+            for _, entry in ipairs(entries) do
+                local path = type(entry) == "table" and entry.path or nil
+                -- Gone checkouts cannot be opened and the main checkout is
+                -- never a worktree target.
+                if type(path) == "string" and path ~= "" and entry.missing ~= true and entry.kind ~= "main" then
+                    if vim.fs.normalize(path) ~= vim.fs.normalize(repo_root) then
+                        local label = worktree_pick_label(entry)
+                        if not by_label[label] then
+                            by_label[label] = entry
+                            options[#options + 1] = label
+                        end
+                    end
+                end
+            end
+            if #options == 0 then
+                ask_name()
+                return
+            end
+            options[#options + 1] = NEW_WORKTREE_CHOICE
+            require("pi.ui.dialog").select(
+                { title = "Worktree", options = options, kind = "pi-worktree" },
+                function(choice)
+                    if type(choice) ~= "string" or choice == "" then
+                        return
+                    end
+                    if choice == NEW_WORKTREE_CHOICE then
+                        ask_name()
+                        return
+                    end
+                    local entry = by_label[choice]
+                    if entry then
+                        open_checkout({ cwd = entry.path })
+                    end
+                end
+            )
+        end)
+    end)
+end
+
 --- Toggle fold/unfold for the session under cursor.
 --- On a parent row with children: toggles fold state for that parent.
 --- On a child row: collapses that child's parent and moves cursor to the parent row.
@@ -2093,6 +2247,12 @@ local function ensure_buf()
         "n",
         new_session_in_checkout_under_cursor,
         vim.tbl_extend("force", map_opts, { desc = "New session in this checkout (new tab)" })
+    )
+    vim.keymap.set(
+        "n",
+        "N",
+        new_worktree_under_cursor,
+        vim.tbl_extend("force", map_opts, { desc = "New worktree of this checkout (new tab)" })
     )
     vim.keymap.set(
         "n",

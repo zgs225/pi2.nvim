@@ -2,9 +2,11 @@
 --
 -- Unlike tests/*_worktree*_spec.lua (mocked RPC/git), this drives the real
 -- feature end to end: `git worktree add`, metadata sidecars, `.worktreeinclude`
--- copies, `setup_cmd`, the diff-review apply path, snapshots/release, and the
--- sessions-list grouping. No provider turn is used and the prompt is never
--- submitted; only the real child processes are started.
+-- copies, `setup_cmd`, the diff-review apply path, snapshots/release, the
+-- sessions-list grouping, and the sessions-list `N` key (real keymap → real
+-- git → real pi, with only the picker/name dialogs answered by the script).
+-- No provider turn is used and the prompt is never submitted; only the real
+-- child processes are started.
 --
 -- Hermetic: every run gets a unique temp root with its own agent dir (the
 -- user's auth/model/settings files are symlinked in read-only), temp git
@@ -506,6 +508,295 @@ local function scenario_s7(repo_dir)
     return session
 end
 
+-- Sessions-list `N` (real keymap) --------------------------------------------
+
+--- Dialog calls collected while the controlled stubs were installed.
+---@class E2EDialogLog
+---@field selects { title: string, options: string[] }[]
+---@field inputs { title: string }[]
+
+---@type E2EDialogLog
+local DialogLog = { selects = {}, inputs = {} }
+
+--- Install controlled `pi.ui.dialog` answers for the duration of `fn`.
+---
+--- Only the two dialogs the `N` flow itself opens (the worktree picker and the
+--- name input) are answered from the script. Everything behind them stays
+--- real: `pi.worktree.list` / `pi.worktree.create`,
+--- `pi.worktree_session.open_existing`, `git`, and the spawned
+--- `pi --mode rpc` processes.
+---@param answers { select?: fun(options: string[]): string?, input?: string? }
+---@param fn fun()
+local function with_worktree_dialogs(answers, fn)
+    local Dialog = require("pi.ui.dialog")
+    local saved_select, saved_input = Dialog.select, Dialog.input
+    DialogLog.selects, DialogLog.inputs = {}, {}
+
+    ---@param opts { title: string, options: string[] }
+    ---@param cb fun(choice: string?)
+    Dialog.select = function(opts, cb)
+        local options = opts.options or {}
+        DialogLog.selects[#DialogLog.selects + 1] = { title = opts.title, options = options }
+        print("[dialog] select " .. tostring(opts.title) .. ": " .. table.concat(options, " | "))
+        local choice = answers.select and answers.select(options) or options[1]
+        vim.schedule(function()
+            cb(choice)
+        end)
+    end
+
+    ---@param opts { title: string }
+    ---@param cb fun(value: string?)
+    Dialog.input = function(opts, cb)
+        DialogLog.inputs[#DialogLog.inputs + 1] = { title = opts.title }
+        print("[dialog] input " .. tostring(opts.title) .. " -> " .. tostring(answers.input))
+        vim.schedule(function()
+            cb(answers.input)
+        end)
+    end
+
+    local ok, err = pcall(fn)
+    Dialog.select, Dialog.input = saved_select, saved_input
+    if not ok then
+        error(err, 0)
+    end
+end
+
+--- Focus `tab`, open the sessions list there, put the cursor on the row that
+--- belongs to `checkout`, and press `key` through the list's own keymap.
+---@param tab integer
+---@param checkout string
+---@param key string
+local function press_on_row(tab, checkout, key)
+    focus_tab(tab)
+    local List = require("pi.ui.sessions")
+    List.open()
+    List._render()
+    local win = List.win(tab)
+    check(win ~= nil, "sessions list window is open in the target tab")
+
+    -- Row plan of the render above: build_rows is deterministic for a given
+    -- session list (only display fields come from elsewhere).
+    local built = List.build_rows(require("pi.sessions.manager").list(), function()
+        return 0
+    end, function()
+        return "(e2e)"
+    end, function()
+        return { done = false, error = false }
+    end, function()
+        return false
+    end)
+    local want = realpath(checkout)
+    local lnum
+    for i, row in ipairs(built) do
+        local path = List.row_checkout(row)
+        if type(path) == "string" and realpath(path) == want then
+            lnum = i
+            break
+        end
+    end
+    check(lnum ~= nil, "sessions list row for the checkout " .. checkout, { rows = #built })
+    vim.api.nvim_set_current_win(win)
+    vim.api.nvim_win_set_cursor(win, { lnum, 0 })
+    vim.api.nvim_feedkeys(vim.keycode(key), "x", false)
+    return win
+end
+
+---@return table<pi.Session, boolean> set
+local function session_set()
+    local set = {}
+    for _, session in ipairs(require("pi.sessions.manager").list_all()) do
+        set[session] = true
+    end
+    return set
+end
+
+--- Wait for a session that was not in `before` and satisfies `pred`.
+---@param before table<pi.Session, boolean>
+---@param pred fun(session: table): boolean
+---@param ms integer
+---@param label string
+---@return table session
+local function wait_new_session(before, pred, ms, label)
+    local found
+    wait(function()
+        for _, session in ipairs(require("pi.sessions.manager").list_all()) do
+            if not before[session] and pred(session) then
+                found = session
+                return true
+            end
+        end
+        return false
+    end, ms, label)
+    return found
+end
+
+--- S11: the real `N` keymap on the sessions list, driving real git + pi.
+---   A: name input -> fresh session in a new `<repo>/.worktrees/<name>`
+---      checkout (detached), main checkout branch/HEAD untouched.
+---   B: picker -> session in an existing, externally created worktree, opened
+---      at the picker entry's own path.
+---@param repo_dir string
+local function scenario_s11(repo_dir)
+    local Sessions = require("pi.sessions.manager")
+    local List = require("pi.ui.sessions")
+
+    step("S11 main-checkout session behind the list")
+    vim.cmd("tabnew")
+    vim.cmd("cd " .. vim.fn.fnameescape(repo_dir))
+    local main_tab = vim.api.nvim_get_current_tabpage()
+    require("pi").show({ layout = "side" })
+    local main_session
+    wait(function()
+        main_session = Sessions.get()
+        return main_session ~= nil and main_session.rpc ~= nil and main_session.rpc:is_running()
+    end, 30000, "main session process live")
+    track(main_session)
+    check(realpath(main_session.cwd) == realpath(repo_dir), "S11 main session runs in the repository root", {
+        cwd = main_session.cwd,
+    })
+    local branch_before = vim.trim(git({ "rev-parse", "--abbrev-ref", "HEAD" }, repo_dir))
+    local base = head(repo_dir)
+
+    step("S11 A: N -> name input -> fresh session in a new worktree")
+    local before_a = session_set()
+    local wt_session
+    with_worktree_dialogs({ input = "e2e-n" }, function()
+        press_on_row(main_tab, repo_dir, "N")
+        wait(function()
+            return #DialogLog.inputs == 1
+        end, 30000, "worktree name input from the N keymap")
+        wt_session = wait_new_session(before_a, function(session)
+            return type(session.worktree) == "table"
+        end, 30000, "worktree session registered by N")
+    end)
+    check(
+        DialogLog.inputs[1].title:find(vim.fn.fnamemodify(repo_dir, ":~"), 1, true) ~= nil,
+        "A: the name dialog names the repository under the cursor",
+        { title = DialogLog.inputs[1].title }
+    )
+    track(wt_session)
+    wait_live(wt_session)
+
+    local wt = repo_dir .. "/.worktrees/e2e-n"
+    check(realpath(wt_session.cwd) == realpath(wt), "A: session cwd is <repo>/.worktrees/e2e-n", {
+        cwd = wt_session.cwd,
+    })
+    check(vim.trim(git({ "rev-parse", "--abbrev-ref", "HEAD" }, wt)) == "HEAD", "A: new checkout is on a detached HEAD")
+    check(head(wt) == base, "A: new checkout HEAD equals the main HEAD", { base = base, head = head(wt) })
+    check(
+        vim.trim(git({ "rev-parse", "--abbrev-ref", "HEAD" }, repo_dir)) == branch_before,
+        "A: main checkout branch is unchanged",
+        { before = branch_before, after = vim.trim(git({ "rev-parse", "--abbrev-ref", "HEAD" }, repo_dir)) }
+    )
+    check(head(repo_dir) == base, "A: main checkout HEAD is unchanged")
+    check(wt_session.attached_tab ~= main_tab, "A: the worktree session opened in a new tab")
+    check(wt_session.id ~= main_session.id, "A: the new tab runs a different session id", {
+        id = wt_session.id,
+        main = main_session.id,
+    })
+
+    -- Fresh, not forked: the spawned process carries no `--fork <file>`, and
+    -- it is a different process from the main session's.
+    local pid = vim.fn.jobpid(wt_session.rpc._job_id)
+    local main_pid = vim.fn.jobpid(main_session.rpc._job_id)
+    local cmdline = pid and pid > 0 and read("/proc/" .. pid .. "/cmdline") or nil
+    check(type(cmdline) == "string" and cmdline ~= "", "A: the new session process is inspectable", { pid = pid })
+    check(cmdline:find("--fork", 1, true) == nil, "A: the new tab is a fresh session (no --fork)", {
+        cmdline = (cmdline or ""):gsub("%z", " "),
+    })
+    check(pid ~= main_pid, "A: the new tab runs its own pi process", { pid = pid, main = main_pid })
+    check(
+        type(wt_session.worktree) == "table"
+            and wt_session.worktree.name == "e2e-n"
+            and realpath(wt_session.worktree.path) == realpath(wt),
+        "A: the session carries the created checkout's worktree metadata",
+        { worktree = wt_session.worktree }
+    )
+
+    step("S11 B: N -> picker -> an externally created worktree")
+    local ext = ROOT .. "/external/e2e-ext"
+    vim.fn.mkdir(ROOT .. "/external", "p")
+    git({ "worktree", "add", "--detach", ext, "HEAD" }, repo_dir)
+    check(exists(ext), "B: plain git created the external worktree")
+    local ext_head = head(ext)
+    check(ext_head == base, "B: the external worktree starts at the main HEAD")
+
+    -- Independently enumerate with the real module the picker uses.
+    local list_pack = call(function(cb)
+        require("pi.worktree").list(repo_dir, cb)
+    end, 20000)
+    local entries = list_pack[1]
+    check(type(entries) == "table", "B: pi.worktree.list returned entries", { err = list_pack[2] })
+    local ext_entry
+    for _, entry in ipairs(entries or {}) do
+        if type(entry.path) == "string" and realpath(entry.path) == realpath(ext) then
+            ext_entry = entry
+        end
+    end
+    check(type(ext_entry) == "table", "B: the real enumeration lists the external worktree")
+
+    local picked
+    local ext_session
+    local before_b = session_set()
+    with_worktree_dialogs({
+        select = function(options)
+            for _, option in ipairs(options) do
+                if option:find(vim.fs.basename(ext), 1, true) then
+                    picked = option
+                    return option
+                end
+            end
+            return options[1]
+        end,
+    }, function()
+        press_on_row(main_tab, repo_dir, "N")
+        wait(function()
+            return #DialogLog.selects == 1
+        end, 30000, "worktree picker from the N keymap")
+        check(picked ~= nil, "B: the picker offers the external worktree", { options = DialogLog.selects[1].options })
+        ext_session = wait_new_session(before_b, function(session)
+            return type(session.cwd) == "string" and realpath(session.cwd) == realpath(ext)
+        end, 30000, "session in the external worktree")
+    end)
+    track(ext_session)
+    wait_live(ext_session)
+
+    check(#DialogLog.inputs == 0, "B: picking an existing worktree asks for no name")
+    check(
+        DialogLog.selects[1].options[#DialogLog.selects[1].options] == "New worktree…",
+        "B: the picker keeps the New worktree… entry"
+    )
+    local saw_managed = false
+    for _, label in ipairs(DialogLog.selects[1].options) do
+        if label:find("e2e-n", 1, true) then
+            saw_managed = true
+        end
+    end
+    check(saw_managed, "B: the picker also lists the worktree created in A")
+    check(ext_session.cwd == ext_entry.path, "B: session cwd is exactly the picked entry.path", {
+        cwd = ext_session.cwd,
+        entry = ext_entry.path,
+    })
+    check(realpath(ext_session.cwd) == realpath(ext), "B: session cwd resolves to the external worktree")
+    check(
+        type(ext_session.worktree) == "table" and realpath(ext_session.worktree.path) == realpath(ext),
+        "B: session carries the external checkout's worktree metadata",
+        { worktree = ext_session.worktree }
+    )
+    check(
+        ext_session.attached_tab ~= main_tab and ext_session.attached_tab ~= wt_session.attached_tab,
+        "B: the external worktree opened in another new tab"
+    )
+    check(not exists(repo_dir .. "/.worktrees/e2e-ext"), "B: opening an existing worktree created no checkout")
+    check(head(ext) == ext_head, "B: the existing checkout was left untouched")
+
+    step("S11 cleanup: close the sessions list in its tab")
+    pcall(function()
+        focus_tab(main_tab)
+        List.close()
+    end)
+end
+
 --- S10: sessions list — one group row per worktree, flat with one worktree.
 ---@param repo_dir string
 local function scenario_s10(repo_dir)
@@ -866,6 +1157,7 @@ local function main()
         scenario_s8(w_branch)
         scenario_s9(repo("s9"))
         scenario_s10(repo("s10"))
+        scenario_s11(repo("s11"))
     end)
 
     cleanup()
