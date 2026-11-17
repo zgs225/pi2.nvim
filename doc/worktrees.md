@@ -18,6 +18,8 @@ Worktree support is opt-in per session, not a mode: you start a session in a new
 - [Removing a worktree](#removing-a-worktree)
 - [Cleanup when a session closes](#cleanup-when-a-session-closes)
 - [Sub-sessions](#sub-sessions)
+  - [Assigning a child to a worktree](#assigning-a-child-to-a-worktree)
+  - [Assigned is not owned](#assigned-is-not-owned)
 - [Resuming across worktrees](#resuming-across-worktrees)
 - [Where you see it](#where-you-see-it)
 - [Configuration](#configuration)
@@ -65,7 +67,7 @@ Creation is refused, with an explicit message, when:
 If the process fails to start after the checkout was created, the fresh worktree is released again instead of being left behind empty.
 ### Naming
 
-The optional argument names the directory under `<repo>/.worktrees/`. Without one, the name is generated from the current time plus this Neovim process's pid and a spawn counter (`wt-<YYYYmmdd-HHMMSS>-<pid>-<seq>`) — a timestamp alone repeats within the same second, so back-to-back creations would collide on one directory. Sub-agent checkouts use the same idea with a `sub-` prefix (`sub-<YYYYmmdd-HHMMSS>-<n>-<pid>`), so a batch fanned out at once still gets distinct names.
+The optional argument names the directory under `<repo>/.worktrees/`. Without one, the name is generated from the current time plus this Neovim process's pid and a spawn counter (`wt-<YYYYmmdd-HHMMSS>-<pid>-<seq>`) — a timestamp alone repeats within the same second, so back-to-back creations would collide on one directory.
 
 Valid names are 1–64 characters, must not start with `.`, and may only contain letters, digits, `.`, `_` and `-`. A name is always a single directory component — `pi.worktree_apply` / `pi.worktree_ship` / `pi.worktree_remove` accept one too, and `worktree=<name>` completion offers the existing names of the current repository.
 
@@ -187,7 +189,7 @@ Snapshots are written, never pruned: they are ordinary patch files you can `git 
 
 An explicit close is the normal end of a worktree session, and it cleans up after itself:
 
-- Closing the session's process (`:PiStop`, `x` in `:PiSessions`, `:PiSubClose` for a child, or the process exiting on its own) releases its worktree.
+- Closing the session's process (`:PiStop`, `x` in `:PiSessions`, `:PiSubClose` for a child, or the process exiting on its own) releases its worktree. Only a checkout the session **owns** is released: a linked worktree explicitly assigned to a sub-session is borrowed and never touched by close, crash, reaping or Neovim exit (see [Sub-sessions](#sub-sessions)).
 - **Release deletes a checkout only when nothing would be lost** — no uncommitted changes and no commits beyond its base commit. A dirty or ahead worktree is **kept**, and a notification names the path (`Worktree kept: <path> …`) so you can inspect, apply or ship it.
 - **Release snapshots before deleting**, like every other removal: a clean checkout's patch is empty, so what it leaves behind is an **empty patch plus its `.patch.json` sidecar** — a record of the checkout (name, path, base commit, HEAD, time) that survives the directory and lets the session still be found on resume. If writing that snapshot fails, the checkout is **kept** instead of deleted.
 - Closing a tab does **not** close the session (see [Sessions → One chat per tab](sessions.md#one-chat-per-tab)), so it does not release the worktree either — an ordinary background session keeps its checkout.
@@ -195,19 +197,45 @@ An explicit close is the normal end of a worktree session, and it cleans up afte
 
 ## Sub-sessions
 
-Sub-sessions ([Sessions → Sub-sessions](sessions.md#sub-sessions)) run in the **parent session's cwd**. They are not given a checkout of their own: a spawned child edits the same working tree as its parent, so several children in one batch share those files.
+Sub-sessions ([Sessions → Sub-sessions](sessions.md#sub-sessions)) run in the **parent session's cwd by default**. A spawned child edits the same working tree as its parent, so several children in one batch share those files unless you prepare separate checkouts for them.
 
-That is a deliberate trade. A checkout per child costs a `git worktree add`, a `.worktreeinclude` copy and a `worktree.setup_cmd` run on every spawn, and the work left in it then has to be moved back into the parent's tree. When a batch must not touch your own checkout, isolate at the **session** level instead: dispatch from a session that already runs in a worktree (`pi.worktree_new()`, `:PiNewTab worktree=<name>`), and every child inherits that checkout while your main checkout stays clean. For children that only read, constrain them with `subagent.tools` (`{ "read", "grep", "find", "ls" }`) — that is enforcement, not a request.
+### Assigning a child to a worktree
 
-A child revived from a manifest written by an earlier version keeps running in the checkout recorded on its row while that directory still exists; once it is gone, the revive starts in the parent's workspace cwd and warns instead of failing. `worktree.isolate_subagents` no longer exists, and neither does the per-child system-prompt paragraph about an isolated path.
+A `dispatch_subagents` **spawn** item can point its child at an **existing linked worktree** of the same repository instead:
 
-A `sub-…` checkout recorded by an earlier version is an ordinary directory now: the idle reaper still releases one that no live π session owns, and anything it cannot prove is safe to delete is yours to remove with `git worktree remove`.
+```lua
+dispatch_subagents({ items = {
+    { task = "…", name = "auth-review", worktree = { path = "/repo/.worktrees/auth-review" } },
+    { task = "…", name = "schema-fix",  worktree = { path = "/repo/.worktrees/schema-fix" } },
+} })
+```
+
+The same field is accepted by the Lua spawner (`require("pi.subsessions").spawn(parent, { task = "…", worktree = { path = "…" } })`). The path is a **reference, never a create request**:
+
+- it must be **absolute** and already exist,
+- it must be a **linked** worktree — the repository's main checkout is refused,
+- it must belong to the **same repository** as the parent's workspace (same common git dir and main root),
+- it is canonicalized to the checkout's real root, so a subdirectory or a symlinked path still resolves to that worktree.
+
+Dirty state and checkouts created by hand (`git worktree add …`) are fine: nothing is reset, cleaned or inspected beyond what git reports. Omitting `worktree` keeps the default — the child inherits the parent's cwd.
+
+Giving several items (or several children over time) the **same** path deliberately shares one checkout. No isolation is enforced between those children, so give them disjoint files; use a distinct worktree per child when they must not see each other's working tree. A worktree is **file-level isolation only, not a sandbox**: the child can still read absolute paths elsewhere, run commands, reach the network, and use the credentials its process inherited. Constrain tools with `subagent.tools` when that matters — that is enforcement, not a request.
+
+### Assigned is not owned
+
+An assigned checkout is **borrowed**, never owned by the child or by π: there is no `git worktree add`, no `.worktreeinclude` copy, no `worktree.setup_cmd`, no reset, merge, apply, snapshot or cleanup. Closing the child, its process crashing, idle reaping and quitting Neovim all leave the checkout exactly as it is. Commits and uncommitted work stay there for you to inspect and ship with git or `pi.worktree_apply` / `pi.worktree_ship`.
+
+`worktree` is **spawn-only**. A reuse item (`{ target, message }`) rejects it and keeps the checkout the child already runs in. A revived child keeps its recorded assignment and revalidates it: if the checkout is gone, moved, no longer linked, or now belongs to another repository, the revival fails with that error and does **not** fall back to the parent's workspace. Recreate/attach the checkout at the same path, or dispatch a *new* child (without `worktree`) to run in the parent's cwd.
+
+To keep a whole batch out of your own checkout, isolate at the **session** level instead: dispatch from a session that already runs in a worktree (`pi.worktree_new()`, `:PiNewTab worktree=<name>`), and every child inherits that checkout while your main checkout stays clean. Per-item `worktree` is for spreading a batch across checkouts you already prepared, not for creating them.
+
+The automatic-integration engine and its `worktree.integration` knobs are gone; manual control (review before applying, shipping a branch) stays with [`pi.worktree_apply` / `pi.worktree_ship`](#applying-a-patch).
 
 ## Resuming across worktrees
 
 `:PiResume` lists the sessions of Neovim's cwd **and of every linked worktree of the same repository** — git's own view, so a checkout you created yourself (`git worktree add ../x`, or a worktree root of your own) is listed exactly like one π created under `<repo>/.worktrees/`. A worktree session can therefore be reopened without `:cd`-ing into its checkout. Each item carries its checkout's info table, and the picker groups sessions per checkout — a `󰙅 <name>` title per linked worktree and the project name for the main checkout, shown once the list spans two or more checkouts (a single checkout stays a flat list). Opening one restarts the process **in that checkout** (closing the current one first when the cwd differs, and refusing while that session is streaming) instead of loading the transcript in the main checkout; opening into a new tab leaves the current session running. Being π-managed is not a filter: it decides the badge, `pi.worktree_ship` / `pi.worktree_apply` and the session binding, never whether a checkout is listed.
 
-Enumeration covers checkouts git still reports (including prunable ones whose directory is gone) **and** checkouts deleted but still present in the snapshot store (`Worktree.snapshot_worktrees` reads `<git common dir>/pi2-worktree-snapshots/`, including the empty patches a clean release leaves). A checkout only earns a title while a **top-level** session lives there, so a dead `sub-…` checkout holding nothing but a sub-session transcript contributes no row at all (sub-sessions belong to `:PiSessions` / `:PiSubSwitch`). Enumeration runs only when the repository shows it has other checkouts — git's linked-worktree registry (`<git common dir>/worktrees/`, a pure directory probe), a `<repo>/.worktrees/` directory, or a snapshot store — so a single-checkout project keeps the old single-workspace picker and never spawns git for it.
+Enumeration covers checkouts git still reports (including prunable ones whose directory is gone) **and** checkouts deleted but still present in the snapshot store (`Worktree.snapshot_worktrees` reads `<git common dir>/pi2-worktree-snapshots/`, including the empty patches a clean release leaves). A checkout only earns a title while a **top-level** session lives there, so a checkout holding nothing but a sub-session transcript contributes no row at all (sub-sessions belong to `:PiSessions` / `:PiSubSwitch`). Enumeration runs only when the repository shows it has other checkouts — git's linked-worktree registry (`<git common dir>/worktrees/`, a pure directory probe), a `<repo>/.worktrees/` directory, or a snapshot store — so a single-checkout project keeps the old single-workspace picker and never spawns git for it.
 
 A listed checkout can be gone by the time you pick it (retention removed it, or it was deleted by hand). Recovery runs **before** any process is touched and never falls back to the main checkout:
 
@@ -222,8 +250,9 @@ A listed checkout can be gone by the time you pick it (retention removed it, or 
 ## Where you see it
 
 - **Chat history title** — a session running in a linked worktree shows `󰙅 <name>` next to the panel title (in the side-layout winbar and the float border), with a trailing `*` while the checkout is dirty or has commits ahead of its base commit. When the session's cwd is **not** Neovim's cwd — normally the case for every worktree session, since starting one does not change Neovim's cwd, and also for a session resumed from another directory — the badge is prefixed with `⚠` in the warning color, because paths you open from your own buffers and paths the agent touches may diverge; `worktree.warn_on_cwd_mismatch = false` drops that prefix and keeps the plain badge. A session in the repository's main worktree with Neovim's cwd shows no badge.
-- **`:PiSessions`** — once the list spans **two or more distinct worktrees**, rows are grouped under a worktree header (`▾ 󰙅 <name> · ~/path`, and `▸ 󰙅 <name> (n) · ~/path` while the group is folded), and `<Tab>` / `za` folds a whole group (`zM` / `zR` collapse or expand everything). The `(n)` is the group's **structural** size — every parent row plus its sub-sessions — and it is displayed while the group is collapsed, does not move when a parent row *inside* the group folds, and only folding the group itself changes what is shown. The header carries the worktree's name for its whole group, and a sub-session row inside it repeats the name in its subtitle (a parent row is already under that header), while a worktree fork carries the `↳ forked from <name>` marker. Sessions whose cwd is not a work tree keep their flat rows, so a single-repository list looks exactly as before. `R` re-detects worktrees along with session names.
+- **`:PiSessions`** — once the list spans **two or more distinct worktrees**, rows are grouped under a worktree header (`▾ 󰙅 <name> · ~/path`, and `▸ 󰙅 <name> (n) · ~/path` while the group is folded), and `<Tab>` / `za` folds a whole group (`zM` / `zR` collapse or expand everything). The `(n)` is the group's **structural** size — every parent row plus its sub-sessions — and it is displayed while the group is collapsed, does not move when a parent row *inside* the group folds, and only folding the group itself changes what is shown. The header carries the worktree's name for its whole group, and a sub-session row inside it repeats that name in its subtitle (a parent row is already under that header) — unless the child was assigned a different checkout, whose own name and path it shows instead — while a worktree fork carries the `↳ forked from <name>` marker. Sessions whose cwd is not a work tree keep their flat rows, so a single-repository list looks exactly as before. `R` re-detects worktrees along with session names.
 - **Highlight groups** — `PiChatHistoryWorktree` (badge in the history title) and `PiSessionsListWorktree` (worktree group header); see [Highlight groups](highlight-groups.md).
+- **Sub-session visibility** — `list_subagents` reports an assigned checkout as `worktree = { path, name? }` (absent for a child running in the parent's cwd), a dispatch block badges that item with `󰙅 <name>`, and `read_subagent` reads the transcript recorded for the child (`session_file`) — for an assigned child that JSONL lives in the worktree's own session directory. `:PiSessions` and the `p` viewer show or replay the child's actual cwd. No row claims the parent's workspace.
 - **Workspace-scoped features follow the session cwd, not Neovim's**: [`:PiDiff`](diff-review.md#session-diff-review-pidiff) anchors each changed file at the session's directory, [quickfix](usage.md#quickfix) resolves `grep`/`find` paths against it, [`@mentions`](usage.md#mentions) (`@git-diff`, `@git-log`, file existence) and `gf`/buffer reload resolve paths there, and [prompt history](usage.md#prompt-history) / [drafts](usage.md#draft-persistence) are keyed per workspace. A resumed session adopts the cwd recorded in its session file, so a resumed worktree session keeps pointing at its worktree.
 - **Session storage is per cwd** — the worktree's own session files (and therefore its `.pi2-subsessions.json` manifest and batch records, which it owns when its sessions spawn children) live in the session directory of *that* cwd, separate from the main checkout's (see [Sessions → Storage and scoping](sessions.md#storage-and-scoping)). A child started *by* a worktree session records its row in the worktree session's workspace, next to that directory, even though the child's own transcript lives in the child's checkout.
 
@@ -255,5 +284,7 @@ Full annotated reference: [Configuration](configuration.md). The `pi.worktree*` 
 
 - **No moving a live conversation.** A session cannot be relocated into or out of a worktree mid-conversation; its cwd is fixed at spawn.
 - **No nested worktrees.** A session (or sub-session) that already runs in a worktree never creates another checkout inside it.
+- **No sandbox.** A worktree separates files, not privileges: the agent can still read absolute paths elsewhere, run shell commands, reach the network, and use the credentials its process inherited. Use `subagent.tools` for a read-only child; the checkout is a workspace, not a security boundary.
+- **No lifecycle on an assigned checkout.** A `worktree = { path = … }` assignment never creates, resets, merges, applies or removes that checkout; the path is only attached to the child's process (see [Sub-sessions](#sub-sessions)).
 - **No automatic commit.** `pi.worktree_apply` writes to a **working tree** only (never the index, never a commit), and `pi.worktree_ship` only prefills a prompt — commits and pushes stay yours (or the agent's, once you send that prompt).
 - **`:PiContinue` is still cwd-scoped.** It means "the most recent session *here*"; the cross-worktree enumeration lives in `:PiResume`.
