@@ -126,23 +126,83 @@ function M.child_name(child_id, cwd)
     return nil
 end
 
+--- Worktree glyph, matching the `󰙅 <name>` badge of the chat title and of
+--- :PiSessions rows.
+local WORKTREE_GLYPH = "󰙅"
+
+--- Display label of a worktree reference as carried by a dispatch/batch item
+--- or a manifest row (`{ kind = "linked", path = string, name? = string }`):
+--- the checkout's name, else its directory name, else the path itself.
+---@param worktree any
+---@return string?
+function M.worktree_label(worktree)
+    if type(worktree) ~= "table" then
+        return nil
+    end
+    if type(worktree.name) == "string" and worktree.name ~= "" then
+        return worktree.name
+    end
+    local path = type(worktree.path) == "string" and worktree.path or ""
+    if path == "" then
+        return nil
+    end
+    -- `:t` keeps a trailing separator, so trim it before asking for the tail.
+    local trimmed = path:gsub("/+$", "")
+    local base = vim.fn.fnamemodify(trimmed ~= "" and trimmed or path, ":t")
+    if type(base) == "string" and base ~= "" then
+        return base
+    end
+    return path
+end
+
+--- Append the assigned worktree badge to a label: `worker 󰙅 wt-1`. Without a
+--- worktree the label is returned untouched, so a non-isolated dispatch renders
+--- exactly as before.
+---@param label string
+---@param worktree any
+---@return string
+function M.with_worktree(label, worktree)
+    local wt = M.worktree_label(worktree)
+    if not wt then
+        return label
+    end
+    return label .. " " .. WORKTREE_GLYPH .. " " .. wt
+end
+
+--- Item label with the worktree explicitly given. `worktree` is the actual
+--- assignment when the caller already knows it (a result item), so a reuse item
+--- needs at most one manifest lookup for both its name and its checkout.
+---@param item table
+---@param worktree table?
+---@return string
+local function label_with_worktree(item, worktree)
+    if type(item.task) == "string" and item.task ~= "" then
+        local label
+        if type(item.name) == "string" and item.name ~= "" then
+            label = item.name
+        else
+            -- Same derivation the manifest stores as name_source = "fallback".
+            label = Manifest.fallback_name(item.task) or "?"
+        end
+        return M.with_worktree(label, worktree)
+    end
+    if type(item.target) == "string" and item.target ~= "" then
+        -- The row the reuse item names carries the child's current checkout.
+        local entry = Manifest.locate(item.target)
+        local name = entry and type(entry.name) == "string" and entry.name ~= "" and entry.name or nil
+        local assigned = worktree or (entry and type(entry.assigned_worktree) == "table" and entry.assigned_worktree)
+        return M.with_worktree(name or M.short_id(item.target) or item.target, assigned)
+    end
+    return "?"
+end
+
 ---@param item table
 ---@return string
 function M.item_label(item)
     if type(item) ~= "table" then
         return "?"
     end
-    if type(item.task) == "string" and item.task ~= "" then
-        if type(item.name) == "string" and item.name ~= "" then
-            return item.name
-        end
-        -- Same derivation the manifest stores as name_source = "fallback".
-        return Manifest.fallback_name(item.task) or "?"
-    end
-    if type(item.target) == "string" and item.target ~= "" then
-        return M.child_name(item.target) or M.short_id(item.target) or item.target
-    end
-    return "?"
+    return label_with_worktree(item, type(item.worktree) == "table" and item.worktree or nil)
 end
 
 --- Format model and thinking level for a dispatch item, e.g. "claude-3-7-sonnet · think: high".
@@ -330,7 +390,21 @@ function M.dispatch_rows(args, details)
         then
             ref = aitem.ref
         end
-        local label = (ref and ("[%s] "):format(ref) or "") .. M.item_label(ditem or aitem)
+        -- The result item is authoritative for the assignment (it is what the
+        -- batch actually gave the child); the args item is the fallback for a
+        -- block replayed before any result detail exists.
+        local base_item = (type(ditem) == "table" and ditem) or aitem
+        local item_wt = type(base_item) == "table" and type(base_item.worktree) == "table" and base_item.worktree
+            or (type(aitem) == "table" and type(aitem.worktree) == "table" and aitem.worktree)
+            or nil
+        -- An item that failed or was cancelled before it ever got a target never
+        -- ran in the checkout that was only *requested* for it: the badge would
+        -- claim a checkout no child was given. Started items keep it.
+        local started = type(ditem) == "table" and type(ditem.target) == "string" and ditem.target ~= ""
+        if item_wt and (status == "failed" or status == "cancelled") and not started then
+            item_wt = nil
+        end
+        local label = (ref and ("[%s] "):format(ref) or "") .. label_with_worktree(base_item, item_wt)
         local excerpt ---@type string?
         if
             (status == "failed" or status == "cancelled")

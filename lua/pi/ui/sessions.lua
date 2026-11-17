@@ -49,7 +49,8 @@ local show_hidden_children = false
 ---@field is_group? boolean worktree group header row (not a session)
 ---@field group_id? string worktree root of a group header and its members
 ---@field worktree? string worktree name shown on a group header / sub-session row
----@field worktree_path? string display path of a worktree group header
+---@field worktree_path? string display path of a worktree group header (· the assigned
+---   worktree of a sub-session row: another checkout of the *same* repository)
 ---@field forked_from? string display name of the session this one was forked from
 
 ---@type integer? shared list buffer
@@ -316,6 +317,33 @@ local function session_worktree(session)
     return detect_worktree(cwd)
 end
 
+--- Name and display path of an *assigned* worktree (`{ kind = "linked", path,
+--- name? }`): the checkout a sub-session was handed, which is another checkout of
+--- the same repository as its parent row (assignment is rejected across
+--- repositories). The name is the checkout's own, else its directory name, else
+--- the path itself.
+---@param worktree any
+---@return string? name
+---@return string? path display form (`~/…`)
+local function assigned_worktree_label(worktree)
+    if type(worktree) ~= "table" then
+        return nil, nil
+    end
+    local path = type(worktree.path) == "string" and worktree.path ~= "" and worktree.path or nil
+    local display_path = path and vim.fn.fnamemodify(path, ":~") or nil
+    local name = type(worktree.name) == "string" and worktree.name ~= "" and worktree.name or nil
+    if not name and path then
+        -- `:t` keeps a trailing separator, so trim it before asking for the tail.
+        local trimmed = path:gsub("/+$", "")
+        local base = vim.fn.fnamemodify(trimmed ~= "" and trimmed or path, ":t")
+        name = base ~= "" and base or path
+    end
+    if not name then
+        return nil, nil
+    end
+    return name, display_path
+end
+
 --- Fold-state key of a worktree group header. The `wt:` namespace keeps it
 --- from colliding with a session lineage or session id.
 ---@param root string
@@ -342,7 +370,11 @@ end
 --- Rows whose session cwd is not a work tree keep their order in a trailing
 --- ungrouped bucket, members keep tabline order inside their group, and a
 --- sub-session row inherits the worktree of the parent row above it (and names
---- it in its subtitle).
+--- it in its subtitle) — unless the child was *assigned* a worktree of its own
+--- (entry.assigned_worktree, set by `append_child_row`), which is named instead.
+--- A child stays nested under its parent whatever checkout it runs in: the
+--- grouping and the parent's fold count follow the parent row, never the
+--- child's cwd.
 ---@param flat pi.SessionsListRow[]
 ---@return pi.SessionsListRow[]
 local function group_by_worktree(flat)
@@ -420,8 +452,9 @@ local function group_by_worktree(flat)
         if not collapsed then
             for _, row in ipairs(members) do
                 row.group_id = root
-                if row.depth and row.depth > 0 then
+                if row.depth and row.depth > 0 and not row.worktree then
                     row.worktree = info.name
+                    row.worktree_path = vim.fn.fnamemodify(root, ":~")
                 end
                 out[#out + 1] = row
             end
@@ -592,6 +625,10 @@ local function append_child_row(out, entry, tab, opts)
     local model = cfg.model
     local subtitle = model and (model.id .. (cfg.thinking_level and (" · " .. cfg.thinking_level) or "")) or ""
     local dormant = entry.status == "dormant" or (child and not child.rpc:is_running())
+    -- A child may be assigned its own checkout (sub-agent worktree isolation):
+    -- name that one, never the parent's group worktree it would otherwise
+    -- inherit.
+    local assigned_name, assigned_path = assigned_worktree_label(entry.assigned_worktree)
     out[#out + 1] = {
         tab = tab,
         child_id = child_id,
@@ -609,6 +646,8 @@ local function append_child_row(out, entry, tab, opts)
         dormant = dormant,
         session = child,
         is_current_view = opts.is_current_view == true,
+        worktree = assigned_name,
+        worktree_path = assigned_path,
     }
 end
 
@@ -1779,6 +1818,14 @@ end
 --- (`group_id` is set on a group header and on every member row, the main
 --- checkout partition included), else the row session's detected worktree,
 --- else its cwd.
+---
+--- A sub-session row never answers with the checkout it was *assigned*: that
+--- checkout is borrowed, not owned, while every consumer of this path (`n` opens
+--- a fresh session in it, `N` creates a worktree from it) treats it as an owned
+--- top-level checkout a session may later close and delete. The assigned
+--- worktree is shown on the row (and `apply` / `ship` target it); `n` / `N` keep
+--- acting on the workspace the row hangs under — its parent's workspace, which
+--- is what this returned before assignments existed.
 ---@param row pi.SessionsListRow?
 ---@return string?
 function M.row_checkout(row)
@@ -1787,6 +1834,25 @@ function M.row_checkout(row)
     end
     if type(row.group_id) == "string" and row.group_id ~= "" then
         return row.group_id
+    end
+    if row.depth and row.depth > 0 then
+        local session = row.session
+        if not session then
+            return nil
+        end
+        -- `manifest_cwd` is the parent workspace the child's rows are owned by,
+        -- even when the child process runs in an assigned checkout.
+        local Manifest = require("pi.subsessions.manifest")
+        local workspace = Manifest.workspace(session)
+        local assigned = type(session.assigned_worktree) == "table" and session.assigned_worktree.path or nil
+        if type(workspace) == "string" and type(assigned) == "string" and assigned ~= "" then
+            if workspace == assigned or vim.fn.resolve(workspace) == vim.fn.resolve(assigned) then
+                -- The only workspace known *is* the borrowed checkout: offer
+                -- nothing rather than hand it to an owning command.
+                return nil
+            end
+        end
+        return workspace
     end
     local worktree = row.session and row.session.worktree
     if type(worktree) == "table" and type(worktree.path) == "string" and worktree.path ~= "" then
