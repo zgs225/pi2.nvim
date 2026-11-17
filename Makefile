@@ -6,6 +6,7 @@
 #   make e2e-worktrees — real-git e2e: worktree create/apply/remove/ship/release (needs pi binary; no provider calls)
 #   make e2e-bg-delivery — real-pi e2e: background bash completion delivery into agent context (needs pi + provider; not CI)
 #   make e2e-subagent-failure — real-pi e2e: a failed child run reaches the parent as a failed item (needs pi; not CI)
+#   make e2e-subagent-worktree — real-pi e2e: a spawn item's assigned worktree is the child's real cwd (needs pi; not CI)
 #   make smoke   — headless end-to-end smoke check (loads the user config, opens the chat)
 #   make format  — reformat lua/ and tests/ in place with stylua
 #   make style   — check formatting only (stylua --check); non-zero exit on drift, for CI/hooks
@@ -21,7 +22,7 @@ MIN_INIT := tests/minimal_init.lua
 STYLUA_BIN ?= stylua
 LUA_LS_BIN ?= lua-language-server
 
-.PHONY: test smoke format style lint docs-links e2e e2e-reaper e2e-worktrees e2e-bg-delivery e2e-subagent-failure
+.PHONY: test smoke format style lint docs-links e2e e2e-reaper e2e-worktrees e2e-bg-delivery e2e-subagent-failure e2e-subagent-worktree
 
 test:
 	PLENARY_PATH=$(PLENARY_PATH) $(NVIM_BIN) --headless -u $(MIN_INIT) \
@@ -53,6 +54,14 @@ e2e-bg-delivery:
 # local fake provider, so it needs the pi binary but no account/quota.
 e2e-subagent-failure:
 	$(NVIM_BIN) --headless -u $(MIN_INIT) -l scripts/e2e/subagent_failure.lua
+
+# Real-pi e2e for a spawn item that assigns an existing linked worktree: a real
+# child process must really run in that checkout (model-driven sentinel + RPC
+# pwd), the manifest must record the assignment, close must keep the checkout,
+# and a deleted checkout must fail a revive closed. Uses a local fake provider,
+# so it needs the pi binary but no account/quota.
+e2e-subagent-worktree:
+	$(NVIM_BIN) --headless -u $(MIN_INIT) -l scripts/e2e/subagent_worktree.lua
 
 smoke:
 	$(NVIM_BIN) --headless -u $(HOME)/.config/nvim/init.lua -l scripts/smoke.lua
