@@ -29,6 +29,10 @@
 --   * after the checkout is deleted, revive fails closed with an error — no
 --     process, no new transcript, no manifest write, nothing spawned in the
 --     parent's workspace.
+--   * a second, `worktree = { create = { name, base } }` item gets a brand-new
+--     checkout under `<repo>/.worktrees/` (a real `git worktree add`), the row
+--     records it as **owned**, the child really runs there, and closing the
+--     clean checkout releases it again (the assigned one above never is).
 --
 -- Needs the pi binary, so it is NOT part of `make test` or CI. Run from the
 -- repo root:
@@ -477,6 +481,10 @@ local ok, failure = pcall(function()
     git({ "config", "user.email", "e2e@example.invalid" }, REPO)
     git({ "config", "user.name", "e2e" }, REPO)
     write_file(REPO .. "/README.md", "# e2e\n")
+    -- Pre-ignored so a created checkout never dirties the parent checkout (the
+    -- "parent unchanged" assertions below would otherwise trip on a generated
+    -- `.gitignore`).
+    write_file(REPO .. "/.gitignore", "/.worktrees/\n")
     git({ "add", "-A" }, REPO)
     git({ "commit", "-q", "-m", "init" }, REPO)
     git({ "worktree", "add", "-q", "-b", "e2e-assigned-" .. NONCE, WT }, REPO)
@@ -747,6 +755,103 @@ local ok, failure = pcall(function()
         )
     end
     step("revive failed closed after deletion, nothing written to the parent")
+
+    -- ---------------------------------------------------------------------
+    -- Owned checkout: `worktree = { create = { name, base } }` really creates
+    -- one with git, the row records it as owned, and a clean close releases it.
+    -- ---------------------------------------------------------------------
+    local created_name = "e2e-created-" .. NONCE
+    local created_path = realpath(REPO .. "/.worktrees/" .. created_name)
+    local worktree_list_before_create = git({ "worktree", "list", "--porcelain" }, REPO)
+
+    local create_dispatched
+    Subsessions.handle_host(
+        parent,
+        vim.json.encode({
+            action = "dispatch_subagents",
+            params = {
+                items = {
+                    {
+                        ref = "create",
+                        task = TASK,
+                        name = "e2e-created",
+                        model = { provider = PROVIDER, id = MODEL_ID },
+                        tools = { "bash" },
+                        worktree = { create = { name = created_name, base = "head" } },
+                    },
+                },
+            },
+        }),
+        function(res)
+            create_dispatched = res
+        end
+    )
+    check(
+        type(create_dispatched) == "table" and type(create_dispatched.batch_id) == "string",
+        "create dispatch returned a batch id",
+        { result = create_dispatched }
+    )
+    local create_snap = wait_terminal(create_dispatched.batch_id, 180000, REPO)
+    check(create_snap ~= nil, "create batch never reached a terminal state")
+    check(create_snap.status == "completed", "create batch status is `completed`", { status = create_snap.status })
+    local created_item = create_snap.items[1]
+    check(created_item.status == "ok", "the created checkout's child run settled as `ok`", { item = created_item })
+    check(
+        type(created_item.worktree) == "table"
+            and realpath(created_item.worktree.path) == created_path
+            and created_item.worktree.owned == true,
+        "the batch item reports the created checkout as owned",
+        { worktree = created_item.worktree, path = created_path }
+    )
+    check(exists(created_path .. "/.git"), "a real linked worktree was created under .worktrees/", {
+        path = created_path,
+    })
+    check(
+        git({ "worktree", "list", "--porcelain" }, REPO) ~= worktree_list_before_create,
+        "git registers the created worktree"
+    )
+
+    local created_child_id = created_item.target
+    local created_child = Sessions.get_by_id(created_child_id)
+    check(created_child ~= nil, "the created check-out's child session exists", { id = created_child_id })
+    check(
+        realpath(rpc_bash(created_child, "pwd -P")) == created_path,
+        "the created check-out's child really runs in it (pwd -P)"
+    )
+    local created_entry = Manifest.load(REPO)[created_child_id]
+    check(type(created_entry) == "table", "the created check-out has a manifest row")
+    check(
+        type(created_entry.worktree) == "table"
+            and realpath(created_entry.worktree.path) == created_path
+            and created_entry.worktree.owned == true,
+        "the manifest records the created check-out as owned",
+        { worktree = created_entry.worktree }
+    )
+    check(created_entry.assigned_worktree == nil, "an owned checkout carries no assignment")
+    check(
+        realpath(session_header_cwd(created_entry.session_file)) == created_path,
+        "the owned child's transcript header records the created checkout"
+    )
+    step("created checkout registered, owned, and used by the real child")
+
+    -- A clean close releases what this spawn created (the assigned one above
+    -- never is). Remove the child's own sentinel first so the checkout is clean.
+    vim.fn.delete(created_path .. "/" .. SENTINEL)
+    Subsessions.close(created_child_id)
+    wait(function()
+        return not child_running(created_child_id)
+    end, 30000, "created child to stop")
+    wait(function()
+        return not exists(created_path)
+    end, 30000, "the owned checkout to be released")
+    check(not exists(created_path), "a clean owned checkout is released on close", { path = created_path })
+    check(
+        git({ "worktree", "list", "--porcelain" }, REPO) == worktree_list_before_create,
+        "git no longer lists the released worktree"
+    )
+    check(git({ "status", "--porcelain" }, REPO) == parent_status, "parent git status is still unchanged")
+    check(head_sha(REPO) == parent_head, "parent HEAD is still unchanged")
+    step("clean owned checkout released on close")
 end)
 
 -- Cleanup: stop timers/processes, drop the throwaway agent dir, restore env.
@@ -774,7 +879,7 @@ if not ok then
 end
 
 print(
-    ("PASS: sub-agent worktree e2e OK — the real child ran in the assigned checkout (sentinel + pwd), manifest recorded assigned_worktree/workspace/session_file, close kept clean and dirty checkouts, revive kept the cwd, and a deleted checkout failed closed without touching the parent (in %.2fs)"):format(
+    ("PASS: sub-agent worktree e2e OK — the real child ran in the assigned checkout (sentinel + pwd), manifest recorded assigned_worktree/workspace/session_file, close kept clean and dirty checkouts, revive kept the cwd, a deleted checkout failed closed without touching the parent, and a `create` item got a real owned checkout under .worktrees/ that a clean close released again (in %.2fs)"):format(
         total
     )
 )

@@ -138,7 +138,7 @@ end
 ---@field thinking_level? string
 ---@field tools? string[] Tool allowlist for this child (default: `subagent.tools`, then nil = every tool).
 ---@field agent_spawned? boolean Block completion prompt injection (Agent tool path).
----@field worktree? { path: string } Pre-existing linked worktree to run the child in (shared, never owned).
+---@field worktree? pi.SubsessionWorktreeRequest Pre-existing linked worktree to run the child in (`{ path }`, shared and never owned), or a checkout to create/adopt (`{ create }`).
 
 --- Resolve the child tool allowlist: per-spawn override, then subagent.tools, then nil (inherit all).
 ---@param opts { tools?: string[] }
@@ -404,10 +404,13 @@ end
 
 --- Worktree metadata recorded on a child's manifest row.
 ---
---- A modern child may be explicitly assigned an existing shared worktree
---- (`assigned_worktree`, owned by the caller); it never gets a checkout of its
---- own. A row written by an older version still records an owned checkout in
---- `worktree`, which `resolve_child_cwd` honours while that directory exists.
+--- Two shapes share this class:
+---   * **owned** — a checkout this spawn created (or recreated on revive) and
+---     therefore may release. It lives in the row's `worktree` field and on the
+---     session as `session.worktree`.
+---   * **adopted / borrowed** — a linked checkout that already existed, named by
+---     `create.name` (adopted) or `worktree.path` (borrowed). It is never created,
+---     reset or released, and lives on `assigned_worktree`.
 ---@class pi.SubsessionWorktree
 ---@field path string Worktree root — the child session cwd.
 ---@field name? string Worktree name (`sub-<timestamp>-<n>-<pid>` for children).
@@ -416,9 +419,17 @@ end
 ---@field git_dir? string Per-worktree git dir.
 ---@field common_dir? string Shared git dir.
 ---@field base_sha? string Commit the worktree was created from.
----@field mode? string Creation mode recorded in the metadata (`"new"` for children).
+---@field mode? string Creation mode recorded in the metadata (`"subagent"` for child checkouts).
+---@field owned? boolean True when this spawn created the checkout, so it may be released; absent on shared checkouts.
+---@field reused? boolean True when an existing checkout was adopted by name instead of created.
+---@field base_ignored? boolean True when a `create.base` was ignored because the checkout already existed.
 ---@field session_id? string pi session bound to the worktree.
 ---@field session_file? string pi session transcript bound to the worktree.
+
+--- A `worktree` request on a spawn item or the Lua API.
+---@class pi.SubsessionWorktreeRequest
+---@field path? string Absolute path of an existing linked worktree to borrow (never owned).
+---@field create? boolean|{ base?: string, name?: string, setup?: boolean } Create a checkout for this child, or adopt the one `name` already resolves to. `base` is `"head"` (default), `"fresh"`, or any revision; `setup` runs `worktree.setup_cmd` (default `subagent.worktree.setup`).
 
 --- Worktree module, loaded lazily.
 ---
@@ -443,6 +454,77 @@ end
 ---@return boolean
 local function is_absolute_path(path)
     return path:sub(1, 1) == "/" or path:match("^%a:[/\\]") ~= nil
+end
+
+--- Validate and normalize a `worktree` request.
+---
+--- The field takes **either** `{ path }` (borrow an existing linked checkout)
+--- **or** `{ create }` (create a checkout for this child, or adopt the one its
+--- `name` already resolves to). Exactly one of the two keys must be present:
+--- carrying both is ambiguous, carrying neither is not a request. `create =
+--- false` is read as "no worktree" so a model can say so explicitly.
+---
+--- Validation here is shape-only and cheap. The borrow path is fully validated by
+--- `resolve_assigned_worktree`; a create request's base/name are validated when
+--- the checkout is prepared (that is where `git rev-parse` runs).
+---@param raw any `opts.worktree` as supplied
+---@return pi.SubsessionWorktreeRequest? request nil when no worktree was requested
+---@return string? err Human-readable rejection reason
+function M.normalize_worktree_request(raw)
+    if raw == nil then
+        return nil, nil
+    end
+    if type(raw) ~= "table" then
+        return nil, "worktree must be an object"
+    end
+    local has_path = raw.path ~= nil
+    local create = raw.create
+    local has_create = create ~= nil and create ~= false
+    if has_path and has_create then
+        return nil, "worktree takes either `path` (borrow an existing checkout) or `create`, not both"
+    end
+    if has_path then
+        if type(raw.path) ~= "string" or raw.path == "" then
+            return nil, "worktree.path must be a non-empty string"
+        end
+        return { path = raw.path }, nil
+    end
+    if not has_create then
+        if create == false then
+            return nil, nil
+        end
+        return nil, "worktree needs `path` (an existing linked worktree) or `create`"
+    end
+    if create == true then
+        return { create = true }, nil
+    end
+    if type(create) ~= "table" then
+        return nil, "worktree.create must be a boolean or an object"
+    end
+    local request = { create = {} }
+    if create.base ~= nil then
+        if type(create.base) ~= "string" or vim.trim(create.base) == "" then
+            return nil, "worktree.create.base must be a non-empty string"
+        end
+        request.create.base = vim.trim(create.base)
+    end
+    if create.name ~= nil then
+        local mod = worktree_mod()
+        if mod and type(mod.validate_name) == "function" then
+            local ok, name_err = mod.validate_name(create.name)
+            if not ok then
+                return nil, name_err
+            end
+        end
+        request.create.name = create.name
+    end
+    if create.setup ~= nil then
+        if type(create.setup) ~= "boolean" then
+            return nil, "worktree.create.setup must be a boolean"
+        end
+        request.create.setup = create.setup
+    end
+    return request, nil
 end
 
 --- Resolve and validate an explicitly assigned worktree.
@@ -521,6 +603,107 @@ local function resolve_assigned_worktree(raw, parent_cwd)
         nil
 end
 
+--- The repository a sub-session checkout belongs to.
+---
+--- Creation never runs inside the parent's own checkout: a parent session may
+--- itself run in a linked worktree, and `Worktree.create` refuses to nest. The
+--- repository's main work tree is the creation cwd, while `head` stays the
+--- parent checkout's HEAD — the commits its conversation sees.
+---@param parent_cwd string?
+---@return string repo_cwd
+---@return table? parent_info `Worktree.detect(parent_cwd)` when it is a checkout.
+local function repository_scope(parent_cwd)
+    local mod = worktree_mod()
+    local info = nil
+    if mod and type(mod.detect) == "function" and type(parent_cwd) == "string" and parent_cwd ~= "" then
+        info = mod.detect(parent_cwd)
+    end
+    if type(info) == "table" and type(info.repo_root) == "string" and info.repo_root ~= "" then
+        return info.repo_root, info
+    end
+    return parent_cwd or "", nil
+end
+
+--- Effective base strategy of a create request: the per-item `base`, else
+--- `worktree.base_ref`, else `head`. Anything but `fresh` degrades to `head`
+--- rather than inventing a strategy.
+---@param requested string?
+---@return string kind `"head"`, `"fresh"`, or an explicit revision.
+local function resolve_base_kind(requested)
+    if type(requested) == "string" and vim.trim(requested) ~= "" then
+        return vim.trim(requested)
+    end
+    local cfg = Config.options.worktree or {}
+    if type(cfg.base_ref) == "string" and vim.trim(cfg.base_ref) == "fresh" then
+        return "fresh"
+    end
+    return "head"
+end
+
+--- Prepare the checkout a `create` request asks for: adopt the one `name`
+--- already resolves to, or create a new one at the resolved base.
+---
+--- Adoption is what makes a repeated dispatch reuse the work an earlier child
+--- left behind: the existing checkout is kept exactly as it is — never reset,
+--- rebased, re-checked-out or released — and a `base` given alongside an
+--- existing name is **ignored** (reported as `base_ignored`) rather than
+--- silently rewriting the state someone worked in.
+---@param parent_cwd string?
+---@param request pi.SubsessionWorktreeRequest Normalized `{ create = ... }` request.
+---@param cb fun(info: pi.SubsessionWorktree?, owned: boolean, base_ignored: boolean, err: string?)
+local function resolve_create_target(parent_cwd, request, cb)
+    local mod = worktree_mod()
+    if not mod or type(mod.create) ~= "function" or type(mod.detect) ~= "function" then
+        return cb(nil, false, false, "worktree support is unavailable")
+    end
+    if type(parent_cwd) ~= "string" or parent_cwd == "" then
+        return cb(nil, false, false, "sub-session workspace is unknown")
+    end
+    local cwd = parent_cwd --[[@as string]]
+    local create = type(request.create) == "table" and request.create or {}
+    local repo_cwd = repository_scope(cwd)
+    local name = create.name
+    local target = name and (repo_cwd .. "/.worktrees/" .. name) or nil
+    if target and vim.fn.isdirectory(target) == 1 then
+        -- Same validation as a borrowed path: an existing linked checkout of the
+        -- same repository, canonicalized from git's own metadata. A directory
+        -- that is not one of those is an error, never a "replace it".
+        local adopted, adopt_err = resolve_assigned_worktree({ path = target }, cwd)
+        if not adopted then
+            return cb(nil, false, false, adopt_err)
+        end
+        adopted.reused = true
+        adopted.base_ignored = create.base ~= nil
+        return cb(adopted, false, create.base ~= nil, nil)
+    end
+    local kind = resolve_base_kind(create.base)
+    mod.resolve_base({ kind = kind, cwd = parent_cwd, repo = repo_cwd }, function(sha, base_err)
+        if type(sha) ~= "string" or sha == "" then
+            return cb(nil, false, false, base_err or "failed to resolve a base commit")
+        end
+        -- `setup_cmd` is an expensive, opt-in step for a child checkout: a
+        -- dispatch is already paying a `git worktree add` plus the include copy.
+        local setup = create.setup
+        if setup == nil then
+            local subcfg = Config.options.subagent or {}
+            setup = type(subcfg.worktree) == "table" and subcfg.worktree.setup == true
+        end
+        mod.create({
+            cwd = repo_cwd,
+            name = name,
+            mode = "subagent",
+            base = sha,
+            setup = setup == true,
+        }, function(info, create_err)
+            if type(info) ~= "table" or type(info.path) ~= "string" or info.path == "" then
+                return cb(nil, false, false, create_err or "failed to create the sub-session worktree")
+            end
+            info.owned = true
+            cb(info, true, false, nil)
+        end)
+    end)
+end
+
 --- Assigned worktree recorded on a manifest row, or nil.
 ---@param entry any
 ---@return pi.SubsessionWorktree?
@@ -543,8 +726,10 @@ end
 --- The other exception is a child spawned by an older version, whose row records
 --- the checkout it used to run in: while that directory still exists, that
 --- recorded cwd is a usable workspace, so a revive keeps running there. Once it
---- is gone the child falls back to the parent's workspace with a single warning
---- — a revive never creates a checkout and never fails over a missing one.
+--- is gone the child falls back to the parent's workspace with a single warning.
+--- (A checkout the current version created is recreated in place before this is
+--- reached — see `recreate_owned_worktree` — so this path only covers rows whose
+--- repository or name can no longer be resolved.)
 ---@param recorded pi.SubsessionWorktree? Checkout recorded on the child's manifest row.
 ---@param parent_cwd string? Parent workspace cwd (the fallback).
 ---@return string?
@@ -580,6 +765,56 @@ local function release_worktree_info(info)
     end
     pcall(mod.release, info, function() end)
     return true
+end
+
+--- Recreate a child's owned checkout that no longer exists.
+---
+--- The transcript records the checkout as its cwd and pi refuses to resume from
+--- a missing directory, so a revive recreates it **in place** at the base commit
+--- recorded when it was created. A recorded base that no longer resolves
+--- (history rewritten, objects pruned) is retried once at the repository HEAD.
+--- The caller decides what a failure means; this never blocks a revive.
+---@param recorded pi.SubsessionWorktree
+---@param parent_cwd string?
+---@param cb fun(info: pi.SubsessionWorktree?, err: string?)
+local function recreate_owned_worktree(recorded, parent_cwd, cb)
+    local mod = worktree_mod()
+    if not mod or type(mod.create) ~= "function" then
+        return cb(nil, "worktree support is unavailable")
+    end
+    local path = type(recorded.path) == "string" and recorded.path or ""
+    local name = type(recorded.name) == "string" and recorded.name ~= "" and recorded.name
+        or (path ~= "" and vim.fs.basename(path) or nil)
+    local repo = type(recorded.repo_root) == "string" and recorded.repo_root ~= "" and recorded.repo_root or nil
+    if not repo and type(parent_cwd) == "string" and parent_cwd ~= "" then
+        repo = repository_scope(parent_cwd)
+    end
+    if type(name) ~= "string" or name == "" or type(repo) ~= "string" or repo == "" then
+        return cb(nil, "cannot locate the repository to recreate the checkout")
+    end
+    local base = type(recorded.base_sha) == "string" and recorded.base_sha ~= "" and recorded.base_sha or nil
+    ---@param sha string?
+    ---@param done fun(info: pi.SubsessionWorktree?, err: string?)
+    local function attempt(sha, done)
+        mod.create({ cwd = repo, name = name, mode = "subagent", base = sha, setup = false }, function(info, err)
+            if type(info) == "table" and type(info.path) == "string" and info.path ~= "" then
+                info.owned = true
+                return done(info, nil)
+            end
+            done(nil, err)
+        end)
+    end
+    attempt(base, function(info, err)
+        if info then
+            return cb(info, nil)
+        end
+        if base and type(err) == "string" and err:find("invalid base commit", 1, true) then
+            return attempt(nil, function(retry_info, retry_err)
+                cb(retry_info, retry_err)
+            end)
+        end
+        cb(nil, err)
+    end)
 end
 
 --- Worktree info recorded on a manifest row, or nil.
@@ -677,13 +912,26 @@ function M.spawn(parent, opts, callback)
     -- nested dispatch from an assigned child keeps building inside the assigned
     -- worktree. Storage above still uses the owner workspace.
     local parent_cwd = (type(parent.cwd) == "string" and parent.cwd ~= "" and parent.cwd) or workspace
-    -- An explicitly assigned worktree is resolved and validated before any slot
-    -- is reserved or a process started: a bad path fails fast and untouched.
-    local assigned, assigned_err = resolve_assigned_worktree(opts.worktree, parent_cwd)
-    if assigned_err then
-        callback(nil, assigned_err)
+    -- The `worktree` request is normalized before any slot is reserved or a
+    -- process started: a malformed request, or a borrow path that does not name
+    -- an existing linked checkout, fails fast and untouched. A `create` request
+    -- is only resolved later, because creating a checkout costs git calls.
+    local wt_req, wt_req_err = M.normalize_worktree_request(opts.worktree)
+    if wt_req_err then
+        callback(nil, wt_req_err)
         return
     end
+    local assigned, assigned_err
+    if wt_req and wt_req.path then
+        assigned, assigned_err = resolve_assigned_worktree({ path = wt_req.path }, parent_cwd)
+        if assigned_err then
+            callback(nil, assigned_err)
+            return
+        end
+    end
+    --- Checkout this spawn created (owned) — resolved after the slot is held.
+    ---@type pi.SubsessionWorktree?
+    local owned = nil
     -- Abort epoch of the lineage as it resolves *now*: `with_parent_id` below can
     -- do an id-lookup round-trip, and before that round-trip finishes the parent
     -- may still be keyed by a `tmp-` id. An abort landing in that window bumps
@@ -742,22 +990,27 @@ function M.spawn(parent, opts, callback)
         end
 
         local tab = parent.attached_tab or vim.api.nvim_get_current_tabpage()
-        --- Start the child process in its assigned worktree, or in the parent's
-        --- actual cwd when no worktree was requested.
-        local child_cwd = assigned and assigned.path or parent_cwd
+        --- The checkout this child runs in: the borrowed or created one, else the
+        --- parent's actual cwd. Computed at launch because a `create` request
+        --- resolves asynchronously, after the slot is reserved.
+        local function child_cwd()
+            return (assigned and assigned.path) or (owned and owned.path) or parent_cwd
+        end
         local function start_child()
+            local cwd = child_cwd()
             -- Reserve the canonical cwd for the synchronous registration window.
             -- Several children may share one worktree; this only keeps an owner
             -- close from releasing the checkout before the new process is
             -- registered (see release_session_worktree's guard).
-            Sessions.reserve_cwd(child_cwd)
+            Sessions.reserve_cwd(cwd)
             local ok_create, child = pcall(Sessions.create_detached, tab, {
                 subagent = false,
                 tools = tools,
-                cwd = child_cwd,
+                cwd = cwd,
                 assigned_worktree = assigned,
+                worktree = owned,
             })
-            Sessions.release_cwd(child_cwd)
+            Sessions.release_cwd(cwd)
             if not ok_create or not child then
                 unreserve()
                 callback(nil, ok_create and "failed to start sub-session process" or tostring(child))
@@ -820,6 +1073,7 @@ function M.spawn(parent, opts, callback)
                     session_file = child.session_file,
                     workspace = workspace,
                     assigned_worktree = assigned,
+                    worktree = owned,
                 }, workspace)
                 unreserve()
                 apply_config(child, config, function(ok, config_err)
@@ -900,6 +1154,43 @@ function M.spawn(parent, opts, callback)
             end)
         end
 
+        -- A create request pays its git calls here, after the slot is held and
+        -- before the process starts; an abort or a failure releases a checkout it
+        -- created itself (an adopted one is never ours to remove).
+        if wt_req and wt_req.create then
+            ---@cast wt_req pi.SubsessionWorktreeRequest
+            resolve_create_target(parent_cwd, wt_req, function(info, is_owned, base_ignored, err)
+                vim.schedule(function()
+                    if not info then
+                        unreserve()
+                        callback(nil, err or "failed to prepare the sub-session worktree")
+                        return
+                    end
+                    if M.abort_epoch(lineage_id) ~= epoch then
+                        if is_owned then
+                            release_worktree_info(info)
+                        end
+                        unreserve()
+                        callback(nil, "sub-session aborted while spawning")
+                        return
+                    end
+                    if is_owned then
+                        owned = info
+                    else
+                        assigned = info
+                        if base_ignored then
+                            Notify.warn(
+                                ("Sub-session worktree %s already exists; reusing it as is (base ignored)"):format(
+                                    info.path
+                                )
+                            )
+                        end
+                    end
+                    start_child()
+                end)
+            end)
+            return
+        end
         -- No checkout to prepare: the child runs in the parent's workspace, so
         -- the process starts straight away.
         if M.abort_epoch(lineage_id) ~= epoch then
@@ -1150,6 +1441,44 @@ function M.revive(child_id, callback)
     end
 
     local recorded = entry_worktree(entry)
+    -- Only a checkout the current version **created** for this child (`owned`) is
+    -- recreated when it vanished: the transcript records that directory as its
+    -- cwd, pi refuses to resume from a missing one, and we can prove we own it.
+    -- A row from an older version records a checkout it never owned; that one
+    -- keeps the old contract — use it while it exists, otherwise run in the
+    -- parent workspace with one warning — because a revive must never resurrect
+    -- a checkout we cannot prove we own. An adopted/borrowed checkout is likewise
+    -- never recreated (a missing one is a hard error further down).
+    local recorded_path = type(recorded) == "table" and recorded.path or nil
+    local owns_checkout = type(recorded) == "table" and recorded.owned == true
+    if
+        not assigned
+        and owns_checkout
+        and type(recorded_path) == "string"
+        and recorded_path ~= ""
+        and vim.fn.isdirectory(recorded_path) == 0
+    then
+        ---@cast recorded pi.SubsessionWorktree
+        recreate_owned_worktree(recorded, manifest_cwd, function(info, err)
+            if info and vim.fn.isdirectory(info.path) == 1 then
+                Manifest.patch(child_id, { worktree = info }, manifest_cwd)
+            else
+                -- Never block a revive on a checkout that cannot come back: drop
+                -- the record (the child then runs in the parent workspace, with
+                -- one warning) instead of retrying the same failure forever.
+                Manifest.patch(child_id, { worktree = Manifest.REMOVE }, manifest_cwd)
+                Notify.warn(
+                    ("Sub-session checkout %s could not be recreated (%s); the child runs in %s"):format(
+                        recorded_path,
+                        tostring(err or "the recreated checkout is missing"),
+                        manifest_cwd or "the current directory"
+                    )
+                )
+            end
+            M.revive(child_id, callback)
+        end)
+        return
+    end
     -- The transcript lives in the workspace the child ran in: an assigned
     -- worktree for a modern row, or a leftover checkout recorded by an older
     -- version, which can differ from the manifest workspace.
@@ -1218,8 +1547,16 @@ function M.revive(child_id, callback)
         keeps_checkout = false
     else
         child_cwd = resolve_child_cwd(recorded, parent_cwd)
-        local recorded_path = type(recorded) == "table" and recorded.path or nil
-        keeps_checkout = type(recorded_path) == "string" and recorded_path ~= "" and recorded_path == child_cwd
+        local kept_path = type(recorded) == "table" and recorded.path or nil
+        keeps_checkout = type(kept_path) == "string" and kept_path ~= "" and kept_path == child_cwd
+    end
+    -- An owned checkout stays owned across the revive: the session carries it, so
+    -- close/settle can release it once it is clean. A row from an older version
+    -- (no `owned` flag) keeps its recorded checkout as a *workspace* only, exactly
+    -- as before this feature.
+    local owned_info = nil
+    if keeps_checkout and type(recorded) == "table" and recorded.owned == true then
+        owned_info = recorded
     end
 
     Sessions.reserve_cwd(child_cwd)
@@ -1228,6 +1565,7 @@ function M.revive(child_id, callback)
         tools = tools,
         cwd = child_cwd,
         assigned_worktree = assigned,
+        worktree = owned_info,
     })
     Sessions.release_cwd(child_cwd)
     if not ok_create or not child then

@@ -121,19 +121,30 @@ function isReadableFile(path: string): boolean {
 }
 
 /**
- * The worktree this child was *assigned* to, projected for list_subagents.
+ * The checkout this child runs in, projected for list_subagents.
  *
- * Reads `assigned_worktree` only. A manifest row also carries `worktree`, the
- * isolated checkout `pi.subsessions.spawn` recorded for the child itself;
- * reporting that as an assignment would tell the parent a child shares a
- * worktree it does not, so the two are never mixed. Absent/blank rows stay
- * undefined — JSON.stringify drops the key and keeps the documented shape.
+ * Prefers `assigned_worktree` (a checkout the dispatch borrowed or adopted by
+ * name — owned by someone else) and falls back to the row's own `worktree` (a
+ * checkout this spawn created). `owned` / `reused` tell the parent which of the
+ * two it is: an `owned` checkout is released automatically once clean, an
+ * adopted/borrowed one is never touched. Absent/blank rows stay undefined —
+ * JSON.stringify drops the key and keeps the documented shape.
  */
-function assignedWorktree(entry: any): { path: string; name?: string } | undefined {
-	const assigned = entry?.assigned_worktree;
-	if (!assigned || typeof assigned.path !== "string" || assigned.path === "") return undefined;
-	const projected: { path: string; name?: string } = { path: assigned.path };
-	if (typeof assigned.name === "string" && assigned.name !== "") projected.name = assigned.name;
+function childWorktree(
+	entry: any,
+): { path: string; name?: string; owned?: boolean; reused?: boolean } | undefined {
+	const typed = entry?.assigned_worktree;
+	const source =
+		typed && typeof typed.path === "string" && typed.path !== ""
+			? typed
+			: entry?.worktree && typeof entry.worktree.path === "string" && entry.worktree.path !== ""
+				? entry.worktree
+				: undefined;
+	if (!source) return undefined;
+	const projected: { path: string; name?: string; owned?: boolean; reused?: boolean } = { path: source.path };
+	if (typeof source.name === "string" && source.name !== "") projected.name = source.name;
+	if (source.owned === true) projected.owned = true;
+	if (source.reused === true) projected.reused = true;
 	return projected;
 }
 
@@ -245,23 +256,75 @@ function projectTail(path: string, tail: number): string[] {
 }
 
 /**
- * A worktree a spawn item runs the new child in. Frozen shape: `{ path }`.
+ * The checkout a spawn item runs its child in. Two mutually exclusive shapes:
+ *
+ * - `{ path }` — **borrow** an existing linked worktree. The extension never
+ *   mutates git state here: the path must already be a linked worktree of the
+ *   parent's repository, and nothing creates, prunes, merges or resets it.
+ * - `{ create }` — **create** a checkout for this child, or **adopt** the one
+ *   its `name` already resolves to (kept as is, never reset). The base is a
+ *   strategy: `"head"` (default; the parent checkout's HEAD), `"fresh"` (the
+ *   repository's remote default branch), or an explicit revision. A checkout
+ *   the spawn created is owned and released when it settles clean; an adopted
+ *   one belongs to whoever had it and is left untouched.
  *
  * Spawn-only on purpose: a reused child keeps the checkout it already runs in
- * (see the reuse variant below), and this extension never mutates git state —
- * the path must be an *existing* linked worktree, and nothing here creates,
- * prunes, merges or resets it.
+ * (see the reuse variant below).
  */
-const WorktreeRefSchema = Type.Object(
+const WorktreeCreateSchema = Type.Object(
 	{
-		path: Type.String({
-			description:
-				"Absolute path of the existing linked worktree, e.g. '/home/me/repo/.worktrees/auth-review'. It must already exist and belong to the parent's repository. Relative paths, paths outside that repository, and paths that are not linked worktrees are rejected.",
-		}),
+		base: Type.Optional(
+			Type.String({
+				description:
+					"Base the new checkout starts from: 'head' (default; the parent checkout's HEAD, including its checked-out commit), 'fresh' (the repository's remote default branch, i.e. origin/HEAD), or any revision git accepts — a branch, tag, remote ref or sha, e.g. 'origin/main' or 'v1.2.0'. Validated by git; an unknown revision fails the item with the list of corrections to try.",
+			}),
+		),
+		name: Type.Optional(
+			Type.String({
+				description:
+					"Checkout name under <repo>/.worktrees/ (1-64 chars: letters, digits, '.', '_', '-'). Omit for a generated 'sub-…' name. If the name already resolves to a linked worktree of the same repository it is reused as is (base is then ignored), so a repeated dispatch or a follow-up task lands in the work already there.",
+			}),
+		),
+		setup: Type.Optional(
+			Type.Boolean({
+				description:
+					"Run worktree.setup_cmd (dependency install etc.) inside the new checkout. Default false — a dispatch already pays a git checkout plus the .worktreeinclude copy, and running an install per child is slow. Ignored when an existing checkout is reused.",
+			}),
+		),
 	},
+	{ description: "Create a checkout for this child (or adopt the one `name` already names)." },
+);
+
+const WorktreeRefSchema = Type.Union(
+	[
+		Type.Object(
+			{
+				path: Type.String({
+					description:
+						"Absolute path of the existing linked worktree, e.g. '/home/me/repo/.worktrees/auth-review'. It must already exist and belong to the parent's repository. Relative paths, paths outside that repository, and paths that are not linked worktrees are rejected.",
+				}),
+			},
+			{
+				description:
+					"Borrow an existing linked worktree. Never created, reset or removed by this tool; the checkout is left exactly as it is when the child finishes.",
+			},
+		),
+		Type.Object(
+			{
+				create: Type.Union([Type.Boolean(), WorktreeCreateSchema], {
+					description:
+						"`true` creates a checkout with the defaults; an object chooses the base strategy, name and setup.",
+				}),
+			},
+			{
+				description:
+					"Create (or adopt by name) a checkout for this child. A checkout this spawn creates is owned: it is released automatically when it settles with no uncommitted work and no commits of its own, and kept (with its path reported) otherwise. Nothing is ever merged or applied for you.",
+			},
+		),
+	],
 	{
 		description:
-			"An existing linked worktree to run the new child in. Spawn items only: a reuse item ({ target, message }) is rejected, because a revived child keeps the checkout it already runs in. `path` is the absolute path of a linked worktree of the parent's repository that already exists — this tool never creates, removes, merges or resets a worktree, so the child's commits stay in that checkout. Omitted: the child inherits the parent's cwd. Giving the same path to several items deliberately shares that one checkout and its files; no isolation between those children is guaranteed, so give each child exclusive files. Use a distinct path per child when they must not touch one another's working tree.",
+			"Checkout to run the new child in. Give either `path` (borrow an existing linked worktree of the parent's repository) or `create` (make one, or adopt the one `name` already names) — not both. Omitted: the child inherits the parent's cwd and edits the same working tree. Giving several items the same `path` or `name` deliberately shares that checkout; no isolation between those children is guaranteed, so give each child exclusive files. A worktree is file-level isolation only, not a sandbox.",
 	},
 );
 
@@ -341,7 +404,7 @@ export default function subagentBridge(pi: ExtensionAPI) {
 		label: "List Sub-agents",
 		promptSnippet: "List sub-agent sessions owned by this session (including dormant ones)",
 		description:
-			"List sub-agents owned by the current parent session, including dormant, completed, failed and interrupted children. Call this before dispatch_subagents when continuing prior work. Returns { subagents: [{ id, name, status, model, thinking_level, parent_epoch, last_active_at, worktree?, error? }] } — empty when the session id is not known yet. `status` is one of 'active', 'completed', 'failed', 'interrupted', 'dormant'; `error` is present on a child whose last run failed and carries the provider/runtime reason (e.g. a quota or auth error). `worktree` is present only for a child that was dispatched into an existing linked worktree, and reports that assignment as { path, name? }: `path` is the absolute checkout the child was pointed at, `name` is the worktree's label when one was recorded. That is the assigned checkout, not a checkout the child created or owns itself; the field is absent for a child running in the parent's cwd. Use `id` (UUID) as the target — not the display name. Closed (dormant) children remain reusable.",
+			"List sub-agents owned by the current parent session, including dormant, completed, failed and interrupted children. Call this before dispatch_subagents when continuing prior work. Returns { subagents: [{ id, name, status, model, thinking_level, parent_epoch, last_active_at, worktree?, error? }] } — empty when the session id is not known yet. `status` is one of 'active', 'completed', 'failed', 'interrupted', 'dormant'; `error` is present on a child whose last run failed and carries the provider/runtime reason (e.g. a quota or auth error). `worktree` is present for a child that runs in its own checkout and reports `{ path, name?, owned?, reused? }`: `path` is the absolute checkout, `owned` marks one this dispatch created (released automatically once clean), `reused` one adopted by name from an earlier run; the field is absent for a child running in the parent's cwd. Use `id` (UUID) as the target — not the display name. Closed (dormant) children remain reusable.",
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			const parent = parentSessionId(ctx);
@@ -358,10 +421,12 @@ export default function subagentBridge(pi: ExtensionAPI) {
 					model: e.config?.model,
 					thinking_level: e.config?.thinking_level,
 					last_active_at: e.last_active_at,
-					// The *assigned* checkout only — never the row's own `worktree`
-					// field. undefined is dropped by JSON.stringify, so a child
-					// without an assignment keeps the documented shape.
-					worktree: assignedWorktree(e),
+					// The checkout the child actually runs in: a borrowed/adopted one
+					// (`assigned_worktree`, never owned) or one this dispatch created
+					// (`worktree`, owned and released when clean). undefined is dropped
+					// by JSON.stringify, so a child in the parent's cwd keeps the
+					// documented shape.
+					worktree: childWorktree(e),
 					// Only set for a failed last run; JSON.stringify drops undefined, so
 					// a healthy row keeps the documented shape.
 					error: e.last_error,
@@ -396,7 +461,7 @@ export default function subagentBridge(pi: ExtensionAPI) {
 		label: "Dispatch Sub-agents",
 		promptSnippet: "Run sub-agent tasks in parallel (fan out, or reuse an existing child)",
 		description:
-			"Run one or more sub-agent tasks in parallel. Each item is either { task, ... } (spawn a new child) or { target, message } (reuse an existing id from list_subagents). Prefer reuse when list_subagents already has a matching child — dormant, completed, failed and interrupted ids are revived automatically; do not spawn a new child only because status is not active. Spawn items take an optional `name`, `model`, `thinking_level`, `tools` and `worktree` (an existing linked worktree of this repository to run that child in; the last two replace the child's whole tool selection and its cwd, respectively, so list every tool it needs); on reuse items those five spawn-only fields are rejected rather than ignored (the revived child keeps its own configuration and checkout), and `target` must belong to this session's lineage. Returns the batch snapshot { batch_id, status, summary, items }, where `status` is 'running' until terminal ('completed', 'partial', 'failed' or 'cancelled'), item statuses are 'queued', 'spawning', 'running', 'ok', 'failed' or 'cancelled', and `summary` counts { total, done, ok, failed, cancelled, running }. A batch is limited to subagent.max_batch_size items (default 5) and to subagent.max_children concurrent children per parent lineage (default 5; dormant target revivals count toward the cap alongside new spawns, while reusing an alive child does not; hitting the cap auto-closes the oldest settled child outside this batch's reuse targets to make room, failing only if all live children are active); exceeding either returns { error } with no batch_id, as does an item that is neither a valid spawn nor a valid reuse. Collect results with wait:true, or poll_subagents / wait_subagents on the returned batch_id. Default failure policy: collect_errors.",
+			"Run one or more sub-agent tasks in parallel. Each item is either { task, ... } (spawn a new child) or { target, message } (reuse an existing id from list_subagents). Prefer reuse when list_subagents already has a matching child — dormant, completed, failed and interrupted ids are revived automatically; do not spawn a new child only because status is not active. Spawn items take an optional `name`, `model`, `thinking_level`, `tools` and `worktree` (the checkout to run that child in: `{ path }` borrows an existing linked worktree of this repository, `{ create }` makes one — or adopts the one its `name` already names, which is how a follow-up task lands in earlier work; `create.base` is 'head' (default), 'fresh' or any revision; a checkout this spawn created is released once it settles clean and kept otherwise. `tools` and `worktree` replace the child's whole tool selection and its cwd, respectively, so list every tool it needs); on reuse items those five spawn-only fields are rejected rather than ignored (the revived child keeps its own configuration and checkout), and `target` must belong to this session's lineage. Returns the batch snapshot { batch_id, status, summary, items }, where `status` is 'running' until terminal ('completed', 'partial', 'failed' or 'cancelled'), item statuses are 'queued', 'spawning', 'running', 'ok', 'failed' or 'cancelled', and `summary` counts { total, done, ok, failed, cancelled, running }. A batch is limited to subagent.max_batch_size items (default 5) and to subagent.max_children concurrent children per parent lineage (default 5; dormant target revivals count toward the cap alongside new spawns, while reusing an alive child does not; hitting the cap auto-closes the oldest settled child outside this batch's reuse targets to make room, failing only if all live children are active); exceeding either returns { error } with no batch_id, as does an item that is neither a valid spawn nor a valid reuse. Collect results with wait:true, or poll_subagents / wait_subagents on the returned batch_id. Default failure policy: collect_errors.",
 		parameters: Type.Object({
 			items: Type.Array(DispatchItemSchema, {
 				description:

@@ -256,6 +256,7 @@
 
 ---@class pi.WorktreeConfig
 ---@field setup_cmd? string[] Command run inside a freshly created worktree before the creation callback fires. Executed directly (no shell) with the worktree root as cwd; a non-zero exit keeps the worktree in place and fails the creation.
+---@field base_ref? "head"|"fresh" Base commit new worktrees start from: `"head"` (default) detaches at the checkout the creating session runs in, `"fresh"` at the repository's remote default branch (`origin/HEAD`, re-fetched at most once per 24h with a 5s cap, falling back to the cached ref then local `HEAD`). A `create.base` on a sub-agent dispatch item overrides it per item.
 ---@field snapshot_before_remove? boolean Write a patch snapshot before removing a worktree (`Worktree.remove`, `pi.worktree_remove`) (default true)
 ---@field warn_on_cwd_mismatch? boolean Prefix the chat-title worktree badge with `⚠` when the session's cwd differs from Neovim's cwd (default true). false keeps the plain `󰙅 <name>` badge instead
 
@@ -332,8 +333,12 @@
 ---@field show_full_ids? boolean Show full UUIDs in sub-agent tool rows (default false; truncated)
 ---@field reap_after_minutes? number Minutes a settled child process idles before auto-close (default 30; 0 disables event-driven reaping)
 ---@field reap_sweep_minutes? number Minutes between periodic idle sweeps (default 10; 0 disables the sweep)
+---@field worktree? pi.SubagentWorktreeConfig Child checkouts created by dispatch items
 ---@field sessions_list? pi.SubagentSessionsListConfig
 ---@field viewer? pi.SubagentViewerConfig Float window sizing for the sub-session viewer
+
+---@class pi.SubagentWorktreeConfig
+---@field setup? boolean Run `worktree.setup_cmd` in a freshly created child checkout (default false: a dispatch already pays a `git worktree add` plus the `.worktreeinclude` copy, and dependency installs would run once per child). A dispatch item's `create.setup` overrides it.
 
 ---@class pi.SubagentSessionsListConfig
 ---@field show_dormant? boolean Show closed (dormant) children in :PiSessions (default false; use :PiSubSwitch)
@@ -514,6 +519,7 @@ local defaults = {
     },
     worktree = {
         setup_cmd = nil,
+        base_ref = "head",
         snapshot_before_remove = true,
         warn_on_cwd_mismatch = true,
     },
@@ -531,6 +537,9 @@ local defaults = {
         show_full_ids = false,
         reap_after_minutes = 30,
         reap_sweep_minutes = 10,
+        worktree = {
+            setup = false,
+        },
         sessions_list = {
             collapse_children = false,
             show_dormant = false,

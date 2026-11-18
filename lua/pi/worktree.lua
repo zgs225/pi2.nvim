@@ -44,6 +44,12 @@ local uv = vim.uv
 ---@field name? string Worktree name (directory under `<repo>/.worktrees/`); generated when omitted
 ---@field mode? string Free-form mode recorded in the metadata (default `"isolated"`)
 ---@field base? string Commit the checkout is detached at (default: the repository's current `HEAD`); any revision `git rev-parse` accepts
+---@field setup? boolean Run `worktree.setup_cmd` after the checkout is ready (default true); `false` skips it for callers that must stay fast (sub-session spawns)
+
+---@class pi.WorktreeBaseOpts
+---@field kind? string `"head"` (default: the checkout `cwd` runs in), `"fresh"` (the remote default branch), or any revision `git rev-parse` accepts
+---@field cwd? string Directory that resolves `head` and the repository (default: the process cwd)
+---@field repo? string Repository root used for `fresh` and revision lookups (default: resolved from `cwd`)
 
 ---@class pi.WorktreeStatus
 ---@field dirty boolean Uncommitted changes (tracked, staged, or untracked)
@@ -103,6 +109,14 @@ local MAX_INCLUDE_FILES = 20000
 local MAX_NAME_LENGTH = 64
 local MAX_WALK_DEPTH = 64
 local COPY_BUDGET = 64
+--- Seconds a cached remote ref stays fresh before `fresh` re-fetches.
+local FRESH_TTL_SECONDS = 24 * 60 * 60
+--- Hard cap on the `fresh` fetch/`ls-remote`, so an offline remote never stalls a spawn.
+local FRESH_TIMEOUT_MS = 5000
+--- Repositories whose `fresh` fetch already failed this session: retrying a
+--- dead remote on every spawn would add the timeout to each one.
+---@type table<string, true>
+local fresh_fetch_failed = {}
 
 --- Test-only override for `MAX_INCLUDE_FILES` (`M._set_max_files`).
 ---@type integer?
@@ -359,7 +373,7 @@ local sidecar_writer_override = nil
 
 --- Run `argv` asynchronously. The callback always fires on the main loop.
 ---@param argv string[]
----@param opts { cwd?: string, stdin?: string }
+---@param opts { cwd?: string, stdin?: string, timeout?: integer } `timeout` (ms) kills the process
 ---@param cb fun(code: integer, stdout: string, stderr: string)
 local function run(argv, opts, cb)
     if runner_override then
@@ -376,6 +390,9 @@ local function run(argv, opts, cb)
     end
     if opts and opts.stdin then
         sys.stdin = opts.stdin
+    end
+    if opts and opts.timeout then
+        sys.timeout = opts.timeout
     end
     -- vim.system throws when the binary cannot be spawned at all.
     local ok, err = pcall(vim.system, argv, sys, function(res)
@@ -632,6 +649,7 @@ function M._reset()
     max_files_override = nil
     sidecar_writer_override = nil
     default_name_seq = 0
+    fresh_fetch_failed = {}
 end
 
 --- Test helper: replace the process runner. Pass nil to restore the real one.
@@ -714,11 +732,212 @@ end
 --- Generated name: second-resolution timestamp, the process pid, and a
 --- per-process sequence. Both extras are needed: a timestamp alone repeats for
 --- creations inside the same second, and the pid keeps concurrent Neovim
---- instances from picking the same directory.
+--- instances from picking the same directory. Sub-session checkouts get their
+--- own `sub-` prefix so an owned child checkout is recognisable by name.
+---@param prefix? string `"wt"` when omitted
 ---@return string
-local function default_name()
+local function default_name(prefix)
     default_name_seq = default_name_seq + 1
-    return string.format("wt-%s-%d-%d", os.date("%Y%m%d-%H%M%S"), vim.uv.os_getpid(), default_name_seq)
+    return string.format("%s-%s-%d-%d", prefix or "wt", os.date("%Y%m%d-%H%M%S"), vim.uv.os_getpid(), default_name_seq)
+end
+
+-- Base resolution -----------------------------------------------------------
+
+--- Modification time of `path`, in seconds (nil when it does not exist).
+---@param path string
+---@return integer?
+local function file_mtime(path)
+    local stat = vim.uv.fs_stat(path)
+    if not stat or not stat.mtime then
+        return nil
+    end
+    return stat.mtime.sec
+end
+
+--- Resolve a base commit for a new worktree.
+---
+--- `kind` is one of:
+---   * `"head"` (default): the commit the checkout `opts.cwd` runs in is on. A
+---     parent session may itself run in a linked worktree, and then this is that
+---     worktree's HEAD — the state its conversation is looking at.
+---   * `"fresh"`: the repository's **remote default branch**
+---     (`refs/remotes/origin/HEAD`). The branch is re-fetched at most once per
+---     24h, capped at 5s; a failed or impossible fetch falls back to the locally
+---     cached remote ref, then to `HEAD`. Never blocks on a prompt (no
+---     credentials) — git is run with a timeout and the result is not checked
+---     for interaction.
+---   * any other string: a revision `git rev-parse` accepts.
+---@param opts pi.WorktreeBaseOpts
+---@param cb fun(sha: string?, err: string?)
+function M.resolve_base(opts, cb)
+    if type(cb) ~= "function" then
+        return
+    end
+    if type(opts) ~= "table" then
+        return cb(nil, "base: opts table required")
+    end
+    local cwd = resolve_dir(opts.cwd or vim.fn.getcwd())
+    if not cwd then
+        return cb(nil, "base: not a directory: " .. tostring(opts.cwd))
+    end
+    local kind = type(opts.kind) == "string" and vim.trim(opts.kind) or ""
+    if kind == "" then
+        kind = "head"
+    end
+    local repo = type(opts.repo) == "string" and vim.trim(opts.repo) or ""
+
+    ---@param fn fun(repo_root: string)
+    local function with_repo(fn)
+        if repo ~= "" then
+            return fn(repo)
+        end
+        run({ "git", "-C", cwd, "rev-parse", "--show-toplevel" }, {}, function(code, stdout)
+            local root = vim.trim(stdout or "")
+            if code ~= 0 or root == "" then
+                return cb(nil, "base: not a git repository: " .. cwd)
+            end
+            repo = realpath(root) or root
+            fn(repo)
+        end)
+    end
+
+    --- Local `HEAD`, falling back to the repository's HEAD when `cwd` has none.
+    local function head()
+        run({ "git", "-C", cwd, "rev-parse", "--verify", "-q", "HEAD^{commit}" }, {}, function(code, stdout)
+            local sha = vim.trim(stdout or "")
+            if code == 0 and sha ~= "" then
+                return cb(sha)
+            end
+            with_repo(function(root)
+                run({ "git", "-C", root, "rev-parse", "--verify", "-q", "HEAD^{commit}" }, {}, function(code2, out2)
+                    local root_sha = vim.trim(out2 or "")
+                    if code2 == 0 and root_sha ~= "" then
+                        return cb(root_sha)
+                    end
+                    cb(nil, "base: repository has no commits yet: " .. root)
+                end)
+            end)
+        end)
+    end
+
+    if kind == "head" then
+        return head()
+    end
+    if kind ~= "fresh" then
+        return with_repo(function(root)
+            run({ "git", "-C", root, "rev-parse", "--verify", "-q", kind .. "^{commit}" }, {}, function(code, stdout)
+                local sha = vim.trim(stdout or "")
+                if code ~= 0 or sha == "" then
+                    return cb(nil, "create: invalid base commit: " .. kind)
+                end
+                cb(sha)
+            end)
+        end)
+    end
+
+    with_repo(function(root)
+        ---@param done fun(sha: string?)
+        local function cached_head(done)
+            run(
+                { "git", "-C", root, "rev-parse", "--verify", "-q", "refs/remotes/origin/HEAD^{commit}" },
+                {},
+                function(code, stdout)
+                    local sha = vim.trim(stdout or "")
+                    done(code == 0 and sha ~= "" and sha or nil)
+                end
+            )
+        end
+
+        --- Default branch name: the cached `origin/HEAD`, else one `ls-remote`
+        --- lookup. A repository without an `origin` reports no branch, so the
+        --- caller falls back instead of failing.
+        ---@param done fun(branch: string?)
+        local function default_branch(done)
+            run(
+                { "git", "-C", root, "symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD" },
+                {},
+                function(code, stdout)
+                    local name = vim.trim(stdout or "")
+                    if code == 0 and name:match("^origin/%S+") then
+                        return done(name:sub(8))
+                    end
+                    if fresh_fetch_failed[root] then
+                        return done(nil)
+                    end
+                    run(
+                        { "git", "-C", root, "ls-remote", "--symref", "origin", "HEAD" },
+                        { timeout = FRESH_TIMEOUT_MS },
+                        function(code2, out2)
+                            local branch = (out2 or ""):match("^ref: refs/heads/(%S+)%s+HEAD")
+                            if code2 ~= 0 or not branch then
+                                fresh_fetch_failed[root] = true
+                                return done(nil)
+                            end
+                            done(branch)
+                        end
+                    )
+                end
+            )
+        end
+
+        default_branch(function(branch)
+            if not branch then
+                return cached_head(function(sha)
+                    if sha then
+                        return cb(sha)
+                    end
+                    head()
+                end)
+            end
+            local ref = "refs/remotes/origin/" .. branch
+            ---@param done fun(sha: string?)
+            local function resolve_ref(done)
+                run({ "git", "-C", root, "rev-parse", "--verify", "-q", ref .. "^{commit}" }, {}, function(code, stdout)
+                    local sha = vim.trim(stdout or "")
+                    done(code == 0 and sha ~= "" and sha or nil)
+                end)
+            end
+            local function after_fetch()
+                resolve_ref(function(sha)
+                    if sha then
+                        return cb(sha)
+                    end
+                    cached_head(function(head_sha)
+                        if head_sha then
+                            return cb(head_sha)
+                        end
+                        head()
+                    end)
+                end)
+            end
+            ---@param fetched_at integer?
+            local function maybe_fetch(fetched_at)
+                local age = fetched_at and (os.time() - fetched_at) or nil
+                if age and age >= 0 and age < FRESH_TTL_SECONDS then
+                    return after_fetch()
+                end
+                run(
+                    { "git", "-C", root, "fetch", "--no-tags", "--quiet", "origin", branch },
+                    { timeout = FRESH_TIMEOUT_MS },
+                    function(code)
+                        if code == 0 then
+                            fresh_fetch_failed[root] = nil
+                        else
+                            fresh_fetch_failed[root] = true
+                        end
+                        after_fetch()
+                    end
+                )
+            end
+            run({ "git", "-C", root, "rev-parse", "--git-path", "FETCH_HEAD" }, {}, function(_, stdout)
+                local path = vim.trim(stdout or "")
+                if path ~= "" and not is_abs(path) then
+                    path = root .. "/" .. path
+                end
+                maybe_fetch(path ~= "" and file_mtime(path) or nil)
+            end)
+        end)
+    end)
 end
 
 -- .gitignore ----------------------------------------------------------------
@@ -943,7 +1162,7 @@ end
 ---   3. `git worktree add --detach <target> <base>` (`opts.base`, default `HEAD`),
 ---   4. write the metadata into the new per-worktree git dir,
 ---   5. copy `.worktreeinclude` ∩ gitignored files,
----   6. run `worktree.setup_cmd` (async, cwd = worktree).
+---   6. run `worktree.setup_cmd` (async, cwd = worktree) unless `opts.setup` is `false`.
 ---
 --- Any failure after step 3 keeps the worktree on disk (so nothing is lost) and
 --- reports the error; the worktree is already registered with git at that point.
@@ -974,15 +1193,15 @@ function M.create(opts, cb)
         )
     end
 
+    local mode = type(opts.mode) == "string" and opts.mode ~= "" and opts.mode or "isolated"
     local name = opts.name
     if name == nil then
-        name = default_name()
+        name = default_name(mode == "subagent" and "sub" or nil)
     end
     local name_ok, name_err = M.validate_name(name)
     if not name_ok then
         return cb(nil, name_err)
     end
-    local mode = type(opts.mode) == "string" and opts.mode ~= "" and opts.mode or "isolated"
 
     run({ "git", "-C", cwd, "rev-parse", "--show-toplevel" }, {}, function(code, stdout)
         local repo_root = vim.trim(stdout or "")
@@ -1056,6 +1275,9 @@ function M.create(opts, cb)
                     copy_includes(info, function(include_err)
                         if include_err then
                             return cb(nil, include_err)
+                        end
+                        if opts.setup == false then
+                            return cb(info, nil)
                         end
                         run_setup(info, function(setup_err)
                             if setup_err then

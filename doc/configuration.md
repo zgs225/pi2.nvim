@@ -218,6 +218,12 @@ require("pi").setup({
         -- worktree root as cwd; nil = no setup step. A non-zero exit keeps
         -- the checkout on disk but fails the creation (no session starts).
         setup_cmd = nil, -- e.g. { "mise", "install" }
+        -- Base commit new checkouts start from: "head" (default; the commit the
+        -- creating session's checkout is on), "fresh" (the repository's remote
+        -- default branch, origin/HEAD — re-fetched at most once per 24h, capped
+        -- at 5s, falling back to the cached ref then local HEAD), or nothing
+        -- else (a per-item revision overrides it, see subagent.worktree).
+        base_ref = "head",
         -- Snapshot a worktree's patch (base commit → now, untracked files
         -- included) before pi.worktree_remove / Worktree.remove deletes it.
         -- When false, the confirmation warns that the work is lost.
@@ -238,6 +244,14 @@ require("pi").setup({
         max_children = 5,           -- max live child processes per parent lineage (auto-closes oldest settled child to make room; dead don't count)
         report_mode = "last_message", -- completion report uses child's last assistant output
         default_config = "inherit",   -- "inherit" parent model/thinking, or "default"
+        -- Child checkouts created by a dispatch item's `worktree.create`.
+        worktree = {
+            -- Run worktree.setup_cmd in a freshly created child checkout
+            -- (default false: a dispatch already pays a git checkout plus the
+            -- .worktreeinclude copy, and an install per child is expensive). A
+            -- dispatch item's `create.setup` overrides it.
+            setup = false,
+        },
         -- tools = { "read", "grep", "find", "ls" }, -- child tool allowlist: replaces the whole selection (nil = inherit every tool)
         max_batch_size = 5,           -- max items per dispatch_subagents batch
         batch_timeout_ms = 300000,    -- default wait_subagents timeout (5 min)

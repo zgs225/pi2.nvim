@@ -37,7 +37,7 @@ local waiters = {}
 ---@field model? pi.ModelRef
 ---@field thinking_level? string
 ---@field tools? string[] Child tool allowlist (spawn items only; nil = inherit every tool)
----@field worktree? { path: string, name?: string } Explicit linked worktree assignment: the request `{ path }` before launch, the canonical `{ path, name? }` result after a successful spawn/revive.
+---@field worktree? { path: string, name?: string, owned?: boolean, reused?: boolean } Checkout the item runs in: the request (`{ path }` / `{ create }`) before launch, the canonical `{ path, name?, owned?, reused? }` result after a successful spawn/revive. `owned` marks a checkout this spawn created (released when clean); `reused` an existing one it adopted by name.
 ---@field status "queued"|"spawning"|"running"|"ok"|"failed"|"cancelled"
 ---@field generation? integer Run generation the item was dispatched against.
 ---@field output? string
@@ -541,9 +541,16 @@ local function normalize_item(raw, index)
         if tools_err then
             return nil, ("item %d: %s"):format(index, tools_err)
         end
-        -- Preserved verbatim here and validated by `Subsessions.spawn` (which
-        -- owns the linked-worktree/repo rules); batch only carries the request.
+        -- Shape is validated here so one malformed request fails the whole
+        -- dispatch before any item spawns; the path/repository checks need the
+        -- live parent checkout and stay in `Subsessions.spawn`.
         local worktree = present(raw.worktree) and raw.worktree or nil
+        if worktree ~= nil then
+            local _, wt_err = require("pi.subsessions").normalize_worktree_request(worktree)
+            if wt_err then
+                return nil, ("item %d: %s"):format(index, wt_err)
+            end
+        end
         return {
             ref = ref,
             task = raw.task,
@@ -631,10 +638,18 @@ local function run_batch(batch, parent)
                 live.target = child.id
                 live.generation = entry and entry.run_generation
                 -- After a successful launch the item reports the canonical
-                -- assignment the child actually runs in (name optional).
-                local assigned = child.assigned_worktree
-                if type(assigned) == "table" and type(assigned.path) == "string" then
-                    live.worktree = { path = assigned.path, name = assigned.name }
+                -- checkout the child actually runs in (name optional): an adopted
+                -- or borrowed assignment, or the owned checkout this spawn created.
+                local checkout = type(child.assigned_worktree) == "table" and child.assigned_worktree
+                    or (type(child.worktree) == "table" and child.worktree or nil)
+                if type(checkout) == "table" and type(checkout.path) == "string" then
+                    live.worktree = { path = checkout.path, name = checkout.name }
+                    if checkout.owned then
+                        live.worktree.owned = true
+                    end
+                    if checkout.reused then
+                        live.worktree.reused = true
+                    end
                 end
                 live.status = "running"
                 persist(b, cwd)

@@ -177,7 +177,8 @@ The git layer is a separate module, `require("pi.worktree")`, which is what `pi.
 
 | Function | Contract |
 | --- | --- |
-| `Worktree.create(opts, cb)` | `opts { cwd, name?, mode?, base? }` → `cb(info, err)`; creates `<repo>/.worktrees/<name>` detached at `base` (default `HEAD`), ensures `/.worktrees/` is in `.gitignore`, writes the metadata, copies `.worktreeinclude` ∩ gitignored files and runs `worktree.setup_cmd`. Refuses nested creation, a missing repository/commit and an invalid or existing name. |
+| `Worktree.create(opts, cb)` | `opts { cwd, name?, mode?, base?, setup? }` → `cb(info, err)`; creates `<repo>/.worktrees/<name>` detached at `base` (default `HEAD`; a `mode = "subagent"` checkout gets a generated `sub-…` name), ensures `/.worktrees/` is in `.gitignore`, writes the metadata, copies `.worktreeinclude` ∩ gitignored files and runs `worktree.setup_cmd` unless `setup = false`. Refuses nested creation, a missing repository/commit and an invalid or existing name. |
+| `Worktree.resolve_base(opts, cb)` | `opts { kind?, cwd?, repo? }` → `cb(sha, err)`. `kind = "head"` (default) is the commit `cwd`'s checkout is on, `"fresh"` is the repository's remote default branch (`origin/HEAD`, re-fetched at most once per 24 h with a 5 s cap, falling back to the cached ref then local `HEAD`), anything else is a revision (`<rev>^{commit}`). Backs `worktree.base_ref` and a dispatch item's `create.base`. |
 | `Worktree.detect(cwd?)` | `pi.WorktreeInfo?` — pure filesystem read (no git subprocess, cached with cheap `stat` revalidation), safe on rendering paths. `kind` is `"linked"` or `"main"`. |
 | `Worktree.list(cwd?, cb)` | `cb(entries, err)` — every live linked worktree of the repository containing `cwd` (from `git worktree list --porcelain`), each as its `detect()` info plus `head` / `branch` / `detached` / `prunable`, sorted by path. Bare, prunable and vanished checkouts are skipped. Backs the cross-worktree `:PiResume` rows. |
 | `Worktree.status(info, cb)` | `cb({ dirty, ahead, head }, err)` — uncommitted changes, commits beyond `base_sha`, current `HEAD`. |
@@ -191,7 +192,7 @@ The git layer is a separate module, `require("pi.worktree")`, which is what `pi.
 | `Worktree.remove(info, opts, cb)` | `opts { force?, snapshot? }` → `cb(removed, err, snapshot_path)`; `snapshot` defaults to `worktree.snapshot_before_remove`. |
 | `Worktree.bind(info, fields)` | Synchronous; publishes `{ session_id, session_file }` onto the worktree metadata. |
 
-`WorktreeInfo` is the table every one of these accepts and returns (`kind`, `name`, `path`, `repo_root`, `git_dir`, `common_dir?`, `base_sha?`, `mode?`, `session_id?`, `session_file?`) — persist it (it is JSON-encodable) and hand it back to `status` / `diff` / `remove` later. `validate_name(name)` returns `ok, err` for the directory-name rules; `pi.worktree` also exposes `_reset` / `_set_runner` test hooks. Full guide: [Worktrees](worktrees.md).
+`WorktreeInfo` is the table every one of these accepts and returns (`kind`, `name`, `path`, `repo_root`, `git_dir`, `common_dir?`, `base_sha?`, `mode?`, `owned?`, `reused?`, `session_id?`, `session_file?`) — persist it (it is JSON-encodable) and hand it back to `status` / `diff` / `remove` later. `owned` marks a checkout the caller created (and may release); `reused` marks one adopted by name instead of created. `validate_name(name)` returns `ok, err` for the directory-name rules; `pi.worktree` also exposes `_reset` / `_set_runner` test hooks. Full guide: [Worktrees](worktrees.md).
 
 ## Queue modes
 

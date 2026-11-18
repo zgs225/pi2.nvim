@@ -1,10 +1,13 @@
 -- Worktree protocol of the parent-side sub-agent extension
 -- (extensions/subagent.ts):
 --
--- 1. `dispatch_subagents` spawn items accept `worktree: { path }` — an existing
---    linked worktree, spawn-only, never created/released/merged/reset.
--- 2. `list_subagents` reports the *assigned* worktree (`assigned_worktree`,
---    shape `{ path, name? }`), never the row's owned `worktree` field.
+-- 1. `dispatch_subagents` spawn items accept `worktree` in two shapes: `{ path }`
+--    borrows an existing linked worktree (never created/released/merged/reset),
+--    `{ create }` creates one — or adopts the one its `name` already names — with
+--    a base strategy (`head` / `fresh` / explicit revision). Spawn-only either way.
+-- 2. `list_subagents` reports the checkout the child runs in: the assigned one
+--    first (`assigned_worktree`, borrowed or adopted), then the owned row
+--    `worktree` this spawn created, projected with `owned` / `reused` flags.
 -- 3. `read_subagent` reads the parent manifest's recorded `session_file` first
 --    (a child in an assigned worktree keeps its JSONL in that other checkout),
 --    falls back to the cwd session-directory scan, and refuses to project a row
@@ -70,8 +73,8 @@ end
 
 local function worktree_schema_block(content)
     return assert(
-        content:match("const WorktreeRefSchema%s*=%s*Type%.Object%((.-)\n%);"),
-        "the worktree schema must be a Type.Object(...) constant"
+        content:match("const WorktreeRefSchema%s*=%s*Type%.Union%((.-)\n%);"),
+        "the worktree schema must be a Type.Union(...) constant"
     )
 end
 
@@ -82,13 +85,17 @@ describe("extensions/subagent.ts worktree protocol (static)", function()
         content = source()
     end)
 
-    it("declares worktree as an optional { path } object on the spawn variant", function()
+    it("declares worktree as an optional borrow-or-create union on the spawn variant", function()
         assert.is_truthy(
             content:match("worktree:%s*Type%.Optional%(WorktreeRefSchema%)"),
             "the spawn variant must declare worktree: Type.Optional(WorktreeRefSchema)"
         )
         local block = worktree_schema_block(content)
-        assert.is_truthy(block:match("path:%s*Type%.String%({"), "the worktree schema must have a string `path`")
+        local _, variants = block:gsub("Type%.Object%(", "")
+        assert.are.equal(2, variants, "the union must carry exactly the borrow and create variants")
+        assert.is_truthy(block:match("path:%s*Type%.String%({"), "the borrow variant must have a string `path`")
+        assert.is_truthy(block:match("create:%s*Type%.Union%("), "the create variant must take a boolean or an object")
+        contains_all(block, { "base", "name", "setup" }, "the create variant")
     end)
 
     it("keeps worktree on the spawn variant only", function()
@@ -104,28 +111,45 @@ describe("extensions/subagent.ts worktree protocol (static)", function()
         )
     end)
 
-    it("documents every frozen rule of the worktree assignment", function()
+    it("documents every frozen rule of the worktree request", function()
         local block = worktree_schema_block(content)
         local descriptions = {}
         for desc in block:gmatch('description:%s*"([^"]*)"') do
             table.insert(descriptions, desc)
         end
-        assert.are.equal(2, #descriptions, "the worktree schema describes the object and its path field")
-        local desc = descriptions[#descriptions]
+        assert.is_true(
+            #descriptions >= 4,
+            "the union, both variants and the create discriminator each describe themselves"
+        )
+        local all = table.concat(descriptions, "\n")
         -- Each rule below is one a model must be able to act on.
-        contains_all(desc, {
-            "linked worktree",
-            "Spawn items only",
-            "reuse item",
-            "absolute",
+        contains_all(all, {
+            "borrow an existing linked worktree",
             "parent's repository",
-            "never creates",
-            "merges or resets",
+            "not both",
+            "adopt",
             "inherits the parent's cwd",
-            "shares that one checkout",
+            "shares that checkout",
             "no isolation between those children",
+            "file-level isolation",
+            "released automatically",
+            "kept",
         }, "the worktree description")
-        contains_none(desc, { "${" }, "the worktree description must stay a static string")
+        contains_none(all, { "${" }, "the worktree description must stay a static string")
+    end)
+
+    it("documents the create variant's base strategy, name reuse and setup opt-in", function()
+        local block = assert(
+            content:match("const WorktreeCreateSchema%s*=%s*Type%.Object%((.-)\n%);"),
+            "the create schema must be its own Type.Object(...) constant"
+        )
+        contains_all(block, {
+            "'head' (default",
+            "'fresh'",
+            "origin/HEAD",
+            "already resolves to a linked worktree",
+            "setup_cmd",
+        }, "the create schema")
     end)
 
     it("describes the path field as an absolute existing linked worktree", function()
@@ -147,7 +171,7 @@ describe("extensions/subagent.ts worktree protocol (static)", function()
     it("documents the worktree projection of list_subagents", function()
         contains_all(
             tool_description(content, "list_subagents"),
-            { "last_active_at, worktree?, error?", "assigned", "{ path, name? }" },
+            { "last_active_at, worktree?, error?", "owned", "reused", "{ path, name?, owned?, reused? }" },
             "the list_subagents description"
         )
     end)
@@ -162,15 +186,17 @@ describe("extensions/subagent.ts worktree protocol (static)", function()
         }, "the read_subagent description")
     end)
 
-    it("maps list_subagents from assigned_worktree, not from the owned worktree row field", function()
+    it("projects the assigned checkout first, then the owned row checkout", function()
         assert.is_truthy(
-            content:match("worktree:%s*assignedWorktree%(%w+%)"),
-            "the listed row must project its worktree through assignedWorktree(entry)"
+            content:match("worktree:%s*childWorktree%(%w+%)"),
+            "the listed row must project its worktree through childWorktree(entry)"
         )
-        local helper =
-            assert(content:match("function assignedWorktree%(entry: any%):(.-)\n}"), "assignedWorktree not found")
-        contains_all(helper, { "entry?.assigned_worktree", "path", "name" }, "assignedWorktree")
-        assert.is_nil(helper:match("entry%.worktree"), "assignedWorktree must never read the owned entry.worktree")
+        local helper = assert(content:match("function childWorktree%(.-\n}"), "childWorktree not found")
+        contains_all(
+            helper,
+            { "entry?.assigned_worktree", "entry?.worktree", "source.owned", "source.reused" },
+            "childWorktree"
+        )
     end)
 
     it("prefers the recorded session_file before the cwd scan in read_subagent", function()
@@ -289,6 +315,11 @@ const dispatch = tools.get("dispatch_subagents").parameters;
 const spawn = dispatch.properties.items.items.anyOf[0];
 const reuse = dispatch.properties.items.items.anyOf[1];
 const worktree = spawn.properties.worktree || null;
+const variants = (worktree && worktree.anyOf) || [];
+const borrow = variants[0] || {};
+const create = variants[1] || {};
+const createValue = (create.properties && create.properties.create) || {};
+const createUnion = createValue.anyOf || [];
 
 const report = {
   sessionsDir,
@@ -297,10 +328,17 @@ const report = {
   schema: {
     spawnHasWorktree: worktree !== null,
     worktreeOptional: !!(worktree && worktree.optional),
-    worktreeType: worktree && worktree.type,
     worktreeDescription: worktree && worktree.description,
-    pathType: worktree && worktree.properties.path.type,
-    pathDescription: worktree && worktree.properties.path.description,
+    worktreeVariants: variants.length,
+    borrowType: borrow.type,
+    pathType: borrow.properties && borrow.properties.path.type,
+    pathDescription: borrow.properties && borrow.properties.path.description,
+    createVariantType: create.type,
+    createAllowsBoolean: createUnion.some((entry) => entry.type === "boolean"),
+    createAllowsObject: createUnion.some((entry) => entry.type === "object"),
+    createObjectKeys: (createUnion.find((entry) => entry.type === "object") || {}).properties
+      ? Object.keys((createUnion.find((entry) => entry.type === "object") || {}).properties)
+      : [],
     reuseHasWorktree: Object.prototype.hasOwnProperty.call(reuse.properties, "worktree"),
   },
   descriptions: {
@@ -385,7 +423,13 @@ describe("extensions/subagent.ts worktree protocol (behaviour)", function()
                     parent_id = parent_id,
                     name = "own-checkout",
                     status = "active",
-                    worktree = { path = "/repo/.worktrees/owned", name = "owned" },
+                    worktree = { path = "/repo/.worktrees/owned", name = "owned", owned = true, base_sha = "abc" },
+                },
+                ["child-adopted"] = {
+                    parent_id = parent_id,
+                    name = "adopted",
+                    status = "completed",
+                    assigned_worktree = { kind = "linked", path = "/repo/.worktrees/kept", reused = true },
                 },
                 ["child-plain"] = { parent_id = parent_id, name = "plain", status = "dormant" },
                 ["child-fallback"] = { parent_id = parent_id, name = "fallback", session_file = tmp .. "/gone.jsonl" },
@@ -426,30 +470,42 @@ describe("extensions/subagent.ts worktree protocol (behaviour)", function()
         return true
     end
 
-    it("registers worktree as an optional { path } object on the spawn variant only", function()
+    it("registers worktree as an optional borrow-or-create union on the spawn variant only", function()
         if not ready() then
             return
         end
         assert.is_true(report.schema.spawnHasWorktree, "spawn items must expose worktree")
         assert.is_true(report.schema.worktreeOptional, "an omitted worktree must mean 'inherit the parent cwd'")
-        assert.are.equal("object", report.schema.worktreeType)
+        assert.are.equal(2, report.schema.worktreeVariants, "the union must carry the borrow and create variants")
+        assert.are.equal("object", report.schema.borrowType)
         assert.are.equal("string", report.schema.pathType)
+        assert.are.equal("object", report.schema.createVariantType)
+        assert.is_true(report.schema.createAllowsBoolean, "create: true must be accepted")
+        assert.is_true(report.schema.createAllowsObject, "create: { ... } must be accepted")
+        for _, key in ipairs({ "base", "name", "setup" }) do
+            assert.is_true(
+                vim.tbl_contains(report.schema.createObjectKeys, key),
+                "create must expose `" .. key .. "`; got: " .. vim.inspect(report.schema.createObjectKeys)
+            )
+        end
         assert.is_false(report.schema.reuseHasWorktree, "reuse items must not accept worktree")
         contains_all(report.schema.worktreeDescription, {
-            "linked worktree",
-            "Spawn items only",
-            "reuse item",
-            "absolute",
+            "borrow an existing linked worktree",
             "parent's repository",
-            "never creates",
-            "merges or resets",
+            "not both",
+            "adopt",
             "inherits the parent's cwd",
-            "shares that one checkout",
+            "shares that checkout",
             "no isolation between those children",
+            "file-level isolation",
         }, "the worktree schema description")
         contains_all(report.descriptions.reuseMessage, { "`worktree`", "rejected" }, "the reuse message description")
         contains_all(report.descriptions.dispatch, { "`worktree`", "five spawn-only fields" }, "dispatch description")
-        contains_all(report.descriptions.list, { "{ path, name? }", "assigned" }, "list_subagents description")
+        contains_all(
+            report.descriptions.list,
+            { "owned", "reused", "{ path, name?, owned?, reused? }" },
+            "list_subagents description"
+        )
         contains_all(
             report.descriptions.read,
             { "session_file", "session file not found" },
@@ -457,7 +513,7 @@ describe("extensions/subagent.ts worktree protocol (behaviour)", function()
         )
     end)
 
-    it("reports the assigned worktree of a child and never the owned one", function()
+    it("reports the checkout a child runs in: assigned first, owned with its flag", function()
         if not ready() then
             return
         end
@@ -468,16 +524,20 @@ describe("extensions/subagent.ts worktree protocol (behaviour)", function()
 
         assert.are.same({ path = "/repo/.worktrees/auth", name = "auth" }, by_id["child-assigned"].worktree)
         assert.are.same({ path = "/repo/.worktrees/b" }, by_id["child-assigned-noname"].worktree)
+        assert.are.same(
+            { path = "/repo/.worktrees/owned", name = "owned", owned = true },
+            by_id["child-owned"].worktree
+        )
+        assert.are.same({ path = "/repo/.worktrees/kept", reused = true }, by_id["child-adopted"].worktree)
         assert.is_false(
             has_key(by_id["child-assigned-noname"].worktree, "name"),
             "an unnamed assignment must not fabricate a name key"
         )
-        for _, id in ipairs({ "child-owned", "child-plain" }) do
-            assert.is_false(has_key(by_id[id], "worktree"), id .. " must not report a worktree")
-        end
-        for _, row in ipairs(report.subagents.subagents) do
-            assert.are_not.same("/repo/.worktrees/owned", (row.worktree or {}).path, "an owned checkout leaked")
-        end
+        assert.is_false(
+            has_key(by_id["child-assigned"].worktree, "owned"),
+            "a borrowed or adopted checkout must not claim ownership"
+        )
+        assert.is_false(has_key(by_id["child-plain"], "worktree"), "child-plain must not report a worktree")
         assert.is_nil(by_id.foreign, "another parent's child must not be listed")
     end)
 
