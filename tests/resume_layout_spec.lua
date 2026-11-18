@@ -149,6 +149,75 @@ describe("pi resume layout", function()
         assert.equals("group:repo", summary(rows)[6])
     end)
 
+    it("puts the current checkout's partition first, then the rest by recency", function()
+        -- polish (500) is the newest checkout, fix-auth (400) second, main (300)
+        -- last — but the caller runs in fix-auth, so that partition leads.
+        local rows = Layout.rows(mixed_items(), {
+            repo_name = "pi2.nvim",
+            current = { cwd = AUTH, repo_root = MAIN },
+        })
+
+        assert.are.same({
+            "group:󰙅 fix-auth",
+            "2025-06-03  auth a",
+            "2025-06-04  auth b",
+            "group:󰙅 polish",
+            "2025-06-05  polish a",
+            "group:pi2.nvim",
+            "2025-06-01  main a",
+            "2025-06-02  main b",
+        }, summary(rows))
+    end)
+
+    it("resolves a current directory inside a checkout and picks the deepest match", function()
+        local items = mixed_items()
+
+        -- A subdirectory belongs to its checkout, with a trailing slash or not.
+        local rows = Layout.rows(items, {
+            repo_name = "pi2.nvim",
+            current = { cwd = AUTH .. "/lua/pi/", repo_root = MAIN },
+        })
+        assert.equals("group:󰙅 fix-auth", summary(rows)[1])
+
+        -- Main checkout: the anchor only reaches it through the repository root.
+        rows = Layout.rows(items, {
+            repo_name = "pi2.nvim",
+            current = { cwd = MAIN .. "/lua", repo_root = MAIN },
+        })
+        assert.are.same({
+            "group:pi2.nvim",
+            "2025-06-01  main a",
+            "2025-06-02  main b",
+            "group:󰙅 polish",
+            "2025-06-05  polish a",
+            "group:󰙅 fix-auth",
+            "2025-06-03  auth a",
+            "2025-06-04  auth b",
+        }, summary(rows))
+    end)
+
+    it("keeps the recency order when the current directory is outside every checkout", function()
+        local rows = Layout.rows(mixed_items(), {
+            repo_name = "pi2.nvim",
+            current = { cwd = "/elsewhere/project", repo_root = "/elsewhere/repo" },
+        })
+
+        assert.equals("group:󰙅 polish", summary(rows)[1])
+        assert.equals("group:pi2.nvim", summary(rows)[6])
+    end)
+
+    it("keeps the current partition first while a query filters", function()
+        local rows = Layout.rows(mixed_items(), {
+            repo_name = "pi2.nvim",
+            current = { cwd = AUTH, repo_root = MAIN },
+            query = "polish",
+        })
+
+        -- Only the matching partition survives: the current one is not shown
+        -- as a ghost title, and the order stays the same as with no query.
+        assert.are.same({ "group:󰙅 polish", "2025-06-05  polish a" }, summary(rows))
+    end)
+
     it("orders equal mtimes by session file path, keeping newest first", function()
         local items = {
             item("/sessions/b.jsonl", "2025-06-01", 100, "b session"),

@@ -663,6 +663,61 @@ describe("pi resume picker", function()
             assert.equals(T_TARGET, find_after(0, "switch_session").sessionPath)
         end)
 
+        it("puts the checkout the tab's session runs in first, ahead of recency", function()
+            -- The tab runs in a linked checkout: a worktree session keeps its
+            -- own cwd while Neovim's cwd stays wherever it was started, so the
+            -- anchor must come from the session, not from `getcwd()`.
+            local AUTH = "/tmp/pi-resume-spec/repo/.worktrees/fix-auth"
+            local REPO = "/tmp/pi-resume-spec/repo"
+            Worktree.detect = function(dir)
+                if dir == AUTH then
+                    return { kind = "linked", name = "fix-auth", path = AUTH, repo_root = REPO }
+                end
+                return { kind = "main", name = vim.fs.basename(dir), path = dir, repo_root = dir }
+            end
+
+            local sess = Sessions.get_or_create()
+            assert.is_not_nil(sess)
+            sess.cwd = AUTH
+
+            History.list = function()
+                return {
+                    {
+                        path = T_TARGET,
+                        name = "main session",
+                        timestamp = "2025-06-01T10:00:00.000Z",
+                        first_message = "",
+                        modified = 900,
+                    },
+                    {
+                        path = T_OTHER,
+                        name = "worktree session",
+                        timestamp = "2025-06-02T11:00:00.000Z",
+                        first_message = "",
+                        modified = 100,
+                        worktree = "fix-auth",
+                        worktree_info = { kind = "linked", name = "fix-auth", path = AUTH, repo_root = REPO },
+                    },
+                }
+            end
+
+            Sessions.resume_session()
+            local rows = picker_rows(tele.new_cfgs[#tele.new_cfgs])
+
+            -- The main checkout's session is far newer, yet the session's own
+            -- checkout leads and the rest follows recency.
+            assert.are.same(
+                { "group", "session", "group", "session" },
+                vim.tbl_map(function(row)
+                    return row.kind
+                end, rows)
+            )
+            assert.equals(AUTH, rows[1].partition)
+            assert.is_true(rows[1].worktree)
+            assert.equals("main", rows[3].partition)
+            assert.equals(T_OTHER, rows[2].item.file)
+        end)
+
         it("re-filters per prompt, keeping a matched session under its title", function()
             local cfg = picker_with_worktree()
 

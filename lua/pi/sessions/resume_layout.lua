@@ -10,6 +10,17 @@
 --- each checkout gets a title row and its sessions follow underneath. The
 --- threshold always counts the **unfiltered** partitions, so typing a query
 --- never changes the layout mid-pick.
+---
+--- Partitions are ordered by their newest session, except for the **current
+--- checkout** — the one the calling session (or Neovim) runs in, fed in through
+--- `opts.current` — which always comes first.
+
+--- Checkout the picker treats as "current": the directory the calling session
+--- runs in, plus the main checkout root of its repository (a linked worktree's
+--- own root is in its path, the main checkout's is not).
+---@class pi.ResumeAnchor
+---@field cwd? string Directory the current session (or Neovim) runs in
+---@field repo_root? string Main checkout root of `cwd`'s repository
 
 ---@class pi.ResumeRow
 ---@field kind "group"|"session"
@@ -100,6 +111,43 @@ end
 ---@field newest number Newest `modified` in the partition (unfiltered)
 ---@field items pi.SessionSelectItem[]
 
+--- Is `path` the checkout `root` itself, or somewhere inside it?
+---@param path string Normalized path
+---@param root string Normalized checkout root
+---@return boolean
+local function within(path, root)
+    return path == root or path:sub(1, #root + 1) == root .. "/"
+end
+
+--- Partition key of the current checkout: the linked worktree the anchor lives
+--- in (the longest match wins, so a path nested deeper still resolves to its
+--- own checkout), else the main checkout when the anchor sits anywhere in the
+--- repository. nil when the anchor is outside every listed checkout.
+---@param partitions pi.ResumePartition[]
+---@param anchor string? Normalized current directory
+---@param repo_root string? Normalized main checkout root
+---@return string?
+local function current_partition_key(partitions, anchor, repo_root)
+    if not anchor then
+        return nil
+    end
+    local best = nil
+    for _, partition in ipairs(partitions) do
+        if partition.key ~= MAIN_PARTITION and within(anchor, partition.key) then
+            if not best or #partition.key > #best then
+                best = partition.key
+            end
+        end
+    end
+    if best then
+        return best
+    end
+    if repo_root and within(anchor, repo_root) then
+        return MAIN_PARTITION
+    end
+    return nil
+end
+
 --- Partition an item belongs to: its checkout path, or "main".
 ---@param item pi.SessionSelectItem
 ---@param repo_name string
@@ -158,7 +206,7 @@ end
 
 --- Build the picker rows for the collected resume items.
 ---@param items pi.SessionSelectItem[]
----@param opts? { query?: string, repo_name?: string, threshold?: integer }
+---@param opts? { query?: string, repo_name?: string, threshold?: integer, current?: pi.ResumeAnchor }
 ---@return pi.ResumeRow[] rows Rows in display order (group rows are inert)
 ---@return integer partition_count Distinct partitions in the unfiltered set
 function M.rows(items, opts)
@@ -167,6 +215,9 @@ function M.rows(items, opts)
     local threshold = tonumber(opts.threshold) or DEFAULT_THRESHOLD
     local query = type(opts.query) == "string" and opts.query or ""
     local needle = query:lower()
+    local current = type(opts.current) == "table" and opts.current or nil
+    local anchor = current and normalize_path(current.cwd) or nil
+    local repo_root = current and normalize_path(current.repo_root) or nil
 
     ---@type pi.ResumePartition[]
     local partitions = {}
@@ -214,8 +265,17 @@ function M.rows(items, opts)
     end
 
     -- Partitions keep their position while the query is typed (ordering uses
-    -- the unfiltered newest mtime), so filtering only removes rows.
+    -- the unfiltered newest mtime), so filtering only removes rows. The
+    -- checkout the caller currently runs in jumps ahead of the recency order:
+    -- resuming right here is the common case, and hunting for your own
+    -- partition below a more recently touched worktree is not.
+    local current_key = current_partition_key(partitions, anchor, repo_root)
     table.sort(partitions, function(a, b)
+        local a_current = current_key ~= nil and a.key == current_key
+        local b_current = current_key ~= nil and b.key == current_key
+        if a_current ~= b_current then
+            return a_current
+        end
         if a.newest ~= b.newest then
             return a.newest > b.newest
         end

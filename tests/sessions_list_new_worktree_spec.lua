@@ -273,7 +273,7 @@ describe(":PiSessions N (new worktree of this checkout)", function()
                 return vim.fn.maparg("N", "n", false, true)
             end)
             assert.is_truthy(map and not vim.tbl_isempty(map))
-            assert.are.equal("New worktree of this checkout (new tab)", map.desc)
+            assert.are.equal("New worktree or main checkout (new tab)", map.desc)
         end)
 
         it("keeps n and W as they were", function()
@@ -297,7 +297,7 @@ describe(":PiSessions N (new worktree of this checkout)", function()
             for _, b in ipairs(vim.api.nvim_list_bufs()) do
                 if vim.api.nvim_buf_is_valid(b) then
                     for _, line in ipairs(vim.api.nvim_buf_get_lines(b, 0, -1, false)) do
-                        if line:find("New worktree of this checkout", 1, true) then
+                        if line:find("New worktree or main checkout", 1, true) then
                             found = true
                         end
                     end
@@ -308,7 +308,7 @@ describe(":PiSessions N (new worktree of this checkout)", function()
     end)
 
     describe("existing worktrees", function()
-        it("offers every managed and external worktree", function()
+        it("offers the main checkout first, then every managed and external worktree", function()
             list_reply = function(cb)
                 cb({ entry("linked", "wt", MANAGED_DIR, { branch = "feat/x", detached = false }) })
             end
@@ -319,10 +319,29 @@ describe(":PiSessions N (new worktree of this checkout)", function()
             assert.are.equal(1, #selects)
             assert.are.equal(0, #inputs)
             local options = selects[1].opts.options
-            assert.are.equal(2, #options)
-            assert.is_truthy(options[1]:find("wt", 1, true))
-            assert.is_truthy(options[1]:find("feat/x", 1, true))
-            assert.are.equal("New worktree…", options[2])
+            assert.are.equal(3, #options)
+            -- The main checkout is what `git worktree list` never reports, so
+            -- the picker builds that row from the repository root and says so.
+            assert.is_truthy(options[1]:find("main checkout", 1, true))
+            assert.is_truthy(options[1]:find(vim.fs.basename(MAIN_DIR), 1, true))
+            assert.is_truthy(options[2]:find("wt", 1, true))
+            assert.is_truthy(options[2]:find("feat/x", 1, true))
+            assert.are.equal("New worktree…", options[3])
+        end)
+
+        it("opens the main checkout as an ordinary session there", function()
+            list_reply = function(cb)
+                cb({ entry("linked", "wt", MANAGED_DIR) })
+            end
+            press_new_worktree(MANAGED_DIR)
+
+            selects[1].cb(selects[1].opts.options[1])
+            flush()
+
+            assert.are.equal(1, #opened)
+            assert.are.equal(MAIN_DIR, opened[1].cwd)
+            assert.is_nil(opened[1].name)
+            assert.is_nil(opened[1].create)
         end)
 
         it("opens the selected entry by its own path", function()
@@ -331,7 +350,7 @@ describe(":PiSessions N (new worktree of this checkout)", function()
             end
             press_new_worktree(MAIN_DIR)
 
-            local label = selects[1].opts.options[1]
+            local label = selects[1].opts.options[2]
             assert.is_truthy(label:find("detached", 1, true))
             selects[1].cb(label)
             flush()
@@ -356,7 +375,7 @@ describe(":PiSessions N (new worktree of this checkout)", function()
             assert.is_true(opened[1].create)
         end)
 
-        it("filters missing checkouts and the main checkout", function()
+        it("filters missing checkouts but keeps the main checkout row", function()
             list_reply = function(cb)
                 cb({
                     entry("linked", "gone", GONE_DIR, { missing = true }),
@@ -365,20 +384,33 @@ describe(":PiSessions N (new worktree of this checkout)", function()
             end
             press_new_worktree(MAIN_DIR)
 
-            -- Nothing left to pick: straight to the name input.
-            assert.are.equal(0, #selects)
-            assert.are.equal(1, #inputs)
+            -- A missing checkout cannot be opened, and the handed-in main
+            -- entry is not duplicated: the built main row stands in for it.
+            assert.are.equal(1, #selects)
+            local options = selects[1].opts.options
+            assert.are.equal(2, #options)
+            assert.is_truthy(options[1]:find("main checkout", 1, true))
+            assert.are.equal("New worktree…", options[2])
         end)
     end)
 
     describe("empty list", function()
-        it("goes straight to the name input and creates there", function()
+        it("still offers the main checkout and the name input", function()
             list_reply = function(cb)
                 cb({})
             end
             press_new_worktree(MAIN_DIR)
 
-            assert.are.equal(0, #selects)
+            -- A repository without linked worktrees keeps the main checkout as
+            -- the one openable row; creating a new checkout stays available.
+            assert.are.equal(1, #selects)
+            assert.are.equal(0, #inputs)
+            local options = selects[1].opts.options
+            assert.are.equal(2, #options)
+            assert.is_truthy(options[1]:find("main checkout", 1, true))
+            assert.are.equal("New worktree…", options[2])
+
+            selects[1].cb(options[2])
             assert.are.equal(1, #inputs)
             assert.is_truthy(inputs[1].opts.title:find("repo", 1, true))
             inputs[1].cb("new-one")
@@ -429,6 +461,7 @@ describe(":PiSessions N (new worktree of this checkout)", function()
             end
             press_new_worktree(MAIN_DIR)
 
+            selects[1].cb("New worktree…")
             inputs[1].cb(nil)
             assert.are.equal(0, #opened)
             inputs[1].cb("   ")
@@ -441,6 +474,7 @@ describe(":PiSessions N (new worktree of this checkout)", function()
             end
             press_new_worktree(MAIN_DIR)
 
+            selects[1].cb("New worktree…")
             inputs[1].cb("bad name")
             assert.are.equal(0, #opened)
             assert.is_true(#warnings >= 1)
@@ -471,6 +505,8 @@ describe(":PiSessions N (new worktree of this checkout)", function()
 
             assert.are.equal(1, #list_calls)
             assert.are.equal(MAIN_DIR, list_calls[1].dir)
+            assert.are.equal(1, #selects)
+            selects[1].cb("New worktree…")
             assert.are.equal(1, #inputs)
             inputs[1].cb("after-switch")
             assert.are.equal(1, #opened)

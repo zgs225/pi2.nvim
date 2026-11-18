@@ -77,7 +77,7 @@ describe("session list help overlay", function()
             "help should describe the new-session key"
         )
         assert.is_truthy(
-            text:find("New worktree of this checkout (new tab)", 1, true),
+            text:find("New worktree or main checkout (new tab)", 1, true),
             "help should describe the new-worktree key"
         )
         assert.is_truthy(text:find("Rename the session under the cursor", 1, true), "help should describe rename")
@@ -98,7 +98,7 @@ describe("session list help overlay", function()
     it("binds N to the new-worktree action in the list buffer", function()
         local map = vim.fn.maparg("N", "n", false, true)
         assert.equals(1, map.buffer)
-        assert.equals("New worktree of this checkout (new tab)", map.desc)
+        assert.equals("New worktree or main checkout (new tab)", map.desc)
     end)
 
     it("binds r to rename and R to refresh in the list buffer", function()

@@ -2542,31 +2542,52 @@ local function open_resume_target(session_path, opts, new_tab, resume)
     proceed(nil)
 end
 
---- Repository name shown as the main checkout's group title. `Worktree.detect`
---- is pure filesystem work (and cached), so naming the main partition spawns no
---- git subprocess; anything unexpected falls back to the cwd basename.
----@return string
-local function resume_repo_name()
-    local cwd = vim.fn.getcwd()
+--- Picker context shared by both backends: the main checkout's group title and
+--- the checkout the caller currently runs in (which the layout puts first).
+---
+--- `Worktree.detect` is pure filesystem work (and cached), so naming the main
+--- partition and locating the current checkout spawns no git subprocess;
+--- anything unexpected falls back to the directory's basename, and the anchor
+--- keeps working (just without a repository root) when detection fails.
+---@class pi.ResumeContext
+---@field repo_name string Title of the main-checkout partition
+---@field current pi.ResumeAnchor Checkout the current session runs in
+
+--- The current session's workspace is the anchor, because a worktree session
+--- runs in its checkout while Neovim's cwd stays wherever it was started;
+--- without a session the editor's cwd is all there is.
+---@return pi.ResumeContext
+local function resume_context()
+    local session = M.get()
+    local cwd = session and type(session.cwd) == "string" and session.cwd ~= "" and session.cwd or vim.fn.getcwd()
+    local repo_root = nil
     local ok, Worktree = pcall(require, "pi.worktree")
     if ok and type(Worktree) == "table" and type(Worktree.detect) == "function" then
         local detected, info = pcall(Worktree.detect, cwd)
         if detected and type(info) == "table" and type(info.repo_root) == "string" and info.repo_root ~= "" then
-            return vim.fs.basename(info.repo_root)
+            repo_root = info.repo_root
         end
     end
-    return vim.fs.basename(cwd)
+    return {
+        repo_name = vim.fs.basename(repo_root or cwd),
+        current = { cwd = cwd, repo_root = repo_root },
+    }
 end
 
 --- Picker rows for the collected items: one partition per checkout, optionally
 --- narrowed by the prompt. `pi.sessions.resume_layout` owns every decision.
 ---@param items pi.SessionSelectItem[]
 ---@param query? string
----@param repo_name? string
+---@param context? pi.ResumeContext
 ---@return pi.ResumeRow[]
-local function resume_rows(items, query, repo_name)
+local function resume_rows(items, query, context)
+    context = context or resume_context()
     ---@type pi.ResumeRow[]
-    local rows = ResumeLayout.rows(items, { query = query, repo_name = repo_name or resume_repo_name() })
+    local rows = ResumeLayout.rows(items, {
+        query = query,
+        repo_name = context.repo_name,
+        current = context.current,
+    })
     return rows
 end
 
@@ -2630,7 +2651,7 @@ local function open_with_telescope(items, opts)
     local actions = require("telescope.actions")
     local action_state = require("telescope.actions.state")
 
-    local repo_name = resume_repo_name()
+    local context = resume_context()
     --- Rows behind the current prompt; a group row is only a title, so the
     --- selection helpers walk this list to find the next session row.
     ---@type pi.ResumeRow[]
@@ -2658,7 +2679,7 @@ local function open_with_telescope(items, opts)
     ---@param prompt string
     ---@return pi.ResumeRow[]
     local function rows_for(prompt)
-        current_rows = resume_rows(items, prompt, repo_name)
+        current_rows = resume_rows(items, prompt, context)
         return current_rows
     end
 

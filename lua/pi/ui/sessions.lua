@@ -1480,7 +1480,7 @@ local HELP_ENTRIES = {
     { "p", "Preview session (read-only viewer)" },
     { "x", "Close sub-session process (:PiSubClose)" },
     { "n", "New session in this checkout (new tab)" },
-    { "N", "New worktree of this checkout (new tab)" },
+    { "N", "New worktree or main checkout (new tab)" },
     { "<Tab>, za", "Fold / unfold worktree groups and sub-sessions" },
     { "zM, zR", "Collapse / expand all groups and sub-sessions" },
     { "H", "Toggle hidden / prior-conversation sub-sessions (all sessions)" },
@@ -1918,6 +1918,23 @@ local function worktree_pick_label(entry)
     return table.concat(parts, " · ")
 end
 
+--- Main checkout marker of the `N` picker label. `git worktree list` omits the
+--- main work tree, so its row is built from the repository root and spelled out;
+--- otherwise it would be indistinguishable from a linked worktree that happens
+--- to carry the repository's name.
+local MAIN_CHECKOUT_LABEL = "main checkout"
+
+--- Label of the main checkout row: name · ~/path · `main checkout`.
+---@param repo_root string
+---@return string
+local function main_checkout_pick_label(repo_root)
+    return table.concat({
+        vim.fs.basename(repo_root),
+        vim.fn.fnamemodify(repo_root, ":~"),
+        MAIN_CHECKOUT_LABEL,
+    }, " · ")
+end
+
 --- Picker entry that switches from an existing checkout to the name input.
 local NEW_WORKTREE_CHOICE = "New worktree…"
 
@@ -1938,9 +1955,9 @@ local function open_checkout(opts)
     return true
 end
 
---- Open a fresh π session in a new worktree of the repository the row under
---- the cursor belongs to (the `N` key): pick an existing worktree of that
---- repository or create a new one by name. The row's checkout and its
+--- Open a fresh π session in the repository the row under the cursor belongs
+--- to (the `N` key): pick the **main checkout** or an existing worktree of that
+--- repository, or create a new worktree by name. The row's checkout and its
 --- repository root are snapshotted at keypress, before the asynchronous
 --- enumeration, so a cursor move (or a tab switch) while git runs cannot
 --- retarget the session to another repository.
@@ -2007,14 +2024,22 @@ local function new_worktree_under_cursor()
                 Notify.warn("Cannot list worktrees: " .. tostring(err or "unknown error"))
                 return
             end
-            ---@type table<string, pi.WorktreeListEntry>
+            ---@type table<string, { path: string }>
             local by_label = {}
             ---@type string[]
             local options = {}
+            -- The main checkout comes first: `git worktree list` never reports
+            -- it, so without this row there is no way to reach the project's
+            -- own checkout from the picker — only its worktrees.
+            if vim.fn.isdirectory(repo_root) == 1 then
+                local label = main_checkout_pick_label(repo_root)
+                by_label[label] = { path = repo_root }
+                options[#options + 1] = label
+            end
             for _, entry in ipairs(entries) do
                 local path = type(entry) == "table" and entry.path or nil
-                -- Gone checkouts cannot be opened and the main checkout is
-                -- never a worktree target.
+                -- Gone checkouts cannot be opened. A main-checkout record, when
+                -- a caller hands one in, was already covered above.
                 if type(path) == "string" and path ~= "" and entry.missing ~= true and entry.kind ~= "main" then
                     if vim.fs.normalize(path) ~= vim.fs.normalize(repo_root) then
                         local label = worktree_pick_label(entry)
@@ -2026,6 +2051,8 @@ local function new_worktree_under_cursor()
                 end
             end
             if #options == 0 then
+                -- The repository root vanished while git ran: nothing to open,
+                -- so behave like the pre-main-checkout picker and ask for a name.
                 ask_name()
                 return
             end
@@ -2318,7 +2345,7 @@ local function ensure_buf()
         "n",
         "N",
         new_worktree_under_cursor,
-        vim.tbl_extend("force", map_opts, { desc = "New worktree of this checkout (new tab)" })
+        vim.tbl_extend("force", map_opts, { desc = "New worktree or main checkout (new tab)" })
     )
     vim.keymap.set(
         "n",
