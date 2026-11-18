@@ -377,14 +377,6 @@ local function norm_checkout(path)
     return normalized ~= "" and normalized or nil
 end
 
---- Is `path` the checkout `root` itself, or somewhere inside it?
----@param path string
----@param root string
----@return boolean
-local function within_checkout(path, root)
-    return path == root or path:sub(1, #root + 1) == root .. "/"
-end
-
 --- Checkout the current tab runs in: the session's own cwd — a worktree session
 --- keeps its checkout while Neovim's cwd does not move — else Neovim's cwd.
 --- The same anchor `:PiResume` uses, so both lists agree on which checkout is
@@ -398,6 +390,26 @@ local function current_checkout()
         cwd = vim.fn.getcwd()
     end
     return norm_checkout(cwd)
+end
+
+--- Main work tree of the project the current editor session belongs to — the
+--- group the overview pins first.
+---
+--- Deliberately resolved from `current_checkout()` to the **repository's main
+--- checkout** rather than pinned to that checkout itself: every tab of the same
+--- repository (its main checkout and all its linked worktrees) resolves to the
+--- same main work tree, so moving focus between two worktree tabs cannot
+--- reshuffle the groups. A tab whose checkout is not inside a git repository
+--- pins nothing.
+---@return string? normalized main checkout root
+local function current_main_checkout()
+    local anchor = current_checkout()
+    local info = anchor and detect_worktree(anchor)
+    local repo_root = info and info.repo_root
+    if type(repo_root) ~= "string" or repo_root == "" then
+        return nil
+    end
+    return norm_checkout(repo_root)
 end
 
 --- Activity clock of a list row: the mtime of the session transcript it belongs
@@ -433,10 +445,13 @@ end
 --- grouping and the parent's fold count follow the parent row, never the
 --- child's cwd.
 ---
---- Group order follows `:PiResume`'s partition order: the checkout the current
---- tab runs in first, then the most recently active groups (newest transcript
---- mtime anywhere in the group), with equal clocks broken by worktree name and
---- then path so a redraw never reshuffles ties.
+--- Group order follows `:PiResume`'s partition order, with one deliberate
+--- difference: the **main work tree of the project the focused tab belongs to**
+--- comes first (see `current_main_checkout`), never the focused tab's own
+--- checkout, so switching focus between two tabs of one repository's worktrees
+--- never reorders the groups. The rest follow by most recently active groups
+--- (newest transcript mtime anywhere in the group), with equal clocks broken by
+--- worktree name and then path so a redraw never reshuffles ties.
 ---@param flat pi.SessionsListRow[]
 ---@return pi.SessionsListRow[]
 local function group_by_worktree(flat)
@@ -481,17 +496,16 @@ local function group_by_worktree(flat)
         return flat
     end
 
-    -- Pin the current checkout: deepest group root containing the anchor, so a
-    -- session in a subdirectory still resolves to its own checkout (the main
-    -- checkout's root is the repository root, a linked worktree's is the
-    -- checkout itself).
-    local anchor = current_checkout()
-    local pinned, pinned_len = nil, 0
-    if anchor then
+    -- Pin the main work tree of the focused tab's project: every checkout of
+    -- one repository (main and linked worktrees) resolves to the same root, so
+    -- the pinned group does not depend on which tab has focus.
+    local main = current_main_checkout()
+    local pinned = nil
+    if main then
         for _, root in ipairs(order) do
-            local normalized = norm_checkout(root)
-            if normalized and within_checkout(anchor, normalized) and #normalized > pinned_len then
-                pinned, pinned_len = root, #normalized
+            if norm_checkout(root) == main then
+                pinned = root
+                break
             end
         end
     end

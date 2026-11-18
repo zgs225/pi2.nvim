@@ -21,6 +21,7 @@ local TAB = 873
 local WORKTREES = {
     ["/repo/main"] = { kind = "main", name = "main", path = "/repo/main", repo_root = "/repo/main" },
     ["/repo/wt"] = { kind = "linked", name = "wt", path = "/repo/wt", repo_root = "/repo/main" },
+    ["/repo/wt2"] = { kind = "linked", name = "wt2", path = "/repo/wt2", repo_root = "/repo/main" },
 }
 
 ---@param opts? { id?: string, tab?: integer, cwd?: string, forked_from?: any, session_file?: string }
@@ -144,8 +145,17 @@ describe(":PiSessions worktree grouping", function()
         orig_children = Manifest.children_of
         real_worktree_module = package.loaded["pi.worktree"]
         package.loaded["pi.worktree"] = {
+            -- Mirrors the real detector, which walks up from the given
+            -- directory to the checkout root.
             detect = function(dir)
-                return WORKTREES[dir]
+                local candidate = vim.fs.normalize(dir):gsub("/+$", "")
+                while candidate and candidate ~= "" and candidate ~= "/" do
+                    if WORKTREES[candidate] then
+                        return WORKTREES[candidate]
+                    end
+                    candidate = vim.fs.dirname(candidate)
+                end
+                return nil
             end,
             status = function() end,
         }
@@ -256,7 +266,7 @@ describe(":PiSessions worktree grouping", function()
             assert.are.same({ "/repo/main", "/repo/wt" }, grouped(rows))
         end)
 
-        it("pins the current tab's checkout first, then orders the rest by activity", function()
+        it("pins the project's main worktree first, then orders the rest by activity", function()
             local main = fake_session({
                 id = "A",
                 cwd = "/repo/main",
@@ -275,14 +285,65 @@ describe(":PiSessions worktree grouping", function()
             end, main)
         end)
 
-        it("resolves the current checkout from a subdirectory and prefers the deepest root", function()
+        it("keeps the project's main worktree first whichever tab has focus", function()
+            local main = fake_session({
+                id = "A",
+                cwd = "/repo/main",
+                session_file = transcript("main-old.jsonl", 1000000),
+            })
+            local wt = fake_session({
+                id = "B",
+                cwd = "/repo/wt",
+                session_file = transcript("wt-newest.jsonl", 3000000),
+            })
+            local wt2 = fake_session({
+                id = "C",
+                cwd = "/repo/wt2",
+                session_file = transcript("wt2-mid.jsonl", 2000000),
+            })
+
+            -- Two linked worktrees of the same repository plus a session in
+            -- its main checkout: focusing a worktree tab must not move that
+            -- tab's group ahead of the main checkout (`/repo/main` stays
+            -- pinned for all three).
+            for _, anchor in ipairs({ main, wt, wt2 }) do
+                with_manager({ main, wt, wt2 }, function()
+                    assert.are.same({ "/repo/main", "/repo/wt", "/repo/wt2" }, grouped(build({ main, wt, wt2 })))
+                end, anchor)
+            end
+        end)
+
+        it("does not reshuffle groups when focus moves between two worktree tabs", function()
+            local wt = fake_session({
+                id = "A",
+                cwd = "/repo/wt",
+                session_file = transcript("a.jsonl", 1000000),
+            })
+            local wt2 = fake_session({
+                id = "B",
+                cwd = "/repo/wt2",
+                session_file = transcript("b.jsonl", 2000000),
+            })
+
+            -- Both tabs are worktrees of the same repository, whose main
+            -- checkout lists no session: the project the list pins is the
+            -- same for either tab, so the recency order never moves with the
+            -- focus.
+            for _, anchor in ipairs({ wt, wt2 }) do
+                with_manager({ wt, wt2 }, function()
+                    assert.are.same({ "/repo/wt2", "/repo/wt" }, grouped(build({ wt, wt2 })))
+                end, anchor)
+            end
+        end)
+
+        it("resolves a subdirectory anchor to its checkout's main worktree", function()
             local main = fake_session({ id = "A", cwd = "/repo/main" })
             local linked = fake_session({
                 id = "B",
                 cwd = "/repo/wt",
                 session_file = transcript("wt-sub.jsonl", 2000000),
             })
-            local anchor = fake_session({ id = "tab", cwd = "/repo/main/lua/pi" })
+            local anchor = fake_session({ id = "tab", cwd = "/repo/wt/lua/pi" })
 
             with_manager({ main, linked }, function()
                 assert.are.same({ "/repo/main", "/repo/wt" }, grouped(build({ main, linked })))
