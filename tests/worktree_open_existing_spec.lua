@@ -362,6 +362,62 @@ describe("open_existing tabs", function()
         assert.are.equal(CHECKOUT, created[1].cwd)
     end)
 
+    it("places the new tabpage right after tab_after", function()
+        install_sessions({ session = fake_session() })
+        -- Anchor in the middle of the tabline, with another tab behind it: the
+        -- new tab belongs next to its group, not appended at the end.
+        vim.cmd("tabnew")
+        local anchor = vim.api.nvim_get_current_tabpage()
+        vim.cmd("tabnew")
+
+        ---@type table<pi.TabId, true>
+        local known = {}
+        for _, tab in ipairs(vim.api.nvim_list_tabpages()) do
+            known[tab] = true
+        end
+
+        WorktreeSession.open_existing({ name = "wt1", tab_after = anchor })
+
+        local order = vim.api.nvim_list_tabpages()
+        assert.are.equal(vim.tbl_count(known) + 1, #order)
+        local anchor_index, new_index
+        for index, tab in ipairs(order) do
+            if tab == anchor then
+                anchor_index = index
+            end
+            if not known[tab] then
+                new_index = index
+            end
+        end
+        assert.is_not_nil(anchor_index)
+        assert.is_not_nil(new_index)
+        assert.are.equal(anchor_index + 1, new_index)
+        -- The chat of the tab that was opened is the one focused.
+        assert.are.equal(order[new_index], vim.api.nvim_get_current_tabpage())
+    end)
+
+    it("appends the new tabpage when tab_after is not a live tabpage", function()
+        install_sessions({ session = fake_session() })
+        local tabs_before = tab_count()
+
+        WorktreeSession.open_existing({ name = "wt1", tab_after = 999999 })
+
+        assert.are.equal(tabs_before + 1, tab_count())
+        assert.are.equal(1, #created)
+    end)
+
+    it("ignores tab_after when it reuses the current tabpage", function()
+        install_sessions({ session = fake_session() })
+        vim.cmd("tabnew")
+        local anchor = vim.api.nvim_get_current_tabpage()
+        local tabs_before = tab_count()
+
+        WorktreeSession.open_existing({ name = "wt1", new_tab = false, tab_after = anchor })
+
+        assert.are.equal(tabs_before, tab_count())
+        assert.are.equal(anchor, vim.api.nvim_get_current_tabpage())
+    end)
+
     it("refuses new_tab = false when the tab already runs a session", function()
         local current = fake_session({ worktree = fake_info() })
         install_sessions({ current = current })

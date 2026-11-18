@@ -31,11 +31,12 @@ pi.worktree_fork(opts?)       -- fork the current conversation into a new git wo
                               -- opts: { name?, layout? }
 pi.worktree_open(opts?, cb?)  -- start a fresh session in an EXISTING directory (:Pi worktree=<name> /
                               -- :PiNewTab worktree=<name>; `:PiSessions` → n / N); opts:
-                              -- { name?, cwd?, repo_cwd?, layout?, new_tab?, create? }. `name` is a managed
+                              -- { name?, cwd?, repo_cwd?, layout?, new_tab?, create?, tab_after? }. `name` is a managed
                               -- linked checkout; `repo_cwd` scopes it to an explicit repository;
                               -- `create = true` makes it first when it does not exist (the :Pi* commands
-                              -- pass it); `cwd` may be any existing directory — a linked worktree
-                              -- (attached as worktree metadata) or the main checkout / plain dir
+                              -- pass it); `tab_after` is the tabpage the new tab is inserted after
+                              -- (default: the end of the tabline); `cwd` may be any existing directory — a linked
+                              -- worktree (attached as worktree metadata) or the main checkout / plain dir
 pi.worktree_branch(branch)    -- put the current worktree session on `branch`, creating it
                               -- when it does not exist
 pi.worktree_apply(opts?)      -- review a worktree's patch in the diff-review panel and apply it to

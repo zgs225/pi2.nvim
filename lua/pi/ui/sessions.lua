@@ -1968,6 +1968,72 @@ function M.row_checkout(row)
     return nil
 end
 
+--- Tabpage a session opened in `checkout` belongs after, so its tab stays
+--- with the rest of that worktree's tabs: the list prints a worktree's rows as
+--- one contiguous block, while `tabnew` always appends at the end of the
+--- tabline, so a session opened in a group whose tabs are not the last ones
+--- would land behind every other checkout's tabs.
+---
+--- The anchor is the group's last tab in tabline order, which is also the
+--- group's last row (rows keep tabline order inside a group), so the new tab
+--- joins its group's block in both. Group *order* is not reproduced: the list
+--- orders groups by activity, so only the placement inside a group can be
+--- stable. A folded group renders no member rows, so its live sessions answer
+--- instead.
+---
+--- nil when nothing should move: a flat list keeps tabline order (appending is
+--- already correct), and a checkout with no group yet is listed last — which is
+--- exactly where its new tab lands anyway.
+---@param checkout string? checkout path resolved from the row (`M.row_checkout`)
+---@return pi.TabId?
+function M.tab_anchor(checkout)
+    if type(checkout) ~= "string" or checkout == "" then
+        return nil
+    end
+    -- Grouping is decided per render: without a group id on any row the list is
+    -- flat, and tabline order is the row order.
+    local grouped = false
+    for _, row in ipairs(rows) do
+        if row.group_id ~= nil then
+            grouped = true
+            break
+        end
+    end
+    if not grouped then
+        return nil
+    end
+
+    ---@type table<pi.TabId, integer>
+    local rank = {}
+    for index, tab in ipairs(vim.api.nvim_list_tabpages()) do
+        rank[tab] = index
+    end
+    local anchor, anchor_rank = nil, 0
+    ---@param tab any
+    local function consider(tab)
+        local position = type(tab) == "number" and rank[tab] or nil
+        if position and position > anchor_rank then
+            anchor, anchor_rank = tab, position
+        end
+    end
+    for _, row in ipairs(rows) do
+        if (row.depth == nil or row.depth == 0) and row.group_id == checkout then
+            consider(row.tab)
+        end
+    end
+    if not anchor then
+        -- Collapsed group: its member rows are folded away, so ask the live
+        -- sessions that belong to that checkout instead.
+        for _, session in ipairs(require("pi.sessions.manager").list()) do
+            local info = session_worktree(session)
+            if info and info.path == checkout then
+                consider(session.tab)
+            end
+        end
+    end
+    return anchor
+end
+
 --- Open a fresh π session in a new tab rooted at the checkout under the cursor
 --- (the `n` key). Works on a worktree group header, on any row inside a group
 --- and on a row of the main-checkout partition alike, so the main checkout is
@@ -1996,8 +2062,10 @@ local function new_session_in_checkout_under_cursor()
     end
     -- `open_existing` reports its own failures (bad target, busy tab, spawn
     -- errors), so no callback is needed here. It also accepts the main
-    -- checkout and plain directories, not just linked worktrees.
-    WorktreeSession.open_existing({ cwd = path })
+    -- checkout and plain directories, not just linked worktrees. `tab_after`
+    -- keeps the tab next to the rest of the row's worktree group instead of at
+    -- the end of the tabline.
+    WorktreeSession.open_existing({ cwd = path, tab_after = M.tab_anchor(path) })
 end
 
 --- Label the `N` picker shows for one existing worktree: name · ~/path ·
@@ -2172,7 +2240,10 @@ local function new_worktree_under_cursor()
                     end
                     local entry = by_label[choice]
                     if entry then
-                        open_checkout({ cwd = entry.path })
+                        -- Same as `n`: an existing checkout already listed under
+                        -- its own worktree group takes the tab next to its
+                        -- siblings, not at the end of the tabline.
+                        open_checkout({ cwd = entry.path, tab_after = M.tab_anchor(entry.path) })
                     end
                 end
             )

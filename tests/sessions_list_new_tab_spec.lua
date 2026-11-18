@@ -348,6 +348,102 @@ describe(":PiSessions n (new session in this checkout)", function()
         end)
     end)
 
+    describe("tab placement (tab_after)", function()
+        --- Run `fn` with `count` real tabpages, passed as `{ tab1, tab2, … }` in
+        --- tabline order. Every extra tabpage is closed again afterwards, so the
+        --- tab handles a row carries are real (the anchor is resolved against
+        --- `nvim_list_tabpages()`).
+        ---@param count integer
+        ---@param fn fun(tabs: pi.TabId[])
+        local function with_tabs(count, fn)
+            local tabs = { vim.api.nvim_get_current_tabpage() }
+            for _ = 2, count do
+                vim.cmd("tabnew")
+                tabs[#tabs + 1] = vim.api.nvim_get_current_tabpage()
+            end
+            local ok, err = pcall(fn, tabs)
+            pcall(SessionList.close)
+            for index = #tabs, 2, -1 do
+                if vim.api.nvim_tabpage_is_valid(tabs[index]) then
+                    pcall(vim.api.nvim_set_current_tabpage, tabs[index])
+                    pcall(vim.cmd, "tabclose")
+                end
+            end
+            if vim.api.nvim_tabpage_is_valid(tabs[1]) then
+                pcall(vim.api.nvim_set_current_tabpage, tabs[1])
+            end
+            if not ok then
+                error(err)
+            end
+        end
+
+        it("anchors on the last tab of the row's worktree group", function()
+            with_tabs(3, function(tabs)
+                -- Tabline: main A, main C, wt B — groups are ordered by activity
+                -- in the list, so the rows are located by name, not by index.
+                local main_a = fake_session({ id = "A", cwd = MAIN_DIR, tab = tabs[1] })
+                local main_c = fake_session({ id = "C", cwd = MAIN_DIR, tab = tabs[2] })
+                local wt_b = fake_session({ id = "B", cwd = WT_DIR, tab = tabs[3] })
+                with_manager({ main_a, main_c, wt_b }, function()
+                    SessionList.open()
+                    assert.are.equal(5, #buffer_lines())
+
+                    --- Buffer line of the group header named `name`.
+                    ---@param name string
+                    ---@return integer
+                    local function header_line(name)
+                        for index, line in ipairs(buffer_lines()) do
+                            if line:find(GLYPH .. " " .. name, 1, true) then
+                                return index
+                            end
+                        end
+                        error("no group header for " .. name)
+                    end
+
+                    -- A main-checkout member row: right after the group's last
+                    -- tab, not at the end of the tabline (which holds wt).
+                    open_under_cursor(header_line("main") + 1)
+                    assert.are.equal(1, #opened)
+                    assert.are.equal(tabs[2], opened[1].tab_after)
+
+                    -- A folded group renders no member rows; the live sessions
+                    -- of that checkout answer instead.
+                    vim.api.nvim_win_set_cursor(0, { header_line("main"), 0 })
+                    press_key("<Tab>")
+                    SessionList._render()
+                    assert.are.equal(3, #buffer_lines())
+                    open_under_cursor(header_line("main"))
+                    assert.are.equal(2, #opened)
+                    assert.are.equal(tabs[2], opened[2].tab_after)
+
+                    -- The last group's header has no tab of its own; its
+                    -- member row supplies the anchor.
+                    open_under_cursor(header_line("wt"))
+                    assert.are.equal(3, #opened)
+                    assert.are.equal(tabs[3], opened[3].tab_after)
+                end)
+            end)
+        end)
+
+        it("does not anchor when the list stays flat", function()
+            with_tabs(2, function(tabs)
+                -- One checkout only: rows keep tabline order, so appending at
+                -- the end of the tabline already matches the list.
+                local first = fake_session({ id = "A", cwd = MAIN_DIR, tab = tabs[1] })
+                local second = fake_session({ id = "B", cwd = MAIN_DIR, tab = tabs[2] })
+                with_manager({ first, second }, function()
+                    SessionList.open()
+                    assert.are.equal(2, #buffer_lines())
+
+                    open_under_cursor(1)
+
+                    assert.are.equal(1, #opened)
+                    assert.is_nil(opened[1].tab_after)
+                end)
+            end)
+        end)
+    end)
+
     describe("keymap", function()
         it("registers n on the list buffer", function()
             local env = worktree_env()
