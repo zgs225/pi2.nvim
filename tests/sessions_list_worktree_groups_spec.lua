@@ -23,7 +23,7 @@ local WORKTREES = {
     ["/repo/wt"] = { kind = "linked", name = "wt", path = "/repo/wt", repo_root = "/repo/main" },
 }
 
----@param opts? { id?: string, tab?: integer, cwd?: string, forked_from?: any }
+---@param opts? { id?: string, tab?: integer, cwd?: string, forked_from?: any, session_file?: string }
 ---@return pi.Session
 local function fake_session(opts)
     opts = opts or {}
@@ -33,6 +33,7 @@ local function fake_session(opts)
         tab = tab,
         attached_tab = tab,
         cwd = opts.cwd,
+        session_file = opts.session_file,
         forked_from = opts.forked_from,
         conversation_epoch = 0,
         rpc = {
@@ -80,14 +81,15 @@ end
 --- Run `fn` with the session manager stubbed to `sessions`.
 ---@param sessions pi.Session[]
 ---@param fn fun()
-local function with_manager(sessions, fn)
+---@param anchor? pi.Session Session the stubbed `get()` reports as the tab's own (default: `sessions[1]`)
+local function with_manager(sessions, fn, anchor)
     local real_manager = package.loaded["pi.sessions.manager"]
     package.loaded["pi.sessions.manager"] = {
         list = function()
             return sessions
         end,
         get = function()
-            return sessions[1]
+            return anchor or sessions[1]
         end,
         get_by_id = function(id)
             for _, session in ipairs(sessions) do
@@ -116,6 +118,18 @@ end
 ---@return string[]
 local function buffer_lines()
     return vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(0), 0, -1, false)
+end
+
+--- A transcript file with a controlled mtime, so group ordering by activity is
+--- deterministic (`getftime` has second resolution).
+---@param name string
+---@param mtime integer
+---@return string
+local function transcript(name, mtime)
+    local path = vim.fn.tempname() .. "-" .. name
+    vim.fn.writefile({ "{}" }, path)
+    vim.uv.fs_utime(path, mtime, mtime)
+    return path
 end
 
 describe(":PiSessions worktree grouping", function()
@@ -189,21 +203,138 @@ describe(":PiSessions worktree grouping", function()
             assert.are.equal("/repo/wt", rows[4].group_id)
         end)
 
-        it("keeps groups in first-appearance order and ungrouped rows last", function()
+        it("breaks equal activity ties by worktree name and keeps ungrouped rows last", function()
             local linked = fake_session({ id = "B", cwd = "/repo/wt" })
             local outside = fake_session({ id = "C", cwd = "/tmp/none" })
             local main = fake_session({ id = "A", cwd = "/repo/main" })
 
+            -- No transcript is known for any row (activity 0 for both groups):
+            -- the name decides (`main` before `wt`), never first appearance.
             local rows = build({ linked, outside, main })
 
             assert.are.equal(5, #rows)
-            assert.are.equal("/repo/wt", rows[1].group_id)
-            assert.are.equal("B", rows[2].session_id)
-            assert.are.equal("/repo/main", rows[3].group_id)
-            assert.are.equal("A", rows[4].session_id)
+            assert.are.equal("/repo/main", rows[1].group_id)
+            assert.are.equal("A", rows[2].session_id)
+            assert.are.equal("/repo/wt", rows[3].group_id)
+            assert.are.equal("B", rows[4].session_id)
             assert.are.equal("C", rows[5].session_id)
             assert.is_nil(rows[5].group_id)
             assert.is_nil(rows[5].worktree)
+        end)
+    end)
+
+    describe("group order", function()
+        --- Group ids of `rows`, in display order (sub-session rows skipped).
+        ---@param rows pi.SessionsListRow[]
+        ---@return string[]
+        local function grouped(rows)
+            local out = {}
+            for _, row in ipairs(rows) do
+                if row.is_group then
+                    out[#out + 1] = row.group_id
+                end
+            end
+            return out
+        end
+
+        it("orders groups by their newest session transcript", function()
+            local main = fake_session({
+                id = "A",
+                cwd = "/repo/main",
+                session_file = transcript("main.jsonl", 2000000),
+            })
+            local linked = fake_session({
+                id = "B",
+                cwd = "/repo/wt",
+                session_file = transcript("wt.jsonl", 1000000),
+            })
+
+            -- Tabline order puts the linked checkout first and the name
+            -- tiebreak would too; the newer transcript still puts main ahead.
+            local rows = build({ linked, main })
+
+            assert.are.same({ "/repo/main", "/repo/wt" }, grouped(rows))
+        end)
+
+        it("pins the current tab's checkout first, then orders the rest by activity", function()
+            local main = fake_session({
+                id = "A",
+                cwd = "/repo/main",
+                session_file = transcript("main-old.jsonl", 1000000),
+            })
+            local linked = fake_session({
+                id = "B",
+                cwd = "/repo/wt",
+                session_file = transcript("wt-new.jsonl", 2000000),
+            })
+
+            -- The tab runs in the main checkout, whose transcript is older:
+            -- it still leads, and the rest keeps its recency order.
+            with_manager({ linked, main }, function()
+                assert.are.same({ "/repo/main", "/repo/wt" }, grouped(build({ linked, main })))
+            end, main)
+        end)
+
+        it("resolves the current checkout from a subdirectory and prefers the deepest root", function()
+            local main = fake_session({ id = "A", cwd = "/repo/main" })
+            local linked = fake_session({
+                id = "B",
+                cwd = "/repo/wt",
+                session_file = transcript("wt-sub.jsonl", 2000000),
+            })
+            local anchor = fake_session({ id = "tab", cwd = "/repo/main/lua/pi" })
+
+            with_manager({ main, linked }, function()
+                assert.are.same({ "/repo/main", "/repo/wt" }, grouped(build({ main, linked })))
+            end, anchor)
+        end)
+
+        it("falls back to recency when the tab runs outside every listed checkout", function()
+            local main = fake_session({
+                id = "A",
+                cwd = "/repo/main",
+                session_file = transcript("main-mid.jsonl", 1500000),
+            })
+            local linked = fake_session({
+                id = "B",
+                cwd = "/repo/wt",
+                session_file = transcript("wt-newest.jsonl", 2000000),
+            })
+            local anchor = fake_session({ id = "tab", cwd = "/tmp/elsewhere" })
+
+            with_manager({ main, linked }, function()
+                assert.are.same({ "/repo/wt", "/repo/main" }, grouped(build({ main, linked })))
+            end, anchor)
+        end)
+
+        it("counts a sub-session transcript recorded on the row", function()
+            local parent = fake_session({ id = "parent-1", cwd = "/repo/main" })
+            local linked = fake_session({
+                id = "B",
+                cwd = "/repo/wt",
+                session_file = transcript("wt-mid.jsonl", 2000000),
+            })
+
+            -- The main group's parent has no transcript of its own; its child's
+            -- recorded JSONL is the freshest activity (reading only
+            -- `row.session` would leave the group at 0 and put wt first).
+            Manifest.children_of = function(lineage)
+                if lineage == "parent-1" then
+                    return {
+                        {
+                            _id = "c1",
+                            name = "worker-1",
+                            status = "active",
+                            parent_id = "parent-1",
+                            config = {},
+                            session_file = transcript("child-newest.jsonl", 3000000),
+                        },
+                    }
+                end
+                return {}
+            end
+
+            assert.are.same({ "/repo/main", "/repo/wt" }, grouped(build({ parent, linked })))
         end)
     end)
 

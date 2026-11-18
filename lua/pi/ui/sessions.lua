@@ -39,6 +39,7 @@ local show_hidden_children = false
 ---@field subtitle? string model · thinking badge for sub-rows
 ---@field dormant? boolean process not running (disk only)
 ---@field session? pi.Session live session reference when available
+---@field session_file? string Recorded transcript of a row without a live session object (a disk-only child row).
 ---@field is_current_view? boolean row is the tab's focused session (parent or child)
 ---@field is_tree_parent? boolean parent row shown while viewing a child in the tab
 ---@field marker_col? integer 1-based byte column of the status dot (for current-tab marker)
@@ -363,6 +364,62 @@ local function row_fold_key(row)
     return parent_key(row.session) or row.session_id
 end
 
+--- Normalized checkout path, or nil when `path` is not one. Mirrors the resume
+--- picker's partition keys: trailing slashes would split one checkout into two
+--- groups.
+---@param path any
+---@return string?
+local function norm_checkout(path)
+    if type(path) ~= "string" or path == "" then
+        return nil
+    end
+    local normalized = vim.fs.normalize(path):gsub("/+$", "")
+    return normalized ~= "" and normalized or nil
+end
+
+--- Is `path` the checkout `root` itself, or somewhere inside it?
+---@param path string
+---@param root string
+---@return boolean
+local function within_checkout(path, root)
+    return path == root or path:sub(1, #root + 1) == root .. "/"
+end
+
+--- Checkout the current tab runs in: the session's own cwd — a worktree session
+--- keeps its checkout while Neovim's cwd does not move — else Neovim's cwd.
+--- The same anchor `:PiResume` uses, so both lists agree on which checkout is
+--- "yours".
+---@return string?
+local function current_checkout()
+    local ok, Sessions = pcall(require, "pi.sessions.manager")
+    local session = ok and type(Sessions) == "table" and type(Sessions.get) == "function" and Sessions.get() or nil
+    local cwd = session and session.cwd
+    if type(cwd) ~= "string" or cwd == "" then
+        cwd = vim.fn.getcwd()
+    end
+    return norm_checkout(cwd)
+end
+
+--- Activity clock of a list row: the mtime of the session transcript it belongs
+--- to (a disk-only child row uses the file recorded for it). It is the same
+--- signal the resume picker orders its partitions by. 0 when no file is known —
+--- a session that has not reported one yet, or one started without a session
+--- file.
+---@param row pi.SessionsListRow
+---@return integer
+local function row_activity(row)
+    local file = row.session_file
+    local session = row.session
+    if type(file) ~= "string" or file == "" then
+        file = session and session.session_file
+    end
+    if type(file) ~= "string" or file == "" then
+        return 0
+    end
+    local mtime = vim.fn.getftime(file)
+    return mtime > 0 and mtime or 0
+end
+
 --- Group parent rows (and their sub-session rows) by git worktree.
 ---
 --- Groups appear only when the rows span at least two distinct worktrees, so a
@@ -375,31 +432,36 @@ end
 --- A child stays nested under its parent whatever checkout it runs in: the
 --- grouping and the parent's fold count follow the parent row, never the
 --- child's cwd.
+---
+--- Group order follows `:PiResume`'s partition order: the checkout the current
+--- tab runs in first, then the most recently active groups (newest transcript
+--- mtime anywhere in the group), with equal clocks broken by worktree name and
+--- then path so a redraw never reshuffles ties.
 ---@param flat pi.SessionsListRow[]
 ---@return pi.SessionsListRow[]
 local function group_by_worktree(flat)
     ---@type table<string, pi.SessionsListRow[]>
     local buckets = {}
-    ---@type string[] root order of first appearance
+    ---@type string[] group roots in first-appearance order (re-ordered below)
     local order = {}
     ---@type table<string, pi.SessionsListWorktree>
     local infos = {}
     ---@type pi.SessionsListRow[]
     local ungrouped = {}
-    ---@type string?
-    local current = nil
+    ---@type string? bucket the last parent row was appended to
+    local bucket = nil
 
     for _, row in ipairs(flat) do
         if row.depth and row.depth > 0 then
             -- Sub-session rows follow the parent row they were emitted under.
-            if current and buckets[current] then
-                buckets[current][#buckets[current] + 1] = row
+            if bucket and buckets[bucket] then
+                buckets[bucket][#buckets[bucket] + 1] = row
             else
                 ungrouped[#ungrouped + 1] = row
             end
         else
             local info = session_worktree(row.session)
-            current = nil
+            bucket = nil
             if info then
                 local root = info.path
                 if not buckets[root] then
@@ -408,7 +470,7 @@ local function group_by_worktree(flat)
                     infos[root] = info
                 end
                 buckets[root][#buckets[root] + 1] = row
-                current = root
+                bucket = root
             else
                 ungrouped[#ungrouped + 1] = row
             end
@@ -418,6 +480,46 @@ local function group_by_worktree(flat)
     if #order < 2 then
         return flat
     end
+
+    -- Pin the current checkout: deepest group root containing the anchor, so a
+    -- session in a subdirectory still resolves to its own checkout (the main
+    -- checkout's root is the repository root, a linked worktree's is the
+    -- checkout itself).
+    local anchor = current_checkout()
+    local pinned, pinned_len = nil, 0
+    if anchor then
+        for _, root in ipairs(order) do
+            local normalized = norm_checkout(root)
+            if normalized and within_checkout(anchor, normalized) and #normalized > pinned_len then
+                pinned, pinned_len = root, #normalized
+            end
+        end
+    end
+
+    ---@type table<string, integer>
+    local activity = {}
+    for _, root in ipairs(order) do
+        local newest = 0
+        for _, row in ipairs(buckets[root]) do
+            newest = math.max(newest, row_activity(row))
+        end
+        activity[root] = newest
+    end
+
+    table.sort(order, function(a, b)
+        if (a == pinned) ~= (b == pinned) then
+            return a == pinned
+        end
+        local am, bm = activity[a] or 0, activity[b] or 0
+        if am ~= bm then
+            return am > bm
+        end
+        local an, bn = infos[a].name or "", infos[b].name or ""
+        if an ~= bn then
+            return an < bn
+        end
+        return a < b
+    end)
 
     ---@type pi.SessionsListRow[]
     local out = {}
@@ -645,6 +747,7 @@ local function append_child_row(out, entry, tab, opts)
         subtitle = subtitle,
         dormant = dormant,
         session = child,
+        session_file = type(entry.session_file) == "string" and entry.session_file ~= "" and entry.session_file or nil,
         is_current_view = opts.is_current_view == true,
         worktree = assigned_name,
         worktree_path = assigned_path,
