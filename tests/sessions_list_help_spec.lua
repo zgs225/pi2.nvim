@@ -92,7 +92,10 @@ describe("session list help overlay", function()
             text:find("Preview session (read-only viewer)", 1, true),
             "help should describe the read-only preview"
         )
-        assert.is_truthy(text:find("Close sub-session process", 1, true), "help should describe sub-session close")
+        assert.is_truthy(
+            text:find("Close sub-session, session tab, or worktree group", 1, true),
+            "help should describe the close key"
+        )
     end)
 
     it("binds N to the new-worktree action in the list buffer", function()

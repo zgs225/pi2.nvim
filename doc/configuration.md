@@ -350,6 +350,13 @@ require("pi").setup({
             height = 0.4, -- fraction (<1) of editor height, or lines (>=1)
             border = "rounded",
         },
+        -- `x` in the list asks before closing, per scope: a sub-session's RPC
+        -- process (child row), a session's π tab — process stopped and tabpage
+        -- closed (session row), every π tab of a checkout (worktree group
+        -- header). All default to true; false closes without the prompt.
+        confirm_close_child = true,
+        confirm_close_session = true,
+        confirm_close_group = true,
     },
 
     -- Background tasks panel (:PiTasks): a live list of the background bash

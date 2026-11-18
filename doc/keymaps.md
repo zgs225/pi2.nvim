@@ -14,7 +14,7 @@ What the plugin does bind on its own:
 - `dd` / `x` to remove an entry in the attachments buffer.
 - The [diff review](diff-review.md) keys inside the diff tab.
 - The `:PiDiff` session diff review: in the panel's file list, moving the cursor previews the file's diff, `<CR>`/`o` jumps to its first changed line, `<C-f>`/`<C-b>`/`<C-d>`/`<C-u>` scroll the diff on the right; in the diff area, `<CR>`/`o` jumps to the line under the cursor; `q` closes the whole review (see [Session diff review](diff-review.md#session-diff-review-pidiff)). When the panel was opened by [`pi.worktree_apply`](worktrees.md#applying-a-patch), an extra `a` applies the reviewed patch to the main checkout.
-- The [sessions overview](sessions.md#sessions-overview-pisessions) keys inside the list, including `n` for a fresh session in the row's checkout and `N` to open the row's main checkout or pick/create one of its worktrees (both insert the new tab next to that checkout's worktree group instead of at the end of the tabline).
+- The [sessions overview](sessions.md#sessions-overview-pisessions) keys inside the list, including `x` to close the sub-session under the cursor, the session's π tab, or every π tab of a worktree group (each scope asks first unless its `sessions_list.confirm_close_*` switch is off), `n` for a fresh session in the row's checkout and `N` to open the row's main checkout or pick/create one of its worktrees (both insert the new tab next to that checkout's worktree group instead of at the end of the tabline).
 - The [background tasks](#background-tasks-panel-pitasks) panel keys inside the list.
 
 ## Background tasks panel (`:PiTasks`)

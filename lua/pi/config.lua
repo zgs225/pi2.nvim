@@ -233,6 +233,9 @@
 ---@field width? integer Window width for left/right placement in the side layout (default 40)
 ---@field height? integer Window height for top/bottom placement in the side layout (default 12)
 ---@field float pi.SessionsListFloatConfig Float window sizing when the current tab uses the float layout
+---@field confirm_close_child? boolean Ask before `x` on a sub-session row closes that child's RPC process (default true)
+---@field confirm_close_session? boolean Ask before `x` on a session row closes its PiTab — process stopped and tabpage closed (default true)
+---@field confirm_close_group? boolean Ask before `x` on a worktree group header closes every PiTab in that checkout (default true)
 
 ---@class pi.TasksPanelConfig
 ---@field mode "follow"|"side"|"float" How the panel opens: "side" or "float" explicitly, or "follow" the current tab's chat layout (default "follow")
@@ -578,6 +581,9 @@ local defaults = {
             height = 0.4,
             border = "rounded",
         },
+        confirm_close_child = true,
+        confirm_close_session = true,
+        confirm_close_group = true,
     },
     tasks_panel = {
         mode = "follow",

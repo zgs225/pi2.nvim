@@ -605,7 +605,9 @@ describe(":PiSessions worktree grouping", function()
                 local wins_before = #vim.api.nvim_list_wins()
                 local lines_before = buffer_lines()
 
-                for _, key in ipairs({ "<CR>", "x", "p", "c", "d", "f", "s" }) do
+                -- `x` is not in this set: on a worktree group header it closes the
+                -- whole group (tests/sessions_list_close_spec.lua).
+                for _, key in ipairs({ "<CR>", "p", "c", "d", "f", "s" }) do
                     press_key(key)
                 end
 

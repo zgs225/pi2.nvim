@@ -1581,7 +1581,7 @@ local HELP_ENTRIES = {
     { "C", "Clone this session (:PiClone)" },
     { "t", "Navigate this session's tree (:PiTree)" },
     { "p", "Preview session (read-only viewer)" },
-    { "x", "Close sub-session process (:PiSubClose)" },
+    { "x", "Close sub-session, session tab, or worktree group" },
     { "n", "New session in this checkout (new tab)" },
     { "N", "New worktree or main checkout (new tab)" },
     { "<Tab>, za", "Fold / unfold worktree groups and sub-sessions" },
@@ -1686,6 +1686,222 @@ local function session_for_tab(tab)
         end
     end
     return nil
+end
+
+-- Closing rows (x) -------------------------------------------------------------
+
+--- Confirmation switch of one `x` close scope (`sessions_list.confirm_close_*`).
+---@param kind "child"|"session"|"group"
+---@return boolean confirm
+local function close_needs_confirm(kind)
+    local cfg = Config.options.sessions_list or {}
+    if kind == "child" then
+        return cfg.confirm_close_child ~= false
+    end
+    if kind == "group" then
+        return cfg.confirm_close_group ~= false
+    end
+    return cfg.confirm_close_session ~= false
+end
+
+--- Close one tabpage, restoring the previously focused tab when it survives.
+---
+--- Refuses the last tab (`:tabclose` raises E784) and reports `false` when
+--- Neovim itself refuses the close (a modified buffer without 'hidden', another
+--- window in use, ...): the caller has already stopped the session, so the tab is
+--- simply kept.
+---@param tab pi.TabId?
+---@return boolean closed
+local function close_tab(tab)
+    if type(tab) ~= "number" or not vim.api.nvim_tabpage_is_valid(tab) then
+        return false
+    end
+    if #vim.api.nvim_list_tabpages() <= 1 then
+        return false
+    end
+    local focus = vim.api.nvim_get_current_tabpage()
+    if not pcall(vim.api.nvim_set_current_tabpage, tab) then
+        return false
+    end
+    local closed = pcall(vim.cmd, "tabclose")
+    if focus ~= tab and vim.api.nvim_tabpage_is_valid(focus) then
+        pcall(vim.api.nvim_set_current_tabpage, focus)
+    end
+    return closed
+end
+
+--- Stop the given sessions' RPC processes and close their PiTab.
+---
+--- Stopping goes through `Sessions.close_session`, so the process is killed, the
+--- session unregisters and an *owned* worktree is released exactly as `:PiStop`
+--- does. The session file stays on disk. Sub-session processes of a closed parent
+--- keep running — closing a tab has never stopped them.
+---@param targets { sessions: pi.Session[], tab: pi.TabId? }[]
+local function close_targets(targets)
+    local Sessions = require("pi.sessions.manager")
+    local stopped = {}
+    local closed, kept = 0, 0
+    for _, target in ipairs(targets) do
+        for _, session in ipairs(target.sessions) do
+            if not stopped[session] then
+                stopped[session] = true
+                Sessions.close_session(session)
+            end
+        end
+        local tab = target.tab
+        if type(tab) == "number" and vim.api.nvim_tabpage_is_valid(tab) then
+            if close_tab(tab) then
+                closed = closed + 1
+            else
+                kept = kept + 1
+            end
+        end
+    end
+    if kept > 0 then
+        require("pi.notify").info(
+            string.format("Closed %d session(s); kept %d tab(s) (last tab or unsaved buffer)", closed, kept)
+        )
+    end
+end
+
+--- Sessions a session row's close action covers, and the tab that shows it.
+---
+--- Normally the row's own session and its own tab. A row shown while the tab
+--- views one of its sub-sessions carries the *parent* session with the child
+--- view's tab, which runs that child: both processes belong to the closed PiTab.
+---@param row pi.SessionsListRow
+---@return pi.Session[] sessions
+---@return pi.TabId? tab
+local function session_close_target(row)
+    local sessions, seen = {}, {}
+    local function add(session)
+        if session and not seen[session] then
+            seen[session] = true
+            sessions[#sessions + 1] = session
+        end
+    end
+    add(row.session)
+    local tab = row.tab
+    if type(tab) == "number" and vim.api.nvim_tabpage_is_valid(tab) then
+        add(session_for_tab(tab))
+    else
+        tab = nil
+    end
+    return sessions, tab
+end
+
+--- PiTabs of one worktree group: one entry per live session in that checkout.
+---
+--- Membership is the checkout, not the rendered rows: a folded group renders no
+--- member rows while its live sessions still have to answer for the close. A tab
+--- viewing a sub-session is listed under its parent's row, so it belongs to the
+--- parent's checkout, and its parent process is stopped with it.
+---@param group_id string?
+---@return { sessions: pi.Session[], tab: pi.TabId? }[]
+local function group_close_targets(group_id)
+    local targets = {}
+    if type(group_id) ~= "string" or group_id == "" then
+        return targets
+    end
+    local Sessions = require("pi.sessions.manager")
+    for _, session in ipairs(Sessions.list()) do
+        local root = session
+        if session.view_parent_id then
+            root = Sessions.get_by_id(session.view_parent_id) or session
+        end
+        local info = session_worktree(root)
+        if info and info.path == group_id then
+            local sessions = { session }
+            if root ~= session then
+                sessions[#sessions + 1] = root
+            end
+            targets[#targets + 1] = { sessions = sessions, tab = session.attached_tab or session.tab }
+        end
+    end
+    return targets
+end
+
+--- Ask for confirmation (`sessions_list.confirm_close_*`) and run `fn` on yes.
+---@param kind "child"|"session"|"group"
+---@param opts { title: string, message: string }
+---@param fn fun()
+local function confirm_close(kind, opts, fn)
+    if not close_needs_confirm(kind) then
+        fn()
+        return
+    end
+    require("pi.ui.dialog").confirm(opts, function(confirmed)
+        if confirmed then
+            fn()
+        end
+    end)
+end
+
+--- `x`: close what is under the cursor.
+---
+--- A sub-session row closes that child's RPC process (never a tab: children run
+--- detached), a session row closes its PiTab — the process stops and the tabpage
+--- closes — and a worktree group header closes every PiTab in that checkout.
+---
+--- Each scope has its own confirmation switch (`sessions_list.confirm_close_child`,
+--- `confirm_close_session`, `confirm_close_group`; all on by default), so declining
+--- closes nothing.
+local function close_under_cursor()
+    local row = rows[vim.api.nvim_win_get_cursor(0)[1]]
+    if not row then
+        return
+    end
+    local Notify = require("pi.notify")
+
+    if row.depth and row.depth > 0 then
+        local child_id = row.child_id
+        if type(child_id) ~= "string" or child_id == "" then
+            return
+        end
+        confirm_close("child", {
+            title = "Close sub-session",
+            message = string.format(
+                "Stop the RPC process of '%s'? Its session file stays on disk and the child can be revived later.",
+                row.name or child_id
+            ),
+        }, function()
+            require("pi.subsessions").close(child_id)
+        end)
+        return
+    end
+
+    if row.is_group then
+        local targets = group_close_targets(row.group_id)
+        if #targets == 0 then
+            Notify.info("No live session in this worktree group")
+            return
+        end
+        confirm_close("group", {
+            title = "Close worktree group",
+            message = string.format(
+                "Close all %d π tab(s) in '%s'? Their processes stop and their tabpages close; session files stay on disk and owned worktrees are released as :PiStop does (their sub-sessions keep running).",
+                #targets,
+                row.worktree or row.group_id or "this checkout"
+            ),
+        }, function()
+            close_targets(targets)
+        end)
+        return
+    end
+
+    local sessions, tab = session_close_target(row)
+    if #sessions == 0 and tab == nil then
+        return
+    end
+    confirm_close("session", {
+        title = "Close session",
+        message = string.format(
+            "Close the π tab of '%s'? Its process stops and its tabpage closes; the session file stays on disk (resume it with :PiResume) and its sub-sessions keep running.",
+            row.name or (row.session and row.session.id) or "this session"
+        ),
+    }, function()
+        close_targets({ { sessions = sessions, tab = tab } })
+    end)
 end
 
 --- Row and session under the cursor. nil, nil when the row is gone, its tab
@@ -2503,12 +2719,12 @@ local function ensure_buf()
         preview_under_cursor,
         vim.tbl_extend("force", map_opts, { desc = "Preview session (read-only viewer)" })
     )
-    vim.keymap.set("n", "x", function()
-        local row = rows[vim.api.nvim_win_get_cursor(0)[1]]
-        if row and row.child_id then
-            require("pi.subsessions").close(row.child_id)
-        end
-    end, vim.tbl_extend("force", map_opts, { desc = "Close sub-session process" }))
+    vim.keymap.set(
+        "n",
+        "x",
+        close_under_cursor,
+        vim.tbl_extend("force", map_opts, { desc = "Close sub-session, session tab, or worktree group" })
+    )
     vim.keymap.set(
         "n",
         "n",

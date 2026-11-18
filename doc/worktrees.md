@@ -189,10 +189,10 @@ Snapshots are written, never pruned: they are ordinary patch files you can `git 
 
 An explicit close is the normal end of a worktree session, and it cleans up after itself:
 
-- Closing the session's process (`:PiStop`, `x` in `:PiSessions`, `:PiSubClose` for a child, or the process exiting on its own) releases its worktree. Only a checkout the session **owns** is released: a linked worktree explicitly assigned to a sub-session is borrowed and never touched by close, crash, reaping or Neovim exit (see [Sub-sessions](#sub-sessions)).
+- Closing the session's process (`:PiStop`, `x` in `:PiSessions`, `:PiSubClose` for a child, or the process exiting on its own) releases its worktree. Only a checkout the session **owns** is released: a linked worktree explicitly assigned to a sub-session is borrowed and never touched by close, crash, reaping or Neovim exit (see [Sub-sessions](#sub-sessions)). `x` on a session row of the sessions list is an explicit close like `:PiStop` (it also closes the tab), and `x` on a worktree group header closes every session of that checkout the same way, so an owned checkout is released once its last session stops.
 - **Release deletes a checkout only when nothing would be lost** — no uncommitted changes and no commits beyond its base commit. A dirty or ahead worktree is **kept**, and a notification names the path (`Worktree kept: <path> …`) so you can inspect, apply or ship it.
 - **Release snapshots before deleting**, like every other removal: a clean checkout's patch is empty, so what it leaves behind is an **empty patch plus its `.patch.json` sidecar** — a record of the checkout (name, path, base commit, HEAD, time) that survives the directory and lets the session still be found on resume. If writing that snapshot fails, the checkout is **kept** instead of deleted.
-- Closing a tab does **not** close the session (see [Sessions → One chat per tab](sessions.md#one-chat-per-tab)), so it does not release the worktree either — an ordinary background session keeps its checkout.
+- Closing a tab (`:tabclose`) does **not** close the session (see [Sessions → One chat per tab](sessions.md#one-chat-per-tab)), so it does not release the worktree either — an ordinary background session keeps its checkout. Closing it from the sessions list (`x`) is the explicit close that does.
 - `pi.worktree_remove()` is the explicit path when you want the directory gone regardless of state (subject to its snapshot).
 
 ## Sub-sessions
