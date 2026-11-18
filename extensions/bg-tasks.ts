@@ -62,6 +62,14 @@
  * the process exits or its own deadline hits. Both are advertised in the bash
  * tool description and in every result that starts or hands off a task.
  *
+ * `stop_task` / `list_tasks` make the task table usable by the model, not only by
+ * the panel: a task nobody wants any more (a stale dev server holding its port, a
+ * watcher for a file that is already fixed) is stopped through the same
+ * process-GROUP signal the panel's `x` uses, and `list_tasks` recovers an id the
+ * model no longer has in front of it. Both go through the same observer lease,
+ * so the exit a stop causes is reported by the stop's own tool result instead of
+ * arriving later as a wake for a result nobody asked for.
+ *
  * Panel reporting is separate from the wake path and never triggers a turn:
  * the frontend (`:PiTasks`) needs the exit status even when a tool call already
  * consumed the result, so `started` / terminal events are pushed as
@@ -112,6 +120,15 @@ const MAX_ATTACH_MS = 600_000;
 const DEFAULT_WAIT_MS = 120_000;
 const MIN_WAIT_MS = 1_000;
 const MAX_WAIT_MS = 1_800_000;
+/** `stop_task` bounds: SIGTERM grace before SIGKILL, and the settle after it. */
+const DEFAULT_STOP_GRACE_MS = 5_000;
+const MIN_STOP_GRACE_MS = 500;
+const MAX_STOP_GRACE_MS = 30_000;
+const STOP_KILL_SETTLE_MS = 5_000;
+/** `list_tasks` output cap (a long-lived process accumulates tasks). */
+const MAX_LISTED_TASKS = 40;
+/** Longest command quoted in a `list_tasks` row. */
+const LISTED_COMMAND_WIDTH = 120;
 /** Model-facing output cap per call (matches pi's built-in bash). */
 const MAX_OUTPUT_BYTES = 50 * 1024;
 const MAX_OUTPUT_LINES = 2000;
@@ -200,17 +217,38 @@ let exitHookInstalled = false;
  */
 let busy = false;
 
-/** Kill a detached process group, falling back to the pid alone. */
-function killProcessGroup(pid: number): void {
+/**
+ * Signal a detached process group, falling back to the bare pid.
+ *
+ * Every task is spawned `detached: true`, so its pid is also its process-group
+ * id and its children — `node` under `npm`, the compiler under `make`, each
+ * stage of a pipeline — belong to that group. Signalling the group is the only
+ * way to stop what was actually started: a bare-pid signal kills the shell and
+ * leaves the children running, holding the port.
+ *
+ * Returns whether a signal was delivered. The fallback covers a pid whose group
+ * is gone (a task inherited from a pi process that already exited).
+ */
+function signalProcessGroup(pid: number, signal: NodeJS.Signals): boolean {
+	if (!Number.isInteger(pid) || pid <= 1) {
+		return false;
+	}
 	try {
-		process.kill(-pid, "SIGKILL");
+		process.kill(-pid, signal);
+		return true;
 	} catch {
 		try {
-			process.kill(pid, "SIGKILL");
+			process.kill(pid, signal);
+			return true;
 		} catch {
-			// Process already dead.
+			return false;
 		}
 	}
+}
+
+/** Kill a detached process group, falling back to the pid alone. */
+function killProcessGroup(pid: number): void {
+	signalProcessGroup(pid, "SIGKILL");
 }
 
 function ensureExitHook(): void {
@@ -444,6 +482,13 @@ function clampWaitWindow(timeout: number | undefined): number {
 		return DEFAULT_WAIT_MS;
 	}
 	return Math.min(MAX_WAIT_MS, Math.max(MIN_WAIT_MS, Math.floor(timeout)));
+}
+
+function clampStopGrace(timeout: number | undefined): number {
+	if (typeof timeout !== "number" || !Number.isFinite(timeout) || timeout <= 0) {
+		return DEFAULT_STOP_GRACE_MS;
+	}
+	return Math.min(MAX_STOP_GRACE_MS, Math.max(MIN_STOP_GRACE_MS, Math.floor(timeout)));
 }
 
 type WaitOutcome = "exited" | "deadline" | "aborted";
@@ -984,7 +1029,8 @@ export default function bgTasks(pi: ExtensionAPI) {
 		" Long-running commands can be backgrounded two ways: pass run_in_background: true (for a dev server, watcher or anything you do not need now) or just run it and let it outlive the attach window (timeout, default 2 minutes) — an outlived command is NOT killed, it keeps running as a background task and the call returns its task id." +
 		" Never wait with `sleep` and never poll a task's output file: you are told the task id, and when the process exits with nobody attached you are woken with its status and output tail." +
 		" If you have other work, do it. If the task's result is all that is left, either end your turn (that is the correct action, not giving up — the wake report starts a new turn) or call wait_task, which blocks until the task exits or its timeout hits and returns the output." +
-		" A wait_task result of \"still running\" is not a failure.";
+		" A wait_task result of \"still running\" is not a failure." +
+		" A task you no longer need — a dev server holding a port, a watcher for a file you already fixed — is stopped with stop_task(task_id), which signals its whole process group; list_tasks shows what is still running.";
 
 	const { prepareArguments: _unusedPrepareArguments, ...builtinRest } = builtin;
 	void _unusedPrepareArguments; // typed for the old schema; the new schema needs no shim
@@ -1267,6 +1313,232 @@ export default function bgTasks(pi: ExtensionAPI) {
 					outputFile: task.outputFile,
 					wallTimeSeconds,
 				} satisfies WaitTaskDetails,
+			};
+		},
+	});
+
+	// ------------------------------------------------------------------
+	// stop_task: the model-side counterpart of the panel's `x`. The kill has
+	// to be a process GROUP signal (`detached: true` makes pid == pgid), and
+	// the caller takes the observer lease BEFORE signalling so the exit this
+	// call causes is reported by its own result instead of as a wake.
+	// ------------------------------------------------------------------
+	const stopTaskParameters = Type.Object({
+		task_id: Type.String({
+			description: 'Task id returned by a bash call (e.g. "b3f2a1").',
+		}),
+		timeout_ms: Type.Optional(
+			Type.Number({
+				description: `How long the task gets to exit after SIGTERM before it is SIGKILLed, in milliseconds (default 5000, max 30000). Most tasks exit on the first signal; the escalation covers a process that traps or ignores it.`,
+			}),
+		),
+	});
+
+	type StopTaskParams = Static<typeof stopTaskParameters>;
+
+	interface StopTaskDetails {
+		taskId: string;
+		status: "stopped" | "already_exited" | "still_running" | "cancelled";
+		command: string;
+		exitCode?: number | null;
+		signal?: string | null;
+		/** Whether SIGTERM was not enough and SIGKILL had to be sent. */
+		escalated: boolean;
+		outputFile?: string;
+		wallTimeSeconds: number;
+	}
+
+	pi.registerTool({
+		name: "stop_task",
+		label: "Stop background task",
+		description:
+			"Stop a running background bash task: SIGTERM its whole process group, and SIGKILL it if it has not exited within the grace window. Use this when a task is no longer needed — a dev server that has to give its port back, a watcher for a file that is already fixed, a run you now know is wrong — instead of leaving it alive for the rest of the session. This stops a task; to get a task's result use wait_task instead.",
+		promptSnippet: "Stop a running background task (SIGTERM its process group, SIGKILL if it ignores it)",
+		promptGuidelines: [
+			"Stop a task you no longer need instead of leaving it running: a stale dev server holds its port, and a stale watcher keeps rewriting files.",
+			"stop_task signals the task's whole process group, so the children of `npm`, `make` or a pipeline are stopped too — nothing is left behind holding the port.",
+			"Do not wait_task a task whose result you no longer want; stop it. Stopping is not an error and the task's output up to that point is returned.",
+		],
+		parameters: stopTaskParameters,
+		// Mutates the shared task table and takes the observer lease.
+		executionMode: "sequential",
+		async execute(toolCallId, params, signal) {
+			void toolCallId;
+			const task = tasks.get(params.task_id);
+			if (!task) {
+				const known = [...tasks.values()].map((candidate) => candidate.taskId);
+				const knownNote = known.length > 0 ? ` Known task ids in this session: ${known.join(", ")}.` : "";
+				throw new Error(`stop_task: unknown task id "${params.task_id}".${knownNote} Task ids come from bash results.`);
+			}
+
+			const started = Date.now();
+			const grace = clampStopGrace(params.timeout_ms);
+			const detailsOf = (status: StopTaskDetails["status"], escalated: boolean, outputFile?: string): StopTaskDetails => ({
+				taskId: task.taskId,
+				status,
+				command: task.command,
+				exitCode: task.exitCode,
+				signal: task.signal,
+				escalated,
+				outputFile,
+				wallTimeSeconds: (Date.now() - started) / 1000,
+			});
+
+			if (task.completed) {
+				const elapsed = formatSeconds((task.endedAt ?? Date.now()) - task.startedAt);
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: `Task ${task.taskId} is not running: it ${describeExit(task)} after ${elapsed}. Nothing to stop.`,
+						},
+					],
+					details: detailsOf("already_exited", false),
+				};
+			}
+
+			if (task.pid === undefined) {
+				throw new Error(`stop_task: task ${task.taskId} has no process id (it failed to start).`);
+			}
+
+			// Take the lease BEFORE signalling: the exit this call causes must be
+			// reported by its own result, not as a wake that races it.
+			let waited = attachWait(task, { deadlineMs: grace, signal });
+			let signalled = signalProcessGroup(task.pid, "SIGTERM");
+			let escalated = false;
+			let outcome = await waited;
+
+			if (outcome === "deadline" && !task.completed) {
+				escalated = true;
+				waited = attachWait(task, { deadlineMs: STOP_KILL_SETTLE_MS, signal });
+				signalled = signalProcessGroup(task.pid, "SIGKILL") || signalled;
+				outcome = await waited;
+			}
+
+			const tail = readOutputTail(task.outputFile, MAX_OUTPUT_BYTES, MAX_OUTPUT_LINES);
+			const elapsed = formatSeconds((task.endedAt ?? Date.now()) - task.startedAt);
+
+			if (task.completed) {
+				// This result carries the terminal state: suppress the wake report.
+				markConfirmed(task);
+				const how = escalated ? "was SIGKILLed (it ignored SIGTERM)" : describeExit(task);
+				const head = `Task ${task.taskId} ${how} after ${elapsed} (stopped).`;
+				return {
+					content: [{ type: "text" as const, text: tail.text ? `${head}\n\n${tail.text}` : head }],
+					details: detailsOf("stopped", escalated, tail.truncated ? task.outputFile : undefined),
+					// A task that died on our signal is not a failure of the call; the
+					// output it produced is still returned above.
+					isError: false,
+				};
+			}
+
+			if (outcome === "aborted") {
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: `[cancelled] stopped waiting for task ${task.taskId} to die; ${signalled ? "SIGTERM was sent" : "no signal could be delivered"} and the process may still be exiting. It will report on its own if it does.`,
+						},
+					],
+					details: detailsOf("cancelled", escalated, task.outputFile),
+					isError: true,
+				};
+			}
+
+			const soFar = tail.text.trim() ? `\n\nOutput so far:\n${tail.text}` : "";
+			return {
+				content: [
+					{
+						type: "text" as const,
+						text: `[still running] Task ${task.taskId} did not exit: ${signalled ? "SIGTERM and SIGKILL were sent to its process group" : "no signal could be delivered to its process group"} (running for ${elapsed}). It may be stuck in an uninterruptible state; its output file is ${task.outputFile}.${soFar}`,
+					},
+				],
+				details: detailsOf("still_running", escalated, task.outputFile),
+				isError: true,
+			};
+		},
+	});
+
+	// ------------------------------------------------------------------
+	// list_tasks: the model's view of the task table. Cheap and bounded — the
+	// table grows for the life of the process, so the output is capped.
+	// ------------------------------------------------------------------
+	const listTasksParameters = Type.Object({
+		include_finished: Type.Optional(
+			Type.Boolean({
+				description: "Also list tasks that have already exited (default false: running tasks only).",
+			}),
+		),
+	});
+
+	/** One `list_tasks` row: id, state, elapsed, command, log file. */
+	function describeTaskLine(task: BgTaskState): string {
+		const elapsed = formatSeconds((task.endedAt ?? Date.now()) - task.startedAt);
+		let command = task.command.replace(/\s+/g, " ").trim();
+		if (command.length > LISTED_COMMAND_WIDTH - 3) {
+			command = `${command.substring(0, LISTED_COMMAND_WIDTH - 3)}...`;
+		}
+		const state = task.completed ? describeExit(task) : "running";
+		return `- ${task.taskId} [${state}] ${elapsed} "${command}" (output: ${task.outputFile})`;
+	}
+
+	pi.registerTool({
+		name: "list_tasks",
+		label: "List background tasks",
+		description:
+			"List the background bash tasks of this pi process: task id, state, elapsed time, command and output file. Use it to find the id of a task you started earlier in the session (before stopping it with stop_task or waiting on it with wait_task) instead of guessing ids.",
+		promptSnippet: "List this session's background bash tasks with their ids and states",
+		promptGuidelines: [
+			"Call list_tasks when you need a task id you no longer have in front of you; do not guess ids — wait_task and stop_task reject unknown ones.",
+			"list_tasks lists running tasks by default; pass include_finished: true to also see the ones that already exited.",
+		],
+		parameters: listTasksParameters,
+		async execute(toolCallId, params) {
+			void toolCallId;
+			const all = [...tasks.values()];
+			const running = all.filter((task) => !task.completed);
+			const listed = params.include_finished ? all : running;
+			const runningCount = running.length;
+
+			if (listed.length === 0) {
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: params.include_finished
+								? "No background tasks in this pi process. Start one with bash(run_in_background: true)."
+								: "No running background tasks in this pi process.",
+						},
+					],
+					details: { total: 0, running: 0, listed: 0 },
+				};
+			}
+
+			// Running first (oldest first), then the finished ones newest first —
+			// the panel's order, so the two views never disagree.
+			listed.sort((a, b) => {
+				if (a.completed !== b.completed) {
+					return a.completed ? 1 : -1;
+				}
+				return a.completed ? (b.endedAt ?? 0) - (a.endedAt ?? 0) : a.startedAt - b.startedAt;
+			});
+			const shown = listed.slice(0, MAX_LISTED_TASKS);
+			const finishNote = runningCount > 0 ? `, ${runningCount} running` : "";
+			const header = `${shown.length} of ${listed.length} background task${listed.length === 1 ? "" : "s"}${finishNote}:`;
+			const hidden =
+				listed.length > shown.length
+					? `\n(${listed.length - shown.length} older task${listed.length - shown.length === 1 ? "" : "s"} not shown.)`
+					: "";
+			const footer =
+				"\nUse stop_task(task_id) to stop one, wait_task(task_id) to block on one, or read its output file for the full log.";
+			return {
+				content: [
+					{
+						type: "text" as const,
+						text: `${header}\n${shown.map(describeTaskLine).join("\n")}${hidden}${footer}`,
+					},
+				],
+				details: { total: all.length, running: runningCount, listed: shown.length },
 			};
 		},
 	});

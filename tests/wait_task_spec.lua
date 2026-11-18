@@ -239,6 +239,85 @@ describe("wait_task renderer", function()
     end)
 end)
 
+describe("stop_task / list_tasks renderer", function()
+    it("gives both tools their own glyph instead of the generic fallback", function()
+        assert.are.equal(vim.fn.nr2char(0xF04DB, 1), Tools.get_tool_icon("stop_task"))
+        assert.are.equal(vim.fn.nr2char(0xF0279, 1), Tools.get_tool_icon("list_tasks"))
+    end)
+
+    it("names the task a stop targets, with the grace window when one was given", function()
+        Tasks._reset()
+        register_task("b3f2a1", "npm run dev")
+        local h = History.new(TAB)
+        h:on_tool_start("stop_task", "st1", { task_id = "b3f2a1", timeout_ms = 5000 })
+        pump(50)
+        local buf = h:buf()
+        assert.is_true(#rows_with(buf, "npm run dev · b3f2a1 (grace 5s)") == 1, table.concat(lines_of(buf), "\n"))
+        delete(h)
+        Tasks._reset()
+    end)
+
+    it("stays silent on a clean stop and badges an escalation", function()
+        local h = History.new(TAB)
+        h:on_tool_start("stop_task", "st2", { task_id = "b3f2a1" })
+        pump(50)
+        h:on_tool_end("stop_task", "st2", {
+            content = { { type = "text", text = "Task b3f2a1 was stopped (signal SIGTERM) after 3.0s (stopped)." } },
+            details = { taskId = "b3f2a1", status = "stopped", escalated = false },
+        }, false)
+        pump(60)
+        assert.is_false(has_badge(h, "killed"))
+        assert.is_false(has_badge(h, "still running"))
+        delete(h)
+
+        local h2 = History.new(TAB)
+        h2:on_tool_start("stop_task", "st3", { task_id = "b3f2a1" })
+        pump(50)
+        h2:on_tool_end("stop_task", "st3", {
+            content = {
+                { type = "text", text = "Task b3f2a1 was SIGKILLed (it ignored SIGTERM) after 8.0s (stopped)." },
+            },
+            details = { taskId = "b3f2a1", status = "stopped", escalated = true },
+        }, false)
+        pump(60)
+        assert.is_true(has_badge(h2, "killed"), table.concat(header_virt(h2), "|"))
+        delete(h2)
+    end)
+
+    it("badges a stop that did not take as still running", function()
+        local h = History.new(TAB)
+        h:on_tool_start("stop_task", "st4", { task_id = "b3f2a1" })
+        pump(50)
+        h:on_tool_end("stop_task", "st4", {
+            content = { { type = "text", text = "[still running] Task b3f2a1 did not exit" } },
+            details = { taskId = "b3f2a1", status = "still_running", escalated = true },
+        }, true)
+        pump(60)
+        assert.is_true(has_badge(h, "still running"), table.concat(header_virt(h), "|"))
+        delete(h)
+    end)
+
+    it("renders the task list as the body, not as one collapsed line", function()
+        local h = History.new(TAB)
+        h:on_tool_start("list_tasks", "lt1", {})
+        pump(50)
+        h:on_tool_end("list_tasks", "lt1", {
+            content = {
+                {
+                    type = "text",
+                    text = '1 of 1 background task, 1 running:\n- b3f2a1 [running] 1m04s "npm run dev" (output: /tmp/pi-bash-b3f2a1.log)',
+                },
+            },
+            details = { total = 1, running = 1, listed = 1 },
+        }, false)
+        pump(60)
+        local text = text_of(h:buf())
+        assert.is_truthy(text:find("npm run dev", 1, true), "expected the task row")
+        assert.is_truthy(text:find("pi-bash-b3f2a1.log", 1, true), "expected the log path")
+        delete(h)
+    end)
+end)
+
 describe("bg-tasks extension contract", function()
     it("registers a wait_task tool and points bash at it", function()
         local src = read_extension()
@@ -273,5 +352,34 @@ describe("bg-tasks extension contract", function()
         -- The lease is what stops a waited-on task from also producing a wake.
         assert.is_truthy(src:find("observers", 1, true))
         assert.is_truthy(src:find("task.observers > 0", 1, true))
+    end)
+
+    it("registers stop_task and list_tasks for the model, not only the panel", function()
+        local src = read_extension()
+        assert.is_truthy(src:find('name: "stop_task"', 1, true), "stop_task must be registered")
+        assert.is_truthy(src:find('name: "list_tasks"', 1, true), "list_tasks must be registered")
+        -- The model has to be told the affordance exists in the bash tool too.
+        assert.is_truthy(src:find("is stopped with stop_task", 1, true))
+        assert.is_truthy(src:find("list_tasks shows what is still running", 1, true))
+    end)
+
+    it("stops the whole process group, escalating SIGTERM to SIGKILL", function()
+        local src = read_extension()
+        -- A bare-pid kill leaves `node` under `npm` running and holding the port.
+        assert.is_truthy(src:find("process.kill(-pid, signal)", 1, true), "must signal the group")
+        assert.is_truthy(src:find("SIGTERM", 1, true))
+        assert.is_truthy(src:find("SIGKILL", 1, true))
+        assert.is_truthy(src:find("pid <= 1", 1, true), "pid 0/1 must never be signalled")
+    end)
+
+    it("takes the observer lease before signalling, so a stop is not also a wake", function()
+        local src = read_extension()
+        -- Order matters: attach, THEN signal. If the exit landed first the model
+        -- would get a wake report for a task this call is describing itself.
+        local attach_at = src:find("let waited = attachWait(task, { deadlineMs: grace, signal })", 1, true)
+        local signal_at = src:find('signalProcessGroup(task.pid, "SIGTERM")', 1, true)
+        assert.is_truthy(attach_at, "stop_task must attach before signalling")
+        assert.is_truthy(signal_at, "stop_task must signal the group")
+        assert.is_true(attach_at < signal_at, "the lease must be taken before the signal")
     end)
 end)

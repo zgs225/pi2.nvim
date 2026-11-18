@@ -30,6 +30,8 @@ end
 local TOOL_ICONS = {
     bash = nf(0xE795), -- nf-dev-terminal
     wait_task = nf(0xF051F), -- nf-md-timer_sand (blocking wait on a bash task)
+    stop_task = nf(0xF04DB), -- nf-md-stop (model-side stop of a bash task)
+    list_tasks = nf(0xF0279), -- nf-md-format-list-bulleted
     codemode = nf(0xF031E), -- nf-md-language_javascript
     read = nf(0xF0219), -- nf-md-file-document
     edit = nf(0xF03EB), -- nf-md-pencil
@@ -1235,6 +1237,34 @@ local function wait_task_status(result)
     return nil
 end
 
+--- Header status for a `stop_task` block.
+---
+--- A clean stop stays silent: the result body already says the task exited, and
+--- a red badge on a stop the model asked for reads as a failure. What a reader
+--- does need to see is an escalation (the task ignored SIGTERM and had to be
+--- SIGKILLed) and a stop that did not take at all.
+---@param result table?
+---@return string?
+local function stop_task_status(result)
+    local details = result and result.details
+    if type(details) ~= "table" then
+        return nil
+    end
+    if details.status == "still_running" then
+        return "still running"
+    end
+    if details.status == "cancelled" then
+        return "stop cancelled"
+    end
+    if details.status == "already_exited" then
+        return "already exited"
+    end
+    if details.escalated == true then
+        return "killed"
+    end
+    return nil
+end
+
 ---@type table<string, pi.ToolRenderer>
 local renderers = {
     -- Synthetic block rendered by pi.nvim (not a real tool call): the
@@ -1285,6 +1315,50 @@ local renderers = {
             render_body_line(history, line)
         end,
         inline_status = wait_task_status,
+        on_end = function(history, _, result, _, insert_at)
+            local text = extract_result_text(result)
+            if text and text ~= "" then
+                insert_at = render_output(history, text, insert_at)
+            end
+            return insert_at
+        end,
+    },
+    -- stop_task is the model-side counterpart of the panel's `x`. The body names
+    -- the task the same way wait_task does (command · id) — a bare id says
+    -- nothing about what was just stopped — and the header carries an escalation
+    -- so a SIGKILL is distinguishable from a clean SIGTERM stop.
+    stop_task = {
+        input_visible = 1,
+        output_visible = 6,
+        on_start = function(history, args)
+            if not (args and type(args.task_id) == "string") then
+                return
+            end
+            local line = wait_task_label(args.task_id)
+            if type(args.timeout_ms) == "number" and args.timeout_ms > 0 then
+                line = string.format("%s (grace %ds)", line, math.floor(args.timeout_ms / 1000))
+            end
+            render_body_line(history, line)
+        end,
+        inline_status = stop_task_status,
+        on_end = function(history, _, result, _, insert_at)
+            local text = extract_result_text(result)
+            if text and text ~= "" then
+                insert_at = render_output(history, text, insert_at)
+            end
+            return insert_at
+        end,
+    },
+    -- list_tasks has no meaningful input: the list in the result is the whole
+    -- point, so the output keeps its room instead of collapsing to one line.
+    list_tasks = {
+        input_visible = 1,
+        output_visible = 12,
+        on_start = function(history, args)
+            if args and args.include_finished == true then
+                render_body_line(history, "including finished tasks")
+            end
+        end,
         on_end = function(history, _, result, _, insert_at)
             local text = extract_result_text(result)
             if text and text ~= "" then
