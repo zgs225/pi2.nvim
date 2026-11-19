@@ -99,7 +99,6 @@ end
 -- Fake OpenAI-compatible provider
 -- ---------------------------------------------------------------------------
 
----@param text string
 ---@return string
 local function sse_headers()
     return "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
