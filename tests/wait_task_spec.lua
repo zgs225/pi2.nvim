@@ -644,4 +644,133 @@ describe("bg-tasks extension contract", function()
         assert.is_truthy(hook:find("clearTimeout(wakeTimer)", 1, true), "the exit hook must clear the pending wake")
         assert.is_truthy(hook:find("wakeTimer = undefined", 1, true), "and forget it")
     end)
+
+    --- Count plain occurrences of `needle` in `text`.
+    ---@param text string
+    ---@param needle string
+    ---@return integer
+    local function count_occurrences(text, needle)
+        local n, at = 0, 1
+        while true do
+            local found = text:find(needle, at, true)
+            if not found then
+                return n
+            end
+            n = n + 1
+            at = found + #needle
+        end
+    end
+
+    it("offers a deadline_ms bash parameter bounded by named constants", function()
+        local src = read_extension()
+        local params_start = assert(src:find("const bgBashParameters", 1, true), "the bash schema must exist")
+        local params_end = assert(src:find("type BgBashParams", params_start, true), "the static shape follows")
+        local params = src:sub(params_start, params_end)
+        assert.is_truthy(params:find("deadline_ms", 1, true), "deadline_ms must be a bash parameter")
+        assert.is_truthy(params:find("run_in_background", 1, true), "next to run_in_background")
+        -- The inferred Static<> shape has to carry it, or the model-facing type lies.
+        assert.is_truthy(params:find("deadline_ms: Type.TOptional<Type.TNumber>", 1, true), "in the Static<> shape too")
+        assert.is_truthy(params:find("minimum: MIN_DEADLINE_MS", 1, true), "the schema must use the named minimum")
+        assert.is_truthy(params:find("maximum: MAX_DEADLINE_MS", 1, true), "and the named maximum")
+
+        for _, name in ipairs({
+            "MIN_DEADLINE_MS",
+            "MAX_DEADLINE_MS",
+            "DEFAULT_MAX_LIFETIME_MS",
+            "LIFETIME_ENV",
+            "CHECK_IN_TAIL_LINES",
+        }) do
+            assert.is_truthy(src:find("const " .. name, 1, true), name .. " must be a named constant")
+        end
+        assert.is_truthy(src:find('const LIFETIME_ENV = "PI_BG_TASK_MAX_LIFETIME_MS"', 1, true))
+        assert.is_truthy(
+            src:find("const DEFAULT_MAX_LIFETIME_MS = 24 * 60 * 60 * 1000", 1, true),
+            "the default lifetime cap is 24 hours"
+        )
+
+        -- The env var is read LAZILY, when a timer is armed, not at module load:
+        -- a child process's environment only exists at arm time.
+        local cap_start = assert(src:find("function lifetimeCapMs", 1, true), "lifetimeCapMs must exist")
+        local cap_end = src:find("\nfunction ", cap_start + 1, true) or #src
+        local cap = src:sub(cap_start, cap_end)
+        assert.is_truthy(cap:find("process.env[LIFETIME_ENV]", 1, true), "the cap comes from the environment")
+        assert.is_truthy(cap:find("Number.isFinite(value) && value > 0", 1, true), "any positive finite number wins")
+        assert.is_truthy(cap:find("return DEFAULT_MAX_LIFETIME_MS", 1, true), "otherwise the default")
+    end)
+
+    it("checks in with a notify-only message, never a kill", function()
+        local src = read_extension()
+
+        -- One shot per task, so a long-lived task cannot flood the context.
+        assert.is_truthy(src:find("deadlineNoted", 1, true), "the deadline check-in must be one-shot")
+        assert.is_truthy(src:find("lifetimeNoted", 1, true), "the lifetime note must be one-shot")
+
+        -- The note builder: both kinds, same block style, no killing in it.
+        local note_start = assert(src:find("function buildCheckInNote", 1, true), "buildCheckInNote must exist")
+        local note_end = assert(src:find("function messageText", note_start, true), "messageText follows it")
+        local note = src:sub(note_start, note_end)
+        assert.is_truthy(note:find('check_in="deadline"', 1, true), "a deadline check-in says so")
+        assert.is_truthy(note:find('check_in="lifetime"', 1, true), "a lifetime note says so")
+        assert.is_truthy(note:find("[SYSTEM NOTIFICATION - NOT USER INPUT]", 1, true), "banner first")
+        assert.is_truthy(note:find("check-in, not a result", 1, true), "a check-in must not read like a result")
+        assert.is_truthy(note:find("wrapReminder(", 1, true), "the block goes through wrapReminder")
+        assert.is_truthy(note:find("escapeAttr(task.command)", 1, true), "the command is escaped")
+        assert.is_truthy(note:find("escapeText(tail.text)", 1, true), "the tail is escaped as text")
+        assert.is_truthy(note:find("CHECK_IN_TAIL_BYTES, CHECK_IN_TAIL_LINES", 1, true), "the tail is bounded")
+        for _, forbidden in ipairs({ "killProcessGroup", "SIGTERM", "SIGKILL", "finishTask" }) do
+            assert.is_nil(note:find(forbidden, 1, true), "a check-in note must never call " .. forbidden)
+        end
+
+        -- The sender: display:false, NO details (a check-in is not a panel row),
+        -- and outside the delivery ladder.
+        local send_start = assert(src:find("function sendCheckIn", 1, true), "sendCheckIn must exist")
+        -- Slice to the function's own closing brace: the next function starts with
+        -- its doc comment, and that comment talks about `finishTask` by name.
+        local send_end = assert(src:find("\n\t}\n", send_start, true), "sendCheckIn must be closed") + 3
+        local sender = src:sub(send_start, send_end)
+        assert.is_truthy(sender:find("display: false", 1, true), "the check-in is display:false")
+        assert.is_nil(sender:find("details:", 1, true), "and carries NO details: no phantom panel row")
+        assert.is_truthy(
+            sender:find("busy ? undefined : { triggerTurn: true }", 1, true),
+            "a wake only when the session is idle"
+        )
+        assert.is_truthy(sender:find("catch", 1, true), "a stale extension ctx must not throw into a timer")
+        assert.is_nil(sender:find("markSent", 1, true), "a check-in is outside the delivery ladder")
+        assert.is_nil(sender:find("markConfirmed", 1, true), "and must not touch a report's delivery state")
+        assert.is_nil(sender:find("pendingReports", 1, true), "nor the report queue")
+        for _, forbidden in ipairs({ "killProcessGroup", "SIGTERM", "SIGKILL", "finishTask" }) do
+            assert.is_nil(sender:find(forbidden, 1, true), "the check-in path must never call " .. forbidden)
+        end
+
+        -- Both timers are unref'd and unarmed for an adopted task.
+        local arm_start = assert(src:find("function armCheckIns", 1, true), "armCheckIns must exist")
+        local arm_end = src:find("\n\t/**", arm_start + 1, true) or #src
+        local arm = src:sub(arm_start, arm_end)
+        assert.are.equal(2, count_occurrences(arm, ".unref?.()"), "both timers must be unref'd")
+        assert.is_truthy(arm:find("task.adopted", 1, true), "an adopted task must never be armed")
+    end)
+
+    it("disarms both check-in timers when the task finishes", function()
+        local src = read_extension()
+        local finish_start = assert(src:find("function finishTask", 1, true), "finishTask must exist")
+        local finish_end = src:find("\n\tfunction ", finish_start + 1, true) or #src
+        local finish = src:sub(finish_start, finish_end)
+        for _, timer in ipairs({ "task.deadlineTimer", "task.lifetimeTimer" }) do
+            assert.is_truthy(finish:find("clearTimeout(" .. timer .. ")", 1, true), timer .. " must be cleared")
+            assert.is_truthy(finish:find(timer .. " = undefined", 1, true), timer .. " must be forgotten")
+        end
+        assert.is_nil(finish:find("killProcessGroup", 1, true), "finishing a task must not kill anything")
+
+        -- Armed exactly where a task BECOMES a background task: with the model's
+        -- deadline on the run_in_background path, and without one where a
+        -- foreground command detaches (there `timeout` was the attach window).
+        assert.is_true(
+            count_occurrences(src, "armCheckIns(task, clampDeadlineMs(") == 1,
+            "the deadline arms on the run_in_background path"
+        )
+        assert.is_true(
+            count_occurrences(src, "armCheckIns(task)") >= 2,
+            "the lifetime note arms on the detach and the '&' paths"
+        )
+    end)
 end)

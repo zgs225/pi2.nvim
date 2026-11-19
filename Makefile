@@ -10,6 +10,7 @@
 #   make e2e-bg-report — real-pi e2e: a completion report is one structured `<background-task>` block (needs pi; fake provider)
 #   make e2e-bg-fallback — real-pi e2e: an injected report survives a FAILED request and is confirmed by the retry (needs pi; fake provider)
 #   make e2e-bg-wake — real-pi e2e: two same-tick completions send ONE coalesced wake naming both tasks (needs pi; fake provider)
+#   make e2e-bg-deadline — real-pi e2e: deadline_ms and the lifetime cap send ONE notify-only check-in each, no kill (needs pi; fake provider)
 #   make e2e-bg-ownership — real-pi e2e: a fork does not adopt the parent's tasks, a clean quit records its kills
 #   make e2e-subagent-failure — real-pi e2e: a failed child run reaches the parent as a failed item (needs pi; not CI)
 #   make smoke   — headless end-to-end smoke check (loads the user config, opens the chat)
@@ -27,7 +28,7 @@ MIN_INIT := tests/minimal_init.lua
 STYLUA_BIN ?= stylua
 LUA_LS_BIN ?= lua-language-server
 
-.PHONY: test smoke format style lint docs-links e2e e2e-reaper e2e-bg-delivery e2e-bg-stop e2e-bg-reconcile e2e-bg-stdin e2e-bg-report e2e-bg-fallback e2e-bg-wake e2e-bg-ownership e2e-subagent-failure
+.PHONY: test smoke format style lint docs-links e2e e2e-reaper e2e-bg-delivery e2e-bg-stop e2e-bg-reconcile e2e-bg-stdin e2e-bg-report e2e-bg-fallback e2e-bg-wake e2e-bg-deadline e2e-bg-ownership e2e-subagent-failure
 
 test:
 	PLENARY_PATH=$(PLENARY_PATH) $(NVIM_BIN) --headless -u $(MIN_INIT) \
@@ -40,7 +41,7 @@ e2e:
 	done
 
 # Real end-to-end against `pi --mode rpc` (scripts/e2e/). None of these are part
-# of `make test`. The seven background-task suites that drive a scripted FAKE
+# of `make test`. The eight background-task suites that drive a scripted FAKE
 # provider run in CI (.github/workflows/e2e.yml); the ones that need a real
 # provider stay manual. See .agents/skills/develop/references/testing.md.
 e2e-reaper:
@@ -87,6 +88,14 @@ e2e-bg-fallback:
 # — runs in CI.
 e2e-bg-wake:
 	$(NVIM_BIN) --headless -u $(MIN_INIT) -l scripts/e2e/bg_tasks_wake.lua
+
+# Real-pi e2e for the two NOTIFY-ONLY timers: `deadline_ms` sends ONE
+# `check_in="deadline"` message (with an output tail) before the task's exit
+# report, the `PI_BG_TASK_MAX_LIFETIME_MS` cap sends ONE `check_in="lifetime"`
+# note, and each task still exits `completed` / `exit_code="0"` — neither timer
+# kills anything. Needs the pi binary only — runs in CI.
+e2e-bg-deadline:
+	$(NVIM_BIN) --headless -u $(MIN_INIT) -l scripts/e2e/bg_tasks_deadline.lua
 
 # Real-pi e2e for ownership: fork inheritance and the clean-quit shutdown record.
 # Needs the pi binary only — runs in CI.

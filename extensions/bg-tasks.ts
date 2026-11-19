@@ -110,6 +110,23 @@
  * window and detaches has no stdin (`task_input` says so instead of silently
  * dropping what it was given).
  *
+ * Two NOTIFY-ONLY timers cover the other half of that hole — a task that runs
+ * far longer than anyone expected while the agent simply never hears about it.
+ * (1) `deadline_ms`, the model-facing bash parameter next to
+ * `run_in_background`: when a task BECOMES a background task it is armed, and
+ * on expiry it sends ONE check-in carrying the task id, its elapsed time and an
+ * output tail. (2) An advisory lifetime note, armed for every background task
+ * from `DEFAULT_MAX_LIFETIME_MS` (overridable through the `LIFETIME_ENV`
+ * environment variable, read at arm time), sent once when the cap passes and
+ * saying the process is NOT being killed. Neither timer kills, signals or
+ * finishes anything: killing is `stop_task`'s job and the user's decision, and
+ * the exit report still arrives through the ladder below exactly once. Both are
+ * one-shot (`deadlineNoted` / `lifetimeNoted`), both are unref'd, both are
+ * cleared in `finishTask`, and neither is ever armed for an adopted task. A
+ * check-in is deliberately OUTSIDE the `none -> sent -> confirmed` ladder: it
+ * carries no `details` (so it cannot fabricate a panel row), marks no delivery
+ * state and is best-effort.
+ *
  * The task table OUTLIVES the process that built it, and the SESSION TRANSCRIPT
  * is the only place it is written. Every state transition already reaches it as
  * a `pi2_bg_task` custom message (`started` carries command/pid/pidStartTime/
@@ -238,6 +255,23 @@ const COUNT_LINES_UP_TO_BYTES = 8 * 1024 * 1024;
 /** Bound on the output tail inlined in a wake report. */
 const WAKE_TAIL_LINES = 40;
 const WAKE_TAIL_BYTES = 4 * 1024;
+/** Bound on the output tail inlined in a check-in (smaller: it is advisory). */
+const CHECK_IN_TAIL_LINES = 20;
+const CHECK_IN_TAIL_BYTES = 2 * 1024;
+/**
+ * `deadline_ms` bounds: a deadline produces ONE check-in, never a kill, so the
+ * only thing worth bounding is how far out a model may point it.
+ */
+const MIN_DEADLINE_MS = 500;
+const MAX_DEADLINE_MS = 24 * 60 * 60 * 1000;
+/**
+ * Advisory lifetime cap for every background task: after this, ONE note says
+ * the task is still running and that it is not being killed. Overridable per
+ * process through `LIFETIME_ENV` (milliseconds), which is read LAZILY when a
+ * timer is armed — a child process's environment therefore applies.
+ */
+const DEFAULT_MAX_LIFETIME_MS = 24 * 60 * 60 * 1000;
+const LIFETIME_ENV = "PI_BG_TASK_MAX_LIFETIME_MS";
 /**
  * Grace window for an idle wake: a message sent this recently may still be on
  * its way into context, so the `context` fallback waits one boundary before
@@ -338,6 +372,17 @@ interface BgTaskState {
 	exitUnknown?: boolean;
 	/** Liveness poll for an adopted task; cleared when the task settles. */
 	adoptPoll?: ReturnType<typeof setInterval>;
+	/**
+	 * The one deadline check-in, and the one advisory lifetime note. Both are
+	 * NOTIFY-ONLY, one-shot, unref'd, and cleared in `finishTask`; neither is ever
+	 * armed for an adopted task (its timers died with the process that armed them).
+	 */
+	deadlineTimer?: ReturnType<typeof setTimeout>;
+	lifetimeTimer?: ReturnType<typeof setTimeout>;
+	/** The single deadline check-in has been sent. */
+	deadlineNoted?: boolean;
+	/** The single lifetime note has been sent. */
+	lifetimeNoted?: boolean;
 	/** The session that produced the record this task was rebuilt from. */
 	sessionId?: string;
 	/**
@@ -810,6 +855,57 @@ function buildBatchNote(batch: BgTaskState[]): string {
 }
 
 /**
+ * What a check-in is about: the model-supplied deadline, or the advisory
+ * lifetime cap. Both are NOTIFY-ONLY — nothing is killed on either.
+ */
+type CheckInKind = "deadline" | "lifetime";
+
+/**
+ * Check-in text for a task that is STILL RUNNING.
+ *
+ * A check-in is not a result, and it must not read like one: the second line
+ * says so explicitly, the element carries `check_in` (instead of `exit_code` /
+ * `signal` / `duration_ms`) and `status="running"`, and the whole thing is
+ * built from the same escapers and the same `wrapReminder` as a report, so a
+ * reader cannot be handed a block that looks like an exit it never got. The
+ * output tail is escaped as TEXT for the same reason a report's is: a program
+ * that prints `</system-reminder>` must not be able to end the block.
+ *
+ * Deliberately carries no `details` and no delivery bookkeeping (see
+ * `sendCheckIn`): a check-in is advisory, best-effort, and outside the
+ * `none -> sent -> confirmed` ladder the exit report walks.
+ */
+function buildCheckInNote(task: BgTaskState, kind: CheckInKind): string {
+	const elapsedMs = Date.now() - task.startedAt;
+	const elapsed = formatSeconds(elapsedMs);
+	const tail = readOutputTail(task.outputFile, CHECK_IN_TAIL_BYTES, CHECK_IN_TAIL_LINES);
+	const attrs =
+		`id="${task.taskId}" status="${reportStatus(task)}" ` +
+		(kind === "deadline" ? 'check_in="deadline"' : 'check_in="lifetime"') +
+		` elapsed_ms="${elapsedMs}" output="${escapeAttr(task.outputFile)}"`;
+	const quoted = `Background task ${task.taskId} ("${escapeAttr(task.command)}")`;
+	const head =
+		kind === "deadline"
+			? `${quoted} is still running after ${elapsed}.`
+			: `${quoted} is still running after ${elapsed}: the lifetime cap passed. ` +
+				`It is NOT being killed — stop_task ${task.taskId} ends it.`;
+	const lines = tail.text.trim()
+		? [
+				`${head} Output tail:`,
+				"",
+				escapeText(tail.text),
+				`Full output: ${escapeText(task.outputFile)} (or wait_task ${task.taskId}).`,
+			]
+		: [head, "No output tail was read: the output file above is the only copy of its output."];
+	return (
+		`[SYSTEM NOTIFICATION - NOT USER INPUT]\n` +
+		"This is an automated task notification, not a message from the user. The task is still running: " +
+		"this is a check-in, not a result, and the process was not touched.\n" +
+		wrapReminder(`<background-task ${attrs}>\n${lines.join("\n")}\n</background-task>`)
+	);
+}
+
+/**
  * Plain text of a message in a `context` payload, for receipt matching. Custom
  * messages map to a user-role message whose content is the string that was
  * sent; user/tool messages carry a content-part array.
@@ -978,6 +1074,35 @@ function clampStopGrace(timeout: number | undefined): number {
 		return DEFAULT_STOP_GRACE_MS;
 	}
 	return Math.min(MAX_STOP_GRACE_MS, Math.max(MIN_STOP_GRACE_MS, Math.floor(timeout)));
+}
+
+/**
+ * The model-supplied check-in deadline, or `undefined` when none was given.
+ * Unlike the attach and wait windows there is no default: a task without a
+ * `deadline_ms` simply gets no deadline check-in (the lifetime note still runs).
+ */
+function clampDeadlineMs(deadline: number | undefined): number | undefined {
+	if (typeof deadline !== "number" || !Number.isFinite(deadline) || deadline <= 0) {
+		return undefined;
+	}
+	return Math.min(MAX_DEADLINE_MS, Math.max(MIN_DEADLINE_MS, Math.floor(deadline)));
+}
+
+/**
+ * The advisory lifetime cap, read LAZILY at arm time: the process environment is
+ * what a spawned child actually got, and `LIFETIME_ENV` may have changed since
+ * this module loaded. Any positive finite number is accepted; anything else
+ * (unset, empty, `NaN`, `0`, negative) falls back to the default.
+ */
+function lifetimeCapMs(): number {
+	const raw = process.env[LIFETIME_ENV];
+	if (raw !== undefined && raw.trim() !== "") {
+		const value = Number(raw);
+		if (Number.isFinite(value) && value > 0) {
+			return Math.floor(value);
+		}
+	}
+	return DEFAULT_MAX_LIFETIME_MS;
 }
 
 type WaitOutcome = "exited" | "deadline" | "aborted";
@@ -1477,6 +1602,7 @@ export default function bgTasks(pi: ExtensionAPI) {
 			};
 		}
 		const task = startTask(command, event.cwd, buildSessionEnv(undefined), { stdin: true });
+		armCheckIns(task);
 		task.panelStarted = true;
 		reportPanel(task);
 		return {
@@ -1629,6 +1755,17 @@ export default function bgTasks(pi: ExtensionAPI) {
 		if (task.adoptPoll) {
 			clearInterval(task.adoptPoll);
 			task.adoptPoll = undefined;
+		}
+		// Both check-in timers are advisory and one-shot: a task that has exited has
+		// nothing left to be checked in about, and a timer that fired after the exit
+		// report would be a stale note about a task that is already done.
+		if (task.deadlineTimer) {
+			clearTimeout(task.deadlineTimer);
+			task.deadlineTimer = undefined;
+		}
+		if (task.lifetimeTimer) {
+			clearTimeout(task.lifetimeTimer);
+			task.lifetimeTimer = undefined;
 		}
 		task.stdinOpen = false;
 		if (task.observers > 0) {
@@ -1797,6 +1934,70 @@ export default function bgTasks(pi: ExtensionAPI) {
 	}
 
 	/**
+	 * Send ONE advisory check-in for a task that is still running.
+	 *
+	 * It is NOT a report: no `details` (the frontend registry keys on
+	 * `details.taskId`, so a check-in must not fabricate a panel row), no
+	 * `pendingReports` entry and no delivery state — the exit report still
+	 * arrives through the ladder exactly once, and nothing here may mark it. It
+	 * is best-effort by construction: a stale extension ctx (after a reload) must
+	 * not throw into a timer, so the send is wrapped.
+	 */
+	function sendCheckIn(task: BgTaskState, kind: CheckInKind): void {
+		if (task.completed) {
+			return;
+		}
+		const text = buildCheckInNote(task, kind);
+		try {
+			// A check-in is worth a turn only when nothing else is happening; while a
+			// run is active it is appended for the next boundary instead.
+			pi.sendMessage(
+				{ customType: CUSTOM_TYPE, content: text, display: false },
+				busy ? undefined : { triggerTurn: true },
+			);
+		} catch {
+			// Stale ctx after reload: a check-in is advisory, and the exit report is
+			// still coming through the ladder.
+		}
+	}
+
+	/**
+	 * Arm the two NOTIFY-ONLY timers for a task that just became a background
+	 * task: the one deadline check-in (when the model asked for one) and the one
+	 * advisory lifetime note. Neither timer signals, kills or finishes anything;
+	 * both are one-shot, unref'd and cleared in `finishTask`, and an adopted task
+	 * is never armed (its timers died with the process that armed them, and the
+	 * successor would only repeat a note this session already sent).
+	 */
+	function armCheckIns(task: BgTaskState, deadlineMs?: number): void {
+		if (task.adopted || task.completed) {
+			return;
+		}
+		const lifetimeMs = lifetimeCapMs();
+		task.lifetimeTimer = setTimeout(() => {
+			task.lifetimeTimer = undefined;
+			if (task.completed || task.lifetimeNoted) {
+				return;
+			}
+			task.lifetimeNoted = true;
+			sendCheckIn(task, "lifetime");
+		}, lifetimeMs);
+		task.lifetimeTimer.unref?.();
+		if (deadlineMs === undefined) {
+			return;
+		}
+		task.deadlineTimer = setTimeout(() => {
+			task.deadlineTimer = undefined;
+			if (task.completed || task.deadlineNoted) {
+				return;
+			}
+			task.deadlineNoted = true;
+			sendCheckIn(task, "deadline");
+		}, deadlineMs);
+		task.deadlineTimer.unref?.();
+	}
+
+	/**
 	 * Frontend notification (task panel): a display:false custom message sent
 	 * WITHOUT options, so core appends it instantly when idle and at the next
 	 * turn end while streaming. Never `triggerTurn` — this fires mid-tool and
@@ -1885,12 +2086,21 @@ export default function bgTasks(pi: ExtensionAPI) {
 					"Run the command as a background task instead of staying attached. Use for long-running commands such as dev servers, watchers, long builds, or test suites that take minutes. The command starts immediately, output streams to a log file whose path is returned, and you are notified with the result when it finishes. Do not poll the output file and do not append '&' to background commands. The timeout parameter does not apply to background tasks.",
 			}),
 		),
+		deadline_ms: Type.Optional(
+			Type.Number({
+				description:
+					"For a background task: send ONE 'still running' check-in (with an output tail) once this many milliseconds have passed, and keep running. It does NOT kill the process and it is not a result: the exit report still arrives exactly once when the command finishes. Minimum 500, maximum 86400000.",
+				minimum: MIN_DEADLINE_MS,
+				maximum: MAX_DEADLINE_MS,
+			}),
+		),
 		// The spread above is runtime-exact but types as a plain Record; pin the
-		// static shape so Static<> keeps command/timeout/run_in_background.
+		// static shape so Static<> keeps command/timeout/run_in_background/deadline_ms.
 	}) as unknown as Type.TObject<{
 		command: Type.TString;
 		timeout: Type.TOptional<Type.TNumber>;
 		run_in_background: Type.TOptional<Type.TBoolean>;
+		deadline_ms: Type.TOptional<Type.TNumber>;
 	}>;
 
 	type BgBashParams = Static<typeof bgBashParameters>;
@@ -1918,7 +2128,8 @@ export default function bgTasks(pi: ExtensionAPI) {
 		" If you have other work, do it. If the task's result is all that is left, either end your turn (that is the correct action, not giving up — the wake report starts a new turn) or call wait_task, which blocks until the task exits or its timeout hits and returns the output." +
 		" A wait_task result of \"still running\" is not a failure." +
 		" A task you no longer need — a dev server holding a port, a watcher for a file you already fixed — is stopped with stop_task(task_id), which signals its whole process group; list_tasks shows what is still running." +
-		" A background task keeps its stdin open: if it is waiting on input (a confirmation, a name, a REPL line), answer it with task_input(task_id, data) instead of killing and restarting it.";
+		" A background task keeps its stdin open: if it is waiting on input (a confirmation, a name, a REPL line), answer it with task_input(task_id, data) instead of killing and restarting it." +
+		" deadline_ms gives ONE 'still running' check-in (with an output tail) at the deadline and does NOT kill the process.";
 
 	const { prepareArguments: _unusedPrepareArguments, ...builtinRest } = builtin;
 	void _unusedPrepareArguments; // typed for the old schema; the new schema needs no shim
@@ -1928,7 +2139,7 @@ export default function bgTasks(pi: ExtensionAPI) {
 		description: `${builtin.description}${BG_GUIDE}`,
 		parameters: bgBashParameters,
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			const { run_in_background, command, timeout } = params;
+			const { run_in_background, deadline_ms, command, timeout } = params;
 			if (typeof command !== "string" || command.trim() === "") {
 				throw new Error("bg-tasks: 'command' must be a non-empty string");
 			}
@@ -1941,6 +2152,9 @@ export default function bgTasks(pi: ExtensionAPI) {
 			});
 
 			if (run_in_background) {
+				// The task BECOMES a background task here: this is the one place the
+				// model's `deadline_ms` can take effect (see `armCheckIns`).
+				armCheckIns(task, clampDeadlineMs(deadline_ms));
 				task.panelStarted = true;
 				reportPanel(task);
 				return {
@@ -2042,6 +2256,9 @@ export default function bgTasks(pi: ExtensionAPI) {
 			// Deadline: hand the command over to the background instead of
 			// killing it (P0-2). It becomes a visible task and a normal wake
 			// target from here on.
+			// A `timeout` the command outlived is the attach window, not a check-in
+			// deadline: arm only the advisory lifetime note.
+			armCheckIns(task);
 			task.panelStarted = true;
 			reportPanel(task);
 			const soFar = tail.text.trim() ? `\n\nOutput so far:\n${tail.text}` : "";
