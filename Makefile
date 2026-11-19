@@ -4,6 +4,8 @@
 #                  Files run in parallel, 120 s per file: tests/worktree_git_spec.lua
 #                  alone spends ~50 s on real git commits at APFS fsync speed, which
 #                  plenary's 50 s default would kill under parallel load.
+#                  render-markdown.nvim is OPTIONAL (RENDER_MARKDOWN_PATH): the
+#                  render-contract spec skips itself when the checkout is missing.
 #   make check   — static gates: LuaJIT parse (G24) + docs sync; `check-selftest`
 #                  proves each gate can still fail. Needs `luajit` (mise install)
 #                  and python3; see .mise.toml.
@@ -36,6 +38,9 @@ NVIM_BIN ?= nvim
 PYTHON_BIN ?= python3
 LUAJIT_BIN ?= luajit
 PLENARY_PATH ?= $(HOME)/.local/share/nvim/lazy/plenary.nvim
+# OPTIONAL: render-markdown.nvim, used only by tests/render_contract_spec.lua.
+# When the checkout is absent, minimal_init skips it and that spec skips itself.
+RENDER_MARKDOWN_PATH ?= $(HOME)/.local/share/nvim/lazy/render-markdown.nvim
 MIN_INIT := tests/minimal_init.lua
 STYLUA_BIN ?= stylua
 LUA_LS_BIN ?= lua-language-server
@@ -46,7 +51,7 @@ export LUAJIT_BIN
 .PHONY: test smoke format style lint docs-links check check-selftest check-list parse e2e e2e-reaper e2e-worktrees e2e-bg-delivery e2e-bg-stop e2e-bg-reconcile e2e-bg-stdin e2e-bg-report e2e-bg-ownership e2e-subagent-failure e2e-subagent-worktree e2e-bg-fallback e2e-bg-wake e2e-bg-wake-gate e2e-bg-deadline
 
 test:
-	PLENARY_PATH=$(PLENARY_PATH) $(NVIM_BIN) --headless -u $(MIN_INIT) \
+	PLENARY_PATH=$(PLENARY_PATH) RENDER_MARKDOWN_PATH=$(RENDER_MARKDOWN_PATH) $(NVIM_BIN) --headless -u $(MIN_INIT) \
 		-c "lua require('plenary.test_harness').test_directory('tests', { minimal_init = '$(MIN_INIT)', timeout = 120000 })"
 
 e2e:
