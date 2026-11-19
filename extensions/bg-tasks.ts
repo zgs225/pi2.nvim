@@ -54,10 +54,17 @@
  *     only by a `turn_end` whose outcome is `completed` — a failed or aborted
  *     request leaves it `sent`, and the next attempt injects it again;
  *  4. `agent_settled` (with `aborted !== true`) flushes reports that finished
- *     after the last boundary, because nothing else would wake the agent.
+ *     after the last boundary, because nothing else would wake the agent. It
+ *     first RE-ARMS every report whose only carrier was a failed request (stage
+ *     3), because a run that settles without a completed turn — retries
+ *     exhausted, hard provider failure — leaves such a report `sent` and no
+ *     later stage would ever look at it again; re-arming it as `none` lets this
+ *     very settle deliver it as a persisted message. A failed request can delay
+ *     a report, never swallow it.
  *
  * An `agent_settled` for an aborted run deliberately wakes nothing (the user
- * asked for the run to stop); the report waits for stage 3.
+ * asked for the run to stop) and re-arms nothing (the report is read on the next
+ * turn, as before); the report waits for stage 3.
  *
  * The report TEXT is a structured reminder block, not prose. The exact string
  * that is handed over is stored on the task (`task.sentText`), and stage 3
@@ -1415,6 +1422,9 @@ export default function bgTasks(pi: ExtensionAPI) {
 			// `context` deliver it. Waking here would fight the abort.
 			return undefined;
 		}
+		// A report that only a failed request ever carried is invisible to both
+		// durable channels; hand it back to them before the flush below.
+		rearmLostFallbacks();
 		// Reports that finished after the last boundary: nothing else would
 		// wake the agent, and a run requested from a settled handler starts
 		// after every settled handler completes.
@@ -1644,6 +1654,28 @@ export default function bgTasks(pi: ExtensionAPI) {
 		for (const task of tasks.values()) {
 			if (task.delivery === "sent" && task.sentVia === "fallback") {
 				markConfirmed(task);
+			}
+		}
+	}
+
+	/**
+	 * Hand a report whose only carrier was a failed request back to the durable
+	 * channels. An injection is not persisted, and while the run retries the
+	 * `context` handler re-injects it into the next attempt; but a run that settles
+	 * without a `completed` turn_end (retries exhausted, hard provider failure)
+	 * leaves it `sent` and nothing would ever look at it again — `flushPending` and
+	 * `deliverAtBoundary` carry only `none`. Re-arming it as `none` makes the
+	 * settle's own wake deliver it as a persisted message, so a failed request can
+	 * delay a report but never swallow it. Only the `fallback` channel is re-armed:
+	 * a `wake`/`boundary` delivery is already durable.
+	 */
+	function rearmLostFallbacks(): void {
+		for (const task of tasks.values()) {
+			if (task.delivery === "sent" && task.sentVia === "fallback") {
+				task.delivery = "none";
+				task.sentText = undefined;
+				task.sentVia = undefined;
+				task.sentAt = undefined;
 			}
 		}
 	}

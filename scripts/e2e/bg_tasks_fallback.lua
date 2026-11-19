@@ -1,21 +1,16 @@
--- Headless e2e: a report the `context` FALLBACK injected survives a failed request.
+-- Headless e2e: the `context` FALLBACK, the report nobody else carried.
 --
--- The fallback exists for the report nobody else carried: `context` is the exact
--- message list about to be sent, so a pending report that is not in there is
--- injected before that request. The catch is that the injection is never
--- persisted — `event.messages` is a per-request deep copy — so a request that
--- then FAILS takes the injected text with it. Confirming at injection time (the
--- old behaviour) therefore lost the report for good: the model never saw it, the
--- task was already `confirmed`, and nothing would ever deliver it again.
---
--- This script reproduces that in a real process: a `pi --mode rpc` child with the
--- bundled `extensions/bg-tasks.ts`, a scripted fake OpenAI-compatible provider on
+-- `context` is the exact message list about to be sent, so a pending report that
+-- is not in there is injected before that request. Two properties follow from the
+-- injection never being persisted — `event.messages` is a per-request deep copy —
+-- and this script proves both in a real `pi --mode rpc` child with the bundled
+-- `extensions/bg-tasks.ts`, a scripted fake OpenAI-compatible provider on
 -- 127.0.0.1, and the exact request bodies the model received as ground truth.
 --
--- Scripted run (attempt = one provider request):
---   attempt 1   bash({ command = "while [ ! -f <marker> ]; do sleep 0.05; done;
---               echo fb-body", run_in_background: true }) -> tool result; the task
---               is blocked on the marker, so the report is `none`.
+-- SCENARIO 1 — the report survives a FAILED request (attempt = one provider
+-- request; the background task is blocked on a marker file):
+--   attempt 1   bash({ command, run_in_background: true }) -> tool result; the
+--               task is blocked on the marker, so the report is `none`.
 --   attempt 2   answered HTTP 500, and only THEN is the marker written. Its
 --               `turn_end` (outcome `error`) is the last boundary of that run, so
 --               the task exits just after it: nothing is appended, nothing is sent.
@@ -27,17 +22,32 @@
 --               that used to eat it.
 --   attempt 4+  the retry must inject it AGAIN; answered 200 with plain text, so
 --               the turn completes and only then is the report confirmed.
+--   Assertions F1..F6 (see their comments): the report is injected into the failed
+--   attempt and again into the successful one, appears once in that body, names the
+--   task id, was never persisted, and the run settles.
 --
--- Assertions (on `provider.bodies` = the exact payload each request carried):
---   F1 neither of the first two attempts carries a report, and the transcript
---      holds no report message at all (nothing was boundary-delivered or
---      persisted: the fallback is the only carrier this run can exercise)
---   F2 at least two requests carry the report — the failed one did not consume it
---   F3 the LAST request that carries it got a 2xx, i.e. the model actually saw it
---      (with the old confirm-at-injection behaviour the only carrier is the 500)
---   F4 that body carries the block exactly once (a re-injection must not stack)
---   F5 the block names the task id from the bash tool result
---   F6 the run settles — nothing hangs
+-- SCENARIO 2 — a report whose ONLY carrier was a failed request still arrives when
+-- the run gives up. Same start (a task blocked on its own marker), then EVERY
+-- attempt is answered 500 (no SSE) until pi's retries are exhausted: no attempt
+-- ever completes, so nothing confirms the injection, and `agent_settled` fires
+-- without a `completed` turn_end. The extension re-arms the report in that settle
+-- and its wake persists it, so:
+--   G1 no report message exists while the failing attempts are running (checked
+--      against the transcript snapshot taken at the last failing attempt),
+--   G2 after `agent_settled` exactly ONE persisted report message exists, and it
+--      carries the banner, the `<background-task` element and the task id,
+--   G3 a further prompt's request body carries that report as a normal message and
+--      NOT a second copy of it (no re-injection once it is persisted),
+--   G4 every run settles — nothing hangs.
+--   Reverting the re-arm fails G2/G3: nothing wakes, no wake attempt arrives.
+--
+-- The retry policy is PINNED in this script's own settings.json
+-- (`retry.maxRetries`, see RETRY_SETTINGS) instead of taken from pi's default, and
+-- the assertions name that value — otherwise a change to the default silently
+-- turns scenario 1 into a different test. The marker margin is deliberately ~1 s
+-- (MARKER_MARGIN_S), comfortably inside the 2 s first backoff and comfortably
+-- longer than the gap between answering a request and its `turn_end`, so the
+-- scenarios do not depend on sub-100 ms scheduling luck.
 --
 -- Needs the pi binary, nothing else (the provider is fake), which is why it runs
 -- in CI (.github/workflows/e2e.yml). Not part of `make test`:
@@ -53,11 +63,46 @@ local RUN_ROOT = vim.fn.tempname() .. "-bg-fallback"
 
 local PROVIDER = "e2efallback"
 local MODEL_ID = "e2e-model"
--- The task holds until attempt 2 has FAILED, so its report is created strictly
--- after that attempt's turn_end (the last boundary of the run) and strictly
--- before the retry — the one window where only `context` can carry it.
+
+--- How many retries the runs get — PINNED, not inherited (see the header).
+--- Scenario 1 needs 2 (fail, fail, succeed) and scenario 2 needs every retry to
+--- fail, so the whole suite stays well under half a minute of backoff.
+local MAX_RETRIES = 2
+--- The agent-dir settings.json this script writes; `retry.baseDelayMs` stays at
+--- pi's 2 s default, which is what the ~1 s marker margin fits inside.
+local RETRY_SETTINGS = { retry = { maxRetries = MAX_RETRIES } }
+--- The last attempt of a give-up run that fails: the failed turn itself plus
+--- every retry pi gets.
+local LAST_FAILING_ATTEMPT = MAX_RETRIES + 2
+
+--- Delay between the task being released and its exit. The marker is written
+--- right after the failing attempt's response, so the task must exit strictly
+--- AFTER that attempt's `turn_end` (the last boundary of the run): ~1 s is a
+--- comfortably wide version of that window, and still well inside the 2 s
+--- backoff before the retry.
+local MARKER_MARGIN_S = 1
+
+-- Declared before the provider, which reads them from its scheduled callback.
+local read_session, report_entries
+
+-- Scenario 1: the task holds until attempt 2 has FAILED, so its report is created
+-- strictly after that attempt's turn_end (the last boundary of the run) and
+-- strictly before the retry — the one window where only `context` can carry it.
 local MARKER = RUN_ROOT .. "/attempt2-failed"
-local COMMAND = ("while [ ! -f '%s' ]; do sleep 0.05; done; sleep 0.25; echo fb-body"):format(MARKER)
+-- Scenario 2: same shape, its own task/marker, and every attempt after the first
+-- fails.
+local MARKER_GIVEUP = RUN_ROOT .. "/giveup-attempt2-failed"
+
+--- A command that blocks on `marker`, then waits the margin before exiting.
+---@param marker string
+---@param body string
+---@return string
+local function waiting_command(marker, body)
+    return ("while [ ! -f '%s' ]; do sleep 0.05; done; sleep %d; echo %s"):format(marker, MARKER_MARGIN_S, body)
+end
+
+local COMMAND = waiting_command(MARKER, "fb-body")
+local COMMAND_GIVEUP = waiting_command(MARKER_GIVEUP, "fb-giveup-body")
 
 io.stdout:setvbuf("no")
 local run_started = uv.hrtime()
@@ -100,12 +145,21 @@ end
 -- Scripted fake provider (OpenAI chat-completions, streamed).
 -- ---------------------------------------------------------------------------
 
+--- One scripted run: which attempts it answers, and what its task waits on.
+---@class FallbackE2EScenario
+---@field mode "retry" | "giveup" `retry` = fail twice then succeed, `giveup` = never succeed
+---@field marker string released after this run's second attempt failed
+---@field command string the background command the first attempt starts
+---@field base integer provider attempts that belong to earlier runs
+
 ---@class FallbackE2EProvider
 ---@field server uv.uv_tcp_t
 ---@field attempt integer requests received so far
 ---@field bodies table<integer, string> request body per attempt
 ---@field status table<integer, integer> HTTP status answered per attempt
 ---@field carries table<integer, boolean> did that body carry the report block
+---@field scenario FallbackE2EScenario the run the next attempt belongs to
+---@field session_dir string? where the transcript is read from mid-run
 
 ---@return string
 local function sse_headers()
@@ -184,42 +238,57 @@ local function plan(provider, attempt)
     local body = provider.bodies[attempt] or ""
     provider.carries[attempt] = body:find("<background-task", 1, true) ~= nil
 
-    if attempt == 1 then
+    local scenario = provider.scenario
+    local local_attempt = attempt - scenario.base
+    local server_error = {
+        status = 500,
+        response = error_response(500, "Internal Server Error", "e2e transient server error"),
+    }
+
+    if local_attempt == 1 then
         -- Start a background task and end the turn: when the tool result is
         -- persisted the task is still running, so nothing can be reported yet.
         return {
             status = 200,
             response = sse_headers() .. sse_chunk('{"role":"assistant","content":""}') .. tool_call_chunk(
                 "bash",
-                { command = COMMAND, run_in_background = true }
+                { command = scenario.command, run_in_background = true }
             ) .. sse_chunk("{}", "tool_calls") .. "data: [DONE]\n\n",
         }
     end
-    if attempt == 2 then
+    if local_attempt == 2 then
         -- The request the tool result belongs to, failed at once so its turn_end
         -- (the last boundary of this run) happens before the task exits: nothing
         -- is pending then, so no report is appended and none is sent.
-        return {
-            status = 500,
-            response = error_response(500, "Internal Server Error", "e2e transient server error"),
-        }
+        return server_error
     end
-    if attempt == 3 then
-        -- The retry: the task exited during the backoff and `context` has just
-        -- injected the report into this request. Failing it is the whole point —
-        -- the injected text dies with it.
-        return {
-            status = 500,
-            response = error_response(500, "Internal Server Error", "e2e transient server error"),
-        }
+    if scenario.mode == "retry" then
+        if local_attempt == 3 then
+            -- The retry: the task exited during the backoff and `context` has just
+            -- injected the report into this request. Failing it is the whole point
+            -- — the injected text dies with it.
+            return server_error
+        end
+        -- The next retry must inject the report again, and this one succeeds.
+        return { status = 200, response = text_response("Background task reported; all done.") }
     end
-    -- The next retry must inject the report again, and this one succeeds.
-    return { status = 200, response = text_response("Background task reported; all done.") }
+    -- give-up mode: every retry fails too, so the run ends without a completed
+    -- turn_end. Only the wake the settle sends afterwards is answered 200.
+    if local_attempt <= LAST_FAILING_ATTEMPT then
+        return server_error
+    end
+    return { status = 200, response = text_response("Noted.") }
 end
 
 ---@return FallbackE2EProvider
 local function start_fake_provider()
-    local provider = { attempt = 0, bodies = {}, status = {}, carries = {} }
+    local provider = {
+        attempt = 0,
+        bodies = {},
+        status = {},
+        carries = {},
+        scenario = { mode = "retry", marker = MARKER, command = COMMAND, base = 0 },
+    }
     local server = assert(uv.new_tcp())
     assert(server:bind("127.0.0.1", 0))
     provider.server = server
@@ -255,17 +324,27 @@ local function start_fake_provider()
                 provider.attempt = provider.attempt + 1
                 local attempt = provider.attempt
                 provider.bodies[attempt] = body
+                local scenario = provider.scenario
+                local local_attempt = attempt - scenario.base
                 local planned = plan(provider, attempt)
                 provider.status[attempt] = planned.status
-                if attempt == 2 then
+                if local_attempt == 2 then
                     -- Release the background task now that this attempt has
                     -- failed: its report lands after the turn_end of this run
                     -- (nothing is pending there) and before the retry.
-                    vim.fn.writefile({ tostring(uv.now()) }, MARKER)
+                    vim.fn.writefile({ tostring(uv.now()) }, scenario.marker)
+                end
+                if scenario.mode == "giveup" and local_attempt == LAST_FAILING_ATTEMPT then
+                    -- The last failing attempt: whatever the transcript holds now is
+                    -- what the model could have seen DURING the run (G1).
+                    local entries = read_session(provider.session_dir)
+                    scenario.snapshot_entries = #entries
+                    scenario.snapshot_reports = #report_entries(entries)
                 end
                 print(
-                    ("[provider] attempt %d -> %d, carries_report=%s"):format(
+                    ("[provider] attempt %d (#%d) -> %d, carries_report=%s"):format(
                         attempt,
+                        local_attempt,
                         planned.status,
                         provider.carries[attempt] and "yes" or "no"
                     )
@@ -279,7 +358,7 @@ local function start_fake_provider()
     return provider
 end
 
---- Isolated agent dir: our own models.json + an empty settings.json.
+--- Isolated agent dir: our own models.json + a pinned retry policy.
 ---@param agent_dir string
 ---@param port integer
 local function write_agent_dir(agent_dir, port)
@@ -306,8 +385,10 @@ local function write_agent_dir(agent_dir, port)
     local f = assert(io.open(agent_dir .. "/models.json", "w"))
     f:write(vim.json.encode(models))
     f:close()
+    -- The retry count is part of the fixture, not pi's default: scenario 1 fails
+    -- twice and needs one more attempt, scenario 2 needs every retry to fail.
     local s = assert(io.open(agent_dir .. "/settings.json", "w"))
-    s:write("{}")
+    s:write(vim.json.encode(RETRY_SETTINGS))
     s:close()
 end
 
@@ -380,6 +461,17 @@ local function send(backend, message)
     check(vim.fn.chansend(backend.job, vim.json.encode(message) .. "\n") > 0, "send " .. tostring(message.type))
 end
 
+--- Print what the backend has seen so far (a timed-out wait has no other trace).
+---@param backend FallbackE2EBackend
+---@param what string
+local function print_events(backend, what)
+    local seen = {}
+    for _, ev in ipairs(backend.events) do
+        seen[#seen + 1] = string.format("%d:%s", ev._n, tostring(ev.type))
+    end
+    print(("[debug] %s timed out; events=%s; stderr=%s"):format(what, table.concat(seen, ","), backend.stderr))
+end
+
 ---@param backend FallbackE2EBackend
 ---@param predicate fun(ev: table): boolean
 ---@param timeout_ms integer
@@ -399,12 +491,60 @@ local function wait_event(backend, predicate, timeout_ms, what)
     if settled and found then
         return found
     end
-    local seen = {}
-    for _, ev in ipairs(backend.events) do
-        seen[#seen + 1] = string.format("%d:%s", ev._n, tostring(ev.type))
-    end
-    print(("[debug] %s timed out; events=%s; stderr=%s"):format(what, table.concat(seen, ","), backend.stderr))
+    print_events(backend, what)
     return nil
+end
+
+--- How many runs have settled so far (each run, and each wake-started
+--- continuation, is its own run).
+---@param backend FallbackE2EBackend
+---@return integer
+local function settle_count(backend)
+    local n = 0
+    for _, ev in ipairs(backend.events) do
+        if ev.type == "agent_settled" then
+            n = n + 1
+        end
+    end
+    return n
+end
+
+--- Wait until at least `at_least` runs have settled.
+---@param backend FallbackE2EBackend
+---@param at_least integer
+---@param timeout_ms integer
+---@param what string
+---@return boolean
+local function wait_settles(backend, at_least, timeout_ms, what)
+    local ok = vim.wait(timeout_ms, function()
+        return settle_count(backend) >= at_least
+    end, 50)
+    if not ok then
+        print_events(backend, what)
+    end
+    return ok
+end
+
+--- Wait until the provider has been asked at least `at_least` times.
+---@param provider FallbackE2EProvider
+---@param at_least integer
+---@param timeout_ms integer
+---@param what string
+---@return boolean
+local function wait_attempts(provider, at_least, timeout_ms, what)
+    local ok = vim.wait(timeout_ms, function()
+        return provider.attempt >= at_least
+    end, 50)
+    if not ok then
+        print(
+            ("[debug] %s timed out; attempts=%d, statuses=%s"):format(
+                what,
+                provider.attempt,
+                vim.inspect(provider.status, { newline = " ", indent = "" })
+            )
+        )
+    end
+    return ok
 end
 
 ---@param backend FallbackE2EBackend
@@ -419,9 +559,12 @@ end
 -- ---------------------------------------------------------------------------
 
 --- Parsed session transcript: every line of every `*.jsonl` in the dir.
----@param session_dir string
+---@param session_dir string?
 ---@return table[]
-local function read_session(session_dir)
+function read_session(session_dir)
+    if type(session_dir) ~= "string" then
+        return {}
+    end
     local names = vim.fn.readdir(session_dir)
     table.sort(names)
     local entries = {}
@@ -442,7 +585,7 @@ end
 --- Every custom message that carries a structured report element.
 ---@param entries table[]
 ---@return table[]
-local function report_entries(entries)
+function report_entries(entries)
     local out = {}
     for index, entry in ipairs(entries) do
         if entry.type == "custom_message" and type(entry.content) == "string" then
@@ -470,47 +613,13 @@ local function count(text, needle)
     end
 end
 
--- ---------------------------------------------------------------------------
-
-local function main()
-    check(vim.fn.executable("pi") == 1, "pi binary not found in PATH (required for this e2e)")
-    vim.fn.mkdir(RUN_ROOT, "p")
-    local agent_dir = RUN_ROOT .. "/agent"
-
-    -- The child pi inherits this env; nothing touches the user's real config.
-    vim.env.PI_CODING_AGENT_DIR = agent_dir
-    vim.env.PI_OFFLINE = "1"
-
-    local provider = start_fake_provider()
-    local addr = provider.server:getsockname()
-    local port = type(addr) == "table" and addr.port or nil
-    check(type(port) == "number" and port > 0, "fake provider did not bind a port", { addr = addr })
-    write_agent_dir(agent_dir, port)
-    step(("fake provider on 127.0.0.1:%d"):format(port))
-
-    local backend = start_backend(RUN_ROOT .. "/sessions", RUN_ROOT .. "/cwd")
-
-    send(backend, { id = "model-1", type = "set_model", provider = PROVIDER, modelId = MODEL_ID })
-    local pinned = wait_event(backend, function(ev)
-        return ev.type == "response" and ev.command == "set_model"
-    end, 30000, "set_model")
-    check(
-        pinned ~= nil and pinned.success ~= false,
-        "fake model selected",
-        { pinned = pinned, stderr = backend.stderr }
-    )
-    step("model pinned to the fake provider")
-
-    send(backend, { id = "prompt-1", type = "prompt", message = "Start the background task." })
-    local settled = wait_event(backend, function(ev)
-        return ev.type == "agent_settled"
-    end, 120000, "agent_settled")
-    check(settled ~= nil, "the scripted run settles", { stderr = backend.stderr })
-    step(("run settled after %d provider attempts"):format(provider.attempt))
-
-    -- The per-attempt table: what each request carried and how it was answered.
-    print("[table] attempt -> status, carries_report")
-    for attempt = 1, provider.attempt do
+---@param provider FallbackE2EProvider
+---@param from integer first attempt to print
+---@param to integer last attempt to print
+---@param title string
+local function print_table(provider, from, to, title)
+    print("[table] " .. title)
+    for attempt = from, math.min(to, provider.attempt) do
         print(
             ("[table]   #%d -> %d, carries_report=%s"):format(
                 attempt,
@@ -519,14 +628,50 @@ local function main()
             )
         )
     end
+end
+
+--- The task id the run's own bash tool result carried. Every request body holds
+--- the WHOLE conversation, so earlier runs' tool results are in there too: take
+--- the LAST match, which is the task this run started.
+---@param provider FallbackE2EProvider
+---@param base integer
+---@return string?
+local function task_id_of(provider, base)
+    local id = nil
+    for attempt = base + 1, provider.attempt do
+        for found in (provider.bodies[attempt] or ""):gmatch("Task (b%x+) running in background") do
+            id = found
+        end
+    end
+    return id
+end
+
+-- ---------------------------------------------------------------------------
+-- Scenario 1: an injection into a failed request is repeated on the retry
+-- ---------------------------------------------------------------------------
+
+---@param backend FallbackE2EBackend
+---@param provider FallbackE2EProvider
+local function run_retry_scenario(backend, provider)
+    provider.scenario = { mode = "retry", marker = MARKER, command = COMMAND, base = provider.attempt }
+
+    send(backend, { id = "prompt-1", type = "prompt", message = "Start the background task." })
+    check(wait_settles(backend, 1, 120000, "agent_settled"), "the scripted run settles", {
+        stderr = backend.stderr,
+    })
+    step(("run settled after %d provider attempts"):format(provider.attempt))
+
+    -- The per-attempt table: what each request carried and how it was answered.
+    print_table(provider, 1, provider.attempt, "attempt -> status, carries_report")
 
     -------------------------------------------------------------------------
     -- F1: nothing was boundary-delivered; the fallback is the only carrier.
     -------------------------------------------------------------------------
-    check(#provider.bodies >= 3, "the provider was asked at least three times (retry on 5xx)", {
-        attempts = provider.attempt,
-        status = provider.status,
-    })
+    check(
+        #provider.bodies >= 3,
+        ("the provider was asked at least three times (retry.maxRetries=%d)"):format(MAX_RETRIES),
+        { attempts = provider.attempt, status = provider.status }
+    )
     check(
         provider.carries[1] ~= true and provider.carries[2] ~= true,
         "the first two attempts carry no report (the task had not exited when they were built)",
@@ -582,16 +727,9 @@ local function main()
     -------------------------------------------------------------------------
     -- F5: the block names the task the bash tool result started.
     -------------------------------------------------------------------------
-    local task_id = winning:match("Task (b%x+) running in background")
+    local task_id = task_id_of(provider, 0)
     if type(task_id) ~= "string" then
-        -- The tool result may have been dropped from later payloads; read it
-        -- out of the earliest body that still carries it.
-        for attempt = 1, provider.attempt do
-            task_id = (provider.bodies[attempt] or ""):match("Task (b%x+) running in background")
-            if type(task_id) == "string" then
-                break
-            end
-        end
+        task_id = winning:match("Task (b%x+) running in background")
     end
     check(type(task_id) == "string", "the bash tool result carried a task id", { attempts = provider.attempt })
     check(
@@ -605,19 +743,232 @@ local function main()
     -------------------------------------------------------------------------
     -- F6: the run settled, so nothing hangs (asserted above as well).
     -------------------------------------------------------------------------
-    local last_settle = nil
-    for _, ev in ipairs(backend.events) do
-        if ev.type == "agent_settled" then
-            last_settle = ev
+    check(settle_count(backend) >= 1, "the run reached agent_settled", { stderr = backend.stderr })
+    step("F6 the run settled")
+end
+
+-- ---------------------------------------------------------------------------
+-- Scenario 2: a report only a failed request carried still arrives when the run
+-- gives up (the re-arm in `agent_settled`)
+-- ---------------------------------------------------------------------------
+
+---@param backend FallbackE2EBackend
+---@param provider FallbackE2EProvider
+local function run_giveup_scenario(backend, provider)
+    local settles_before = settle_count(backend)
+    local scenario = {
+        mode = "giveup",
+        marker = MARKER_GIVEUP,
+        command = COMMAND_GIVEUP,
+        base = provider.attempt,
+    }
+    provider.scenario = scenario
+    local first_attempt = scenario.base + 1
+    local last_failing_attempt = scenario.base + LAST_FAILING_ATTEMPT
+    local wake_attempt = last_failing_attempt + 1
+    local followup_attempt = wake_attempt + 1
+
+    step(("scenario 2: every attempt fails (retry.maxRetries=%d) until the run gives up"):format(MAX_RETRIES))
+    send(backend, { id = "prompt-2", type = "prompt", message = "Start the second background task." })
+    check(
+        wait_settles(backend, settles_before + 1, 120000, "agent_settled after the retries were exhausted"),
+        "the run whose attempts all failed settles — the retries are exhausted, nothing hangs",
+        { stderr = backend.stderr, attempts = provider.attempt, status = provider.status }
+    )
+    step(("the failed run settled after %d attempts"):format(provider.attempt - scenario.base))
+    print_table(provider, first_attempt, provider.attempt, "scenario 2 attempt -> status, carries_report")
+
+    -------------------------------------------------------------------------
+    -- G1: nothing was persisted while the attempts were running. The snapshot
+    -- is taken at the LAST failing attempt, so it is what the model could have
+    -- seen mid-run; the exits and the injections are all in that window.
+    -------------------------------------------------------------------------
+    check(
+        type(scenario.snapshot_reports) == "number",
+        "the last failing attempt was observed (transcript snapshot taken)",
+        { snapshot = scenario.snapshot_reports, attempts = provider.attempt }
+    )
+    check(
+        scenario.snapshot_reports == 0,
+        "no report message exists while the failing attempts are running (only `context` carried it)",
+        { reports = scenario.snapshot_reports, entries = scenario.snapshot_entries }
+    )
+    local injected = {}
+    for attempt = first_attempt, last_failing_attempt do
+        if provider.carries[attempt] then
+            injected[#injected + 1] = attempt
         end
     end
-    check(last_settle ~= nil, "the run reached agent_settled", { stderr = backend.stderr })
-    step("F6 the run settled")
+    check(#injected >= 1, "at least one failing attempt had the report injected into it", {
+        carriers = provider.carries,
+        status = provider.status,
+    })
+    for _, attempt in ipairs(injected) do
+        check(
+            (provider.status[attempt] or 0) >= 500,
+            "every attempt that carried the report while the run was failing was answered 500",
+            { carriers = injected, status = provider.status }
+        )
+    end
+    step(
+        ("G1 no persisted report while attempts %d..%d ran (%d carried it, all 500)"):format(
+            first_attempt,
+            last_failing_attempt,
+            #injected
+        )
+    )
+
+    local task_id = task_id_of(provider, scenario.base)
+    check(type(task_id) == "string", "the bash tool result carried a task id for the second run", {
+        attempts = provider.attempt,
+    })
+
+    -------------------------------------------------------------------------
+    -- G2: the settle re-armed the report, so its wake persisted EXACTLY ONE
+    -- report message — and it woke a real request (the wake attempt below).
+    -------------------------------------------------------------------------
+    check(
+        wait_attempts(provider, wake_attempt, 30000, "the re-armed report woke a new turn"),
+        "after the run gave up, the re-armed report woke a new turn (a failed request must not swallow it)",
+        {
+            wake_attempt = wake_attempt,
+            attempts = provider.attempt,
+            status = provider.status,
+            carriers = provider.carries,
+        }
+    )
+    check(
+        (provider.status[wake_attempt] or 0) >= 200 and (provider.status[wake_attempt] or 0) < 300,
+        "the wake request was answered 2xx",
+        { status = provider.status[wake_attempt] }
+    )
+    check(
+        provider.carries[wake_attempt] == true,
+        "the wake request carries the re-armed report as a persisted message",
+        { carriers = provider.carries }
+    )
+
+    local entries = read_session(backend.session_dir)
+    local reports = report_entries(entries)
+    if #reports > 0 then
+        for _, rep in ipairs(reports) do
+            print(("[debug] persisted report entry #%d: %s"):format(rep.index, (rep.content:gsub("\n", "\\n"))))
+        end
+    end
+    check(
+        #reports == 1,
+        "after agent_settled exactly one persisted report message exists (the re-arm delivered it)",
+        { count = #reports, attempts = provider.attempt, status = provider.status }
+    )
+    local persisted = reports[1]
+    check(
+        persisted.index > (scenario.snapshot_entries or 0),
+        "the persisted report was appended AFTER the failing attempts (it came from the settle)",
+        { index = persisted.index, snapshot_entries = scenario.snapshot_entries }
+    )
+    for _, needle in ipairs({ "[SYSTEM NOTIFICATION", "<background-task", task_id }) do
+        check(
+            persisted.content:find(needle, 1, true) ~= nil,
+            "the persisted report carries " .. needle,
+            { task_id = task_id }
+        )
+    end
+    step(("G2 one persisted report after the settle, naming task %s"):format(task_id))
+    print("[report] " .. ((persisted.content:match("<system%-reminder>.-</system%-reminder>") or ""):gsub("\n", "\\n")))
+
+    -------------------------------------------------------------------------
+    -- G3: a further prompt carries it as a NORMAL message, and no second copy:
+    -- once the report is persisted, `context` confirms it instead of injecting.
+    -------------------------------------------------------------------------
+    check(
+        wait_settles(backend, settles_before + 2, 60000, "the wake turn settles"),
+        "the wake turn settles",
+        { stderr = backend.stderr }
+    )
+    step("the wake turn completed (the re-armed report reached the model)")
+
+    send(backend, { id = "prompt-3", type = "prompt", message = "Nothing to do; confirm you are done." })
+    check(
+        wait_attempts(provider, followup_attempt, 30000, "the follow-up prompt is answered"),
+        "a further prompt is answered (the session is not stuck)",
+        { followup_attempt = followup_attempt, attempts = provider.attempt }
+    )
+    local followup_body = provider.bodies[followup_attempt] or ""
+    check(
+        count(followup_body, "[SYSTEM NOTIFICATION") == 1,
+        "the follow-up request carries the report banner exactly once (no re-injection)",
+        { count = count(followup_body, "[SYSTEM NOTIFICATION") }
+    )
+    check(
+        count(followup_body, "<background-task") == 1,
+        "the follow-up request carries exactly one report element (no second copy)",
+        { count = count(followup_body, "<background-task") }
+    )
+    check(
+        followup_body:find(task_id, 1, true) ~= nil,
+        "the report the follow-up request carries names the task (it is the persisted message)",
+        { task_id = task_id }
+    )
+    step("G3 the follow-up request carries the report once, as a normal message")
+
+    check(
+        wait_settles(backend, settles_before + 3, 60000, "the follow-up turn settles"),
+        "the follow-up turn settles",
+        { stderr = backend.stderr }
+    )
+    local reports_after = report_entries(read_session(backend.session_dir))
+    check(
+        #reports_after == 1,
+        "still exactly one persisted report message (nothing added a second copy)",
+        { count = #reports_after }
+    )
+    -------------------------------------------------------------------------
+    -- G4: every run settled — asserted by the waits above, restated for the log.
+    -------------------------------------------------------------------------
+    step(
+        ("G4 all %d runs settled, %d provider attempts, no duplicates"):format(settle_count(backend), provider.attempt)
+    )
+end
+
+-- ---------------------------------------------------------------------------
+
+local function main()
+    check(vim.fn.executable("pi") == 1, "pi binary not found in PATH (required for this e2e)")
+    vim.fn.mkdir(RUN_ROOT, "p")
+    local agent_dir = RUN_ROOT .. "/agent"
+
+    -- The child pi inherits this env; nothing touches the user's real config.
+    vim.env.PI_CODING_AGENT_DIR = agent_dir
+    vim.env.PI_OFFLINE = "1"
+
+    local provider = start_fake_provider()
+    local addr = provider.server:getsockname()
+    local port = type(addr) == "table" and addr.port or nil
+    check(type(port) == "number" and port > 0, "fake provider did not bind a port", { addr = addr })
+    write_agent_dir(agent_dir, port)
+    step(("fake provider on 127.0.0.1:%d (retry.maxRetries=%d pinned)"):format(port, MAX_RETRIES))
+
+    local backend = start_backend(RUN_ROOT .. "/sessions", RUN_ROOT .. "/cwd")
+    provider.session_dir = backend.session_dir
+
+    send(backend, { id = "model-1", type = "set_model", provider = PROVIDER, modelId = MODEL_ID })
+    local pinned = wait_event(backend, function(ev)
+        return ev.type == "response" and ev.command == "set_model"
+    end, 30000, "set_model")
+    check(
+        pinned ~= nil and pinned.success ~= false,
+        "fake model selected",
+        { pinned = pinned, stderr = backend.stderr }
+    )
+    step("model pinned to the fake provider")
+
+    run_retry_scenario(backend, provider)
+    run_giveup_scenario(backend, provider)
 
     stop_backend(backend)
 
     print(
-        ("ALL bg-tasks fallback cases passed (the report survives a failed request, exactly once, in a 2xx) in %.2fs"):format(
+        ("ALL bg-tasks fallback cases passed (an injection survives a failed request, and a run that gives up delivers it as a persisted message, exactly once) in %.2fs"):format(
             (uv.hrtime() - run_started) / 1e9
         )
     )
