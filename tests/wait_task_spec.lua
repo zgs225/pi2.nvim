@@ -645,6 +645,92 @@ describe("bg-tasks extension contract", function()
         assert.is_truthy(hook:find("wakeTimer = undefined", 1, true), "and forget it")
     end)
 
+    it("never wakes into a run that became active inside the window", function()
+        local src = read_extension()
+        local sched_start = assert(src:find("function scheduleWake", 1, true), "scheduleWake must exist")
+        local sched_end = src:find("\n\tfunction ", sched_start + 1, true) or #src
+        local sched = src:sub(sched_start, sched_end)
+        local callback_at = assert(sched:find("setTimeout(", 1, true), "scheduleWake must arm a timer")
+        local body = sched:sub(callback_at)
+        local flush_at =
+            assert(body:find("flushPending({ wake: true })", 1, true), "the wake must still be flushed from the timer")
+        -- `triggerTurn` on a run that is already going queues a FOLLOW-UP TURN, so
+        -- the report would not arrive at this run's next boundary: with a run
+        -- active the reports must stay `none` for `deliverAtBoundary` (turn_end /
+        -- agent_before_settle) or the next `agent_settled` to carry them.
+        local busy_at = assert(body:find("if (busy)", 1, true), "the timer must look at the run state")
+        assert.is_true(busy_at < flush_at, "the busy check must gate the flush")
+        assert.is_truthy(
+            body:sub(busy_at, flush_at):find("return", 1, true),
+            "a run that became active must skip the wake, not queue a turn"
+        )
+    end)
+
+    it("drops a queued wake when its session goes away", function()
+        local src = read_extension()
+        local shut_start = assert(src:find('pi.on("session_shutdown"', 1, true), "the shutdown handler must exist")
+        local shut_end = src:find("\n\tpi.on(", shut_start + 1, true) or #src
+        local shutdown = src:sub(shut_start, shut_end)
+        local clear_at =
+            assert(shutdown:find("clearTimeout(wakeTimer)", 1, true), "session_shutdown must clear the pending wake")
+        assert.is_truthy(shutdown:find("wakeTimer = undefined", 1, true), "and forget it")
+        -- Before anything else: the successor (a `/new`, a resume, a fork) would
+        -- otherwise deliver the replaced session's report.
+        local tasks_at = assert(
+            shutdown:find("for (const task of tasks.values())", 1, true),
+            "the handler still walks the task table"
+        )
+        assert.is_true(clear_at < tasks_at, "the timer must be cleared before the handler does its work")
+    end)
+
+    it("escapes the id and the exit status instead of trusting the record", function()
+        local src = read_extension()
+        local attrs_start = assert(src:find("function taskAttrs", 1, true), "taskAttrs must exist")
+        local attrs = src:sub(attrs_start, assert(src:find("function wrapReminder", attrs_start, true)))
+        -- A record FOLDED from a doctored transcript carries an id this extension
+        -- never generated (`b` + 6 hex): interpolated raw it could close the
+        -- attribute or forge a second element.
+        for _, shape in ipairs({ 'id="${escapeAttr(', 'exit_code="${escapeAttr(', 'signal="${escapeAttr(' }) do
+            assert.is_truthy(attrs:find(shape, 1, true), "taskAttrs must emit " .. shape)
+        end
+
+        -- The prose line and the `wait_task` pointer interpolate the id as TEXT.
+        local wake_start = assert(src:find("function buildWakeNote", 1, true))
+        local wake = src:sub(wake_start, assert(src:find("function buildBatchNote", wake_start, true)))
+        assert.is_truthy(wake:find("Background task ${id}", 1, true), "the prose id must be escaped text")
+        assert.is_truthy(wake:find("wait_task ${id}", 1, true), "and so must the wait_task pointer")
+        assert.is_nil(wake:find("${task.taskId}", 1, true), "no raw task id may reach a report")
+
+        -- The check-in note has the same hole and the same fix.
+        local note_start = assert(src:find("function buildCheckInNote", 1, true))
+        local note = src:sub(note_start, assert(src:find("function messageText", note_start, true)))
+        assert.is_truthy(note:find('id="${escapeAttr(', 1, true), "a check-in id must be escaped")
+        assert.is_truthy(note:find("Background task ${id}", 1, true), "its prose id too")
+        assert.is_nil(note:find("${task.taskId}", 1, true), "no raw task id may reach a check-in")
+    end)
+
+    it("bounds the re-arm so a failing provider cannot loop forever", function()
+        local src = read_extension()
+        assert.is_truthy(src:find("rearmCount?: number", 1, true), "the task must count its re-arms")
+        local cap = src:match("const MAX_REARMS = (%d+)")
+        assert.is_truthy(cap, "the cap must be a named constant")
+        assert.is_true(tonumber(cap) > 0 and tonumber(cap) <= 5, "the cap must be a small, finite bound")
+
+        local fn_start = assert(src:find("function rearmLostFallbacks", 1, true), "the helper must exist")
+        local fn_end = src:find("\n\tfunction ", fn_start + 1, true) or #src
+        local body = src:sub(fn_start, fn_end)
+        local guard_at =
+            assert(body:find("task.rearmCount ?? 0) >= MAX_REARMS", 1, true), "the cap must gate the re-arm")
+        assert.is_true(
+            guard_at < assert(body:find('task.delivery = "none"', 1, true)),
+            "the cap must be checked before the report is re-armed"
+        )
+        assert.is_truthy(
+            body:find("task.rearmCount = (task.rearmCount ?? 0) + 1", 1, true),
+            "every re-arm must be counted"
+        )
+    end)
+
     --- Count plain occurrences of `needle` in `text`.
     ---@param text string
     ---@param needle string

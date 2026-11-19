@@ -287,6 +287,15 @@ const IDLE_WAKE_GRACE_MS = 5_000;
  * human or a model can perceive in a wake.
  */
 const WAKE_COALESCE_MS = 40;
+/**
+ * How many times one report may be re-armed after a run settled carrying it only
+ * through a failed request (see `rearmLostFallbacks`). Bounded on purpose: a
+ * provider that keeps producing new runs without ever accepting a request would
+ * otherwise cycle settle -> re-arm -> wake -> settle with no user input at all.
+ * Past the cap the report stays `sent` and still rides the `context` fallback on
+ * the next user turn, so nothing is lost — only the wake loop is.
+ */
+const MAX_REARMS = 3;
 
 /** How far a completion report has got on its way into model context. */
 type DeliveryState = "none" | "sent" | "confirmed";
@@ -383,6 +392,14 @@ interface BgTaskState {
 	deadlineNoted?: boolean;
 	/** The single lifetime note has been sent. */
 	lifetimeNoted?: boolean;
+	/**
+	 * How many times this report has been re-armed because the only carrier it
+	 * ever had was a failed request (`rearmLostFallbacks`). Capped by `MAX_REARMS`
+	 * so a provider that never accepts a request cannot cycle settle -> re-arm ->
+	 * wake -> settle forever; past the cap the report stays `sent` and the next
+	 * user turn's `context` fallback carries it.
+	 */
+	rearmCount?: number;
 	/** The session that produced the record this task was rebuilt from. */
 	sessionId?: string;
 	/**
@@ -412,7 +429,8 @@ const trackedPids = new Set<number>();
 let exitHookInstalled = false;
 /**
  * The pending coalesced idle wake, if one is queued. Module-level because the
- * exit hook has to clear it, and because one burst must never queue two.
+ * exit hook and `session_shutdown` have to clear it, and because one burst must
+ * never queue two.
  */
 let wakeTimer: ReturnType<typeof setTimeout> | undefined;
 /**
@@ -773,10 +791,10 @@ function escapeAttr(value: string): string {
 function taskAttrs(task: BgTaskState): string {
 	const durationMs = (task.endedAt ?? Date.now()) - task.startedAt;
 	return [
-		`id="${task.taskId}"`,
+		`id="${escapeAttr(task.taskId)}"`,
 		`status="${reportStatus(task)}"`,
-		`exit_code="${task.exitCode ?? ""}"`,
-		`signal="${task.signal ?? ""}"`,
+		`exit_code="${escapeAttr(`${task.exitCode ?? ""}`)}"`,
+		`signal="${escapeAttr(task.signal ?? "")}"`,
 		`duration_ms="${durationMs}"`,
 		`output="${escapeAttr(task.outputFile)}"`,
 	].join(" ");
@@ -808,8 +826,12 @@ function wrapReminder(body: string): string {
 function buildWakeNote(task: BgTaskState): string {
 	const elapsed = formatSeconds((task.endedAt ?? Date.now()) - task.startedAt);
 	const tail = readOutputTail(task.outputFile, WAKE_TAIL_BYTES, WAKE_TAIL_LINES);
+	// Every interpolation is escaped: a record FOLDED from a doctored session
+	// transcript carries an id this extension never generated, and an unescaped
+	// one could close the element's attribute or forge a second element.
+	const id = escapeText(task.taskId);
 	const head =
-		`Background task ${task.taskId} ("${escapeAttr(task.command)}") ` +
+		`Background task ${id} ("${escapeAttr(task.command)}") ` +
 		`${escapeText(describeExit(task))} after ${elapsed}.`;
 	// Only the TEXT of the tail is escaped (attributes need more): output is
 	// arbitrary program output and may well print `</system-reminder>`.
@@ -818,7 +840,7 @@ function buildWakeNote(task: BgTaskState): string {
 				`${head} Output tail:`,
 				"",
 				escapeText(tail.text),
-				`Full output: ${escapeText(task.outputFile)} (or wait_task ${task.taskId}).`,
+				`Full output: ${escapeText(task.outputFile)} (or wait_task ${id}).`,
 			]
 		: [head, "No output tail was read: the output file above is the only copy of its output."];
 	return (
@@ -879,22 +901,24 @@ function buildCheckInNote(task: BgTaskState, kind: CheckInKind): string {
 	const elapsedMs = Date.now() - task.startedAt;
 	const elapsed = formatSeconds(elapsedMs);
 	const tail = readOutputTail(task.outputFile, CHECK_IN_TAIL_BYTES, CHECK_IN_TAIL_LINES);
+	// Same escaping rules as a report: a folded record's id is arbitrary text too.
+	const id = escapeText(task.taskId);
 	const attrs =
-		`id="${task.taskId}" status="${reportStatus(task)}" ` +
+		`id="${escapeAttr(task.taskId)}" status="${reportStatus(task)}" ` +
 		(kind === "deadline" ? 'check_in="deadline"' : 'check_in="lifetime"') +
 		` elapsed_ms="${elapsedMs}" output="${escapeAttr(task.outputFile)}"`;
-	const quoted = `Background task ${task.taskId} ("${escapeAttr(task.command)}")`;
+	const quoted = `Background task ${id} ("${escapeAttr(task.command)}")`;
 	const head =
 		kind === "deadline"
 			? `${quoted} is still running after ${elapsed}.`
 			: `${quoted} is still running after ${elapsed}: the lifetime cap passed. ` +
-				`It is NOT being killed — stop_task ${task.taskId} ends it.`;
+				`It is NOT being killed — stop_task ${id} ends it.`;
 	const lines = tail.text.trim()
 		? [
 				`${head} Output tail:`,
 				"",
 				escapeText(tail.text),
-				`Full output: ${escapeText(task.outputFile)} (or wait_task ${task.taskId}).`,
+				`Full output: ${escapeText(task.outputFile)} (or wait_task ${id}).`,
 			]
 		: [head, "No output tail was read: the output file above is the only copy of its output."];
 	return (
@@ -1439,6 +1463,15 @@ export default function bgTasks(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", (event) => {
+		// A wake queued a moment ago belongs to THIS instance. The successor (a
+		// `/new`, a resume, a fork) folds the transcript again and runs its own
+		// ladder, so a timer left behind would fire into it and deliver this
+		// session's report there — or into nothing at all. The exit hook clears the
+		// same timer for the process-level case.
+		if (wakeTimer !== undefined) {
+			clearTimeout(wakeTimer);
+			wakeTimer = undefined;
+		}
 		// This instance is going away — replaced by a reload/session switch, or
 		// followed by the exit hook. Stop polling adopted tasks first: the
 		// successor folds the same records and watches them again, and a stale
@@ -1828,10 +1861,24 @@ export default function bgTasks(pi: ExtensionAPI) {
 	 * settle's own wake deliver it as a persisted message, so a failed request can
 	 * delay a report but never swallow it. Only the `fallback` channel is re-armed:
 	 * a `wake`/`boundary` delivery is already durable.
+	 *
+	 * Bounded by `MAX_REARMS`: every re-arm buys one more wake, and a provider that
+	 * fails in a way that keeps producing FRESH runs would otherwise let one report
+	 * wake the agent forever. Past the cap the report stays `sent`, which is still
+	 * recoverable — `context` injects it before the next user turn.
 	 */
 	function rearmLostFallbacks(): void {
 		for (const task of tasks.values()) {
 			if (task.delivery === "sent" && task.sentVia === "fallback") {
+				if ((task.rearmCount ?? 0) >= MAX_REARMS) {
+					// A provider that never accepts a request can produce settle ->
+					// re-arm -> wake -> settle with no user input at all, so the re-arm
+					// is bounded. The report is NOT lost: `context` still injects a
+					// `sent` report on the next user turn, which is what the whole
+					// ladder exists for; only the self-sustaining wake loop is gone.
+					continue;
+				}
+				task.rearmCount = (task.rearmCount ?? 0) + 1;
 				task.delivery = "none";
 				task.sentText = undefined;
 				task.sentVia = undefined;
@@ -1928,6 +1975,15 @@ export default function bgTasks(pi: ExtensionAPI) {
 		}
 		wakeTimer = setTimeout(() => {
 			wakeTimer = undefined;
+			if (busy) {
+				// A run became active inside the window (a user prompt, or another
+				// wake): `triggerTurn` would now queue the report as a FOLLOW-UP TURN
+				// instead of letting it arrive at a boundary of the run that is already
+				// going. Leave the reports `none`; `deliverAtBoundary` (turn_end /
+				// agent_before_settle) carries them inside this run, and the next
+				// `agent_settled` re-arms a wake if the run ends first.
+				return;
+			}
 			flushPending({ wake: true });
 		}, WAKE_COALESCE_MS);
 		wakeTimer.unref?.();

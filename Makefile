@@ -8,7 +8,7 @@
 #   make e2e-bg-reconcile — real-pi e2e: the task table survives a SIGKILLed pi and is adopted by the next run (needs pi; fake provider)
 #   make e2e-bg-stdin — real-pi e2e: a background task keeps its stdin and task_input feeds it (needs pi; fake provider)
 #   make e2e-bg-report — real-pi e2e: a completion report is one structured `<background-task>` block (needs pi; fake provider)
-#   make e2e-bg-fallback — real-pi e2e: an injected report survives a FAILED request and is confirmed by the retry (needs pi; fake provider)
+#   make e2e-bg-fallback — real-pi e2e: BOTH fallback scenarios — a failed injection retried until the request succeeds, and a run that gives up delivering it yet still wakes with the report (needs pi; fake provider)
 #   make e2e-bg-wake — real-pi e2e: two same-tick completions send ONE coalesced wake naming both tasks (needs pi; fake provider)
 #   make e2e-bg-deadline — real-pi e2e: deadline_ms and the lifetime cap send ONE notify-only check-in each, no kill (needs pi; fake provider)
 #   make e2e-bg-ownership — real-pi e2e: a fork does not adopt the parent's tasks, a clean quit records its kills

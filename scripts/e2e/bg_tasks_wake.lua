@@ -11,13 +11,21 @@
 -- (JSONL) as ground truth.
 --
 -- Scripted turns:
---   T1  TWO background bash calls in ONE assistant message (indexes 0 and 1),
---       both `sleep 0.4; echo wake-<x>`, so the two exits land milliseconds
---       apart
---   T2  plain assistant text — the run ends ~0.4 s BEFORE the tasks exit, so
+--   T1  TWO background bash calls in ONE assistant message (indexes 0 and 1).
+--       Each command BLOCKS on its own marker file under the run dir
+--       (`while [ ! -f <marker> ]; do sleep 0.02; done; echo wake-<x>`), so
+--       neither exit can be decided by scheduling luck.
+--   T2  plain assistant text — the run ends with both tasks still blocked, so
 --       both completions arrive with nobody attached and the run idle (the
 --       same-tick idle wake path, not the boundary path)
 --   T3  plain assistant text (answers the wake)
+--
+-- After the run settles the script releases BOTH markers back-to-back in ONE
+-- step, which is what makes this a burst by construction: the two `close`
+-- events are microseconds apart on any machine, loaded or not. (The old form
+-- used `sleep 0.4` in both commands and relied on the two sleeps expiring
+-- within the 40 ms window — a loaded runner could emit two reports of the new
+-- code and fail the suite for the wrong reason.)
 --
 -- Assertions, all behavioural:
 --   W1 exactly ONE custom message carries `<background-task` (printed in the
@@ -25,6 +33,9 @@
 --   W2 that message names BOTH task ids, read out of the two tool results of T1
 --   W3 exactly ONE assistant message follows it — one wake, not two — and the
 --      run the wake started settles
+--   W4 both markers were released in the SAME scripted step (and the wake turn
+--      started after it), so the burst is deterministic, not a wall-clock
+--      coincidence
 --
 -- Needs the pi binary, nothing else (the provider is fake), which is why it runs
 -- in CI (.github/workflows/e2e.yml). Not part of `make test`:
@@ -40,8 +51,12 @@ local RUN_ROOT = vim.fn.tempname() .. "-bg-wake"
 
 local PROVIDER = "e2ewake"
 local MODEL_ID = "e2e-model"
-local COMMAND_A = "sleep 0.4; echo wake-a"
-local COMMAND_B = "sleep 0.4; echo wake-b"
+-- Both tasks block until their own marker exists, and the script writes the two
+-- markers back-to-back in one step (see `main`): the burst is deterministic.
+local RELEASE_A = RUN_ROOT .. "/release-a"
+local RELEASE_B = RUN_ROOT .. "/release-b"
+local COMMAND_A = ("while [ ! -f '%s' ]; do sleep 0.02; done; echo wake-a"):format(RELEASE_A)
+local COMMAND_B = ("while [ ! -f '%s' ]; do sleep 0.02; done; echo wake-b"):format(RELEASE_B)
 
 io.stdout:setvbuf("no")
 local run_started = uv.hrtime()
@@ -177,8 +192,8 @@ local function respond(provider)
             return text_response("missing task ids in the bash results")
         end
         provider.task_ids = ids
-        -- Plain text, no tool call: the run ends now, ~0.4 s before the two
-        -- tasks exit, so both completions arrive with the run idle.
+        -- Plain text, no tool call: the run ends now, with BOTH tasks still
+        -- blocked on their markers, so both completions arrive with the run idle.
         return text_response("Both background tasks are running.")
     end
 
@@ -470,8 +485,25 @@ local function main()
     })
     step(("task ids %s, %s"):format(provider.task_ids[1], provider.task_ids[2]))
 
-    -- Both tasks exit ~0.4 s after start, in the same tick, with the run idle:
-    -- one coalesced wake, one turn.
+    -- Both tasks are blocked on their own marker (neither can have exited: the
+    -- markers do not exist yet), so releasing them back-to-back in ONE scripted
+    -- step makes the two `close` events microseconds apart by construction.
+    local release_steps = 0
+    local function release_both()
+        release_steps = release_steps + 1
+        for _, marker in ipairs({ RELEASE_A, RELEASE_B }) do
+            local f = assert(io.open(marker, "w"))
+            f:write("go")
+            f:close()
+        end
+    end
+
+    local released_at_event = #backend.events
+    release_both()
+    step("released both tasks in one scripted step")
+
+    -- Both tasks exit ~instantly, in the same tick, with the run idle: one
+    -- coalesced wake, one turn.
     local wake_start = wait_event(backend, function(ev)
         return ev.type == "agent_start" and ev._n > settled._n
     end, 20000, "wake turn")
@@ -526,12 +558,34 @@ local function main()
     })
     step("W3 exactly one assistant message after the report")
 
+    -- W4: the burst was scripted, not lucky. Both markers were written in the
+    -- same step, microseconds apart, and nothing was woken before that step, so
+    -- both exits are strictly after it.
+    check(release_steps == 1, "both markers must be released in the same scripted step", {
+        steps = release_steps,
+    })
+    check(wake_start._n > released_at_event, "the wake turn must start after the release step", {
+        wake = wake_start._n,
+        released = released_at_event,
+    })
+    local stat_a = uv.fs_stat(RELEASE_A)
+    local stat_b = uv.fs_stat(RELEASE_B)
+    check(stat_a ~= nil and stat_b ~= nil, "both release markers exist", { a = stat_a, b = stat_b })
+    ---@param st table
+    ---@return number
+    local function mtime_seconds(st)
+        return (st.mtime.sec or 0) + (st.mtime.nsec or 0) / 1e9
+    end
+    local marker_gap = math.abs(mtime_seconds(stat_a) - mtime_seconds(stat_b))
+    check(marker_gap <= 0.05, "the two markers must be written back-to-back", { gap = marker_gap })
+    step(("W4 both markers released in one scripted step (%.3fs apart)"):format(marker_gap))
+
     stop_backend(backend)
 
     print(
         (
-            "ALL bg-tasks wake cases passed (two same-tick completions sent ONE report naming both tasks,\n"
-            .. "answered by ONE turn) in %.2fs"
+            "ALL bg-tasks wake cases passed (two tasks released in one scripted step sent ONE report naming\n"
+            .. "both tasks, answered by ONE turn) in %.2fs"
         ):format((uv.hrtime() - run_started) / 1e9)
     )
     vim.cmd("cq 0")
@@ -539,6 +593,15 @@ end
 
 local ok, err = pcall(main)
 if not ok then
+    -- Never leave a marker-blocked task behind: releasing the markers lets any
+    -- task this run started exit on its own once the backend is gone.
+    for _, marker in ipairs({ RELEASE_A, RELEASE_B }) do
+        local f = io.open(marker, "w")
+        if f then
+            f:write("go")
+            f:close()
+        end
+    end
     io.stderr:write("e2e bg_tasks_wake: " .. tostring(err) .. "\n")
     vim.cmd("cq 1")
 end
