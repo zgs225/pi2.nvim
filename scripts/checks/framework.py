@@ -13,6 +13,18 @@ Three design rules, all of them consequences of past fake-green incidents
   fail, it is not a gate.
 * **Findings are `path:line: severity: [rule] message`.** Grep-able, clickable
   in an editor, and stable enough to diff in CI logs.
+
+Exit codes
+----------
+    0   clean: every rule ran and reported nothing
+    1   findings: the code is wrong (whether or not a gate also broke)
+    2   broken gate: no findings, but at least one rule could not run
+
+Findings deliberately outrank a broken gate: a run that found real violations
+must not be reported as "the gate is broken", or the violations get ignored
+while someone debugs the harness. Errors are always printed to stderr, and
+`--json` always carries both `findings` and `errors`, so nothing is hidden when
+both happen at once.
 """
 
 from __future__ import annotations
@@ -35,7 +47,8 @@ class CheckError(RuntimeError):
 
     Distinct from a finding: findings mean "the code is wrong", a CheckError
     means "the gate is broken". The runner reports the two with different exit
-    codes so CI never confuses them.
+    codes so CI never confuses them, and findings win when both occur (a real
+    violation must not be reported as a harness problem).
     """
 
 
@@ -238,7 +251,10 @@ def self_test() -> int:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python3 -m scripts.checks",
-        description="Static gates for pi.nvim. Exit 0 = clean, 1 = findings, 2 = broken gate.",
+        description=(
+            "Static gates for pi.nvim. Exit 0 = clean, 1 = findings, 2 = broken gate (no findings). "
+            "Findings outrank a broken gate."
+        ),
     )
     parser.add_argument("--root", default=str(REPO_ROOT), help="tree to check (default: repo root)")
     parser.add_argument("--only", action="append", metavar="NAME", help="run one check (repeatable)")
@@ -273,6 +289,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif not errors:
             print(f"ok: {count} check(s), 0 findings", file=sys.stderr)
 
+    # Findings win: real violations must never be reported as "the gate broke".
+    if findings:
+        return 1
     if errors:
         return 2
-    return 1 if findings else 0
+    return 0

@@ -35,6 +35,9 @@ Run
     make check                 # every rule, human-readable output
     make check-selftest        # prove every rule can fail (fixtures)
     python3 -m scripts.checks --only docs-commands --json
+
+Exit codes: 0 clean, 1 findings, 2 broken gate (a rule could not run). Findings
+outrank a broken gate, and errors are printed even when findings exist.
 """
 
 from .framework import (  # noqa: F401  (re-exported API)
