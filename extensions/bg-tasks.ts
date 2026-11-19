@@ -1122,6 +1122,16 @@ export default function bgTasks(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", (event) => {
+		// This instance is going away — replaced by a reload/session switch, or
+		// followed by the exit hook. Stop polling adopted tasks first: the
+		// successor folds the same records and watches them again, and a stale
+		// poller would report one exit twice.
+		for (const task of tasks.values()) {
+			if (task.adoptPoll) {
+				clearInterval(task.adoptPoll);
+				task.adoptPoll = undefined;
+			}
+		}
 		// Only a quit ends these processes: `reload`, `new`, `resume` and `fork`
 		// replace the extension instance while the tasks keep running, and their
 		// records must stay "running" for the successor to adopt.
