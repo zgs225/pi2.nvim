@@ -80,7 +80,7 @@ end
 -- ---------------------------------------------------------------------------
 
 ---@class StdinE2EProvider
----@field server uv.uv_tcp_t
+---@field server? uv.uv_tcp_t
 ---@field turn integer
 ---@field bodies string[]
 ---@field out_path string file the background shell writes the line it read into

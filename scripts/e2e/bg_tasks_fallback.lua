@@ -153,7 +153,7 @@ end
 ---@field base integer provider attempts that belong to earlier runs
 
 ---@class FallbackE2EProvider
----@field server uv.uv_tcp_t
+---@field server? uv.uv_tcp_t
 ---@field attempt integer requests received so far
 ---@field bodies table<integer, string> request body per attempt
 ---@field status table<integer, integer> HTTP status answered per attempt

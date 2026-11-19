@@ -108,7 +108,7 @@ end
 -- ---------------------------------------------------------------------------
 
 ---@class OwnershipE2EProvider
----@field server uv.uv_tcp_t
+---@field server? uv.uv_tcp_t
 ---@field phase "A"|"F"|"C"|"D"
 ---@field turn integer
 ---@field bodies string[] request body per answered request, in this phase

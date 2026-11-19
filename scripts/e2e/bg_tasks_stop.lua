@@ -111,7 +111,7 @@ end
 -- ---------------------------------------------------------------------------
 
 ---@class StopE2EProvider
----@field server uv.uv_tcp_t
+---@field server? uv.uv_tcp_t
 ---@field turn integer requests answered so far
 ---@field bodies string[] request body per turn
 ---@field gc_path string file the background shell writes its child pid to

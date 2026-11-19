@@ -94,12 +94,12 @@ end
 -- ---------------------------------------------------------------------------
 
 ---@class ReportE2EProvider
----@field server uv.uv_tcp_t
+---@field server? uv.uv_tcp_t
 ---@field turn integer requests answered so far
 ---@field bodies string[] request body per turn
 ---@field task_id string? the task id read out of T1's tool result
 ---@field missing_task_id boolean? set when the bash result carried no task id
----@field script fun(body: string): string[] queued scripted answers (R5, R6)
+---@field script (fun(): string)[] queued scripted answers (R5, R6)
 ---@field forged_task_id string? id of the delimiter-forging task (R5)
 ---@field batch_task_ids string[] ids of the two batched tasks (R6)
 

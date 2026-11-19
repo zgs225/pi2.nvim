@@ -94,10 +94,10 @@ end
 -- ---------------------------------------------------------------------------
 
 ---@class DeadlineE2EProvider
----@field server uv.uv_tcp_t
+---@field server? uv.uv_tcp_t
 ---@field turn integer requests answered so far
 ---@field bodies string[] request body per turn
----@field script fun(body: string): string[] queued scripted answers
+---@field script (fun(): string)[] queued scripted answers
 
 ---@return string
 local function sse_headers()

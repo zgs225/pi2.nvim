@@ -128,7 +128,7 @@ end
 -- ---------------------------------------------------------------------------
 
 ---@class ReconcileE2EProvider
----@field server uv.uv_tcp_t
+---@field server? uv.uv_tcp_t
 ---@field phase "A"|"B" which run is being answered
 ---@field turn integer requests answered in this phase
 ---@field bodies string[] request body per answered request, in order

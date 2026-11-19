@@ -100,7 +100,7 @@ end
 -- ---------------------------------------------------------------------------
 
 ---@class WakeE2EProvider
----@field server uv.uv_tcp_t
+---@field server? uv.uv_tcp_t
 ---@field turn integer requests answered so far
 ---@field bodies string[] request body per turn
 ---@field task_ids string[] ids read out of T1's two tool results
