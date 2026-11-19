@@ -4,6 +4,9 @@
 #                  Files run in parallel, 120 s per file: tests/worktree_git_spec.lua
 #                  alone spends ~50 s on real git commits at APFS fsync speed, which
 #                  plenary's 50 s default would kill under parallel load.
+#   make check   — static gates: LuaJIT parse (G24) + docs sync; `check-selftest`
+#                  proves each gate can still fail. Needs `luajit` (mise install)
+#                  and python3; see .mise.toml.
 #   make e2e     — run headless end-to-end scripts (tests/*_e2e.lua)
 #   make e2e-reaper — real-pi e2e: subagent idle reaper + max_children cap (needs pi binary + provider; not CI)
 #   make e2e-worktrees — real-git e2e: worktree create/apply/remove/ship/release (needs pi binary; no provider calls)
@@ -16,21 +19,26 @@
 #   make e2e-subagent-failure — real-pi e2e: a failed child run reaches the parent as a failed item (needs pi; not CI)
 #   make e2e-subagent-worktree — real-pi e2e: a spawn item's assigned worktree is the child's real cwd (needs pi; not CI)
 #   make smoke   — headless end-to-end smoke check (loads the user config, opens the chat)
-#   make format  — reformat lua/ and tests/ in place with stylua
-#   make style   — check formatting only (stylua --check); non-zero exit on drift, for CI/hooks
-#   make lint    — static/type check lua/ with lua-language-server (--check); non-zero on problems
+#   make format  — reformat in place: stylua (Lua) + ruff format (Python under scripts/)
+#   make style   — check formatting only (stylua --check + ruff format --check); for CI/hooks
+#   make lint    — static analysis: lua-language-server over lua/ + ruff check over scripts/
 #   make docs-links — validate relative links and anchors in README.md and doc/*.md
 #
 # The suite is intentionally runnable without the user's full Neovim config so
 # it stays fast and deterministic; PLENARY_PATH overrides the plenary location.
 
 NVIM_BIN ?= nvim
+PYTHON_BIN ?= python3
+LUAJIT_BIN ?= luajit
 PLENARY_PATH ?= $(HOME)/.local/share/nvim/lazy/plenary.nvim
 MIN_INIT := tests/minimal_init.lua
 STYLUA_BIN ?= stylua
 LUA_LS_BIN ?= lua-language-server
+RUFF_BIN ?= ruff
 
-.PHONY: test smoke format style lint docs-links e2e e2e-reaper e2e-worktrees e2e-bg-delivery e2e-bg-stop e2e-bg-reconcile e2e-bg-stdin e2e-bg-report e2e-bg-ownership e2e-subagent-failure e2e-subagent-worktree
+export LUAJIT_BIN
+
+.PHONY: test smoke format style lint docs-links check check-selftest check-list parse e2e e2e-reaper e2e-worktrees e2e-bg-delivery e2e-bg-stop e2e-bg-reconcile e2e-bg-stdin e2e-bg-report e2e-bg-ownership e2e-subagent-failure e2e-subagent-worktree
 
 test:
 	PLENARY_PATH=$(PLENARY_PATH) $(NVIM_BIN) --headless -u $(MIN_INIT) \
@@ -114,15 +122,41 @@ smoke:
 format:
 	$(STYLUA_BIN) .
 	$(STYLUA_BIN) .
+	$(RUFF_BIN) format scripts
+	$(RUFF_BIN) check --fix scripts
 
+# Formatting only. Ruff sees `scripts/` — the check harness itself, which had no
+# gate at all before ruff (stylua only reads Lua, lua-language-server only reads
+# lua/). Config: ruff.toml.
 style:
 	$(STYLUA_BIN) --check .
+	$(RUFF_BIN) format --check scripts
 
 # lua-language-server exits non-zero when diagnostics are found, so this gates
 # directly. Config is .luarc.json (portable: bundled luv types only; vim runtime
 # types are intentionally not loaded so the check is environment-independent).
+# ruff check is the analysis half for Python (imports, unused names, bug patterns).
 lint:
 	$(LUA_LS_BIN) --check lua --configpath $(CURDIR)/.luarc.json --loglevel error
+	$(RUFF_BIN) check scripts
 
 docs-links:
-	python3 scripts/check_docs_links.py
+	$(PYTHON_BIN) scripts/check_docs_links.py
+
+# Static gates that can be decided by a machine (scripts/checks/): the LuaJIT
+# parse gate, docs sync, and every rule added later. `check-selftest` proves the
+# gates can still fail (fixtures), which is the guard against a check that
+# reports green because it never matches anything.
+check:
+	$(PYTHON_BIN) -m scripts.checks
+
+check-selftest:
+	$(PYTHON_BIN) -m scripts.checks --self-test
+
+check-list:
+	$(PYTHON_BIN) -m scripts.checks --list
+
+# LuaJIT syntax gate alone (G24): the cheapest way to answer "does this load on
+# Neovim stable". Any LuaJIT 2.1 build works; mise pins one for parity.
+parse:
+	$(PYTHON_BIN) -m scripts.checks --only parse-luajit

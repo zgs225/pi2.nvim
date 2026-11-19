@@ -1,0 +1,31 @@
+# Python gate config for the check harness (`scripts/**`).
+#
+# Why: until this file existed, the Python in this repo — the gates themselves,
+# 1000+ lines that are edited most often — was the only code with no gate at
+# all. stylua only sees Lua, lua-language-server only sees `lua/`.
+#
+# Conventions mirror `.stylua.toml` so a Python file and a Lua file in this repo
+# look like they came from the same project: 4-space indent, 120 columns,
+# double quotes, LF endings.
+#
+# `target-version` is the *floor* the tooling must run on (a distro python, the
+# macOS CLT python, CI's python), not the newest interpreter available: the
+# checks are stdlib-only by design and must not require 3.9+ syntax.
+
+target-version = "py38"
+line-length = 120
+extend-exclude = [".git", ".worktrees", "scripts/checks/fixtures"]
+
+[format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+
+[lint]
+# E/W/F are the classic pycodestyle/pyflakes set, I sorts imports, B catches
+# real bug patterns (mutable defaults, shadowed loop vars), C4 simplifies
+# comprehensions, UP keeps the code from carrying pre-3.8 idioms.
+select = ["E", "W", "F", "I", "B", "C4", "UP"]
+# Line length is the formatter's job; flagging long comment/URL lines on top of
+# it produces churn with no fix.
+ignore = ["E501"]

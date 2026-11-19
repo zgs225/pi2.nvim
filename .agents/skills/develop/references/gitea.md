@@ -1,37 +1,66 @@
-# Gitea via tea CLI
-
-All Gitea interaction goes through `tea` (`/usr/bin/tea`, 0.15.1, installed via eos-bootstrap `pacman_packages`). **Never hand-roll curl against the API** — labels/state must be set through tea so commands stay reproducible.
+# Gitea issues — `gt` (gitea-cli)
 
 **This repo's issue tracker lives exclusively on Gitea (`git.yuez.me/yuez/pi2.nvim`). GitHub is a public mirror only; do not open or leave personal development issues there. If one is accidentally created on GitHub, migrate it here and delete the GitHub copy (see the "Migrate from GitHub" row below).**
 
-## Login
+All issue interaction goes through **`gt`** — gitea-cli 1.2.0, installed system-wide at
+`/usr/bin/gt`. `tea` is gone: gitea-cli replaced it (upstream moved to
+`gitea.com/gitea/cli`, the binary is now `gt`, and its config lives in
+`~/.config/gitea-cli/`). Do not invoke `tea`, and **never hand-roll curl against
+the API** — labels and state must be set through `gt` so commands stay
+reproducible.
 
-Done once (token from chezmoi-encrypted `GITEA_TOKEN` in `~/.zshrc.local`):
+## Auth
+
+The token is stored in the **keyring** and `gt auth status` is the check:
 
 ```bash
-tea login add --url https://git.yuez.me --token "$GITEA_TOKEN" --name yuez
-tea whoami   # verify
+gt auth status
+# https://git.yuez.me  yuez  true  token  keyring  true   <- last column: can authenticate
 ```
 
-`tea` stores config in `~/.config/tea/config.yml`. Outside a repo checkout, always pass `-r yuez/pi2.nvim`; inside the repo it is discovered from the git remote.
+**Pitfall — an exported `GITEA_TOKEN` breaks `gt`.** `gt` prefers the environment
+token over the keyring and then demands to know which instance it belongs to:
+
+```text
+Error: GITEA_TOKEN requires GITEA_CLI_HOST or GITEA_INSTANCE_URL naming its instance
+```
+
+Either name the instance for the session, or fall back to the keyring credential:
+
+```bash
+export GITEA_INSTANCE_URL=https://git.yuez.me     # keep using $GITEA_TOKEN
+env -u GITEA_TOKEN gt issue view 117 -R yuez/pi2.nvim   # or use the keyring
+```
+
+**Repo discovery:** the git remote here is the GitHub mirror, so `gt` will not
+find the Gitea repo by itself — pass `-R yuez/pi2.nvim` (it is an inherited flag
+on every `gt issue` command). Multiline bodies come from a file (`-F body.md`,
+or `-F -` for stdin), never from shell quoting.
 
 ## Issue lifecycle cheat sheet
 
 | Action | Command |
 |--------|---------|
-| Create | `tea issue create -r yuez/pi2.nvim -t "<title>" -d "$(cat body.md)" -L "rpc,priority:low,review:pending"` |
-| Migrate from GitHub (Gitea is the source of truth) | Recreate on Gitea then delete on GitHub: `tea issue create -r yuez/pi2.nvim -t "..." -d "$(cat body.md)" -L "original,priority:medium,review:pending"` and `gh issue delete --repo zgs225/pi2.nvim <gh-number> --yes` |
-| List | `tea issue list -r yuez/pi2.nvim` |
-| Show one | `tea issue show -r yuez/pi2.nvim <index>` |
-| Comment (implementation notes) | `tea comments add -r yuez/pi2.nvim <index> "note"` |
-| Add labels (triage → approved) | `tea issue edit -r yuez/pi2.nvim <index> -L "review:approved"` |
-| Swap labels | `tea issue edit -r yuez/pi2.nvim <index> -L "pr:awaiting-review" --remove-labels "review:pending"` |
-| Close | `tea issue close -r yuez/pi2.nvim <index>` |
-| Reopen | `tea issue open -r yuez/pi2.nvim <index>` |
+| Create | `gt issue create -R yuez/pi2.nvim -t "<title>" -F body.md -l original -l priority:low -l review:pending` |
+| Migrate from GitHub | recreate here with the line above, then `gh issue delete --repo zgs225/pi2.nvim <gh-number> --yes` |
+| List | `gt issue list -R yuez/pi2.nvim` (`-s all`, `-l label` to filter, `-L <n>` to limit) |
+| Show one | `gt issue view -R yuez/pi2.nvim <index>` |
+| Timeline | `gt issue timeline -R yuez/pi2.nvim <index>` |
+| Comment (implementation notes) | `gt issue comment -R yuez/pi2.nvim <index> -F note.md` |
+| Add a label (triage → approved) | `gt issue edit -R yuez/pi2.nvim <index> --add-label review:approved` |
+| Swap labels | `gt issue edit -R yuez/pi2.nvim <index> --add-label pr:awaiting-review --remove-label review:pending` |
+| Close | `gt issue close -R yuez/pi2.nvim <index>` (`-c "note"` comments first) |
+| Reopen | `gt issue reopen -R yuez/pi2.nvim <index>` |
+
+Notes: `-l` / `--add-label` take label **names** (no id mapping, and names must
+exist in the repo — see `gt label list -R yuez/pi2.nvim`). `--dry-run` prints the
+write requests without sending them, which is the cheapest way to check a
+composite command.
 
 ## Conventions
 
-- Issue **body is the spec** — never overwrite it (`tea issue edit -d` only for typos). Implementation notes go in **comments** (`tea comments add`).
-- Labels: type `rpc` / `original`, `priority:{high,medium,low}`, review gate `review:pending` → `review:approved` → `pr:awaiting-review` / `pr:changes-requested` / `pr:approved`.
-- `-L` takes a comma-separated list; `--remove-labels` mirrors it. `--add-labels`/`--remove-labels` also exist for non-destructive updates.
-- Multiline bodies: write to a temp file and pass `-d "$(cat body.md)"`.
+- Issue **body is the spec** — never overwrite it (`gt issue edit -F` is for
+  typos only). Implementation notes go in **comments**.
+- Labels: type `original` (Neovim-specific feature) / `rpc` (pi RPC protocol),
+  `priority:{high,medium,low}`, review gate `review:pending` → `review:approved` →
+  `pr:awaiting-review` / `pr:changes-requested` / `pr:approved`.

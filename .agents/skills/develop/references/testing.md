@@ -1,6 +1,8 @@
-# Testing — the three layers in depth
+# Testing — the layers in depth
 
-The repo ships `tests/minimal_init.lua` and a `Makefile` with `test` (hermetic plenary), `smoke` (headless boot of the user config + open the chat), plus `format`/`style`/`lint` (stylua + lua-language-server; `style` and `lint` also gate CI — see `SKILL.md` § CI verification). This file explains each layer, the pitfalls unique to it, and how the `scripts/` templates sidestep them. Pick the cheapest layer that can observe the behavior; escalate only when it cannot.
+The repo ships `tests/minimal_init.lua` and a `Makefile` with `test` (hermetic plenary), `smoke` (headless boot of the user config + open the chat), plus the static gates `style`/`lint`/`check`/`docs-links` (stylua + ruff for formatting, lua-language-server + ruff for analysis, `scripts/checks/` for the LuaJIT/docs gates; all four gate CI — see `SKILL.md` § CI verification and `references/checks.md`). This file explains each runtime layer, the pitfalls unique to it, and how the `scripts/` templates sidestep them. Pick the cheapest layer that can observe the behavior; escalate only when it cannot.
+
+**Before any layer:** run the static gates (`make check`, `make style`, `make lint`). They are seconds, they catch whole classes of defect (a LuaJIT parse error means the plugin does not load at all; a stale doc claim means the docs lie), and they are what CI will judge first.
 
 ## Layer 1 — Unit tests (hermetic plenary)
 
@@ -111,7 +113,7 @@ When in doubt, add the cheaper test *and* the GUI screenshot; the screenshot is 
 
 ## Verification discipline (how to avoid stacking errors)
 
-1. **Lock a baseline first (M0).** Before any feature work, confirm `make test` + `make smoke` are green on a clean checkout and create a feature branch. Every later step re-runs these; a regression fails fast.
+1. **Lock a baseline first (M0).** Before any feature work, confirm `make test` + `make smoke` + `make check` are green on a clean checkout and create a feature branch. Every later step re-runs these; a regression fails fast.
 2. **Small steps, each verified, each committed.** Build a feature as: pure module → unit test (green) → commit; wire it in → headless e2e (green) → commit; if key/visual → GUI e2e (green) → commit. Each commit is a rollback point.
 3. **Milestone gates.** Group steps into milestones; do not start the next milestone until the gate (unit + smoke + relevant e2e, all green) passes. The risky rendering work goes *after* the low-risk input work is locked.
 4. **Stub the LLM.** In any e2e that submits a prompt, replace the backend so no real model call and no transcript write happen: `chat._agent.send = function(_) end`. Because the stub short-circuits *before* the RPC send, the pi backend never writes a session file — so sessions are not polluted. (Do **not** `grep` your way to "test sessions" to delete: a match can be inside an *assistant* quote of your test text, i.e. a real session. See gotcha G18.)
@@ -124,7 +126,7 @@ When in doubt, add the cheaper test *and* the GUI screenshot; the screenshot is 
      ```
      (requires the one-time `dir = vim.env.PI_DEV_DIR or nil` line in the user's pi lazy spec — present in this setup). Mention that a plain `nvim` (no `PI_DEV_DIR`) shows the pre-change behavior for comparison.
    - Change already **merged to `main`** → plain `nvim` (the live lazy checkout tracks `main`; restart nvim so lazy reloads, G21).
-8. **Confirm CI is green post-merge.** After pushing `main`, check the GitHub Actions run for the merge commit (`make style` + `make lint`). The runner is a clean environment, so a local pass does not guarantee a CI pass — the run is the authoritative reproducibility gate, and the feature is not done until it is green. Commands in `SKILL.md` § CI verification.
+8. **Confirm CI is green post-merge.** After pushing `main`, check the GitHub Actions run for the merge commit (`make style` + `make lint` + `make check` + `make docs-links`). The runner is a clean environment, so a local pass does not guarantee a CI pass — the run is the authoritative reproducibility gate, and the feature is not done until it is green. Commands in `SKILL.md` § CI verification.
 
 ## How to use the bundled scripts
 
