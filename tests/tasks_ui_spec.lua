@@ -1241,3 +1241,34 @@ describe("tasks panel UI", function()
         end)
     end)
 end)
+
+describe("pi.tasks panel row for a held report", function()
+    before_each(function()
+        Tasks._reset()
+    end)
+
+    it("shows the hold reason on a finished row", function()
+        local base = now_ms()
+        seed({
+            id = "held1",
+            command = "make test",
+            status = "completed",
+            start_time = base - 65000,
+            end_time = base - 5000,
+            exit_code = 0,
+            held_reason = "cache",
+        })
+        local row = Tasks.build_rows(base)[1]
+        local line = Panel.format_line(row, 0, 120)
+        assert.is_truthy(line:find("held1", 1, true))
+        assert.is_truthy(line:find("held (cache)", 1, true), "the row must say why the report is waiting: " .. line)
+    end)
+
+    it("keeps a delivered row clean", function()
+        local base = now_ms()
+        seed({ id = "plain1", status = "completed", start_time = base - 65000, end_time = base - 5000 })
+        local row = Tasks.build_rows(base)[1]
+        local line = Panel.format_line(row, 0, 120)
+        assert.is_nil(line:find("held", 1, true))
+    end)
+end)

@@ -1060,3 +1060,58 @@ describe("resumed session (history replay)", function()
         assert.are.equal("echo quick-done", Tasks.get("b3f2a1").command)
     end)
 end)
+
+describe("bg-tasks idle-wake gate contract", function()
+    it("gates the idle wake behind an explicit policy lookup", function()
+        local src = read_extension()
+        assert.is_truthy(src:find("function idleWakeHold", 1, true))
+        assert.is_truthy(src:find('const PREFS_ENV = "PI_NVIM_BG_TASKS_FILE"', 1, true))
+        -- The decision runs inside the coalescing timer, i.e. only on the idle
+        -- path: a boundary delivery is already paid for by the run it joins.
+        local decision = src:find("const hold = idleWakeHold(pending)", 1, true)
+        assert.is_truthy(decision)
+        local held = src:find("markHeld(pending, hold)", 1, true)
+        assert.is_truthy(held)
+        assert.is_true(decision < held)
+        -- The counter moves only on the path that actually sends a wake.
+        local bump = src:find("wakesThisTurn += 1", 1, true)
+        assert.is_truthy(bump)
+        assert.is_true(held < bump)
+    end)
+
+    it("names every reason a wake can be held", function()
+        local src = read_extension()
+        assert.is_truthy(
+            src:find('type HoldReason = "policy" | "absent" | "cache" | "stale" | "budget"', 1, true),
+            "each rule must be nameable in the panel and in list_tasks"
+        )
+    end)
+
+    it("defaults to a budgeted policy that keeps plain pi working", function()
+        local src = read_extension()
+        assert.is_truthy(src:find('const DEFAULT_WAKE_POLICY: WakePolicy = "budgeted"', 1, true))
+        assert.is_truthy(src:find("const DEFAULT_WAKE_BUDGET = 2", 1, true))
+        assert.is_truthy(src:find("const DEFAULT_WAKE_CACHE_WINDOW_MS = 5 * 60 * 1000", 1, true))
+        -- No frontend file (plain TUI / SDK) must mean "someone may be reading".
+        assert.is_truthy(src:find("present: true,", 1, true))
+    end)
+
+    it("replenishes the budget and refreshes the cache clock from real activity", function()
+        local src = read_extension()
+        assert.is_truthy(src:find('pi.on("input"', 1, true))
+        assert.is_truthy(src:find('if (event.source === "extension")', 1, true))
+        assert.is_truthy(src:find("wakesThisTurn = 0", 1, true))
+        assert.is_truthy(src:find("lastUserAt = Date.now()", 1, true))
+        assert.is_truthy(src:find("lastRequestAt = Date.now()", 1, true))
+    end)
+
+    it("defers by leaving the report pending, not with a second channel", function()
+        local src = read_extension()
+        -- The deferred report rides the boundary / `context` path that already
+        -- exists; a second channel would deliver it twice.
+        assert.is_nil(src:find('deliverAs: "nextTurn"', 1, true))
+        assert.is_truthy(src:find("task.held = undefined", 1, true), "an actual delivery clears the hold")
+        assert.is_truthy(src:find("report held (${task.held})", 1, true), "list_tasks must explain the hold")
+        assert.is_truthy(src:find("held: task.held", 1, true), "the panel must explain the hold")
+    end)
+end)
