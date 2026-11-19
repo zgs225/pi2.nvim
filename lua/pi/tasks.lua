@@ -21,6 +21,9 @@ local M = {}
 ---@field pid integer|nil
 ---@field session_id string?  owning session id (passed in at event routing; nil = unknown ownership)
 ---@field tab integer?        owning tabpage handle (passed in at event routing; panel display)
+---@field held_reason string? why an idle wake for this task's report is being
+---                          held for the next user turn (see the bg-tasks
+---                          extension's idle-wake gate); nil once delivered
 
 ---@class pi.TasksRow
 ---@field task pi.Task
@@ -99,6 +102,12 @@ function M._reset()
     refresh_scheduled = false
     generation = generation + 1
     escalate_ms = DEFAULT_ESCALATE_MS
+    focused = true
+    published_cfg = nil
+    if presence_group then
+        pcall(vim.api.nvim_del_augroup_by_id, presence_group)
+        presence_group = nil
+    end
     for id in pairs(escalations) do
         cancel_escalation(id)
     end
@@ -110,6 +119,157 @@ end
 ---@param ms integer|nil
 function M._set_escalate_ms(ms)
     escalate_ms = type(ms) == "number" and ms >= 1 and math.floor(ms) or DEFAULT_ESCALATE_MS
+end
+
+-- Idle-wake policy plumbing ---------------------------------------------------
+--
+-- The bundled bg-tasks extension owns the wake decision (it is the process that
+-- can start a turn), but the policy belongs to the user's config, which lives
+-- here. The two are in different processes, so the policy travels through a
+-- runtime file — the same pattern as title.lua and todo/tool_ui.lua, and for the
+-- same reason: the child process env is frozen at spawn, so a live setup() call
+-- must reach an already-running backend without a respawn.
+
+---@type string?
+local state_path_override = nil
+
+--- Last config published, so a focus change can republish `present` alone.
+---@type pi.BackgroundTasksConfig?
+local published_cfg = nil
+
+--- Whether a human is at the editor right now: `nvim_list_uis()` is empty for
+--- headless and `--embed` instances, where nobody can be looking at a wake.
+---@type boolean
+local focused = true
+
+---@type integer?
+local presence_group = nil
+
+-- Mirror the extension's clamping (extensions/bg-tasks.ts) so a published value
+-- means exactly what the backend will do with it.
+local DEFAULT_WAKE_BUDGET = 2
+local MAX_WAKE_BUDGET = 10
+local DEFAULT_WAKE_CACHE_WINDOW_MS = 300000
+local MAX_WAKE_CACHE_WINDOW_MS = 86400000
+
+--- Runtime file conveying the configured idle-wake policy to already-spawned
+--- RPC processes, as JSON:
+--- `{wake_on_idle:string, wake_budget:number, wake_cache_window_ms:number, present:boolean}`.
+--- The PID is part of the name because stdpath("run") is per-user, not
+--- per-process: without it two concurrently running nvim instances would clobber
+--- each other's policy.
+---@return string
+function M.state_path()
+    if state_path_override then
+        return state_path_override
+    end
+    return vim.fn.stdpath("run") .. "/pi2nvim-bg-tasks-config-" .. tostring(vim.fn.getpid())
+end
+
+--- Override the state file path (tests).
+---@param path string?
+function M._set_path(path)
+    state_path_override = path
+end
+
+---@param value any
+---@param default integer
+---@param max integer
+---@return integer
+local function clamp_int(value, default, max)
+    if type(value) ~= "number" or value ~= value then
+        return default
+    end
+    return math.max(0, math.min(max, math.floor(value)))
+end
+
+--- Whether a human is at the editor right now.
+---@return boolean
+function M.present()
+    local ok, uis = pcall(vim.api.nvim_list_uis)
+    if not ok or type(uis) ~= "table" or #uis == 0 then
+        return false
+    end
+    return focused
+end
+
+--- Watch focus once per process. The extension only ever sees the resulting
+--- `present` flag; a lost wake costs a whole turn, so an unfocused editor is
+--- enough to hold it for the next prompt.
+local function watch_presence()
+    if presence_group then
+        return
+    end
+    local ok, group = pcall(vim.api.nvim_create_augroup, "PiTasksPresence", { clear = true })
+    if not ok then
+        return
+    end
+    ---@param value boolean
+    ---@return fun()
+    local function set(value)
+        return function()
+            focused = value
+            M.publish()
+        end
+    end
+    local gained = pcall(vim.api.nvim_create_autocmd, "FocusGained", { group = group, callback = set(true) })
+    local lost = pcall(vim.api.nvim_create_autocmd, "FocusLost", { group = group, callback = set(false) })
+    if gained and lost then
+        presence_group = group
+    else
+        pcall(vim.api.nvim_del_augroup_by_id, group)
+    end
+end
+
+--- Publish the idle-wake policy for the extension. Always writes the file, so a
+--- live setup() change (or an explicit `wake_on_idle = "never"`) reaches a
+--- backend that was spawned earlier.
+---@param cfg pi.BackgroundTasksConfig?
+function M.publish(cfg)
+    if cfg ~= nil then
+        published_cfg = cfg
+    end
+    watch_presence()
+    local c = published_cfg or {}
+    local policy = c.wake_on_idle
+    if policy ~= "always" and policy ~= "never" then
+        policy = "budgeted"
+    end
+    local ok, payload = pcall(vim.json.encode, {
+        wake_on_idle = policy,
+        wake_budget = clamp_int(c.wake_budget, DEFAULT_WAKE_BUDGET, MAX_WAKE_BUDGET),
+        wake_cache_window_ms = clamp_int(
+            c.wake_cache_window_ms,
+            DEFAULT_WAKE_CACHE_WINDOW_MS,
+            MAX_WAKE_CACHE_WINDOW_MS
+        ),
+        present = M.present(),
+    })
+    if not ok then
+        return
+    end
+    local f = io.open(M.state_path(), "w")
+    if f then
+        f:write(payload)
+        f:close()
+    end
+end
+
+--- The published policy, if the file exists and decodes (what the extension
+--- sees). Useful to the panel and to specs; never required for behavior.
+---@return table?
+function M.published()
+    local f = io.open(M.state_path(), "r")
+    if not f then
+        return nil
+    end
+    local content = f:read("*a") or ""
+    f:close()
+    local ok, decoded = pcall(vim.json.decode, content)
+    if not ok or type(decoded) ~= "table" then
+        return nil
+    end
+    return decoded
 end
 
 --- Insert a task, or replace the existing record with the same id wholesale.
@@ -289,6 +449,19 @@ function M.handle_event(ev, session_id, tab)
     local id = d.taskId
     if type(id) ~= "string" or id == "" then
         return false
+    end
+    -- A held report is announced by a repeat panel message, not by a state
+    -- change: the task is terminal and only its report is waiting for the user.
+    -- Handled before the kind switches so a replayed terminal event cannot
+    -- re-stamp end_time just to carry the reason.
+    local held = non_null(d.held)
+    if type(held) == "string" and held ~= "" then
+        local waiting = store[id]
+        if waiting then
+            waiting.held_reason = held
+            M.request_refresh()
+        end
+        return true
     end
     local ts = normalize_ts(ev.timestamp)
     -- An adopted task (one a previous pi process started, reported again on

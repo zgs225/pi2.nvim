@@ -88,6 +88,9 @@ jobs:
       - name: coalesced idle wake (two same-tick completions, ONE wake)
         run: make e2e-bg-wake
 
+      - name: idle-wake cost gate (a held completion starts no turn, rides the next prompt)
+        run: make e2e-bg-wake-gate
+
       - name: deadline check-in + lifetime note (ONE notify-only message each, no kill)
         run: make e2e-bg-deadline
 

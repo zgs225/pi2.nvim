@@ -127,6 +127,20 @@
  * carries no `details` (so it cannot fabricate a panel row), marks no delivery
  * state and is best-effort.
  *
+ * The IDLE WAKE is the expensive path, so it is gated (`idleWakeHold`). A
+ * completion that lands while nothing is running starts a turn of its own, and
+ * that turn is priced by the whole conversation, not by the report — harshest
+ * where it is least useful: nobody at the editor, prompt cache expired (a wake
+ * minutes later re-reads everything at full input price instead of the cache
+ * read), or a task that predates the newest user message, i.e. old news. So the
+ * idle branch consults a policy the frontend publishes (`PREFS_ENV`, re-read per
+ * decision): `always`, `budgeted` (default: `wake_budget` wakes per user prompt,
+ * then hold), or `never`. A held report is NOT dropped and gets no new channel:
+ * it stays `none`, so the next boundary — the user's next turn — or the
+ * `context` fallback carries it exactly as before. What the hold adds is the
+ * REASON (`policy` / `absent` / `cache` / `stale` / `budget`), shown by `:PiTasks`
+ * and `list_tasks`, because a hold nobody can explain reads as a lost report.
+ *
  * The task table OUTLIVES the process that built it, and the SESSION TRANSCRIPT
  * is the only place it is written. Every state transition already reaches it as
  * a `pi2_bg_task` custom message (`started` carries command/pid/pidStartTime/
@@ -273,6 +287,29 @@ const MAX_DEADLINE_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_MAX_LIFETIME_MS = 24 * 60 * 60 * 1000;
 const LIFETIME_ENV = "PI_BG_TASK_MAX_LIFETIME_MS";
 /**
+ * Where the frontend publishes its idle-wake policy (JSON:
+ * `{wake_on_idle, wake_budget, wake_cache_window_ms, present}`), re-read at every
+ * decision so a live `setup()` call or a focus change applies without respawning
+ * the process. Absent file = defaults (see `readWakePrefs`).
+ */
+const PREFS_ENV = "PI_NVIM_BG_TASKS_FILE";
+/** Idle-wake policies, most to least eager. */
+const WAKE_POLICIES = ["always", "budgeted", "never"] as const;
+type WakePolicy = (typeof WAKE_POLICIES)[number];
+const DEFAULT_WAKE_POLICY: WakePolicy = "budgeted";
+/** Idle wakes allowed per user prompt under `budgeted`. */
+const DEFAULT_WAKE_BUDGET = 2;
+const MAX_WAKE_BUDGET = 10;
+/**
+ * How stale the prompt cache may be before an idle wake is held. A wake costs
+ * one full request priced by the CONVERSATION, and a request after the cache
+ * lifetime (5 minutes by default) re-reads all of it at full input price instead
+ * of the cache-read price. 0 disables the window.
+ */
+const DEFAULT_WAKE_CACHE_WINDOW_MS = 5 * 60 * 1000;
+/** Anything longer than a day is a typo, not a policy. */
+const MAX_WAKE_CACHE_WINDOW_MS = 24 * 60 * 60 * 1000;
+/**
  * Grace window for an idle wake: a message sent this recently may still be on
  * its way into context, so the `context` fallback waits one boundary before
  * concluding it was dropped. Only applies to the `wake` channel — boundary
@@ -299,6 +336,21 @@ const MAX_REARMS = 3;
 
 /** How far a completion report has got on its way into model context. */
 type DeliveryState = "none" | "sent" | "confirmed";
+/**
+ * Why an idle wake was HELD instead of sent. Recorded on the task so the panel
+ * and `list_tasks` can explain it — a hold nobody can see is indistinguishable
+ * from a report that was lost.
+ */
+type HoldReason = "policy" | "absent" | "cache" | "stale" | "budget";
+
+/** The frontend-published idle-wake policy (see `PREFS_ENV`). */
+interface WakePrefs {
+	policy: WakePolicy;
+	budget: number;
+	cacheWindowMs: number;
+	/** Whether a human is at the editor (frontend `FocusGained`/`FocusLost`). */
+	present: boolean;
+}
 /** Channel that carried a report's text. */
 type DeliveryChannel = "boundary" | "wake" | "fallback" | "tool-result";
 
@@ -318,6 +370,8 @@ interface BgTaskDetails {
 	outputFile: string;
 	exitCode?: number | null;
 	signal?: string | null;
+	/** Set when the report is waiting for the next user turn, not for a wake. */
+	held?: HoldReason;
 	/**
 	 * When the process actually started (epoch ms). The message that carries
 	 * this is stamped when it is SENT, so an adopted task — one whose process
@@ -370,6 +424,14 @@ interface BgTaskState {
 	sentAt?: number;
 	/** Which channel carried `sentText`. */
 	sentVia?: DeliveryChannel;
+	/**
+	 * Why the idle wake for this report is being held (see `idleWakeHold`). Cleared
+	 * as soon as a channel carries the report, so the panel never shows a stale
+	 * reason for a report that has since been delivered.
+	 */
+	held?: HoldReason;
+	/** When the hold was recorded (ms), so the UI can age it. */
+	heldAt?: number;
 	/**
 	 * Whether this record was rebuilt from the transcript rather than spawned by
 	 * this process — either adopted (a `/reload`, or a resume after a crash) or a
@@ -666,6 +728,18 @@ function pidIsRecordedProcess(pid: number, recorded: string | undefined): boolea
  * here (not read from a ctx) because the exit callbacks run outside any event.
  */
 let busy = false;
+/**
+ * Wake-budget bookkeeping. `lastUserAt` is the newest real user input (typed or
+ * API): a task that started BEFORE it is reporting old news. `lastRequestAt` is
+ * when a request was last handed over, which is the closest proxy for "the
+ * prompt cache is warm". `wakesThisTurn` is the per-prompt allowance, reset by
+ * the next user input rather than by a clock.
+ */
+let lastUserAt = 0;
+let lastRequestAt: number | undefined;
+let wakesThisTurn = 0;
+/** Last read of the frontend policy file, keyed by mtime+size. */
+let prefsCache: { key: string; value: WakePrefs } | undefined;
 
 /**
  * Signal a detached process group, falling back to the bare pid.
@@ -1519,6 +1593,9 @@ export default function bgTasks(pi: ExtensionAPI) {
 	// a deep copy; nothing here is persisted.
 	// ------------------------------------------------------------------
 	pi.on("context", (event) => {
+		// Every request is one more chance that the prompt cache is warm; the
+		// closest thing to a cache timestamp an extension can observe.
+		lastRequestAt = Date.now();
 		const injectedStartup = applyStartupNote(event);
 		const outstanding = pendingReports();
 		if (outstanding.length === 0) {
@@ -1576,6 +1653,21 @@ export default function bgTasks(pi: ExtensionAPI) {
 	// aggregated `custom_message` entry — durable, unlike a steering message —
 	// and ask for one continuation so the model can act on it in this run.
 	// ------------------------------------------------------------------
+	// ------------------------------------------------------------------
+	// User presence. A real input (typed, or sent through the API) opens a new wake
+	// budget and makes every task that predates it old news (`idleWakeHold`'s
+	// `stale` rule). Messages another extension sends through `sendUserMessage` are
+	// not user presence and must reset neither.
+	// ------------------------------------------------------------------
+	pi.on("input", (event) => {
+		if (event.source === "extension") {
+			return undefined;
+		}
+		lastUserAt = Date.now();
+		wakesThisTurn = 0;
+		return undefined;
+	});
+
 	pi.on("agent_start", () => {
 		busy = true;
 		return undefined;
@@ -1825,6 +1917,31 @@ export default function bgTasks(pi: ExtensionAPI) {
 		task.sentVia = via;
 		task.sentText = text;
 		task.sentAt = Date.now();
+		// A report a channel now carries is no longer held for the user; a stale
+		// reason would make the panel contradict `list_tasks`.
+		task.held = undefined;
+		task.heldAt = undefined;
+	}
+
+	/**
+	 * Record that a completion is waiting for the USER, not for a turn.
+	 *
+	 * The report is deliberately left `none`: the boundary path (`deliverAtBoundary`
+	 * / the `context` fallback) already carries unelected reports on the next user
+	 * turn, so deferring needs no new channel and cannot double-deliver. What the
+	 * hold adds is the reason, which the panel and `list_tasks` show — the value of
+	 * the gate is that its cost is visible, and an invisible hold would read as a
+	 * lost report.
+	 */
+	function markHeld(batch: BgTaskState[], reason: HoldReason): void {
+		for (const task of batch) {
+			if (task.held === reason) {
+				continue;
+			}
+			task.held = reason;
+			task.heldAt = Date.now();
+			reportPanel(task);
+		}
 	}
 
 	/**
@@ -1964,6 +2081,96 @@ export default function bgTasks(pi: ExtensionAPI) {
 	}
 
 	/**
+	 * The frontend-published idle-wake policy, with defaults that keep a plain pi
+	 * (TUI, SDK, no pi.nvim) behaving as it did before: `budgeted`, two wakes per
+	 * prompt, and `present: true` because there is no focus to observe.
+	 *
+	 * The read is cached by mtime+size so the per-completion decision costs one
+	 * `stat`; a live `setup()` or a focus change rewrites the file and the next
+	 * decision sees it, without respawning the RPC process.
+	 */
+	function readWakePrefs(): WakePrefs {
+		const fallback: WakePrefs = {
+			policy: DEFAULT_WAKE_POLICY,
+			budget: DEFAULT_WAKE_BUDGET,
+			cacheWindowMs: DEFAULT_WAKE_CACHE_WINDOW_MS,
+			present: true,
+		};
+		const path = process.env[PREFS_ENV];
+		if (!path) {
+			return fallback;
+		}
+		try {
+			const stat = statSync(path);
+			const key = `${stat.mtimeMs}:${stat.size}`;
+			if (prefsCache?.key === key) {
+				return prefsCache.value;
+			}
+			const parsed = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+			const policy =
+				typeof parsed.wake_on_idle === "string" && (WAKE_POLICIES as readonly string[]).includes(parsed.wake_on_idle)
+					? (parsed.wake_on_idle as WakePolicy)
+					: fallback.policy;
+			const budget =
+				typeof parsed.wake_budget === "number" && Number.isFinite(parsed.wake_budget)
+					? Math.min(MAX_WAKE_BUDGET, Math.max(0, Math.floor(parsed.wake_budget)))
+					: fallback.budget;
+			const cacheWindowMs =
+				typeof parsed.wake_cache_window_ms === "number" && Number.isFinite(parsed.wake_cache_window_ms)
+					? Math.min(MAX_WAKE_CACHE_WINDOW_MS, Math.max(0, Math.floor(parsed.wake_cache_window_ms)))
+					: fallback.cacheWindowMs;
+			const value: WakePrefs = {
+				policy,
+				budget,
+				cacheWindowMs,
+				present: typeof parsed.present === "boolean" ? parsed.present : true,
+			};
+			prefsCache = { key, value };
+			return value;
+		} catch {
+			// Missing, unreadable, or caught mid-rewrite: keep the last good value
+			// rather than flipping the policy for one burst.
+			return prefsCache?.value ?? fallback;
+		}
+	}
+
+	/**
+	 * Decide whether this burst of completions may start a turn of its own.
+	 *
+	 * A wake is one full provider request whose price is the CONVERSATION, not the
+	 * report — and that price is highest exactly when a wake is least useful: nobody
+	 * is looking (`absent`), the prompt cache has expired so the whole conversation
+	 * is re-read at full input price (`cache`), the task predates the newest user
+	 * message so its result is old news (`stale`), or the prompt's allowance is
+	 * spent (`budget`). Holding is never a drop: the report stays `none` and rides
+	 * the next boundary or the `context` fallback, i.e. the user's next turn.
+	 *
+	 * Order matters. `never` explains every hold it causes; presence is the user's
+	 * own signal; then the cache window (the most expensive mistake); then
+	 * staleness; and the budget last, so a report held for a cheaper reason keeps
+	 * that reason instead of degrading to `budget`.
+	 */
+	function idleWakeHold(reports: BgTaskState[]): HoldReason | undefined {
+		const prefs = readWakePrefs();
+		if (prefs.policy === "never") {
+			return "policy";
+		}
+		if (!prefs.present) {
+			return "absent";
+		}
+		if (prefs.cacheWindowMs > 0 && lastRequestAt !== undefined && Date.now() - lastRequestAt > prefs.cacheWindowMs) {
+			return "cache";
+		}
+		if (lastUserAt > 0 && reports.every((task) => task.startedAt < lastUserAt)) {
+			return "stale";
+		}
+		if (prefs.policy === "budgeted" && wakesThisTurn >= prefs.budget) {
+			return "budget";
+		}
+		return undefined;
+	}
+
+	/**
 	 * Schedule ONE wake for every report that is pending when it fires. Idempotent
 	 * inside the window, so N completions in the same tick cost one `sendMessage`
 	 * (and `flushPending` drains all of them into one message). A pending wake does
@@ -1984,6 +2191,18 @@ export default function bgTasks(pi: ExtensionAPI) {
 				// `agent_settled` re-arms a wake if the run ends first.
 				return;
 			}
+			const pending = pendingReports().filter((task) => task.delivery === "none" && task.observers === 0);
+			if (pending.length === 0) {
+				return;
+			}
+			const hold = idleWakeHold(pending);
+			if (hold !== undefined) {
+				// Held, not dropped: the report stays `none`, so the next boundary or
+				// the `context` fallback carries it on the user's next turn.
+				markHeld(pending, hold);
+				return;
+			}
+			wakesThisTurn += 1;
 			flushPending({ wake: true });
 		}, WAKE_COALESCE_MS);
 		wakeTimer.unref?.();
@@ -2079,6 +2298,9 @@ export default function bgTasks(pi: ExtensionAPI) {
 			outputFile: task.outputFile,
 			exitCode: task.exitCode,
 			signal: task.signal,
+			// A terminal report that is held for the next user turn says so, so the
+			// panel can distinguish "done" from "done and waiting for you".
+			held: task.held,
 			// The message is stamped when it is sent, so an adopted task would
 			// otherwise render as if it had just started.
 			startedAt: task.startedAt,
@@ -2805,7 +3027,10 @@ export default function bgTasks(pi: ExtensionAPI) {
 					: "running";
 		// Only a live background task can be fed, and the model can only see that here.
 		const stdin = !task.completed && task.stdinOpen ? ", stdin open" : "";
-		return `- ${task.taskId} [${state}${stdin}] ${elapsed} "${command}" (output: ${task.outputFile})`;
+		// A held report is still pending delivery: say why, so the model can decide
+		// to `wait_task` instead of assuming the completion was swallowed.
+		const held = task.held !== undefined ? `, report held (${task.held})` : "";
+		return `- ${task.taskId} [${state}${stdin}${held}] ${elapsed} "${command}" (output: ${task.outputFile})`;
 	}
 
 	pi.registerTool({
