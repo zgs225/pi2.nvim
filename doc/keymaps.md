@@ -26,7 +26,7 @@ What the plugin does bind on its own:
 | `<CR>` / `o` | Open this task's output in a vsplit (cursor stays in the list) |
 | `a` / `i` | Open the output and focus it |
 | `p` | Preview the output live in a float (command + metadata header); press `p` again to close |
-| `x` | Stop the task under the cursor (asks for confirmation first) |
+| `x` | Stop the task under the cursor (asks for confirmation, then SIGTERMs its process group and SIGKILLs it if it has not exited after 5 s) |
 | `A` | Toggle between the current session's tasks (default) and all sessions' tasks |
 | `R` | Redraw the list |
 | `q` | Close the panel |

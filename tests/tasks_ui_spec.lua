@@ -852,7 +852,7 @@ describe("tasks panel UI", function()
     end)
 
     describe("stop key (x)", function()
-        it("confirms, marks the task stopped, and signals the pid", function()
+        it("confirms, marks the task stopped, and signals its process group", function()
             seed({ id = "run1", pid = 987654321 })
             Panel.open()
             vim.api.nvim_set_current_win(Panel.win(vim.api.nvim_get_current_tabpage()))
@@ -867,6 +867,34 @@ describe("tasks panel UI", function()
             local stopped = Tasks.get("run1")
             assert.are.equal("stopped", stopped.status)
             assert.is_not_nil(stopped.end_time)
+        end)
+
+        it("stops through the shared group-kill helper, not a bare-pid kill", function()
+            -- The panel used to call uv.kill(pid) itself, which left the
+            -- children of `npm run dev` running. It now goes through
+            -- pi.tasks.stop -> kill_group, so the group (and its guard against
+            -- pid 0/1) is the one place that decides.
+            seed({ id = "run1", pid = 4242 })
+            Panel.open()
+            vim.api.nvim_set_current_win(Panel.win(vim.api.nvim_get_current_tabpage()))
+
+            local orig_confirm = vim.fn.confirm
+            local orig_kill_group = Tasks.kill_group
+            local seen = nil
+            vim.fn.confirm = function()
+                return 1
+            end
+            Tasks.kill_group = function(pid, signum)
+                seen = { pid = pid, signum = signum }
+                return true
+            end
+            press("x")
+            vim.fn.confirm = orig_confirm
+            Tasks.kill_group = orig_kill_group
+
+            assert.is_not_nil(seen, "the panel must signal through pi.tasks.kill_group")
+            assert.are.equal(4242, seen.pid)
+            assert.are.equal("stopped", Tasks.get("run1").status)
         end)
 
         it("keeps the task running when the confirmation is declined", function()

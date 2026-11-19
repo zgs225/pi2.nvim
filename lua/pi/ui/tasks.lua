@@ -1041,9 +1041,11 @@ end
 
 -- Stop (x) --------------------------------------------------------------------
 
---- Stop the task under the cursor: confirm first, then optimistically mark it
---- stopped locally and signal the process. The authoritative stopped state
---- arrives later from the backend's pi2_bg_task event.
+--- Stop the task under the cursor: confirm first, then signal the task's
+--- process GROUP (not the bare pid) and optimistically mark it stopped locally.
+--- The authoritative stopped state arrives later from the backend's
+--- pi2_bg_task event. `Tasks.stop` owns both halves so the escalation rules and
+--- the group semantics live in one place.
 local function stop_under_cursor()
     local row, task = row_task_under_cursor()
     if not row or not task then
@@ -1058,10 +1060,7 @@ local function stop_under_cursor()
     if choice ~= 1 then
         return
     end
-    Tasks.mark_stopped(task.id)
-    if task.pid then
-        pcall(uv.kill, task.pid, "sigterm")
-    end
+    Tasks.stop(task.id)
 end
 
 -- Buffer & windows ------------------------------------------------------------

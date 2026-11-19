@@ -129,6 +129,31 @@ describe("pi.tasks handle_event", function()
         assert.is_true(t.start_time >= before, "start_time must come from vim.uv.now()")
     end)
 
+    it("prefers the payload's startedAt over the message timestamp", function()
+        -- An adopted task — a snapshot record from an earlier pi process,
+        -- reported again on session start — is stamped with the moment it was
+        -- REPORTED. Its real start is in the payload; without this the panel's
+        -- clock restarts at zero for a process that has run for minutes.
+        local started_at = os.time() * 1000 - 180000
+        Tasks.handle_event(started_ev("a", os.time() * 1000, { startedAt = started_at }))
+        local t = Tasks.get("a")
+        local expected_age = 180000
+        local age = vim.uv.now() - t.start_time
+        assert.is_true(
+            math.abs(age - expected_age) <= 2000,
+            "start_time must come from details.startedAt, got age " .. age
+        )
+
+        -- A terminal event for a task the frontend never saw start is
+        -- synthesized from the same fields, so it must agree.
+        Tasks.handle_event(ev("completed", { taskId = "b", startedAt = started_at }, os.time() * 1000))
+        local synthetic_age = vim.uv.now() - Tasks.get("b").start_time
+        assert.is_true(
+            math.abs(synthetic_age - expected_age) <= 2000,
+            "a synthesized record must use details.startedAt too, got age " .. synthetic_age
+        )
+    end)
+
     it("rebases Unix-epoch timestamps onto the uv clock", function()
         -- Core stamps custom messages with Date.now(); storing it verbatim
         -- makes age math (uv.now() - end_time) go negative and clamp to zero.
@@ -466,6 +491,211 @@ describe("pi.tasks refresh debounce", function()
         Tasks.request_refresh()
         pump(50)
         assert.are.equal(0, calls, "a canceled listener must not run")
+    end)
+end)
+
+---@param pid integer
+---@return boolean
+local function alive(pid)
+    local out = vim.fn.system({ "ps", "-p", tostring(pid), "-o", "pid=" })
+    return vim.trim(out or "") ~= ""
+end
+
+--- Spawn a real detached shell, the way the extension does (`detached: true`
+--- makes the child a process-group leader, so `-pid` addresses its group).
+---@param command string
+---@return table handle, integer pid
+local function spawn_detached(command)
+    local handle, pid = vim.uv.spawn("sh", { args = { "-c", command }, detached = true, stdio = { nil, nil, nil } })
+    assert(handle, "failed to spawn: " .. command)
+    return handle, pid
+end
+
+describe("pi.tasks kill_group", function()
+    before_each(function()
+        Tasks._reset()
+    end)
+
+    it("signals the process GROUP, so a shell's children die with it", function()
+        local pidfile = vim.fn.tempname() .. ".pid"
+        local handle, shell_pid = spawn_detached("sleep 3000 & echo $! > " .. pidfile .. "; wait")
+
+        local grandchild = nil
+        assert.is_true(
+            vim.wait(5000, function()
+                if vim.fn.filereadable(pidfile) ~= 1 then
+                    return false
+                end
+                local lines = vim.fn.readfile(pidfile)
+                grandchild = tonumber(lines[1] or "")
+                return grandchild ~= nil
+            end, 20),
+            "the shell never reported its child"
+        )
+        assert.is_true(alive(grandchild), "the child must be running before the test")
+        assert.is_true(Tasks.kill_group(shell_pid))
+
+        -- The whole point of the fix: a bare-pid signal leaves this alive, and
+        -- `npm run dev` is exactly this shape (a shell plus a long-lived child).
+        assert.is_true(
+            vim.wait(5000, function()
+                return not alive(grandchild)
+            end, 50),
+            "the grandchild outlived the group signal (pid-only kill regression)"
+        )
+        pcall(handle.close, handle)
+    end)
+
+    it("never addresses this process's own group or init", function()
+        -- pid 0 is OUR process group: a negative-pid kill there would signal
+        -- the Neovim running the suite. If this guard breaks, this test does
+        -- not fail — it dies.
+        assert.is_false(Tasks.kill_group(0))
+        assert.is_false(Tasks.kill_group(1))
+        assert.is_false(Tasks.kill_group(nil))
+        assert.is_false(Tasks.kill_group(-5))
+        assert.is_false(Tasks.kill_group("123"))
+    end)
+
+    it("reports false for an already dead pid instead of raising", function()
+        local handle, pid = spawn_detached("true")
+        vim.wait(5000, function()
+            return not alive(pid)
+        end, 20)
+        pcall(handle.close, handle)
+        assert.is_false(Tasks.kill_group(pid))
+    end)
+end)
+
+describe("pi.tasks stop", function()
+    before_each(function()
+        Tasks._reset()
+    end)
+
+    it("marks the task stopped and signals its process", function()
+        local handle, pid = spawn_detached("sleep 3000")
+        Tasks.upsert({ id = "b1", command = "sleep 3000", status = "running", start_time = 1, pid = pid })
+
+        assert.is_true(Tasks.stop("b1", 1800))
+        local task = Tasks.get("b1")
+        assert.are.equal("stopped", task.status)
+        assert.are.equal(1800, task.end_time)
+        assert.is_true(
+            vim.wait(5000, function()
+                return not alive(pid)
+            end, 50),
+            "the stopped task's process must be signalled"
+        )
+        pcall(handle.close, handle)
+    end)
+
+    it("does nothing for unknown, finished, or pid-less tasks", function()
+        assert.is_false(Tasks.stop("ghost"))
+
+        Tasks.upsert({ id = "done", command = "", status = "completed", start_time = 1, end_time = 2 })
+        assert.is_false(Tasks.stop("done"))
+        assert.are.equal("completed", Tasks.get("done").status)
+
+        -- A task whose spawn failed has no pid: it is still stopped locally,
+        -- because the record is what the panel renders.
+        Tasks.upsert({ id = "nopid", command = "", status = "running", start_time = 1 })
+        assert.is_true(Tasks.stop("nopid", 30))
+        assert.are.equal("stopped", Tasks.get("nopid").status)
+    end)
+end)
+
+describe("pi.tasks stop escalation", function()
+    before_each(function()
+        Tasks._reset()
+        Tasks._set_escalate_ms(150)
+    end)
+
+    after_each(function()
+        Tasks._set_escalate_ms(nil)
+    end)
+
+    --- Spawn a detached shell that has PROVABLY installed a SIGTERM trap.
+    ---
+    --- The marker file is written after `trap`, because a naive
+    --- spawn-then-signal race is decided by scheduling: a SIGTERM that lands
+    --- before the trap is installed kills the shell, and the test would pass
+    --- for the wrong reason.
+    ---@return table handle, integer pid
+    local function spawn_trapper()
+        local marker = vim.fn.tempname() .. ".ready"
+        local handle, pid = spawn_detached("trap '' TERM; : > " .. marker .. "; while :; do sleep 1; done")
+        assert.is_true(
+            vim.wait(5000, function()
+                return vim.fn.filereadable(marker) == 1
+            end, 10),
+            "the trapper never signalled readiness"
+        )
+        return handle, pid
+    end
+
+    --- Stop and reap a detached shell, whatever the test asserted.
+    ---@param handle table
+    ---@param pid integer
+    local function cleanup(handle, pid)
+        Tasks.kill_group(pid, "sigkill")
+        vim.wait(3000, function()
+            return not alive(pid)
+        end, 20)
+        pcall(handle.close, handle)
+    end
+
+    it("SIGKILLs a task that ignores SIGTERM, so `stopped` never means `running`", function()
+        local handle, pid = spawn_trapper()
+        Tasks.upsert({ id = "trapper", command = "ignore-term", status = "running", start_time = 1, pid = pid })
+
+        assert.is_true(Tasks.stop("trapper", 100), "the local stop must be accepted")
+        pump(80)
+        assert.is_true(alive(pid), "the trap must survive SIGTERM for this test to mean anything")
+        assert.is_true(
+            vim.wait(3000, function()
+                return not alive(pid)
+            end, 20),
+            "the escalation must SIGKILL a process that ignores SIGTERM"
+        )
+        cleanup(handle, pid)
+    end)
+
+    it("disarms the escalation when the backend's terminal event arrives", function()
+        local handle, pid = spawn_trapper()
+        Tasks.upsert({ id = "trapper", command = "ignore-term", status = "running", start_time = 1, pid = pid })
+        assert.is_true(Tasks.stop("trapper", 100))
+
+        -- The authoritative event lands inside the grace window: from here the
+        -- row's state is the backend's, so nothing may be killed behind it.
+        Tasks.handle_event(ev("stopped", { taskId = "trapper", signal = "SIGTERM" }), "sess-A")
+        pump(600) -- four times the escalation window
+
+        assert.is_true(alive(pid), "a task the backend already settled must not be SIGKILLed")
+        cleanup(handle, pid)
+    end)
+
+    it("forgets pending escalations on _reset instead of leaking or killing", function()
+        local handle, pid = spawn_trapper()
+        Tasks.upsert({ id = "trapper", command = "ignore-term", status = "running", start_time = 1, pid = pid })
+        assert.is_true(Tasks.stop("trapper", 100))
+
+        Tasks._reset()
+        pump(600)
+
+        assert.is_true(alive(pid), "a reset registry must not act on stale state")
+        cleanup(handle, pid)
+    end)
+
+    it("does not arm an escalation when no signal could be delivered", function()
+        -- A pid that never existed: kill_group cannot signal it, so the row is
+        -- marked stopped locally and nothing else is scheduled.
+        Tasks.upsert({ id = "ghostpid", command = "x", status = "running", start_time = 1, pid = 987654321 })
+        assert.is_true(Tasks.stop("ghostpid", 100))
+        assert.are.equal("stopped", Tasks.get("ghostpid").status)
+        pump(600)
+        -- Nothing to assert about a process; the point is that the timer path
+        -- stays silent (no error, no refresh storm) after the window passes.
+        assert.is_false(Tasks.refresh_due())
     end)
 end)
 

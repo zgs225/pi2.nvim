@@ -239,6 +239,148 @@ describe("wait_task renderer", function()
     end)
 end)
 
+describe("stop_task / list_tasks renderer", function()
+    it("gives both tools their own glyph instead of the generic fallback", function()
+        assert.are.equal(vim.fn.nr2char(0xF04DB, 1), Tools.get_tool_icon("stop_task"))
+        assert.are.equal(vim.fn.nr2char(0xF0279, 1), Tools.get_tool_icon("list_tasks"))
+    end)
+
+    it("names the task a stop targets, with the grace window when one was given", function()
+        Tasks._reset()
+        register_task("b3f2a1", "npm run dev")
+        local h = History.new(TAB)
+        h:on_tool_start("stop_task", "st1", { task_id = "b3f2a1", timeout_ms = 5000 })
+        pump(50)
+        local buf = h:buf()
+        assert.is_true(#rows_with(buf, "npm run dev · b3f2a1 (grace 5s)") == 1, table.concat(lines_of(buf), "\n"))
+        delete(h)
+        Tasks._reset()
+    end)
+
+    it("stays silent on a clean stop and badges an escalation", function()
+        local h = History.new(TAB)
+        h:on_tool_start("stop_task", "st2", { task_id = "b3f2a1" })
+        pump(50)
+        h:on_tool_end("stop_task", "st2", {
+            content = { { type = "text", text = "Task b3f2a1 was stopped (signal SIGTERM) after 3.0s (stopped)." } },
+            details = { taskId = "b3f2a1", status = "stopped", escalated = false },
+        }, false)
+        pump(60)
+        assert.is_false(has_badge(h, "killed"))
+        assert.is_false(has_badge(h, "still running"))
+        delete(h)
+
+        local h2 = History.new(TAB)
+        h2:on_tool_start("stop_task", "st3", { task_id = "b3f2a1" })
+        pump(50)
+        h2:on_tool_end("stop_task", "st3", {
+            content = {
+                { type = "text", text = "Task b3f2a1 was SIGKILLed (it ignored SIGTERM) after 8.0s (stopped)." },
+            },
+            details = { taskId = "b3f2a1", status = "stopped", escalated = true },
+        }, false)
+        pump(60)
+        assert.is_true(has_badge(h2, "killed"), table.concat(header_virt(h2), "|"))
+        delete(h2)
+    end)
+
+    it("badges a stop that did not take as still running", function()
+        local h = History.new(TAB)
+        h:on_tool_start("stop_task", "st4", { task_id = "b3f2a1" })
+        pump(50)
+        h:on_tool_end("stop_task", "st4", {
+            content = { { type = "text", text = "[still running] Task b3f2a1 did not exit" } },
+            details = { taskId = "b3f2a1", status = "still_running", escalated = true },
+        }, true)
+        pump(60)
+        assert.is_true(has_badge(h, "still running"), table.concat(header_virt(h), "|"))
+        delete(h)
+    end)
+
+    it("renders the task list as the body, not as one collapsed line", function()
+        local h = History.new(TAB)
+        h:on_tool_start("list_tasks", "lt1", {})
+        pump(50)
+        h:on_tool_end("list_tasks", "lt1", {
+            content = {
+                {
+                    type = "text",
+                    text = '1 of 1 background task, 1 running:\n- b3f2a1 [running] 1m04s "npm run dev" (output: /tmp/pi-bash-b3f2a1.log)',
+                },
+            },
+            details = { total = 1, running = 1, listed = 1 },
+        }, false)
+        pump(60)
+        local text = text_of(h:buf())
+        assert.is_truthy(text:find("npm run dev", 1, true), "expected the task row")
+        assert.is_truthy(text:find("pi-bash-b3f2a1.log", 1, true), "expected the log path")
+        delete(h)
+    end)
+end)
+
+describe("task_input renderer", function()
+    it("gives the tool its own glyph instead of the generic fallback", function()
+        assert.are.equal(vim.fn.nr2char(0xF030C, 1), Tools.get_tool_icon("task_input"))
+    end)
+
+    it("names the task and quotes the line it wrote", function()
+        Tasks._reset()
+        register_task("b3f2a1", "npm run dev")
+        local h = History.new(TAB)
+        h:on_tool_start("task_input", "ti1", { task_id = "b3f2a1", data = "y" })
+        pump(50)
+        local buf = h:buf()
+        assert.is_true(#rows_with(buf, "npm run dev · b3f2a1") == 1, table.concat(lines_of(buf), "\n"))
+        assert.is_true(#rows_with(buf, "→ y") == 1, table.concat(lines_of(buf), "\n"))
+        delete(h)
+        Tasks._reset()
+    end)
+
+    it("flags a raw write and stays silent when the bytes landed", function()
+        Tasks._reset()
+        register_task("b3f2a1", "npm run dev")
+        local h = History.new(TAB)
+        h:on_tool_start("task_input", "ti2", { task_id = "b3f2a1", data = "x", newline = false })
+        pump(50)
+        assert.is_true(#rows_with(h:buf(), "(no newline)") == 1, table.concat(lines_of(h:buf()), "\n"))
+        h:on_tool_end("task_input", "ti2", {
+            content = { { type = "text", text = "Wrote 1 byte(s) to task b3f2a1's stdin." } },
+            details = { taskId = "b3f2a1", status = "written", bytes = 1 },
+        }, false)
+        pump(60)
+        assert.is_false(has_badge(h, "no stdin"))
+        assert.is_false(has_badge(h, "already exited"))
+        delete(h)
+        Tasks._reset()
+    end)
+
+    it("badges a task that has no stdin, and one that already exited", function()
+        local h = History.new(TAB)
+        h:on_tool_start("task_input", "ti3", { task_id = "bdead1", data = "y" })
+        pump(50)
+        h:on_tool_end("task_input", "ti3", {
+            content = {
+                { type = "text", text = "Task bdead1 has no usable stdin: it was started without a stdin pipe" },
+            },
+            details = { taskId = "bdead1", status = "no_stdin" },
+        }, true)
+        pump(60)
+        assert.is_true(has_badge(h, "no stdin"), table.concat(header_virt(h), "|"))
+        delete(h)
+
+        local h2 = History.new(TAB)
+        h2:on_tool_start("task_input", "ti4", { task_id = "bdead2", data = "y" })
+        pump(50)
+        h2:on_tool_end("task_input", "ti4", {
+            content = { { type = "text", text = "Task bdead2 exited with code 0 — its stdin is gone" } },
+            details = { taskId = "bdead2", status = "exited" },
+        }, true)
+        pump(60)
+        assert.is_true(has_badge(h2, "already exited"), table.concat(header_virt(h2), "|"))
+        delete(h2)
+    end)
+end)
+
 describe("bg-tasks extension contract", function()
     it("registers a wait_task tool and points bash at it", function()
         local src = read_extension()
@@ -273,5 +415,101 @@ describe("bg-tasks extension contract", function()
         -- The lease is what stops a waited-on task from also producing a wake.
         assert.is_truthy(src:find("observers", 1, true))
         assert.is_truthy(src:find("task.observers > 0", 1, true))
+    end)
+
+    it("registers stop_task and list_tasks for the model, not only the panel", function()
+        local src = read_extension()
+        assert.is_truthy(src:find('name: "stop_task"', 1, true), "stop_task must be registered")
+        assert.is_truthy(src:find('name: "list_tasks"', 1, true), "list_tasks must be registered")
+        -- The model has to be told the affordance exists in the bash tool too.
+        assert.is_truthy(src:find("is stopped with stop_task", 1, true))
+        assert.is_truthy(src:find("list_tasks shows what is still running", 1, true))
+    end)
+
+    it("stops the whole process group, escalating SIGTERM to SIGKILL", function()
+        local src = read_extension()
+        -- A bare-pid kill leaves `node` under `npm` running and holding the port.
+        assert.is_truthy(src:find("process.kill(-pid, signal)", 1, true), "must signal the group")
+        assert.is_truthy(src:find("SIGTERM", 1, true))
+        assert.is_truthy(src:find("SIGKILL", 1, true))
+        assert.is_truthy(src:find("pid <= 1", 1, true), "pid 0/1 must never be signalled")
+    end)
+
+    it("takes the observer lease before signalling, so a stop is not also a wake", function()
+        local src = read_extension()
+        -- Order matters: attach, THEN signal. If the exit landed first the model
+        -- would get a wake report for a task this call is describing itself.
+        local attach_at = src:find("let waited = attachWait(task, { deadlineMs: grace, signal })", 1, true)
+        local signal_at = src:find('signalProcessGroup(task.pid, "SIGTERM")', 1, true)
+        assert.is_truthy(attach_at, "stop_task must attach before signalling")
+        assert.is_truthy(signal_at, "stop_task must signal the group")
+        assert.is_true(attach_at < signal_at, "the lease must be taken before the signal")
+    end)
+
+    it("identifies an adopted pid by its start time, not by its command line", function()
+        local src = read_extension()
+        -- A shell execs the last command of its `-c` script, so the recorded
+        -- command text and the live command line routinely disagree; identity
+        -- has to be the pid's start time. Text matching must not come back.
+        assert.is_truthy(src:find("pidStartTime", 1, true), "adoption must record a start-time fingerprint")
+        assert.is_truthy(src:find("/proc/", 1, true), "the fingerprint comes from the process table")
+        assert.is_nil(src:find("pidMatchesCommand", 1, true), "a command line is not identity")
+    end)
+
+    it("wraps every report in one structured reminder block", function()
+        local src = read_extension()
+        -- ONE helper builds the block, so the single and the batched form cannot
+        -- drift apart (a reader looks for the same wrapper either way).
+        local _, wrap_defs = src:gsub("function wrapReminder%(", "")
+        assert.are.equal(1, wrap_defs, "wrapReminder must be defined exactly once")
+        assert.is_truthy(src:find("<system-reminder>", 1, true))
+        assert.is_truthy(src:find("</system-reminder>", 1, true))
+        assert.is_truthy(src:find("<background-task ", 1, true), "each task is one element")
+        local wake_start = assert(src:find("function buildWakeNote", 1, true), "buildWakeNote must exist")
+        local batch_start = assert(src:find("function buildBatchNote", wake_start, true), "buildBatchNote follows")
+        local batch_end = src:find("function messageText", batch_start, true) or #src
+        assert.is_truthy(
+            src:sub(wake_start, batch_start):find("wrapReminder(", 1, true),
+            "the single-task note must go through wrapReminder"
+        )
+        assert.is_truthy(
+            src:sub(batch_start, batch_end):find("wrapReminder(", 1, true),
+            "the batch note must go through wrapReminder"
+        )
+    end)
+
+    it("carries the status in machine-readable attributes", function()
+        local src = read_extension()
+        assert.is_truthy(src:find("function reportStatus(", 1, true), "reportStatus must exist")
+        for _, status in ipairs({ '"running"', '"completed"', '"failed"', '"stopped"' }) do
+            assert.is_truthy(src:find(status, 1, true), "reportStatus must be able to say " .. status)
+        end
+        local start = assert(src:find("function taskAttrs", 1, true), "taskAttrs must exist")
+        local stop = assert(src:find("function wrapReminder", start, true), "wrapReminder follows taskAttrs")
+        local body = src:sub(start, stop)
+        for _, attr in ipairs({ 'id="', 'status="', 'exit_code="', 'signal="', 'duration_ms="', 'output="' }) do
+            assert.is_truthy(body:find(attr, 1, true), "taskAttrs must emit " .. attr)
+        end
+    end)
+
+    it("escapes the command, which is arbitrary shell text", function()
+        local src = read_extension()
+        assert.is_truthy(src:find("function escapeMarkup(", 1, true), "escapeMarkup must exist")
+        for _, entity in ipairs({ "&amp;", "&lt;", "&gt;", "&quot;" }) do
+            assert.is_truthy(src:find(entity, 1, true), "escapeMarkup must map to " .. entity)
+        end
+        assert.is_truthy(src:find("escapeMarkup(task.command)", 1, true), "the command must be escaped")
+    end)
+
+    it("keeps the banner as the first line, ahead of the reminder block", function()
+        local src = read_extension()
+        local wake_start = assert(src:find("function buildWakeNote", 1, true))
+        local wake = src:sub(wake_start, assert(src:find("function buildBatchNote", wake_start, true)))
+        local banner_at = assert(
+            wake:find("[SYSTEM NOTIFICATION - NOT USER INPUT]", 1, true),
+            "the banner literal must be in buildWakeNote itself"
+        )
+        local block_at = assert(wake:find("wrapReminder(", 1, true), "buildWakeNote must open the block")
+        assert.is_true(banner_at < block_at, "the banner must precede the <system-reminder> block")
     end)
 end)

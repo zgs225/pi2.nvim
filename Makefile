@@ -8,6 +8,11 @@
 #   make e2e-reaper — real-pi e2e: subagent idle reaper + max_children cap (needs pi binary + provider; not CI)
 #   make e2e-worktrees — real-git e2e: worktree create/apply/remove/ship/release (needs pi binary; no provider calls)
 #   make e2e-bg-delivery — real-pi e2e: background bash completion delivery into agent context (needs pi + provider; not CI)
+#   make e2e-bg-stop — real-pi e2e: stop_task kills the process group, list_tasks sees it (needs pi; fake provider, no account)
+#   make e2e-bg-reconcile — real-pi e2e: the task table survives a SIGKILLed pi and is adopted by the next run (needs pi; fake provider)
+#   make e2e-bg-stdin — real-pi e2e: a background task keeps its stdin and task_input feeds it (needs pi; fake provider)
+#   make e2e-bg-report — real-pi e2e: a completion report is one structured `<background-task>` block (needs pi; fake provider)
+#   make e2e-bg-ownership — real-pi e2e: a fork does not adopt the parent's tasks, a clean quit records its kills
 #   make e2e-subagent-failure — real-pi e2e: a failed child run reaches the parent as a failed item (needs pi; not CI)
 #   make e2e-subagent-worktree — real-pi e2e: a spawn item's assigned worktree is the child's real cwd (needs pi; not CI)
 #   make smoke   — headless end-to-end smoke check (loads the user config, opens the chat)
@@ -25,7 +30,7 @@ MIN_INIT := tests/minimal_init.lua
 STYLUA_BIN ?= stylua
 LUA_LS_BIN ?= lua-language-server
 
-.PHONY: test smoke format style lint docs-links e2e e2e-reaper e2e-worktrees e2e-bg-delivery e2e-subagent-failure e2e-subagent-worktree
+.PHONY: test smoke format style lint docs-links e2e e2e-reaper e2e-worktrees e2e-bg-delivery e2e-bg-stop e2e-bg-reconcile e2e-bg-stdin e2e-bg-report e2e-bg-ownership e2e-subagent-failure e2e-subagent-worktree
 
 test:
 	PLENARY_PATH=$(PLENARY_PATH) $(NVIM_BIN) --headless -u $(MIN_INIT) \
@@ -37,9 +42,10 @@ e2e:
 		$(NVIM_BIN) --headless -u $(MIN_INIT) -l $$f || exit 1; \
 	done
 
-# Real end-to-end against `pi --mode rpc` + live provider calls (scripts/e2e/).
-# Deliberately excluded from CI and `make test`: needs the pi binary and a
-# configured provider. See .agents/skills/develop/references/testing.md.
+# Real end-to-end against `pi --mode rpc` (scripts/e2e/). None of these are part
+# of `make test`. The four background-task suites that drive a scripted FAKE
+# provider run in CI (.github/workflows/e2e.yml); the ones that need a real
+# provider stay manual. See .agents/skills/develop/references/testing.md.
 e2e-reaper:
 	$(NVIM_BIN) --headless -u $(MIN_INIT) -l scripts/e2e/reaper.lua
 
@@ -51,6 +57,34 @@ e2e-worktrees:
 # stays out of CI and `make test`.
 e2e-bg-delivery:
 	$(NVIM_BIN) --headless -u $(MIN_INIT) -l scripts/e2e/bg_tasks_delivery.lua
+
+# Real-pi e2e for `stop_task` / `list_tasks`: a scripted fake provider drives the
+# real extension against a real process tree. Needs the pi binary only — runs in
+# CI.
+e2e-bg-stop:
+	$(NVIM_BIN) --headless -u $(MIN_INIT) -l scripts/e2e/bg_tasks_stop.lua
+
+# Real-pi e2e for the task-table snapshot: run pi, start a background task, SIGKILL
+# pi, then start pi again on the same session and let it adopt the orphan.
+# Needs the pi binary only — runs in CI.
+e2e-bg-reconcile:
+	$(NVIM_BIN) --headless -u $(MIN_INIT) -l scripts/e2e/bg_tasks_reconcile.lua
+
+# Real-pi e2e for stdin: a background shell reads a line, `task_input` writes it.
+# Needs the pi binary only — runs in CI.
+e2e-bg-stdin:
+	$(NVIM_BIN) --headless -u $(MIN_INIT) -l scripts/e2e/bg_tasks_stdin.lua
+
+# Real-pi e2e for the shape of a completion report: the banner, the
+# `<system-reminder>` / `<background-task …>` block, its attributes, and that the
+# model's next request actually carries it. Needs the pi binary only — runs in CI.
+e2e-bg-report:
+	$(NVIM_BIN) --headless -u $(MIN_INIT) -l scripts/e2e/bg_tasks_report.lua
+
+# Real-pi e2e for ownership: fork inheritance and the clean-quit shutdown record.
+# Needs the pi binary only — runs in CI.
+e2e-bg-ownership:
+	$(NVIM_BIN) --headless -u $(MIN_INIT) -l scripts/e2e/bg_tasks_ownership.lua
 
 # Real-pi e2e for a failed child run (quota/auth/network error) surfacing as a
 # failed batch item with the provider reason instead of an empty `ok`. Uses a
