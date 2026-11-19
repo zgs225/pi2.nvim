@@ -314,8 +314,68 @@ function M.subagent_child_extension_path()
     return plugin_root() .. "/extensions/subagent-child.ts"
 end
 
+--- The two tools that make every `codemode` / `deferred` exposure tool reachable
+--- (see pi's docs/mcp.md, "Control tool exposure").
+---@type string[]
+local MCP_REACH_TOOLS = { "codemode", "tool_search" }
+
+--- Match a `--tools` entry against a tool name, mirroring pi's own matcher: an
+--- entry without `*` compares exactly, `*` matches any run of characters.
+---@param entry string
+---@param name string
+---@return boolean
+local function tool_entry_matches(entry, name)
+    if not entry:find("*", 1, true) then
+        return entry == name
+    end
+    local pattern = entry:gsub("[%^%$%(%)%%%.%[%]%+%-%?]", "%%%1"):gsub("%*", ".*")
+    return name:find("^" .. pattern .. "$") ~= nil
+end
+
+--- Whether a child's `--tools` allowlist can still reach a single MCP tool.
+---
+--- pi keeps MCP tools registered whatever the list says (it only filters them
+--- when an entry starts with `mcp__`), but their default `codemode` exposure
+--- leaves them callable *only* from a `codemode` script or after `tool_search`
+--- loads them — and `--tools` drops both of those from the registry like any
+--- other tool name. So a list naming neither cannot reach one MCP tool; a list
+--- with `+name`/`-name` entries is not an allowlist at all (pi keeps its default
+--- selection), and an `mcp__` entry asks for MCP tools explicitly: both reach.
+---@param tools string[]
+---@return boolean
+local function allowlist_reaches_mcp(tools)
+    for _, entry in ipairs(tools) do
+        if type(entry) == "string" then
+            local head = entry:sub(1, 1)
+            if head == "+" or head == "-" or entry:find("mcp__", 1, true) then
+                return true
+            end
+            for _, reach in ipairs(MCP_REACH_TOOLS) do
+                if tool_entry_matches(entry, reach) then
+                    return true
+                end
+            end
+        end
+    end
+    return false
+end
+
+--- `--no-mcp` is gated to pi >= 1.0.4 (see GATED_ARGS). An older or
+--- unprobeable binary keeps MCP — and pi's one-line warning — rather than
+--- failing to start on an unknown option.
+---@return boolean
+local function can_disable_mcp()
+    local version = M.pi_version()
+    if version == nil then
+        return false
+    end
+    local cmp = Compat.compare_versions(version, GATED_ARGS["--no-mcp"])
+    return cmp ~= nil and cmp >= 0
+end
+
 ---@class pi.CliCommandOpts
 ---@field subagent? boolean false marks a child (sub-session) process: inject subagent-child.ts instead of subagent.ts (default: parent — inject subagent.ts).
+---@field extra_args? string[] Extra args appended right after the configured `cli.args`, e.g. `{ "--fork", path }`. Used to bootstrap a session into a new process; plain pass-through (not filtered or version-gated).
 ---@field tools? string[] Child tool allowlist; when set it replaces `cli.args`' own --tools for this process.
 
 ---@param opts? pi.CliCommandOpts
@@ -324,6 +384,16 @@ function M.command(opts)
     opts = opts or {}
     local cmd = { M.bin() }
     vim.list_extend(cmd, M.args())
+    -- Session-bootstrap args ride directly behind the configured ones and
+    -- never land after `--mode rpc`. Empty/non-string entries are dropped
+    -- rather than poisoning the argv (a nil would make jobstart throw).
+    if type(opts.extra_args) == "table" then
+        for _, arg in ipairs(opts.extra_args) do
+            if type(arg) == "string" and arg ~= "" then
+                cmd[#cmd + 1] = arg
+            end
+        end
+    end
     -- Inject the bundled extension that bridges session-tree navigation
     -- (:PiTree) into RPC mode; explicit -e paths work even if the user
     -- passed --no-extensions in cli.args.
@@ -414,6 +484,15 @@ function M.command(opts)
         end
         cmd[#cmd + 1] = "--tools"
         cmd[#cmd + 1] = table.concat(opts.tools, ",")
+        -- A child restricted away from `codemode` and `tool_search` cannot call
+        -- one MCP tool, so ask pi to skip MCP for it: the servers would
+        -- otherwise be connected (an HTTP round trip each) purely to leave
+        -- every tool unreachable, and pi reports that in the editor once per
+        -- spawn as "MCP tools are only reachable from the codemode or
+        -- tool_search tool, but neither is active; they cannot be called."
+        if not vim.tbl_contains(cmd, "--no-mcp") and not allowlist_reaches_mcp(opts.tools) and can_disable_mcp() then
+            cmd[#cmd + 1] = "--no-mcp"
+        end
     end
     cmd[#cmd + 1] = "--mode"
     cmd[#cmd + 1] = "rpc"

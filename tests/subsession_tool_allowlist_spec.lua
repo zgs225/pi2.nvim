@@ -241,6 +241,95 @@ describe("Cli.command tools allowlist", function()
         assert.equals("read", cmd[index_of(cmd, "--tools") + 1])
         assert.equals(0, #notes)
     end)
+
+    --- Set the probed pi version and drop the cached probe.
+    ---@param version? string
+    local function probe(version)
+        Cli._probe_version = function()
+            return version
+        end
+        Cli._reset()
+    end
+
+    --- Whether the command asks pi to skip MCP for this process.
+    ---@param cmd string[]
+    ---@return boolean
+    local function disables_mcp(cmd)
+        return index_of(cmd, "--no-mcp") ~= nil
+    end
+
+    -- A child restricted away from `codemode` and `tool_search` cannot call one
+    -- MCP tool (pi keeps the tools registered but they are reachable only from
+    -- those two). Such a child gets `--no-mcp`, which also silences pi's
+    -- "MCP tools are only reachable …" warning, emitted once per spawn.
+    describe("child MCP reachability", function()
+        it("spawns with --no-mcp when the allowlist can reach no MCP tool", function()
+            probe("pi 1.5.2")
+            local cmd = Cli.command({ subagent = false, tools = { "read", "grep" } })
+            local no_mcp_at = index_of(cmd, "--no-mcp")
+            assert.is_not_nil(no_mcp_at, "an MCP-less child must be told to skip MCP")
+            assert.equals(1, count_of(cmd, "--no-mcp"))
+            assert.is_true(no_mcp_at > index_of(cmd, "--tools"), "--no-mcp follows the tool selection")
+            assert.is_true(no_mcp_at < index_of(cmd, "--mode"), "--no-mcp precedes --mode rpc")
+        end)
+
+        it("keeps MCP when the allowlist names codemode", function()
+            probe("pi 1.5.2")
+            local cmd = Cli.command({ subagent = false, tools = { "read", "codemode" } })
+            assert.is_false(disables_mcp(cmd))
+        end)
+
+        it("keeps MCP when the allowlist names tool_search", function()
+            probe("pi 1.5.2")
+            local cmd = Cli.command({ subagent = false, tools = { "tool_search" } })
+            assert.is_false(disables_mcp(cmd))
+        end)
+
+        it("keeps MCP when an entry names MCP tools", function()
+            probe("pi 1.5.2")
+            local cmd = Cli.command({ subagent = false, tools = { "read", "mcp__trilium__search_notes" } })
+            assert.is_false(disables_mcp(cmd))
+        end)
+
+        it("keeps MCP when patterns cover codemode or tool_search", function()
+            probe("pi 1.5.2")
+            assert.is_false(disables_mcp(Cli.command({ subagent = false, tools = { "code*" } })))
+            assert.is_false(disables_mcp(Cli.command({ subagent = false, tools = { "*search" } })))
+            -- A name without `*` compares exactly, so it does not cover either.
+            assert.is_true(disables_mcp(Cli.command({ subagent = false, tools = { "tool" } })))
+        end)
+
+        it("keeps MCP when the list is a +name/-name modifier set, not an allowlist", function()
+            probe("pi 1.5.2")
+            assert.is_false(disables_mcp(Cli.command({ subagent = false, tools = { "+bash" } })))
+            assert.is_false(disables_mcp(Cli.command({ subagent = false, tools = { "-edit" } })))
+        end)
+
+        it("keeps MCP on a pi too old for --no-mcp", function()
+            probe("pi 1.0.3")
+            local cmd = Cli.command({ subagent = false, tools = { "read", "grep" } })
+            assert.is_false(disables_mcp(cmd))
+        end)
+
+        it("keeps MCP when the version cannot be probed", function()
+            probe(nil)
+            local cmd = Cli.command({ subagent = false, tools = { "read", "grep" } })
+            assert.is_false(disables_mcp(cmd))
+        end)
+
+        it("does not duplicate a --no-mcp the user already passes", function()
+            probe("pi 1.5.2")
+            Config.options.cli.args = { "--no-mcp" }
+            local cmd = Cli.command({ subagent = false, tools = { "read", "grep" } })
+            assert.equals(1, count_of(cmd, "--no-mcp"))
+        end)
+
+        it("leaves a parent command alone", function()
+            probe("pi 1.5.2")
+            Config.options.cli.args = { "--tools", "read" }
+            assert.is_false(disables_mcp(Cli.command()))
+        end)
+    end)
 end)
 
 describe("Batch.dispatch tools allowlist", function()

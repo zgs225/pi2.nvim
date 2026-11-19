@@ -14,6 +14,19 @@ Neovim plugin (Lua) — a frontend for the [pi coding agent](https://github.com/
 
 > **Developing or testing a feature?** Read `.agents/skills/develop/SKILL.md` first. It is the operational playbook: the three-layer test stack (unit / headless-e2e / GUI automation), the non-obvious Neovim-Lua gotchas, the standard places a change lands, and the verification discipline. `AGENTS.md` (this file) stays the authority on architecture and style.
 
+## Startup cost is a hard budget (iron rule)
+
+`pi` is **lazy-loaded inside the first `<leader>ap`**, so everything `pi.setup()` does synchronously is time the user spends staring at a frozen editor — on every Neovim start, over state that only grows (`~/.pi/agent/sessions` is routinely multi-GB and thousands of files on a long-lived machine). A startup freeze is a **bug**, never an acceptable trade-off.
+
+1. **Nothing on the setup path may scale with stored history.** `pi.setup()` registers autocmds/commands and nothing else. The startup status rebuild (`pi.subsessions.rebuild_statuses`) is the single exception and must stay in the hundreds of milliseconds, never seconds: no `History.parse` / `History.list` per file, no full-JSONL decode per manifest row, no `git` call, no synchronous child process.
+2. **Budget cost per row and per file, not per call.** One extra read per manifest row becomes 1.4 k reads of files up to 12 MB. A full decode per row cost 5–9 s on the author's tree; reading transcript tails plus a filename index brought it to ~0.5 s.
+3. **Cheap answer first.** Session ids resolve from the `<timestamp>_<id>.jsonl` filename convention (verify with the one-line header, not a parse); an unchanged mtime means the status inferred last time still holds; only then read content.
+4. **Never read a transcript end-to-end to look at its end.** Use `pi.subsessions.read`'s tail reader (`open_tail`) instead of `read_jsonl` for "last entry / run status / last assistant turn": it walks backwards, reads each byte once, and skips lines that cannot describe a turn before decoding them.
+5. **What cannot be made cheap is deferred, not blocking** — schedule it off the keypress path so the delay stays invisible.
+6. **Measure when you touch the path**, and put the number in the change: time `require("pi.sessions.manager")` plus `require("pi").setup({})` under the real config (a `PI_DEV_DIR` run does not run `setup` by itself, so call it). A few added milliseconds need a reason in the description.
+
+`tests/subsessions_rebuild_spec.lua` and `tests/subsessions_read_spec.lua` encode this contract (no per-file parse on the fast path, no re-decode of an unchanged transcript, decode counts bounded by the tail window); `doc/troubleshooting.md` documents the user-visible side.
+
 ## Layout
 
 Use `find lua -type f` for the authoritative file list — don't rely on any snapshot. Directory-level map:

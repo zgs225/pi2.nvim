@@ -37,6 +37,8 @@ Each entry is a real defect or trap encountered while adding features to this pl
 | G25 | Prove a gate can fail before trusting it; never grep coloured test output. `make check-selftest` institutionalises this |
 | G26 | uv callbacks (`vim.system`, timers) are fast events — `vim.schedule` any editor work; `repeat = 0` is one-shot; hold timer objects or they are GC'd |
 | G31 | `Config.setup()` shares nested tables with the module-local `defaults` (`tbl_deep_extend` keeps references) — never mutate `options.subagent` in place in specs; deepcopy first |
+| G32 | macOS: `tempname()` is `/var/…` (symlink to `/private/var/…`) while the code reports real paths ⇒ canonicalize the temp root in specs (`fs_realpath` after `mkdir`) and derive node `sessionsDir` from `process.cwd()`, or expectations never match |
+| G33 | Plenary's default 50 s per-file timeout silently kills `worktree_git_spec.lua` on a real (APFS-fsync) disk: no output, `make test` exits 2; pass `timeout = 120000` |
 
 ### G27 — macOS: Screen Recording is a hard gate for screenshots AND window discovery
 - **现象:** On a macOS GUI run, `gui_launch.sh` finds the wezterm-gui pid but **no CGWindowID**; `screencapture` fails with `could not create image`; a direct `CGWindowListCopyWindowInfo` probe returns an empty/`{}` list even though several apps have visible windows.
@@ -223,3 +225,25 @@ Each entry is a real defect or trap encountered while adding features to this pl
   ```
   — or point `Config.options` at a hand-built table and restore the original afterwards. Top-level scalar writes are safe (`options.foo = 1` copies by value); only nested tables alias.
 - **元教训:** "setup resets state" is only true when setup's source of truth was never mutated. After changing global config in a test, ask: did I just write through into the defaults?
+
+### G32 — macOS: `tempname()` is a symlinked path, so path-equality specs fail only on the author's laptop
+- **现象:** `make test` had 9 red specs on macOS (`tests/worktree_spec.lua` 6, `tests/subagent_worktree_protocol_spec.lua` 3) that were green in CI and green on any Linux box. The worktree ones diff `/private/var/folders/…/repo/.worktrees/wt-1` against `/var/folders/…/repo/.worktrees/wt-1`; the protocol ones reported `subagents = {}` and `session file not found` for every read, although the driver had just written the manifest.
+- **根因:** macOS `$TMPDIR` (`/var/folders/…`) is a symlink to `/private/var/folders/…`, and the code resolves it while the specs do not. `pi.worktree`'s `resolve_dir`/`create`/`list` call `fs_realpath` on the repo root — documented behaviour (`doc/worktrees.md`: "canonicalized to the checkout's real root") — so every path it returns is `/private/var/…`. Separately `extensions/subagent.ts` derives its session directory from `process.cwd()`, and node's `getcwd()` is the **physical** path after `chdir`, while the spec's driver wrote the manifest under `encodeCwd(config.workspace)` — the unresolved string. Proof it is only the path shape: `TMPDIR=$HOME/pitmp nvim --headless -u tests/minimal_init.lua -c "PlenaryBustedFile tests/worktree_spec.lua"` (a non-symlinked tmpdir) turns both files green.
+- **修法:** Canonicalize the temp root *after* creating it, never at the comparison site:
+  ```lua
+  local path = vim.fn.tempname()
+  vim.fn.mkdir(path, "p")
+  return vim.uv.fs_realpath(path) or path   -- /private/var/… on macOS
+  ```
+  Note `fs_realpath` before `mkdir` returns `nil` for `tempname()` (it does not exist yet) — the fallback then silently keeps the symlinked path, which is how `worktree_git_spec.lua`'s `make_repo` stayed broken. On the node side derive the directory the same way the extension does (`encodeCwd(process.cwd())` after `chdir`), not from the config string. Do **not** "fix" this by dropping `fs_realpath` from the product: it is what makes worktree sessions, `reload`, and sub-agent `worktree = { path }` resolve symlinks consistently.
+- **元教训:** A spec that compares absolute paths is asserting an environment detail. When a suite is red only on one machine, diff the *strings* in the failure before reading the logic — `/var` vs `/private/var` is macOS, `/tmp` vs `/private/tmp` is the same bug through a different door.
+
+### G33 — Plenary's 50 s per-file timeout kills the slow real-git spec with no output
+- **现象:** `make test` exited 2 while every spec that produced output reported `Failed: 0`. `tests/worktree_git_spec.lua` had no `Testing:` section at all — it was scheduled but never reported.
+- **根因:** Two layers. (1) `make test` runs all spec files as parallel child nvims with plenary's default `timeout = 50000`; `Job.join` stops waiting, the killed child exits nonzero, and `test_harness` turns any nonzero child code into `1cq` — with `keep_going` the missing file also loses its output, so the suite looks green-but-exits-2. (2) That spec really needs ~50 s here: it builds a fresh git repository per case (23 cases), and on APFS the first `git commit` of each repo costs ~0.7 s plus ~1 s to `rm -rf` the tree — ~1 s per `before_each`, ~25 s of commits/teardowns, and more under 165-way parallel load.
+- **修法:** Pass an explicit budget: `test_directory('tests', { minimal_init = …, timeout = 120000 })` (done in the `Makefile`). "Silent" is the tell — a spec that is scheduled but prints no `Testing:` header was killed, not passed:
+  ```bash
+  grep -c 'Testing:' out.txt; ls tests/*_spec.lua | wc -l   # the two counts must match
+  ```
+- **排查方法:** Do not guess which child died — patch a copy of plenary's `test_harness.lua` to print `code`/`signal` per job (`j.nvim_busted_path`), or read the `Scheduling:` lines and diff them against the `Testing:` headers. A child that exits **2** is different: that is `#results.errs ~= 0`, i.e. the file failed to *load* (see G24 — a `1_000`-style digit separator breaks the whole file this way, printing `FAILED TO LOAD FILE` and `malformed number near '1_000'`).
+- **元教训:** Exit status is the assertion; the summary lines only describe the specs that got far enough to print them. Always check `make test`'s exit code and the `Testing:` count alongside `Failed : 0`.

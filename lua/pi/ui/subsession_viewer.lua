@@ -19,6 +19,7 @@ local TodoToolUi = require("pi.todo.tool_ui")
 ---@class pi.SubsessionViewerOpts
 ---@field on_close? fun()
 ---@field name? string Display-name override (beats manifest entry and JSONL session_info)
+---@field cwd? string Workspace whose manifest holds the row (default: locate it)
 ---@field width? number Width in columns (>=1) or fraction of editor width (<1)
 ---@field height? number Height in lines (>=1) or fraction of editor height (<1)
 ---@field border? string|string[] Float border style
@@ -535,6 +536,53 @@ local function replay(history, messages)
             history:scroll_to_bottom()
         end
     end)
+end
+
+--- Whether a path names a readable file (nil-tolerant: manifest rows and
+--- sessions carry optional strings).
+---@param path any
+---@return string?
+local function readable_path(path)
+    if type(path) == "string" and path ~= "" and vim.fn.filereadable(path) == 1 then
+        return path
+    end
+    return nil
+end
+
+--- Path of the checkout a row was *assigned* (sub-agent isolation), when the
+--- row records one.
+---@param entry? pi.SubsessionManifestEntry
+---@return string?
+local function assigned_worktree_path(entry)
+    if type(entry) ~= "table" or type(entry.assigned_worktree) ~= "table" then
+        return nil
+    end
+    local path = entry.assigned_worktree.path
+    if type(path) == "string" and path ~= "" then
+        return path
+    end
+    return nil
+end
+
+--- Workspace a viewed row ran in, when it is recorded but no transcript cwd is
+--- available: the worktree the row was *assigned* (sub-agent isolation), else
+--- the one it owns. Either lives in another checkout's session directory, so the
+--- JSONL cwd is preferred while it exists.
+---@param entry? pi.SubsessionManifestEntry
+---@return string?
+local function recorded_worktree_cwd(entry)
+    local assigned = assigned_worktree_path(entry)
+    if assigned then
+        return assigned
+    end
+    if type(entry) ~= "table" or type(entry.worktree) ~= "table" then
+        return nil
+    end
+    local path = entry.worktree.path
+    if type(path) == "string" and path ~= "" then
+        return path
+    end
+    return nil
 end
 
 ---@param path string
@@ -1141,9 +1189,13 @@ function M.open(child_id, opts)
     -- 1. Close any existing viewer
     M.close()
 
-    -- 2. Look up manifest entry for name/status
-    local manifest = Manifest.load()
-    local entry = manifest[child_id]
+    -- 2. Look up the child's manifest row. Sub-session rows live in the *parent*
+    -- session's workspace manifest, which is not necessarily Neovim's cwd (a tab
+    -- can run in a worktree checkout): `opts.cwd` is the hint, otherwise the row
+    -- is located across live workspaces and the manifests on disk.
+    local workspace = type(opts.cwd) == "string" and opts.cwd ~= "" and opts.cwd or nil
+    local entry, entry_cwd = Manifest.locate(child_id, workspace)
+    workspace = entry_cwd or workspace
 
     -- Name precedence: opts.name > manifest entry name > JSONL session_info > raw id.
     ---@type string?
@@ -1203,7 +1255,23 @@ function M.open(child_id, opts)
     -- cwd, or a session file opened by id).
     local session_cwd = (session and session.cwd) or nil
     if not is_live then
-        local path = (session and session.session_file) or Read.find_path(child_id)
+        -- Transcript lookup: the manifest's recorded path first (a child
+        -- running in its own worktree keeps its JSONL in *that* workspace's
+        -- session directory, which the id lookup scoped to the parent's
+        -- workspace cannot see), then the live session's reported file, then
+        -- the id lookup — searched in the assigned checkout before the legacy
+        -- parent/live workspace.
+        local entry_file = type(entry) == "table" and entry.session_file or nil
+        local path = readable_path(entry_file) or readable_path(session and session.session_file)
+        if not path then
+            local assigned_cwd = assigned_worktree_path(entry)
+            if assigned_cwd then
+                path = Read.find_path(child_id, { cwd = assigned_cwd })
+            end
+        end
+        if not path then
+            path = Read.find_path(child_id, { cwd = (session and session.cwd) or workspace })
+        end
         if not path and vim.fn.filereadable(child_id) == 1 then
             path = child_id
         end
@@ -1214,7 +1282,7 @@ function M.open(child_id, opts)
         local msgs, session_name, jsonl_status, entries = load_messages_from_jsonl(path)
         dormant_messages = msgs
         viewer_todo_entries = entries
-        session_cwd = (jsonl_status and jsonl_status.cwd) or session_cwd
+        session_cwd = (jsonl_status and jsonl_status.cwd) or session_cwd or recorded_worktree_cwd(entry)
         -- The JSONL fallback only applies while no name is known yet.
         if session_name and session_name ~= "" and not opts_name and not entry_name then
             name = session_name
@@ -1300,7 +1368,7 @@ function M.open(child_id, opts)
     viewer_win = win
     viewer_history = history
     viewer_child_id = child_id
-    viewer_is_child = Manifest.is_child_session(child_id)
+    viewer_is_child = type(entry) == "table" and entry.parent_id ~= nil
     viewer_session_name = name
     viewer_loading = false
     viewer_event_queue = nil

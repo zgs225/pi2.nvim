@@ -16,6 +16,7 @@ local Config = require("pi.config")
 local Rpc = require("pi.rpc")
 local Sessions = require("pi.sessions.manager")
 local History = require("pi.sessions.history")
+local Worktree = require("pi.worktree")
 local Pi = require("pi")
 
 Config.setup({})
@@ -31,6 +32,14 @@ local real_rpc = { start = Rpc.start, stop = Rpc.stop, send = Rpc.send }
 local real_history_list = History.list
 local real_notify = vim.notify
 local real_select = vim.ui.select
+-- The resume picker's partition titles come from `Worktree.detect` and its
+-- multi-checkout collection from `Worktree.list`; both are stubbed so a spec
+-- never spawns git or depends on this checkout's own `.worktrees` directory.
+local real_worktree = {
+    detect = Worktree.detect,
+    list = Worktree.list,
+    snapshot_worktrees = Worktree.snapshot_worktrees,
+}
 
 --- Commands sent through the stub, in order.
 local sent = {}
@@ -84,6 +93,16 @@ local function install_stub()
         select_spy.pending = on_choice
     end
 
+    Worktree.detect = function()
+        return nil
+    end
+    Worktree.list = function(_, callback)
+        callback(nil, nil)
+    end
+    Worktree.snapshot_worktrees = function()
+        return {}
+    end
+
     responders.get_commands = function()
         return { type = "response", success = true, data = { commands = {} } }
     end
@@ -128,6 +147,9 @@ local function restore_stub(first_tab)
     History.list = real_history_list
     vim.notify = real_notify
     vim.ui.select = real_select
+    Worktree.detect = real_worktree.detect
+    Worktree.list = real_worktree.list
+    Worktree.snapshot_worktrees = real_worktree.snapshot_worktrees
 end
 
 --- Wait until fn() is truthy; fail the spec with `what` otherwise.
@@ -158,6 +180,26 @@ local function last_select_call(kind)
     return nil
 end
 
+--- Rows the telescope finder produces for `prompt` (dynamic finder).
+---@param cfg table
+---@param prompt? string
+---@return pi.ResumeRow[]
+local function picker_rows(cfg, prompt)
+    return cfg.finder.fn(prompt or "")
+end
+
+--- First session row of the picker (skipping partition titles).
+---@param cfg table
+---@return pi.ResumeRow?
+local function first_session_row(cfg)
+    for _, row in ipairs(picker_rows(cfg)) do
+        if row.kind == "session" then
+            return row
+        end
+    end
+    return nil
+end
+
 --- Create the fake telescope module tree and return recording state.
 local function install_fake_telescope()
     ---@class FakeTeleState
@@ -182,13 +224,31 @@ local function install_fake_telescope()
         new_table = function(tbl)
             return tbl
         end,
+        -- The resume picker uses a dynamic finder: rows are recomputed from the
+        -- prompt, so specs call `cfg.finder.fn(prompt)` to see them.
+        new_dynamic = function(tbl)
+            return tbl
+        end,
     }
+    -- Mirrors the installed telescope commit: `config.values` has no
+    -- `empty_sorter` (newer builds add it) and order comes from
+    -- `telescope.sorters.empty()`. Modelling the real API here is what would
+    -- have caught the missing `conf.empty_sorter` field.
     package.loaded["telescope.config"] = {
         values = {
             generic_sorter = function()
-                return "sorter"
+                return "generic_sorter"
             end,
         },
+    }
+    package.loaded["telescope.sorters"] = {
+        empty = function()
+            return {
+                scoring_function = function()
+                    return 1
+                end,
+            }
+        end,
     }
     package.loaded["telescope.actions"] = {
         -- Called as a method: replace(self, replacement_fn).
@@ -206,7 +266,7 @@ local function install_fake_telescope()
             return state.entry
         end,
         get_multi_selection = function(_bufnr)
-            return {}
+            return state.multi or {}
         end,
         get_current_picker = function(_bufnr)
             return {
@@ -225,6 +285,7 @@ local FAKE_MODULES = {
     "telescope.pickers",
     "telescope.finders",
     "telescope.config",
+    "telescope.sorters",
     "telescope.actions",
     "telescope.actions.state",
 }
@@ -274,8 +335,10 @@ describe("pi resume picker", function()
         assert.is_not_nil(call)
         assert.equals("Resume session", call.opts.prompt)
         assert.equals(2, #call.items)
-        assert.equals(T_TARGET, call.items[1].file)
-        assert.equals("named session", call.items[2].session.name)
+        -- Single partition: flat session rows (row.item is the picker item).
+        assert.equals("session", call.items[1].kind)
+        assert.equals(T_TARGET, call.items[1].item.file)
+        assert.equals("named session", call.items[2].item.session.name)
 
         -- Row rendering stays date + label.
         local label = call.opts.format_item(call.items[1])
@@ -405,6 +468,39 @@ describe("pi resume picker", function()
     describe("with telescope installed", function()
         local tele
 
+        --- Picker over two partitions: this checkout's session plus a managed
+        --- worktree's (main newest, so its title row comes first).
+        ---@return table telescope config
+        local function picker_with_worktree()
+            History.list = function()
+                return {
+                    {
+                        path = T_TARGET,
+                        name = "main session",
+                        timestamp = "2025-06-01T10:00:00.000Z",
+                        first_message = "",
+                        modified = 500,
+                    },
+                    {
+                        path = T_OTHER,
+                        name = "worktree session",
+                        timestamp = "2025-06-02T11:00:00.000Z",
+                        first_message = "",
+                        modified = 400,
+                        worktree = "fix-auth",
+                        worktree_info = {
+                            kind = "linked",
+                            name = "fix-auth",
+                            path = "/tmp/pi-resume-spec/repo/.worktrees/fix-auth",
+                            repo_root = "/tmp/pi-resume-spec/repo",
+                        },
+                    },
+                }
+            end
+            Sessions.resume_session()
+            return tele.new_cfgs[#tele.new_cfgs]
+        end
+
         before_each(function()
             tele = install_fake_telescope()
         end)
@@ -426,8 +522,45 @@ describe("pi resume picker", function()
 
             local cfg = tele.new_cfgs[1]
             assert.equals(false, theme.previewer)
-            assert.equals(2, #cfg.finder.results)
-            assert.equals(T_TARGET, cfg.finder.results[1].file)
+            -- Rows arrive pre-filtered and pre-ordered: the picker must not
+            -- re-score them, and the sorter must resolve on telescope versions
+            -- that only ship `telescope.sorters.empty()`.
+            local sorter = cfg.sorter
+            assert.is_table(sorter)
+            assert.equals("function", type(sorter.scoring_function))
+            assert.equals(1, sorter.scoring_function("", ""))
+            local rows = picker_rows(cfg)
+            assert.equals(2, #rows)
+            assert.equals("session", rows[1].kind)
+            assert.equals(T_TARGET, rows[1].item.file)
+        end)
+
+        it("resolves the order-preserving sorter across telescope versions", function()
+            -- Installed builds: only `telescope.sorters.empty()` exists.
+            local sorter = Sessions._resume_sorter()
+            assert.is_table(sorter)
+            assert.equals("function", type(sorter.scoring_function))
+            assert.equals(1, sorter.scoring_function("pi", "pi"))
+
+            -- Newer builds: `config.values.empty_sorter()` wins.
+            local values = require("telescope.config").values
+            values.empty_sorter = function()
+                return {
+                    scoring_function = function()
+                        return 1
+                    end,
+                    origin = "config",
+                }
+            end
+            assert.equals("config", Sessions._resume_sorter().origin)
+            values.empty_sorter = nil
+
+            -- Neither API: degrade to the generic sorter instead of crashing.
+            local sorters = require("telescope.sorters")
+            local real_empty = sorters.empty
+            sorters.empty = nil
+            assert.equals("generic_sorter", Sessions._resume_sorter())
+            sorters.empty = real_empty
         end)
 
         it("maps o/t/<C-t> and opens rows via select_default and <C-t>", function()
@@ -440,7 +573,7 @@ describe("pi resume picker", function()
             end)
 
             -- select_default -> current tab.
-            tele.entry = { value = cfg.finder.results[1] }
+            tele.entry = { value = first_session_row(cfg) }
             tele.select_default()
             wait_or_fail(function()
                 local switch, sidx = find_after(0, "switch_session")
@@ -459,8 +592,8 @@ describe("pi resume picker", function()
             cfg.attach_mappings(8, function(_modes, lhs, fn)
                 tele.maps[lhs] = fn
             end)
-            tele.entry = { value = cfg.finder.results[1] }
-            local o_target_path = tele.entry.value.file
+            tele.entry = { value = first_session_row(cfg) }
+            local o_target_path = tele.entry.value.item.file
             assert.equals(T_TARGET, o_target_path)
             tele.maps["o"]()
             wait_or_fail(function()
@@ -476,7 +609,7 @@ describe("pi resume picker", function()
             cfg.attach_mappings(9, function(_modes, lhs, fn)
                 tele.maps[lhs] = fn
             end)
-            tele.entry = { value = cfg.finder.results[1] }
+            tele.entry = { value = first_session_row(cfg) }
             tele.maps["t"]()
 
             wait_or_fail(function()
@@ -493,12 +626,172 @@ describe("pi resume picker", function()
             cfg.attach_mappings(10, function(_modes, lhs, fn)
                 tele.maps[lhs] = fn
             end)
-            tele.entry = { value = cfg.finder.results[1] }
+            tele.entry = { value = first_session_row(cfg) }
             tele.maps["<C-t>"]()
             wait_or_fail(function()
                 return #vim.api.nvim_list_tabpages() == tabs_before_ct + 1
                     and find_after(base_ct, "switch_session") ~= nil
             end, "<C-t> did not open a new tab")
+        end)
+
+        it("groups rows by checkout and steps over a group row when opening", function()
+            local cfg = picker_with_worktree()
+            cfg.attach_mappings(11, function(_modes, lhs, fn)
+                tele.maps[lhs] = fn
+            end)
+
+            local rows = picker_rows(cfg)
+            assert.are.same(
+                { "group", "session", "group", "session" },
+                vim.tbl_map(function(row)
+                    return row.kind
+                end, rows)
+            )
+            -- Main checkout: project name, no worktree glyph.
+            assert.is_false(rows[1].worktree)
+            -- Linked worktree: the glyph names the checkout.
+            assert.is_true(rows[3].worktree)
+            assert.truthy(rows[3].text:find("󰙅 fix-auth", 1, true))
+
+            -- A title row is not resumable: select_default opens the session below it.
+            tele.entry = { value = rows[1], index = 1 }
+            tele.select_default()
+            wait_or_fail(function()
+                local switch, sidx = find_after(0, "switch_session")
+                return switch ~= nil and sidx ~= nil and find_after(sidx, "get_messages") ~= nil
+            end, "select_default on a group row did not open the next session")
+            assert.equals(T_TARGET, find_after(0, "switch_session").sessionPath)
+        end)
+
+        it("puts the checkout the tab's session runs in first, ahead of recency", function()
+            -- The tab runs in a linked checkout: a worktree session keeps its
+            -- own cwd while Neovim's cwd stays wherever it was started, so the
+            -- anchor must come from the session, not from `getcwd()`.
+            local AUTH = "/tmp/pi-resume-spec/repo/.worktrees/fix-auth"
+            local REPO = "/tmp/pi-resume-spec/repo"
+            Worktree.detect = function(dir)
+                if dir == AUTH then
+                    return { kind = "linked", name = "fix-auth", path = AUTH, repo_root = REPO }
+                end
+                return { kind = "main", name = vim.fs.basename(dir), path = dir, repo_root = dir }
+            end
+
+            local sess = Sessions.get_or_create()
+            assert.is_not_nil(sess)
+            sess.cwd = AUTH
+
+            History.list = function()
+                return {
+                    {
+                        path = T_TARGET,
+                        name = "main session",
+                        timestamp = "2025-06-01T10:00:00.000Z",
+                        first_message = "",
+                        modified = 900,
+                    },
+                    {
+                        path = T_OTHER,
+                        name = "worktree session",
+                        timestamp = "2025-06-02T11:00:00.000Z",
+                        first_message = "",
+                        modified = 100,
+                        worktree = "fix-auth",
+                        worktree_info = { kind = "linked", name = "fix-auth", path = AUTH, repo_root = REPO },
+                    },
+                }
+            end
+
+            Sessions.resume_session()
+            local rows = picker_rows(tele.new_cfgs[#tele.new_cfgs])
+
+            -- The main checkout's session is far newer, yet the session's own
+            -- checkout leads and the rest follows recency.
+            assert.are.same(
+                { "group", "session", "group", "session" },
+                vim.tbl_map(function(row)
+                    return row.kind
+                end, rows)
+            )
+            assert.equals(AUTH, rows[1].partition)
+            assert.is_true(rows[1].worktree)
+            assert.equals("main", rows[3].partition)
+            assert.equals(T_OTHER, rows[2].item.file)
+        end)
+
+        it("re-filters per prompt, keeping a matched session under its title", function()
+            local cfg = picker_with_worktree()
+
+            -- "worktree session" matches only the worktree row's text, not the
+            -- main checkout's; the fix-auth group must survive because its
+            -- session does, even though the title itself does not match.
+            local rows = cfg.finder.fn("worktree session")
+            assert.are.same(
+                { "group", "session" },
+                vim.tbl_map(function(row)
+                    return row.kind
+                end, rows)
+            )
+            assert.equals(T_OTHER, rows[2].item.file)
+            -- R3: a session row never repeats its checkout context.
+            assert.is_nil(rows[2].text:find("fix-auth", 1, true))
+            assert.is_nil(rows[2].text:find("󰙅", 1, true))
+
+            -- A query with no match yields no rows (and therefore no titles).
+            assert.equals(0, #cfg.finder.fn("zzz-no-match"))
+
+            -- The empty prompt restores both partitions, main first (its
+            -- session is newer).
+            assert.are.same(
+                { "group", "session", "group", "session" },
+                vim.tbl_map(function(row)
+                    return row.kind
+                end, cfg.finder.fn(""))
+            )
+        end)
+
+        it("deletes only session rows when a title row is multi-selected", function()
+            local cfg = picker_with_worktree()
+            cfg.attach_mappings(13, function(_modes, lhs, fn)
+                tele.maps[lhs] = fn
+            end)
+            local rows = picker_rows(cfg)
+            tele.multi = { { value = rows[1] }, { value = rows[2] } }
+
+            local removed = {}
+            local real_remove = os.remove
+            os.remove = function(path)
+                removed[#removed + 1] = path
+                return true
+            end
+            local orig_confirm = vim.fn.confirm
+            vim.fn.confirm = function()
+                return 1 -- Yes
+            end
+            tele.maps["<C-x>"]()
+            vim.fn.confirm = orig_confirm
+            os.remove = real_remove
+
+            assert.are.same({ T_TARGET }, removed, "the title row is not a deletion target")
+        end)
+
+        it("keeps group rows out of the <C-x> selection", function()
+            local cfg = picker_with_worktree()
+            cfg.attach_mappings(12, function(_modes, lhs, fn)
+                tele.maps[lhs] = fn
+            end)
+            local rows = picker_rows(cfg)
+            tele.multi = { { value = rows[1] }, { value = rows[2] } }
+
+            local confirmed = nil
+            local orig_confirm = vim.fn.confirm
+            vim.fn.confirm = function(msg)
+                confirmed = msg
+                return 2 -- No: this spec only checks which rows count as targets.
+            end
+            tele.maps["<C-x>"]()
+            vim.fn.confirm = orig_confirm
+
+            assert.equals("Delete session?", confirmed, "a group row must not count as a deletion target")
         end)
     end)
 
@@ -533,6 +826,280 @@ describe("pi resume picker", function()
         Manifest.is_child_session = orig_is_child
 
         assert.equals(1, #call.items)
-        assert.equals("parent-session-id", call.items[1].session.id)
+        assert.equals("parent-session-id", call.items[1].item.session.id)
+    end)
+
+    it("resolves a real telescope Sorter when telescope is installed", function()
+        local root = vim.fn.expand("~/.local/share/nvim/lazy/telescope.nvim")
+        if vim.fn.isdirectory(root) == 0 then
+            return -- telescope not installed (CI): nothing to resolve for real
+        end
+
+        -- Load the actual plugin, the way the user's editor does. The stubs
+        -- above mirror the installed commit, but only the real modules can
+        -- prove that the API symbol exists (a stub once hid a missing one).
+        vim.opt.runtimepath:prepend(root)
+        local sorters = require("telescope.sorters")
+        local real_empty = sorters.empty
+        local used_empty = false
+        sorters.empty = function()
+            used_empty = true
+            return real_empty()
+        end
+        local sorter = Sessions._resume_sorter()
+        sorters.empty = real_empty
+
+        assert.is_true(used_empty, "without config.values.empty_sorter the picker must use telescope.sorters.empty")
+        assert.is_table(sorter)
+        assert.equals("function", type(sorter.scoring_function))
+        assert.equals(1, sorter.scoring_function("pi", "pi", {}))
+        assert.equals("function", type(require("telescope.finders").new_dynamic))
+
+        -- Partition titles rely on `display` returning (text, hl_group).
+        local entry_display = require("telescope.pickers.entry_display")
+        local entry = {
+            value = { text = "󰙅 fix-auth" },
+            display = function(e)
+                return e.value.text, "PiSessionsListWorktree"
+            end,
+        }
+        local text, hl = entry_display.resolve({ _increment = function() end }, entry)
+        assert.equals("󰙅 fix-auth", text)
+        assert.equals("PiSessionsListWorktree", hl)
+    end)
+end)
+
+-- Cross-checkout collection (`resume_session` → `collect_resume_sessions`).
+--
+-- Which checkouts the picker enumerates is a collection question, so these
+-- specs assert the rows the collection produces (through the `vim.ui.select`
+-- fallback, which receives the final row list) rather than the layout rules —
+-- those live in `tests/resume_layout_spec.lua`.
+describe("pi resume picker cross-checkout collection", function()
+    local Manifest = require("pi.subsessions.manifest")
+    local real_is_child = Manifest.is_child_session
+
+    local dir
+    local ext
+    local calls
+    local first_tab
+    local tele
+
+    --- A row as `History.list` returns it.
+    ---@param path string
+    ---@param id string
+    ---@param modified integer
+    ---@param name string
+    ---@return pi.SessionInfo
+    local function session(path, id, modified, name)
+        return {
+            path = path,
+            id = id,
+            name = name,
+            timestamp = "2025-06-01T10:00:00.000Z",
+            first_message = "",
+            modified = modified,
+        }
+    end
+
+    --- A checkout `snapshot_worktrees` reports: gone from disk, patch on hand.
+    ---@param path string
+    ---@param name string
+    ---@return table
+    local function recovered(path, name)
+        return {
+            kind = "linked",
+            name = name,
+            path = path,
+            repo_root = dir,
+            git_dir = dir .. "/.git/worktrees/" .. name,
+            common_dir = dir .. "/.git",
+            missing = true,
+            prunable = true,
+        }
+    end
+
+    --- Group titles / session texts of the final rows, in display order.
+    ---
+    --- Rows come from the telescope picker's dynamic finder (the fake
+    --- telescope module records it), so a real telescope left on the
+    --- runtimepath by another spec cannot change the path under test.
+    ---@return string[] titles
+    ---@return string[] sessions
+    local function collect_rows()
+        local cfg = tele.new_cfgs[#tele.new_cfgs]
+        local rows = cfg.finder.fn("")
+        local titles, sessions = {}, {}
+        for _, row in ipairs(rows) do
+            if row.kind == "group" then
+                if row.worktree then
+                    titles[#titles + 1] = row.text
+                end
+            else
+                sessions[#sessions + 1] = row.text
+            end
+        end
+        return titles, sessions
+    end
+
+    before_each(function()
+        install_stub()
+        tele = install_fake_telescope()
+        first_tab = vim.api.nvim_get_current_tabpage()
+        calls = { list = 0, snapshot = 0 }
+        -- A repository whose only trace of other checkouts is git's own
+        -- registry: no `<repo>/.worktrees`, no snapshot store.
+        dir = vim.fn.tempname()
+        vim.fn.mkdir(dir .. "/.git/worktrees", "p")
+        ext = dir .. "/external"
+        vim.fn.mkdir(ext, "p")
+        Worktree.detect = function()
+            return { kind = "main", path = dir, repo_root = dir, common_dir = dir .. "/.git" }
+        end
+        Worktree.list = function(_, cb)
+            calls.list = calls.list + 1
+            cb({
+                {
+                    kind = "linked",
+                    name = "external",
+                    path = ext,
+                    repo_root = dir,
+                    git_dir = dir .. "/.git/worktrees/external",
+                    common_dir = dir .. "/.git",
+                    head = "",
+                    detached = true,
+                },
+            }, nil)
+        end
+        Worktree.snapshot_worktrees = function()
+            calls.snapshot = calls.snapshot + 1
+            return {}
+        end
+        History.list = function()
+            return { session(dir .. "/main.jsonl", "main", 100, "main work") }
+        end
+    end)
+
+    after_each(function()
+        Manifest.is_child_session = real_is_child
+        pcall(vim.fn.delete, dir, "rf")
+        remove_fake_telescope()
+        restore_stub(first_tab)
+    end)
+
+    it("enumerates a linked worktree created outside pi", function()
+        History.list = function(cwd)
+            if cwd == ext then
+                return { session(ext .. "/top.jsonl", "top", 200, "external work") }
+            end
+            return { session(dir .. "/main.jsonl", "main", 100, "main work") }
+        end
+
+        Sessions.resume_session()
+
+        assert.equals(1, calls.list, "git enumeration must not be limited to pi-managed checkouts")
+        local titles, sessions = collect_rows()
+        assert.same({ "󰙅 external" }, titles)
+        assert.same({ "2025-06-01  external work", "2025-06-01  main work" }, sessions)
+    end)
+
+    it("drops sub-session transcripts from a per-checkout listing", function()
+        History.list = function(cwd)
+            if cwd == ext then
+                return {
+                    session(ext .. "/top.jsonl", "top", 200, "external work"),
+                    session(ext .. "/kid.jsonl", "kid", 300, "subagent run"),
+                }
+            end
+            return { session(dir .. "/main.jsonl", "main", 100, "main work") }
+        end
+        Manifest.is_child_session = function(id)
+            return id == "kid"
+        end
+
+        Sessions.resume_session()
+
+        local titles, sessions = collect_rows()
+        assert.same({ "󰙅 external" }, titles)
+        assert.same({ "2025-06-01  external work", "2025-06-01  main work" }, sessions)
+        for _, text in ipairs(sessions) do
+            assert.is_nil(text:find("subagent run", 1, true), "a child transcript must not be a resumable row")
+        end
+    end)
+
+    it("keeps a snapshot-recoverable checkout only while it holds a top-level session", function()
+        local recovered_top = dir .. "/.worktrees/recovered"
+        local recovered_child = dir .. "/.worktrees/dead-kid"
+        Worktree.list = function(_, cb)
+            calls.list = calls.list + 1
+            cb({}, nil)
+        end
+        Worktree.snapshot_worktrees = function()
+            calls.snapshot = calls.snapshot + 1
+            return { recovered(recovered_top, "recovered"), recovered(recovered_child, "dead-kid") }
+        end
+        History.list = function(cwd)
+            if cwd == recovered_top then
+                return { session(recovered_top .. "/t.jsonl", "t", 200, "recovered work") }
+            end
+            if cwd == recovered_child then
+                return { session(recovered_child .. "/k.jsonl", "k", 400, "subagent run") }
+            end
+            return { session(dir .. "/main.jsonl", "main", 100, "main work") }
+        end
+        Manifest.is_child_session = function(id)
+            return id == "k"
+        end
+
+        Sessions.resume_session()
+
+        local titles, sessions = collect_rows()
+        -- The dead `sub-*` checkout holds only a child transcript, so it
+        -- contributes neither a title nor a row: no ghost partition.
+        assert.same({ "󰙅 recovered" }, titles)
+        assert.same({ "2025-06-01  recovered work", "2025-06-01  main work" }, sessions)
+    end)
+
+    it("finds a child recorded only in the main checkout's manifest", function()
+        -- Neovim runs somewhere other than the main checkout (`dir`), so the
+        -- only evidence that this row is a sub-session is the main checkout's
+        -- manifest — not Neovim's cwd, not the dead checkout's own.
+        local dead = dir .. "/.worktrees/sub-dead"
+        Worktree.list = function(_, cb)
+            calls.list = calls.list + 1
+            cb({}, nil)
+        end
+        Worktree.snapshot_worktrees = function()
+            calls.snapshot = calls.snapshot + 1
+            return { recovered(dead, "sub-dead") }
+        end
+        History.list = function(cwd)
+            if cwd == dead then
+                return { session(dead .. "/k.jsonl", "kid", 200, "subagent run") }
+            end
+            return { session(dir .. "/main.jsonl", "main", 100, "main work") }
+        end
+        Manifest.is_child_session = function(id, cwd)
+            return id == "kid" and cwd == dir
+        end
+
+        Sessions.resume_session()
+
+        -- One surviving partition: a flat list, and no `󰙅 sub-dead` title.
+        local titles, sessions = collect_rows()
+        assert.same({}, titles)
+        assert.same({ "2025-06-01  main work" }, sessions)
+    end)
+
+    it("never spawns git when the repository has no other checkout", function()
+        pcall(vim.fn.delete, dir .. "/.git", "rf")
+
+        Sessions.resume_session()
+
+        assert.equals(0, calls.list, "a single-checkout repository keeps the historical flat list")
+        assert.equals(0, calls.snapshot)
+        local titles, sessions = collect_rows()
+        assert.same({}, titles)
+        assert.same({ "2025-06-01  main work" }, sessions)
     end)
 end)

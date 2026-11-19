@@ -41,6 +41,34 @@ local refresh_scheduled = false
 ---@type integer
 local generation = 0
 
+local uv = vim.uv or vim.loop
+
+--- Grace window before a local stop escalates SIGTERM to SIGKILL. Matches the
+--- extension's `stop_task` default, so the panel and the model behave the same.
+local DEFAULT_ESCALATE_MS = 5000
+
+---@type integer
+local escalate_ms = DEFAULT_ESCALATE_MS
+
+--- Pending SIGKILL escalations, by task id. Presence means "SIGTERM was sent
+--- and the backend has not reported a terminal state yet" — which is why a row
+--- that already reads `stopped` (marked optimistically by M.stop) still
+--- escalates: the authoritative `pi2_bg_task` event is what cancels this.
+---@type table<string, uv.uv_timer_t>
+local escalations = {}
+
+--- Cancel a pending escalation for one task. Safe for unknown ids.
+---@param id string
+local function cancel_escalation(id)
+    local timer = escalations[id]
+    if not timer then
+        return
+    end
+    escalations[id] = nil
+    pcall(timer.stop, timer)
+    pcall(timer.close, timer)
+end
+
 ---@return integer
 local function current_ms()
     return vim.uv.now()
@@ -70,11 +98,27 @@ function M._reset()
     listeners = {}
     refresh_scheduled = false
     generation = generation + 1
+    escalate_ms = DEFAULT_ESCALATE_MS
+    for id in pairs(escalations) do
+        cancel_escalation(id)
+    end
+end
+
+--- Override the SIGTERM→SIGKILL grace window. Test-only: specs must not wait
+--- the real five seconds. Passing nil (or an invalid value) restores the
+--- default; _reset() restores it too.
+---@param ms integer|nil
+function M._set_escalate_ms(ms)
+    escalate_ms = type(ms) == "number" and ms >= 1 and math.floor(ms) or DEFAULT_ESCALATE_MS
 end
 
 --- Insert a task, or replace the existing record with the same id wholesale.
 ---@param t pi.Task
 function M.upsert(t)
+    if t.status ~= "running" then
+        -- A finished record cannot have a stop in flight.
+        cancel_escalation(t.id)
+    end
     store[t.id] = t
 end
 
@@ -247,14 +291,22 @@ function M.handle_event(ev, session_id, tab)
         return false
     end
     local ts = normalize_ts(ev.timestamp)
+    -- An adopted task (one a previous pi process started, reported again on
+    -- session start) would otherwise be timestamped at the moment the message
+    -- was sent, so the panel's clock would restart at zero for a process that
+    -- has been running for minutes. The payload's own `startedAt` wins.
+    local started = non_null(d.startedAt)
+    local start_ts = type(started) == "number" and started > 0 and normalize_ts(started) or ts
 
     if d.kind == "started" then
+        -- A fresh start for an id with a stop in flight replaces the record.
+        cancel_escalation(id)
         ---@type pi.Task
         local task = {
             id = id,
             command = non_null(d.command) or "",
             status = "running",
-            start_time = ts,
+            start_time = start_ts,
             pid = non_null(d.pid),
             output_file = merge_output_file(nil, d.outputFile),
             session_id = session_id,
@@ -278,7 +330,7 @@ function M.handle_event(ev, session_id, tab)
                 id = id,
                 command = non_null(d.command) or "",
                 status = "running",
-                start_time = ts,
+                start_time = start_ts,
                 session_id = session_id,
                 tab = tab,
             }
@@ -290,6 +342,9 @@ function M.handle_event(ev, session_id, tab)
         task.status = d.kind
         task.end_time = ts
         task.exit_code = exit_code or (d.kind == "completed" and 0 or 1)
+        -- The authoritative terminal state: a stop that was still escalating
+        -- has succeeded (or was never needed).
+        cancel_escalation(id)
         M.request_refresh()
         return true
     end
@@ -316,6 +371,7 @@ function M.handle_event(ev, session_id, tab)
         if changed then
             M.request_refresh()
         end
+        cancel_escalation(id)
         return true
     end
 
@@ -333,6 +389,7 @@ function M.remove_session(session_id)
     for id, t in pairs(store) do
         if t.session_id == session_id then
             store[id] = nil
+            cancel_escalation(id)
             removed = removed + 1
         end
     end
@@ -355,6 +412,100 @@ function M.mark_stopped(id, now_ms)
     task.status = "stopped"
     task.end_time = now_ms or current_ms()
     M.request_refresh()
+    return true
+end
+
+--- Signal a background task's process GROUP.
+---
+--- The extension spawns every task `detached: true`, so the child is its own
+--- process-group leader (pgid == pid) and its children live in that group:
+--- `node` under `npm run dev`, the compiler under `make`, every stage of a
+--- pipeline. Signalling the bare pid stops only the shell — the children are
+--- orphaned, keep the port bound, and the row reads "stopped" while the work
+--- goes on. The group is the unit that was started, so it is the unit that is
+--- stopped.
+---
+--- Falls back to the bare pid when the group is gone (a task started by a pi
+--- process that already exited, or a record replayed from a session file).
+---@param pid integer|nil
+---@param signum? integer|string Signal number or name. Defaults to "sigterm".
+---@return boolean signalled
+function M.kill_group(pid, signum)
+    -- A nil/0/1 pid would address no task: pid 0 is OUR process group, so a
+    -- negative-program-id kill there would signal this Neovim.
+    if type(pid) ~= "number" or pid <= 1 then
+        return false
+    end
+    -- A JSON-decoded pid is an integer, but a replayed record can carry a
+    -- float; luv wants an integer pid.
+    local target = math.floor(pid)
+    local uv = vim.uv or vim.loop
+    signum = signum or "sigterm"
+    local ok, res = pcall(uv.kill, -target, signum)
+    if ok and res == 0 then
+        return true
+    end
+    ok, res = pcall(uv.kill, target, signum)
+    return ok and res == 0
+end
+
+--- Arm the SIGKILL escalation for a task whose SIGTERM has just been sent.
+---
+--- The timer is registered in `escalations` before it starts, and its own
+--- firing re-checks that registration: a terminal `pi2_bg_task` event (or a
+--- reset, or the tab closing) removes the entry, so a task the backend already
+--- settled is never killed behind its back. Closing the handle from inside the
+--- callback is the canonical luv timer teardown.
+---
+--- The residual exposure is the one every "SIGKILL after a grace window" has:
+--- the backend's event is what proves the process is gone, so an event that is
+--- lost (the pi process died without reporting) could address a pid the OS has
+--- since recycled. The window is one grace period and the registration lives
+--- only while the row is still unconfirmed; the model's `stop_task` has the
+--- same shape, with the child handle's liveness as its extra guard.
+---@param id string
+---@param pid integer
+local function schedule_escalation(id, pid)
+    cancel_escalation(id)
+    local timer = uv.new_timer()
+    if not timer then
+        return
+    end
+    escalations[id] = timer
+    timer:start(escalate_ms, 0, function()
+        pcall(timer.stop, timer)
+        if escalations[id] == timer then
+            escalations[id] = nil
+            local task = store[id]
+            M.kill_group(task and task.pid or pid, "sigkill")
+        end
+        pcall(timer.close, timer)
+    end)
+end
+
+--- Stop a running task (the panel's `x`): SIGTERM its process group, then mark
+--- it stopped locally so the row reacts immediately, then arm a SIGKILL for the
+--- case where the process traps or ignores SIGTERM — a row that reads
+--- `stopped` must not stand for a process that is still running. The
+--- authoritative terminal state still arrives from the extension's
+--- `pi2_bg_task` event, which carries the real exit signal and disarms the
+--- escalation.
+--- Returns false (no side effects) for unknown ids or non-running tasks.
+---@param id string
+---@param now_ms? integer Defaults to vim.uv.now().
+---@return boolean stopped
+function M.stop(id, now_ms)
+    local task = store[id]
+    if not task or task.status ~= "running" then
+        return false
+    end
+    local signalled = M.kill_group(task.pid)
+    M.mark_stopped(id, now_ms)
+    -- Only arm when a signal actually landed: nothing to escalate otherwise
+    -- (the process is already gone, so its terminal event is on its way).
+    if signalled and type(task.pid) == "number" and task.pid > 1 then
+        schedule_escalation(id, task.pid)
+    end
     return true
 end
 

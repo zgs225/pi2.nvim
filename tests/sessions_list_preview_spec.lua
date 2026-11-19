@@ -1,9 +1,11 @@
 -- Sessions-list `p` key (issue #107): preview ANY row — parent/tab rows
 -- included — in the read-only sub-session viewer. The target id prefers the
 -- live session object's id (freshest across the tmp-N → real-id migration) and
--- the row's resolved display name is forwarded to the viewer. `x` stays
--- sub-session-only. The viewer module is stubbed so this spec does not depend
--- on the viewer's own generalization landing first.
+-- the row's resolved display name is forwarded to the viewer. `x` on a child
+-- row still closes that child's process (now behind its own confirmation — see
+-- tests/sessions_list_close_spec.lua for the full close behaviour). The viewer
+-- module is stubbed so this spec does not depend on the viewer's own
+-- generalization landing first.
 
 local SessionList = require("pi.ui.sessions")
 local Sidebar = require("pi.ui.sidebar")
@@ -124,6 +126,23 @@ local function with_manifest_children(fn, body)
     Manifest.children_of = fn
     local ok, err = pcall(body)
     Manifest.children_of = real_children_of
+    if not ok then
+        error(err)
+    end
+end
+
+--- Answer the `x` confirmation picker with `choice` while `fn` runs.
+---@param choice string?
+---@param fn fun(prompts: string[])
+local function with_confirm(choice, fn)
+    local real = vim.ui.select
+    local prompts = {}
+    vim.ui.select = function(_, opts, on_choice)
+        prompts[#prompts + 1] = opts and opts.prompt or ""
+        on_choice(choice)
+    end
+    local ok, err = pcall(fn, prompts)
+    vim.ui.select = real
     if not ok then
         error(err)
     end
@@ -330,7 +349,7 @@ describe("sessions list preview key", function()
         end)
     end)
 
-    it("leaves x sub-session-only: a parent row performs no close", function()
+    it("asks before closing a parent session: a decline performs no close", function()
         local tab = vim.api.nvim_get_current_tabpage()
         local s = fake_session({ tab = tab, id = "parent-live-id", name = "Parent task" })
         with_manager({ s }, function()
@@ -338,7 +357,11 @@ describe("sessions list preview key", function()
                 SessionList.open()
                 settle_names({ s })
                 vim.api.nvim_win_set_cursor(0, { 1, 0 })
-                press_key("x")
+                with_confirm("No", function(prompts)
+                    press_key("x")
+                    assert.are.equal(1, #prompts)
+                    assert.is_truthy(prompts[1]:find("Close session", 1, true))
+                end)
 
                 assert.are.equal(0, #calls.close)
                 assert.are.equal(0, #calls.viewer)
@@ -366,7 +389,9 @@ describe("sessions list preview key", function()
                     assert.are.equal(2, #vim.api.nvim_buf_get_lines(0, 0, -1, false))
 
                     vim.api.nvim_win_set_cursor(0, { 2, 0 })
-                    press_key("x")
+                    with_confirm("Yes", function()
+                        press_key("x")
+                    end)
 
                     assert.same({ "child-id" }, calls.close)
                 end)
