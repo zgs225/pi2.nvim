@@ -17,7 +17,7 @@ it is "everything is green while the defect ships" (G25).
 | 7 rules: LuaJIT parse (G24), docs sync, config three-spots (G19) | `make check` | `luajit`, `python3` | `checks` job |
 | Prove the gates can fail | `make check-selftest` | same as above | `checks` job (runs first) |
 | Doc links + anchors | `make docs-links` | `python3` | `checks` job |
-| Behaviour | `make test` / `make smoke` / GUI | nvim (+ plenary) | **not yet** (issue #118) |
+| Behaviour | `make test` / `make smoke` / GUI | nvim (+ plenary, optional render-markdown) | `tests` job (`make test` only; `make smoke` and the GUI layer stay local — they load the user's own config) |
 
 `make check` is the fast, hermetic half: no nvim, no plugin loading, no fixture
 data — it reads the tree and answers questions about it in about a second.
