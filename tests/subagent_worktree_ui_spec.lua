@@ -20,6 +20,8 @@ local Read = require("pi.subsessions.read")
 local SessionList = require("pi.ui.sessions")
 local Sessions = require("pi.sessions.manager")
 local SubToolUi = require("pi.subsessions.tool_ui")
+local History = require("pi.ui.chat.history")
+local Tools = require("pi.ui.chat.tools")
 local Viewer = require("pi.ui.subsession_viewer")
 
 local GLYPH = "󰙅"
@@ -177,6 +179,66 @@ describe("assigned worktree in sub-agent tool rows", function()
             last_active_at = "t",
         })
         assert.are.equal("auth-review", SubToolUi.item_label({ target = "child-2", message = "hi" }))
+    end)
+
+    it("badges a create request with the name it asks for, else +new", function()
+        assert.are.equal(
+            "t1 " .. GLYPH .. " wt-a",
+            SubToolUi.item_label({ task = "t1", worktree = { create = { name = "wt-a" } } })
+        )
+        assert.are.equal("t1 " .. GLYPH .. " +new", SubToolUi.item_label({ task = "t1", worktree = { create = true } }))
+        assert.are.equal(
+            "t1 " .. GLYPH .. " +new",
+            SubToolUi.item_label({ task = "t1", worktree = { create = { base = "fresh" } } })
+        )
+    end)
+
+    it("badges the block header with the requested checkout", function()
+        local args = { items = { { task = "t1", worktree = { create = { name = "wt-a" } } } }, wait = false }
+        assert.are.equal("t1 " .. GLYPH .. " wt-a", SubToolUi.dispatch_header_detail(args))
+    end)
+
+    it("shows the request while no result item exists, the created checkout once it does", function()
+        local args = { items = { { task = "t1", worktree = { create = { name = "wt-a" } } } }, wait = true }
+        assert.are.equal("t1 " .. GLYPH .. " wt-a", SubToolUi.dispatch_inline_detail(args))
+        local details = {
+            status = "completed",
+            items = {
+                {
+                    status = "ok",
+                    target = "child-1",
+                    worktree = { path = "/repo/.worktrees/sub-1", name = "sub-1", owned = true },
+                },
+            },
+        }
+        assert.are.equal("t1 " .. GLYPH .. " sub-1", SubToolUi.dispatch_inline_detail(args, details))
+    end)
+
+    it("keeps the item's model and thinking level next to the created checkout", function()
+        local args = {
+            items = {
+                { task = "t1", worktree = { create = true }, model = { id = "m" }, thinking_level = "high" },
+            },
+            wait = true,
+        }
+        local details = {
+            status = "completed",
+            items = { { status = "ok", target = "c1", worktree = { path = "/w/sub-1", name = "sub-1" } } },
+        }
+        assert.are.equal("t1 " .. GLYPH .. " sub-1 (m · think: high)", SubToolUi.dispatch_inline_detail(args, details))
+    end)
+
+    it("drops the request badge from an inline row whose item never started", function()
+        local args = { items = { { task = "t1", worktree = { path = "/x/asked/wt-1" } } }, wait = true }
+        local details = { status = "failed", items = { { status = "failed", task = "t1", error = "spawn failed" } } }
+        assert.are.equal("t1", SubToolUi.dispatch_inline_detail(args, details))
+    end)
+
+    it("badges a create request on a block row before its result lands", function()
+        local args = { items = { { task = "t1", worktree = { create = true } } }, wait = false }
+        local details = { status = "running", items = { { status = "queued", task = "t1" } } }
+        local rows = SubToolUi.dispatch_rows(args, details)
+        assert.are.equal("t1 " .. GLYPH .. " +new", rows[1].label)
     end)
 end)
 
@@ -588,5 +650,149 @@ describe("dormant subsession viewer with an assigned worktree", function()
             return false
         end, 10)
         assert.is_truthy(concat_lines(buf):find("plain dormant child", 1, true))
+    end)
+end)
+
+-- inline dispatch row --------------------------------------------------------
+
+-- A single item with `wait: true` renders as an **inline** row, written before
+-- the batch result exists — so it can only name the checkout the item *asked*
+-- for (`{ path }`, or a `create.name` / `+new` request). Once the result lands
+-- the row is rewritten to the checkout the child actually got through the
+-- renderer's `inline_result_text` hook, and an item that never started loses
+-- the badge instead of claiming a checkout no child was given.
+
+describe("inline dispatch row with a requested checkout", function()
+    local manifest_tmp
+
+    ---@param h pi.ChatHistory
+    ---@return string
+    local function row_text(h)
+        return vim.api.nvim_buf_get_lines(h:buf(), 0, -1, false)[1] or ""
+    end
+
+    ---@param h pi.ChatHistory
+    ---@return integer? end_col of the row's PiToolCall detail highlight
+    local function detail_end_col(h)
+        local found
+        for _, em in ipairs(vim.api.nvim_buf_get_extmarks(h:buf(), h:ns(), 0, -1, { details = true })) do
+            local details = em[4] or {}
+            if details.hl_group == "PiToolCall" and em[2] == 0 and details.end_row == 0 then
+                found = details.end_col
+            end
+        end
+        return found
+    end
+
+    ---@param item table result item
+    ---@return table
+    local function result_with(item)
+        return {
+            content = {
+                {
+                    type = "text",
+                    text = vim.json.encode({
+                        status = "completed",
+                        summary = { total = 1, done = 1 },
+                        items = { item },
+                    }),
+                },
+            },
+        }
+    end
+
+    before_each(function()
+        manifest_tmp = vim.fn.tempname() .. ".json"
+        Manifest.path = function()
+            return manifest_tmp
+        end
+        Config.setup({ title = { lang = "en" }, render = { engine = "builtin" } })
+    end)
+
+    after_each(function()
+        os.remove(manifest_tmp)
+        Config.setup({})
+    end)
+
+    it("replaces a create request with the checkout the child got", function()
+        local h = History.new(TAB)
+        h:on_tool_start("dispatch_subagents", "d1", {
+            items = { { task = "do it", worktree = { create = true } } },
+            wait = true,
+        })
+        vim.wait(60)
+        assert.is_truthy(row_text(h):find("do it " .. GLYPH .. " +new", 1, true), row_text(h))
+
+        h:on_tool_end(
+            "dispatch_subagents",
+            "d1",
+            result_with({
+                status = "ok",
+                target = "child-1",
+                worktree = { path = "/repo/.worktrees/sub-1", name = "sub-1", owned = true },
+            }),
+            false
+        )
+        vim.wait(60)
+        local text = row_text(h)
+        assert.is_truthy(text:find("do it " .. GLYPH .. " sub-1", 1, true), text)
+        assert.is_nil(text:find("+new", 1, true), text)
+        -- The subdued detail highlight must follow the rewritten text, not keep
+        -- the byte span of the shorter request badge.
+        assert.are.equal(#text, detail_end_col(h))
+        pcall(vim.api.nvim_buf_delete, h:buf(), { force = true })
+    end)
+
+    it("keeps a named create request, then names the created checkout", function()
+        local h = History.new(TAB)
+        h:on_tool_start("dispatch_subagents", "d2", {
+            items = { { task = "do it", worktree = { create = { name = "wt-a" } } } },
+            wait = true,
+        })
+        vim.wait(60)
+        assert.is_truthy(row_text(h):find("do it " .. GLYPH .. " wt-a", 1, true), row_text(h))
+
+        h:on_tool_end(
+            "dispatch_subagents",
+            "d2",
+            result_with({
+                status = "ok",
+                target = "child-2",
+                worktree = { path = "/repo/.worktrees/sub-2", name = "sub-2", reused = true },
+            }),
+            false
+        )
+        vim.wait(60)
+        assert.is_truthy(row_text(h):find("do it " .. GLYPH .. " sub-2", 1, true), row_text(h))
+        pcall(vim.api.nvim_buf_delete, h:buf(), { force = true })
+    end)
+
+    it("drops the badge when the item failed before it got a checkout", function()
+        local h = History.new(TAB)
+        h:on_tool_start("dispatch_subagents", "d3", {
+            items = { { task = "do it", worktree = { path = "/repo/.worktrees/wt-b" } } },
+            wait = true,
+        })
+        vim.wait(60)
+        assert.is_truthy(row_text(h):find("do it " .. GLYPH .. " wt-b", 1, true), row_text(h))
+
+        h:on_tool_end(
+            "dispatch_subagents",
+            "d3",
+            result_with({ status = "failed", task = "do it", error = "spawn failed" }),
+            false
+        )
+        vim.wait(60)
+        local text = row_text(h)
+        assert.is_truthy(text:find("do it", 1, true), text)
+        assert.is_nil(text:find(GLYPH, 1, true), text)
+        pcall(vim.api.nvim_buf_delete, h:buf(), { force = true })
+    end)
+
+    it("leaves a non-inline dispatch to the block rows", function()
+        local renderer = Tools.get_renderer("dispatch_subagents")
+        local args = { items = { { task = "t1", worktree = { create = true } }, { task = "t2" } }, wait = false }
+        assert.is_false(Tools.is_inline(renderer, args))
+        assert.is_nil(renderer.inline_result_text(args, result_with({ status = "ok", target = "c1" })))
     end)
 end)
