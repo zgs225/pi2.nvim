@@ -7,7 +7,9 @@
 #
 # Three jobs, all required to merge:
 #   style    — `make style`  (stylua --check for Lua, ruff format --check for Python)
-#   lint     — `make lint`   (lua-language-server --check for lua/, ruff check for scripts/)
+#   lint     — `make lint`   (lua-language-server --check for lua/ (strict, .luarc.json)
+#                              + tests/ and scripts/e2e/ (.luarc-tests.json, narrower);
+#                              ruff check for scripts/)
 #   checks   — `make check`  (LuaJIT parse gate, docs sync; scripts/checks/)
 #              preceded by `make check-selftest`, which proves every gate in
 #              `make check` can still FAIL. A gate nobody has seen fail is not a
@@ -91,8 +93,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install luajit
-        # Any LuaJIT 2.1 build is the authority for "loads on Neovim stable":
-        # it rejects Lua 5.3-only syntax the way Neovim's embedded LuaJIT does.
+        # A LuaJIT 2.1 build is the authority for "loads on Neovim stable" when
+        # it rejects Lua 5.3-only syntax, which is not a property of the version
+        # number: `parse-luajit` probes the binary before scanning and fails with
+        # exit 2 if it accepts `&`, `|`, `<<`, `>>`, `~` or `//`. The distro
+        # build installed here passes that probe (`make check` is green).
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends luajit

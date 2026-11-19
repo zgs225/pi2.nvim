@@ -24,7 +24,8 @@
 #   make smoke   — headless end-to-end smoke check (loads the user config, opens the chat)
 #   make format  — reformat in place: stylua (Lua) + ruff format (Python under scripts/)
 #   make style   — check formatting only (stylua --check + ruff format --check); for CI/hooks
-#   make lint    — static analysis: lua-language-server over lua/ + ruff check over scripts/
+#   make lint    — static analysis: lua-language-server over lua/ (strict, .luarc.json)
+#                  + tests/ and scripts/e2e/ (.luarc-tests.json, narrower) + ruff check over scripts/
 #   make docs-links — validate relative links and anchors in README.md and doc/*.md
 #
 # The suite is intentionally runnable without the user's full Neovim config so
@@ -160,8 +161,15 @@ style:
 # directly. Config is .luarc.json (portable: bundled luv types only; vim runtime
 # types are intentionally not loaded so the check is environment-independent).
 # ruff check is the analysis half for Python (imports, unused names, bug patterns).
+# lua/ is checked with the full diagnostic set (.luarc.json), while tests/ and
+# scripts/e2e/ are checked with .luarc-tests.json, a documented narrower set
+# (busted/plenary globals; the diagnostic classes that are pure harness noise are
+# disabled there) — because those trees ship nothing and are run only by a
+# developer's Neovim, so their annotations must not be held to library quality.
 lint:
 	$(LUA_LS_BIN) --check lua --configpath $(CURDIR)/.luarc.json --loglevel error
+	$(LUA_LS_BIN) --check tests --configpath $(CURDIR)/.luarc-tests.json --loglevel error
+	$(LUA_LS_BIN) --check scripts/e2e --configpath $(CURDIR)/.luarc-tests.json --loglevel error
 	$(RUFF_BIN) check scripts
 
 docs-links:
@@ -181,6 +189,8 @@ check-list:
 	$(PYTHON_BIN) -m scripts.checks --list
 
 # LuaJIT syntax gate alone (G24): the cheapest way to answer "does this load on
-# Neovim stable". Any LuaJIT 2.1 build works; mise pins one for parity.
+# Neovim stable". The binary is probed first — a build that accepts Lua 5.3
+# syntax is refused with exit 2 instead of reporting green — so any LuaJIT 2.1
+# build works exactly when it passes that probe; mise pins one for parity.
 parse:
 	$(PYTHON_BIN) -m scripts.checks --only parse-luajit
