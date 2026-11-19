@@ -111,12 +111,14 @@ Each is a scar from a run that reported green while checking nothing (G25).
    and a cached "good" must not launder a lenient parser.
 
    This is measured, not defensive: `/usr/bin/luajit` 2.1.1794386141 accepts
-   `1 & 2` (it rejects only `//`), so `make check` printed `ok: 0 findings` on a
-   tree the pinned 2.1.1744318430 reports as 2 findings. The same distrust applies
-   to text matching: rules tokenize with `lua.code_tokens` first, because the G24
-   "banned syntax" greps that shipped for a year matched `-- Buffer & windows ---`
-   and the string `"&Yes\n&No"` in this very repo — five hits, zero real. A rule
-   that cries wolf gets deleted.
+   `1 & 2` (it rejects only `//`), so on a tree whose only Lua 5.3 use is `&` the
+   old gate printed `ok: 0 findings` where the pinned 2.1.1744318430 finds one —
+   and on `fixtures/parse-luajit/bad` (one `&` file, one `//` file) the lenient
+   build reports 1 of the 2 findings, silently dropping the `&` file. The same
+   distrust applies to text matching: rules tokenize with `lua.code_tokens`
+   first, because the G24 "banned syntax" greps that shipped for a year matched
+   `-- Buffer & windows ---` and the string `"&Yes\n&No"` in this very repo — five
+   hits, zero real. A rule that cries wolf gets deleted.
 3. **A tree is never silently clean: warn vs error.** One contract, both rules.
    The *subject tree is absent or unreadable* → `CheckError`, exit 2: a root with
    no `lua/` directory is refused by both `docs-commands` and `parse-luajit`,

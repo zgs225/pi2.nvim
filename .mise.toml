@@ -38,6 +38,8 @@ ruff = "0.17.5"
 # operators (`&`, `|`, `~`, `<<`, `>>`, `//`) that a newer Lua parser would let
 # through, while accepting the LuaJIT/Lua 5.2 extensions this repo does use
 # (`goto` + `::label::`). Pinned to one conda-forge build so every machine
-# parses byte-identically; `make parse LUAJIT_BIN=/usr/bin/luajit` overrides for
-# a distro/pkgsrc luajit (any 2.1 build is the same authority on 5.3 syntax).
+# parses byte-identically. `make parse LUAJIT_BIN=/usr/bin/luajit` overrides it
+# for a distro/pkgsrc build, but a version number is only a claim: the gate probes
+# the binary's grammar first (see `scripts/checks/rules/parse_luajit.py`) and
+# refuses one that accepts Lua 5.3 syntax — measured, some 2.1 builds do.
 luajit = "2.1.1744318430"

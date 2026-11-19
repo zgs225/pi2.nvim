@@ -261,7 +261,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--list", action="store_true", help="list checks and exit")
     parser.add_argument("--self-test", action="store_true", help="prove every check can fail, using fixtures")
     parser.add_argument("--json", action="store_true", help="machine-readable output")
-    parser.add_argument("--quiet", action="store_true", help="only print findings and the summary line")
     args = parser.parse_args(argv)
 
     if args.list:
