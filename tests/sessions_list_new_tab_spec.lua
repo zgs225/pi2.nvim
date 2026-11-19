@@ -379,8 +379,9 @@ describe(":PiSessions n (new session in this checkout)", function()
 
         it("anchors on the last tab of the row's worktree group", function()
             with_tabs(3, function(tabs)
-                -- Tabline: main A, main C, wt B — groups are ordered by activity
-                -- in the list, so the rows are located by name, not by index.
+                -- Tabline: main A, main C, wt B — group order follows first
+                -- appearance, so main's block leads; rows are located by name,
+                -- not by index.
                 local main_a = fake_session({ id = "A", cwd = MAIN_DIR, tab = tabs[1] })
                 local main_c = fake_session({ id = "C", cwd = MAIN_DIR, tab = tabs[2] })
                 local wt_b = fake_session({ id = "B", cwd = WT_DIR, tab = tabs[3] })

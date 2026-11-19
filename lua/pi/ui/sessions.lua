@@ -364,74 +364,6 @@ local function row_fold_key(row)
     return parent_key(row.session) or row.session_id
 end
 
---- Normalized checkout path, or nil when `path` is not one. Mirrors the resume
---- picker's partition keys: trailing slashes would split one checkout into two
---- groups.
----@param path any
----@return string?
-local function norm_checkout(path)
-    if type(path) ~= "string" or path == "" then
-        return nil
-    end
-    local normalized = vim.fs.normalize(path):gsub("/+$", "")
-    return normalized ~= "" and normalized or nil
-end
-
---- Checkout the current tab runs in: the session's own cwd — a worktree session
---- keeps its checkout while Neovim's cwd does not move — else Neovim's cwd.
---- The same anchor `:PiResume` uses, so both lists agree on which checkout is
---- "yours".
----@return string?
-local function current_checkout()
-    local ok, Sessions = pcall(require, "pi.sessions.manager")
-    local session = ok and type(Sessions) == "table" and type(Sessions.get) == "function" and Sessions.get() or nil
-    local cwd = session and session.cwd
-    if type(cwd) ~= "string" or cwd == "" then
-        cwd = vim.fn.getcwd()
-    end
-    return norm_checkout(cwd)
-end
-
---- Main work tree of the project the current editor session belongs to — the
---- group the overview pins first.
----
---- Deliberately resolved from `current_checkout()` to the **repository's main
---- checkout** rather than pinned to that checkout itself: every tab of the same
---- repository (its main checkout and all its linked worktrees) resolves to the
---- same main work tree, so moving focus between two worktree tabs cannot
---- reshuffle the groups. A tab whose checkout is not inside a git repository
---- pins nothing.
----@return string? normalized main checkout root
-local function current_main_checkout()
-    local anchor = current_checkout()
-    local info = anchor and detect_worktree(anchor)
-    local repo_root = info and info.repo_root
-    if type(repo_root) ~= "string" or repo_root == "" then
-        return nil
-    end
-    return norm_checkout(repo_root)
-end
-
---- Activity clock of a list row: the mtime of the session transcript it belongs
---- to (a disk-only child row uses the file recorded for it). It is the same
---- signal the resume picker orders its partitions by. 0 when no file is known —
---- a session that has not reported one yet, or one started without a session
---- file.
----@param row pi.SessionsListRow
----@return integer
-local function row_activity(row)
-    local file = row.session_file
-    local session = row.session
-    if type(file) ~= "string" or file == "" then
-        file = session and session.session_file
-    end
-    if type(file) ~= "string" or file == "" then
-        return 0
-    end
-    local mtime = vim.fn.getftime(file)
-    return mtime > 0 and mtime or 0
-end
-
 --- Group parent rows (and their sub-session rows) by git worktree.
 ---
 --- Groups appear only when the rows span at least two distinct worktrees, so a
@@ -445,19 +377,19 @@ end
 --- grouping and the parent's fold count follow the parent row, never the
 --- child's cwd.
 ---
---- Group order follows `:PiResume`'s partition order, with one deliberate
---- difference: the **main work tree of the project the focused tab belongs to**
---- comes first (see `current_main_checkout`), never the focused tab's own
---- checkout, so switching focus between two tabs of one repository's worktrees
---- never reorders the groups. The rest follow by most recently active groups
---- (newest transcript mtime anywhere in the group), with equal clocks broken by
---- worktree name and then path so a redraw never reshuffles ties.
+--- Group order is **first appearance in tabline order** and nothing else: a
+--- group is emitted where its first tab sits, so the list keeps following the
+--- tabline as tabs move and never reshuffles itself between redraws. No
+--- activity clock (transcript mtime), no focus-dependent pin — both reordered
+--- the headers underneath the reader and broke the row ↔ tab correspondence
+--- (`:PiResume` keeps its own recency + current-checkout partition order; this
+--- list is deliberately different).
 ---@param flat pi.SessionsListRow[]
 ---@return pi.SessionsListRow[]
 local function group_by_worktree(flat)
     ---@type table<string, pi.SessionsListRow[]>
     local buckets = {}
-    ---@type string[] group roots in first-appearance order (re-ordered below)
+    ---@type string[] group roots in first-appearance (tabline) order
     local order = {}
     ---@type table<string, pi.SessionsListWorktree>
     local infos = {}
@@ -495,45 +427,6 @@ local function group_by_worktree(flat)
     if #order < 2 then
         return flat
     end
-
-    -- Pin the main work tree of the focused tab's project: every checkout of
-    -- one repository (main and linked worktrees) resolves to the same root, so
-    -- the pinned group does not depend on which tab has focus.
-    local main = current_main_checkout()
-    local pinned = nil
-    if main then
-        for _, root in ipairs(order) do
-            if norm_checkout(root) == main then
-                pinned = root
-                break
-            end
-        end
-    end
-
-    ---@type table<string, integer>
-    local activity = {}
-    for _, root in ipairs(order) do
-        local newest = 0
-        for _, row in ipairs(buckets[root]) do
-            newest = math.max(newest, row_activity(row))
-        end
-        activity[root] = newest
-    end
-
-    table.sort(order, function(a, b)
-        if (a == pinned) ~= (b == pinned) then
-            return a == pinned
-        end
-        local am, bm = activity[a] or 0, activity[b] or 0
-        if am ~= bm then
-            return am > bm
-        end
-        local an, bn = infos[a].name or "", infos[b].name or ""
-        if an ~= bn then
-            return an < bn
-        end
-        return a < b
-    end)
 
     ---@type pi.SessionsListRow[]
     local out = {}
@@ -2206,10 +2099,9 @@ end
 ---
 --- The anchor is the group's last tab in tabline order, which is also the
 --- group's last row (rows keep tabline order inside a group), so the new tab
---- joins its group's block in both. Group *order* is not reproduced: the list
---- orders groups by activity, so only the placement inside a group can be
---- stable. A folded group renders no member rows, so its live sessions answer
---- instead.
+--- joins its group's block in both. Group order follows first appearance too,
+--- so the block itself keeps its place in the tabline. A folded group renders
+--- no member rows, so its live sessions answer instead.
 ---
 --- nil when nothing should move: a flat list keeps tabline order (appending is
 --- already correct), and a checkout with no group yet is listed last — which is

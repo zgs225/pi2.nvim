@@ -121,8 +121,9 @@ local function buffer_lines()
     return vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(0), 0, -1, false)
 end
 
---- A transcript file with a controlled mtime, so group ordering by activity is
---- deterministic (`getftime` has second resolution).
+--- A transcript file with a controlled mtime: group order must ignore it, so a
+--- spec can prove the headers do not follow it (`getftime` has second
+--- resolution).
 ---@param name string
 ---@param mtime integer
 ---@return string
@@ -213,20 +214,20 @@ describe(":PiSessions worktree grouping", function()
             assert.are.equal("/repo/wt", rows[4].group_id)
         end)
 
-        it("breaks equal activity ties by worktree name and keeps ungrouped rows last", function()
+        it("orders groups by first appearance and keeps ungrouped rows last", function()
             local linked = fake_session({ id = "B", cwd = "/repo/wt" })
             local outside = fake_session({ id = "C", cwd = "/tmp/none" })
             local main = fake_session({ id = "A", cwd = "/repo/main" })
 
-            -- No transcript is known for any row (activity 0 for both groups):
-            -- the name decides (`main` before `wt`), never first appearance.
+            -- Tabline order: wt, ungrouped, main. The wt tab comes first, so
+            -- its group leads; no name or activity tiebreak reorders headers.
             local rows = build({ linked, outside, main })
 
             assert.are.equal(5, #rows)
-            assert.are.equal("/repo/main", rows[1].group_id)
-            assert.are.equal("A", rows[2].session_id)
-            assert.are.equal("/repo/wt", rows[3].group_id)
-            assert.are.equal("B", rows[4].session_id)
+            assert.are.equal("/repo/wt", rows[1].group_id)
+            assert.are.equal("B", rows[2].session_id)
+            assert.are.equal("/repo/main", rows[3].group_id)
+            assert.are.equal("A", rows[4].session_id)
             assert.are.equal("C", rows[5].session_id)
             assert.is_nil(rows[5].group_id)
             assert.is_nil(rows[5].worktree)
@@ -247,155 +248,56 @@ describe(":PiSessions worktree grouping", function()
             return out
         end
 
-        it("orders groups by their newest session transcript", function()
+        it("follows tabline first appearance, never a transcript clock", function()
             local main = fake_session({
                 id = "A",
                 cwd = "/repo/main",
-                session_file = transcript("main.jsonl", 2000000),
+                session_file = transcript("main-new.jsonl", 2000000),
             })
             local linked = fake_session({
                 id = "B",
                 cwd = "/repo/wt",
-                session_file = transcript("wt.jsonl", 1000000),
+                session_file = transcript("wt-old.jsonl", 1000000),
             })
 
-            -- Tabline order puts the linked checkout first and the name
-            -- tiebreak would too; the newer transcript still puts main ahead.
-            local rows = build({ linked, main })
-
-            assert.are.same({ "/repo/main", "/repo/wt" }, grouped(rows))
+            -- The linked checkout's tab comes first, so its group leads even
+            -- though main's transcript is newer (and even though the name
+            -- tiebreak would say otherwise).
+            assert.are.same({ "/repo/wt", "/repo/main" }, grouped(build({ linked, main })))
+            -- Tabline order reversed, group order reversed: pure first appearance.
+            assert.are.same({ "/repo/main", "/repo/wt" }, grouped(build({ main, linked })))
         end)
 
-        it("pins the project's main worktree first, then orders the rest by activity", function()
+        it("does not move a group when a session's transcript gets fresher", function()
+            local file = transcript("wt-activity.jsonl", 1000000)
             local main = fake_session({
                 id = "A",
                 cwd = "/repo/main",
-                session_file = transcript("main-old.jsonl", 1000000),
+                session_file = transcript("main-activity.jsonl", 2000000),
             })
-            local linked = fake_session({
-                id = "B",
-                cwd = "/repo/wt",
-                session_file = transcript("wt-new.jsonl", 2000000),
-            })
+            local linked = fake_session({ id = "B", cwd = "/repo/wt", session_file = file })
 
-            -- The tab runs in the main checkout, whose transcript is older:
-            -- it still leads, and the rest keeps its recency order.
-            with_manager({ linked, main }, function()
-                assert.are.same({ "/repo/main", "/repo/wt" }, grouped(build({ linked, main })))
-            end, main)
+            assert.are.same({ "/repo/wt", "/repo/main" }, grouped(build({ linked, main })))
+
+            -- A turn written while the list is open touches the transcript
+            -- mtime; the headers must not follow it.
+            vim.fn.writefile({ "{}" }, file)
+            vim.uv.fs_utime(file, 3000000, 3000000)
+            assert.are.same({ "/repo/wt", "/repo/main" }, grouped(build({ linked, main })))
         end)
 
-        it("keeps the project's main worktree first whichever tab has focus", function()
-            local main = fake_session({
-                id = "A",
-                cwd = "/repo/main",
-                session_file = transcript("main-old.jsonl", 1000000),
-            })
-            local wt = fake_session({
-                id = "B",
-                cwd = "/repo/wt",
-                session_file = transcript("wt-newest.jsonl", 3000000),
-            })
-            local wt2 = fake_session({
-                id = "C",
-                cwd = "/repo/wt2",
-                session_file = transcript("wt2-mid.jsonl", 2000000),
-            })
+        it("keeps the headers fixed when focus moves between tabs", function()
+            local wt = fake_session({ id = "A", cwd = "/repo/wt" })
+            local wt2 = fake_session({ id = "B", cwd = "/repo/wt2" })
+            local main = fake_session({ id = "C", cwd = "/repo/main" })
 
-            -- Two linked worktrees of the same repository plus a session in
-            -- its main checkout: focusing a worktree tab must not move that
-            -- tab's group ahead of the main checkout (`/repo/main` stays
-            -- pinned for all three).
+            -- No focus-dependent pin: whichever tab is current, the headers
+            -- keep the tabline order of their first member.
             for _, anchor in ipairs({ main, wt, wt2 }) do
-                with_manager({ main, wt, wt2 }, function()
-                    assert.are.same({ "/repo/main", "/repo/wt", "/repo/wt2" }, grouped(build({ main, wt, wt2 })))
+                with_manager({ wt, wt2, main }, function()
+                    assert.are.same({ "/repo/wt", "/repo/wt2", "/repo/main" }, grouped(build({ wt, wt2, main })))
                 end, anchor)
             end
-        end)
-
-        it("does not reshuffle groups when focus moves between two worktree tabs", function()
-            local wt = fake_session({
-                id = "A",
-                cwd = "/repo/wt",
-                session_file = transcript("a.jsonl", 1000000),
-            })
-            local wt2 = fake_session({
-                id = "B",
-                cwd = "/repo/wt2",
-                session_file = transcript("b.jsonl", 2000000),
-            })
-
-            -- Both tabs are worktrees of the same repository, whose main
-            -- checkout lists no session: the project the list pins is the
-            -- same for either tab, so the recency order never moves with the
-            -- focus.
-            for _, anchor in ipairs({ wt, wt2 }) do
-                with_manager({ wt, wt2 }, function()
-                    assert.are.same({ "/repo/wt2", "/repo/wt" }, grouped(build({ wt, wt2 })))
-                end, anchor)
-            end
-        end)
-
-        it("resolves a subdirectory anchor to its checkout's main worktree", function()
-            local main = fake_session({ id = "A", cwd = "/repo/main" })
-            local linked = fake_session({
-                id = "B",
-                cwd = "/repo/wt",
-                session_file = transcript("wt-sub.jsonl", 2000000),
-            })
-            local anchor = fake_session({ id = "tab", cwd = "/repo/wt/lua/pi" })
-
-            with_manager({ main, linked }, function()
-                assert.are.same({ "/repo/main", "/repo/wt" }, grouped(build({ main, linked })))
-            end, anchor)
-        end)
-
-        it("falls back to recency when the tab runs outside every listed checkout", function()
-            local main = fake_session({
-                id = "A",
-                cwd = "/repo/main",
-                session_file = transcript("main-mid.jsonl", 1500000),
-            })
-            local linked = fake_session({
-                id = "B",
-                cwd = "/repo/wt",
-                session_file = transcript("wt-newest.jsonl", 2000000),
-            })
-            local anchor = fake_session({ id = "tab", cwd = "/tmp/elsewhere" })
-
-            with_manager({ main, linked }, function()
-                assert.are.same({ "/repo/wt", "/repo/main" }, grouped(build({ main, linked })))
-            end, anchor)
-        end)
-
-        it("counts a sub-session transcript recorded on the row", function()
-            local parent = fake_session({ id = "parent-1", cwd = "/repo/main" })
-            local linked = fake_session({
-                id = "B",
-                cwd = "/repo/wt",
-                session_file = transcript("wt-mid.jsonl", 2000000),
-            })
-
-            -- The main group's parent has no transcript of its own; its child's
-            -- recorded JSONL is the freshest activity (reading only
-            -- `row.session` would leave the group at 0 and put wt first).
-            Manifest.children_of = function(lineage)
-                if lineage == "parent-1" then
-                    return {
-                        {
-                            _id = "c1",
-                            name = "worker-1",
-                            status = "active",
-                            parent_id = "parent-1",
-                            config = {},
-                            session_file = transcript("child-newest.jsonl", 3000000),
-                        },
-                    }
-                end
-                return {}
-            end
-
-            assert.are.same({ "/repo/main", "/repo/wt" }, grouped(build({ parent, linked })))
         end)
     end)
 

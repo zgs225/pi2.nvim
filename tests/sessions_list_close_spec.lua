@@ -358,7 +358,7 @@ describe("session list close key", function()
             with_manager({ main, w1, w2 }, function(closed)
                 SessionList.open()
                 -- 1 main header, 2 main row, 3 wt header, 4 W1, 5 W2
-                -- (the current checkout is pinned first).
+                -- (groups follow tabline first appearance: main's tab is first).
                 assert.are.equal(5, #buffer_lines())
                 vim.api.nvim_win_set_cursor(0, { 3, 0 })
 
