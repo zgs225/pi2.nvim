@@ -497,12 +497,70 @@ local function update_todo_mirror(session, tool_name, result)
     end
 end
 
+--- Forward one bg-tasks lifecycle payload to the task registry, stamped with
+--- the owning session/tab so the registry (and the :PiTasks panel) can scope
+--- rows per session. Shared by the live path (a pushed custom message) and
+--- history replay, so a resumed session folds its transcript the way the
+--- extension itself does and the two tables cannot disagree about a task's
+--- command or state.
+---@param details table pi2_bg_task payload (kind/taskId/command/...)
+---@param timestamp integer? message timestamp (task start/end time)
+---@param session_id string? owning session id (nil = unknown ownership)
+---@param tab integer? owning tabpage handle (panel display)
+---@return boolean consumed
+local function apply_bg_task_event(details, timestamp, session_id, tab)
+    if type(details) ~= "table" then
+        return false
+    end
+    local ok, consumed = pcall(Tasks.handle_event, {
+        type = "pi2_bg_task",
+        details = details,
+        timestamp = timestamp,
+    }, session_id, tab)
+    if not ok then
+        Notify.warn("Background task event failed: " .. tostring(consumed))
+        return false
+    end
+    return consumed == true
+end
+
+--- Fold a replayed `pi2_bg_task` custom message (role="custom") into the task
+--- registry. A transcript entry is not conversation content, so it renders
+--- nothing; but it is the only record of a task's command, and a resumed
+--- session's history re-renders `wait_task` / `stop_task` / `task_input`
+--- blocks from it. Without this fold those blocks fall back to a bare task id
+--- (and the id of a task that already exited in a previous pi process is
+--- exactly what a resumed session has in front of it). Panel side effects
+--- (auto-open/auto-close) are deliberately skipped: replaying a session must
+--- not pop panels.
+---@param message table replayed message (role="custom")
+---@param session_id string? owning session id
+---@param tab integer? owning tabpage handle
+local function replay_bg_task_message(message, session_id, tab)
+    if message.customType ~= "pi2_bg_task" then
+        return
+    end
+    local details = message.details
+    -- A task the registry already tracks keeps its live state. Replay runs more
+    -- than once per session (a compaction rebuild, :PiTree), and a rebuilt
+    -- window can hold a task's `started` entry without the terminal one; folding
+    -- that again would turn a finished row back into a running one (spinner and
+    -- all). Terminal entries are always folded — they carry the exit status and
+    -- are idempotent.
+    if type(details) == "table" and details.kind == "started" then
+        local id = details.taskId
+        if type(id) == "string" and Tasks.get(id) ~= nil then
+            return
+        end
+    end
+    apply_bg_task_event(details, message.timestamp, session_id, tab)
+end
+
 --- Consume a pi2_bg_task custom message pushed by the bg-tasks extension:
---- forward the lifecycle event to the task registry, stamped with the owning
---- session/tab so the registry (and the :PiTasks panel) can scope rows
---- per session. Terminal states surface through the panel row and the
---- agent's own triggerTurn report — no extra vim.notify on top. Runs on the
---- RPC callback thread: every user-facing touch (Notify) is vim.schedule'd.
+--- forward the lifecycle event to the task registry, then act on the panel.
+--- Terminal states surface through the panel row and the agent's own
+--- triggerTurn report — no extra vim.notify on top. Runs on the RPC callback
+--- thread: every user-facing touch (Notify) is vim.schedule'd.
 ---@param message table custom message object (role="custom", customType="pi2_bg_task")
 ---@param session_id string? owning session id (task ownership routing; nil = unknown)
 ---@param tab integer? owning tabpage handle (panel display)
@@ -511,16 +569,7 @@ local function handle_bg_task_message(message, session_id, tab)
     if type(details) ~= "table" then
         return
     end
-    local ok, consumed = pcall(Tasks.handle_event, {
-        type = "pi2_bg_task",
-        details = details,
-        timestamp = message.timestamp,
-    }, session_id, tab)
-    if not ok then
-        Notify.warn("Background task event failed: " .. tostring(consumed))
-        return
-    end
-    if not consumed then
+    if not apply_bg_task_event(details, message.timestamp, session_id, tab) then
         return
     end
     local tasks_cfg = Config.options.tasks_panel or {}
@@ -1714,6 +1763,17 @@ local function replay_messages(session, messages)
                 pending_agent_end = false
             end
             session.chat:on_bash_replay(msg)
+        elseif role == "custom" then
+            -- Extension lifecycle entries (the bg-tasks extension's
+            -- pi2_bg_task messages) render nothing, but they carry the task
+            -- table: fold them in transcript order so a tool block replayed
+            -- from here — wait_task's body leads with the command the task
+            -- runs — resolves the command instead of a bare id. Folding in
+            -- order also means the terminal entries that follow a `started`
+            -- one land on the same record, exactly as in the live path, and
+            -- pending_agent_end is left alone: a custom entry is not a
+            -- conversation turn.
+            replay_bg_task_message(msg, session.id, session.attached_tab or session.tab)
         end
     end
     -- Flush any remaining pending agent_end

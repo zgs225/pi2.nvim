@@ -860,3 +860,203 @@ describe("bg-tasks extension contract", function()
         )
     end)
 end)
+
+-- A resumed session replays its transcript (`replay_messages`) instead of
+-- receiving live events. The bg-tasks extension keeps the task table in the
+-- transcript, so the frontend has to fold the same entries: without that fold
+-- `pi.tasks` is empty and every replayed `wait_task` / `stop_task` /
+-- `task_input` block falls back to a bare task id — precisely the shape a
+-- resumed session sees, because the tasks in front of it have already exited.
+describe("resumed session (history replay)", function()
+    local Config = require("pi.config")
+    local Rpc = require("pi.rpc")
+    local Sessions = require("pi.sessions.manager")
+    local SessionsList = require("pi.ui.sessions")
+
+    local real = {} ---@type table<string, function>
+    local tab = nil ---@type integer?
+    local session ---@type pi.Session?
+    --- What the stubbed get_messages serves (nil = the whole transcript). A
+    --- second replay can serve a narrower window, the way a compaction rebuild
+    --- does.
+    local served = nil ---@type table[]?
+
+    --- The transcript of a resumed run: a background task started, the model
+    --- waiting on it, and — because this is a resume — the task already exited.
+    --- Entry shapes are copied from a real `pi --mode rpc` get_messages
+    --- snapshot (`role="custom"`, `customType="pi2_bg_task"`, details payload).
+    ---@return table[]
+    local function transcript()
+        return {
+            { role = "user", content = { { type = "text", text = "go" } }, timestamp = 1 },
+            {
+                role = "assistant",
+                content = {
+                    {
+                        type = "toolCall",
+                        toolCallId = "call_1",
+                        toolName = "bash",
+                        arguments = { command = "echo quick-done", run_in_background = true },
+                    },
+                },
+                timestamp = 2,
+            },
+            {
+                role = "toolResult",
+                toolCallId = "call_1",
+                toolName = "bash",
+                content = { { type = "text", text = "Task b3f2a1 running in background (output: /tmp/x.log)" } },
+                timestamp = 3,
+            },
+            {
+                role = "custom",
+                customType = "pi2_bg_task",
+                content = "[Background task b3f2a1 started]",
+                display = false,
+                timestamp = 4,
+                details = {
+                    kind = "started",
+                    taskId = "b3f2a1",
+                    command = "echo quick-done",
+                    pid = 424242,
+                    startedAt = 4,
+                    sessionId = "sess-1",
+                },
+            },
+            {
+                role = "assistant",
+                content = {
+                    {
+                        type = "toolCall",
+                        toolCallId = "call_2",
+                        toolName = "wait_task",
+                        arguments = { task_id = "b3f2a1", timeout_ms = 30000 },
+                    },
+                },
+                timestamp = 5,
+            },
+            {
+                role = "toolResult",
+                toolCallId = "call_2",
+                toolName = "wait_task",
+                content = { { type = "text", text = "Task b3f2a1 exited with code 0 after 0.3s.\n\nquick-done" } },
+                timestamp = 6,
+            },
+            {
+                role = "custom",
+                customType = "pi2_bg_task",
+                content = "[Background task b3f2a1 completed]",
+                display = false,
+                timestamp = 7,
+                details = { kind = "completed", taskId = "b3f2a1", command = "echo quick-done", exitCode = 0 },
+            },
+        }
+    end
+
+    before_each(function()
+        Tasks._reset()
+        Config.setup({})
+        real = {
+            start = Rpc.start,
+            stop = Rpc.stop,
+            send = Rpc.send,
+            log_unhandled = Rpc.log_unhandled,
+            request_refresh = SessionsList.request_refresh,
+        }
+        Rpc.start = function(self)
+            self._job_id = 999
+            return true
+        end
+        Rpc.stop = function(self)
+            self._job_id = nil
+            self._pending = {}
+        end
+        Rpc.send = function(_, cmd, callback)
+            if cmd.type == "get_messages" then
+                local messages = served or transcript()
+                vim.schedule(function()
+                    callback({ success = true, data = { messages = messages } })
+                end)
+            elseif cmd.type == "get_commands" then
+                vim.schedule(function()
+                    callback({ success = true, data = { commands = {} } })
+                end)
+            end
+            return true
+        end
+        Rpc.log_unhandled = function() end
+        SessionsList.request_refresh = function() end
+
+        vim.cmd("tabnew")
+        tab = vim.api.nvim_get_current_tabpage()
+        session = Sessions.get_or_create({ layout = "split" })
+        assert.truthy(session, "session creation failed")
+        served = nil
+    end)
+
+    after_each(function()
+        if tab then
+            local tabs = vim.api.nvim_list_tabpages()
+            if #tabs > 1 then
+                vim.api.nvim_set_current_tabpage(tabs[1])
+            end
+            pcall(vim.api.nvim_tabpage_close, tab)
+            tab = nil
+        end
+        session = nil
+        Rpc.start = real.start
+        Rpc.stop = real.stop
+        Rpc.send = real.send
+        Rpc.log_unhandled = real.log_unhandled
+        SessionsList.request_refresh = real.request_refresh
+        Tasks._reset()
+    end)
+
+    it("names the command of a task that already exited in a previous process", function()
+        assert.truthy(session, "session missing")
+        Sessions.reload_messages(session)
+        local h = session.chat._history
+        local found = vim.wait(2000, function()
+            return #rows_with(h:buf(), "echo quick-done · b3f2a1") == 1
+        end, 20)
+        assert.is_true(
+            found,
+            "the replayed wait_task block must lead with the command, not the bare id:\n" .. text_of(h:buf())
+        )
+
+        -- ...and the fold is the frontend's copy of the table, not a one-off
+        -- label: a later live call (or `:PiTasks`) sees the same record.
+        local task = Tasks.get("b3f2a1")
+        assert.is_table(task)
+        assert.are.equal("echo quick-done", task.command)
+        assert.are.equal("completed", task.status)
+    end)
+
+    it("keeps a finished task finished when a replay window drops its terminal entry", function()
+        assert.truthy(session, "session missing")
+        Sessions.reload_messages(session)
+        local h = session.chat._history
+        assert.is_true(
+            vim.wait(2000, function()
+                return #rows_with(h:buf(), "echo quick-done · b3f2a1") == 1
+            end, 20),
+            text_of(h:buf())
+        )
+        assert.are.equal("completed", Tasks.get("b3f2a1").status)
+
+        -- A compaction rebuild (or :PiTree) replays a narrower window that can
+        -- hold the `started` entry without the terminal one. Folding that again
+        -- must not resurrect the row as running.
+        served = {}
+        for _, m in ipairs(transcript()) do
+            served[#served + 1] = m
+            if m.role == "custom" and type(m.details) == "table" and m.details.kind == "started" then
+                break
+            end
+        end
+        Sessions.reload_messages(session)
+        vim.wait(300)
+        assert.are.equal("completed", Tasks.get("b3f2a1").status)
+        assert.are.equal("echo quick-done", Tasks.get("b3f2a1").command)
+    end)
+end)
