@@ -60,8 +60,11 @@ end
 --- Create a repository with one commit and neutral local identity.
 ---@return string repo absolute, symlink-resolved path
 local function make_repo()
-    local dir = vim.uv.fs_realpath(vim.fn.tempname()) or vim.fn.tempname()
+    local dir = vim.fn.tempname()
     vim.fn.mkdir(dir, "p")
+    -- Resolve after the mkdir: pi.worktree reports real paths, and on macOS
+    -- `tempname()` lives under `/var/…`, a symlink to `/private/var/…`.
+    dir = vim.uv.fs_realpath(dir) or dir
     git_ok({ "git", "init", "-q" }, dir)
     git_ok({ "git", "config", "user.email", "pi-test@example.com" }, dir)
     git_ok({ "git", "config", "user.name", "pi test" }, dir)

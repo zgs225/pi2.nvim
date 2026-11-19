@@ -293,7 +293,10 @@ process.env.PI_CODING_AGENT_DIR = config.agentDir;
 process.chdir(config.workspace);
 
 const encodeCwd = (cwd) => `--${cwd.replace(/^[\\/]+/, "").replace(/[\\/:]/g, "-")}--`;
-const sessionsDir = join(config.agentDir, "sessions", encodeCwd(config.workspace));
+// The extension derives this directory from process.cwd(), which is the physical
+// path after chdir (on macOS /var/folders/… resolves to /private/var/folders/…).
+// Derive it the same way instead of from the unresolved config value.
+const sessionsDir = join(config.agentDir, "sessions", encodeCwd(process.cwd()));
 mkdirSync(sessionsDir, { recursive: true });
 for (const [name, content] of Object.entries(config.sessionsFiles)) {
   writeFileSync(join(sessionsDir, name), content);

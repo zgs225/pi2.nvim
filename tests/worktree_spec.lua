@@ -34,6 +34,17 @@ local function call(fn, ...)
     return pack or { n = 0 }
 end
 
+--- A temp directory whose path is already canonical. `tempname()` returns the
+--- unresolved `$TMPDIR`, which on macOS is `/var/…` — a symlink to
+--- `/private/var/…` — while pi.worktree deliberately resolves every checkout to
+--- its real path (see doc/worktrees.md). Expectations must use the same shape.
+---@return string
+local function tempdir()
+    local path = vim.fn.tempname()
+    vim.fn.mkdir(path, "p")
+    return vim.uv.fs_realpath(path) or path
+end
+
 --- Fake git runner. `handler(argv, opts)` returns { code, stdout, stderr }.
 ---@param handler fun(argv: string[], opts: table): { [1]: integer?, [2]: string?, [3]: string? }
 ---@param calls string[]?
@@ -224,7 +235,7 @@ describe("worktree detect", function()
 
     before_each(function()
         W._reset()
-        root = vim.fn.tempname()
+        root = tempdir()
         vim.fn.mkdir(root, "p")
     end)
 
@@ -309,7 +320,7 @@ describe("worktree bind", function()
 
     before_each(function()
         W._reset()
-        root = vim.fn.tempname()
+        root = tempdir()
         vim.fn.mkdir(root, "p")
     end)
 
@@ -365,7 +376,7 @@ describe("worktree create (injected runner)", function()
     before_each(function()
         W._reset()
         Config.setup({})
-        root = vim.fn.tempname()
+        root = tempdir()
         repo = root .. "/repo"
         vim.fn.mkdir(repo, "p")
         calls = {}
@@ -626,7 +637,7 @@ describe("worktree metadata version guard", function()
 
     before_each(function()
         W._reset()
-        root = vim.fn.tempname()
+        root = tempdir()
         vim.fn.mkdir(root, "p")
     end)
 
@@ -673,7 +684,7 @@ describe("worktree snapshot guards", function()
 
     before_each(function()
         W._reset()
-        root = vim.fn.tempname()
+        root = tempdir()
         vim.fn.mkdir(root, "p")
     end)
 
@@ -791,7 +802,7 @@ describe("worktree probe and apply_patch", function()
 
     before_each(function()
         W._reset()
-        root = vim.fn.tempname()
+        root = tempdir()
         vim.fn.mkdir(root, "p")
         calls = {}
     end)
@@ -923,7 +934,7 @@ describe("worktree diff base override", function()
 
     before_each(function()
         W._reset()
-        root = vim.fn.tempname()
+        root = tempdir()
         vim.fn.mkdir(root, "p")
     end)
 
@@ -995,7 +1006,7 @@ describe("worktree snapshot sidecar", function()
 
     before_each(function()
         W._reset()
-        root = vim.fn.tempname()
+        root = tempdir()
         vim.fn.mkdir(root, "p")
     end)
 
@@ -1102,7 +1113,7 @@ describe("worktree list", function()
 
     before_each(function()
         W._reset()
-        root = vim.fn.tempname()
+        root = tempdir()
         vim.fn.mkdir(root, "p")
     end)
 
@@ -1294,7 +1305,7 @@ describe("worktree snapshot_worktrees", function()
 
     before_each(function()
         W._reset()
-        root = vim.fn.tempname()
+        root = tempdir()
         vim.fn.mkdir(root, "p")
     end)
 
@@ -1390,7 +1401,7 @@ describe("worktree release snapshot", function()
 
     before_each(function()
         W._reset()
-        root = vim.fn.tempname()
+        root = tempdir()
         vim.fn.mkdir(root, "p")
         calls = {}
     end)

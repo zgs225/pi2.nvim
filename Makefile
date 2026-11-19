@@ -1,6 +1,9 @@
 # pi.nvim development helpers.
 #
-#   make test    — run the plenary unit test suite (hermetic, -u tests/minimal_init.lua)
+#   make test    — run the plenary unit test suite (hermetic, -u tests/minimal_init.lua).
+#                  Files run in parallel, 120 s per file: tests/worktree_git_spec.lua
+#                  alone spends ~50 s on real git commits at APFS fsync speed, which
+#                  plenary's 50 s default would kill under parallel load.
 #   make e2e     — run headless end-to-end scripts (tests/*_e2e.lua)
 #   make e2e-reaper — real-pi e2e: subagent idle reaper + max_children cap (needs pi binary + provider; not CI)
 #   make e2e-worktrees — real-git e2e: worktree create/apply/remove/ship/release (needs pi binary; no provider calls)
@@ -26,7 +29,7 @@ LUA_LS_BIN ?= lua-language-server
 
 test:
 	PLENARY_PATH=$(PLENARY_PATH) $(NVIM_BIN) --headless -u $(MIN_INIT) \
-		-c "lua require('plenary.test_harness').test_directory('tests', { minimal_init = '$(MIN_INIT)' })"
+		-c "lua require('plenary.test_harness').test_directory('tests', { minimal_init = '$(MIN_INIT)', timeout = 120000 })"
 
 e2e:
 	@for f in tests/*_e2e.lua; do \
