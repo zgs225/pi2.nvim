@@ -36,7 +36,10 @@
  * `none -> sent -> confirmed`, and only `confirmed` stops further delivery:
  *
  *  1. idle at exit -> `sendMessage(..., { triggerTurn: true })` starts a turn
- *     immediately (the completion is the only thing left to do);
+ *     immediately (the completion is the only thing left to do). The wake is
+ *     COALESCED: a short timer merges every completion of one burst (and of a
+ *     settle that is about to flush anyway) into ONE message and ONE turn,
+ *     instead of one wake per task, each paying a full context read;
  *  2. a run is active -> the next actionable boundary (`turn_end`, then
  *     `agent_before_settle`) appends ONE aggregated `custom_message` entry and
  *     asks for `continue: true`, so the model acts on it in this run. Entries
@@ -242,6 +245,14 @@ const WAKE_TAIL_BYTES = 4 * 1024;
  * entries are durable and are read from context on the very next request.
  */
 const IDLE_WAKE_GRACE_MS = 5_000;
+/**
+ * How long an idle completion waits for companions. Two tasks that exit in the
+ * same event-loop tick would otherwise send two wakes — two turns, each paying a
+ * full context read for one burst. A short timer merges the burst (and merges it
+ * with a settle that is about to flush anyway); 40 ms is far below the delay a
+ * human or a model can perceive in a wake.
+ */
+const WAKE_COALESCE_MS = 40;
 
 /** How far a completion report has got on its way into model context. */
 type DeliveryState = "none" | "sent" | "confirmed";
@@ -354,6 +365,11 @@ const tasks = new Map<string, BgTaskState>();
 /** Background process groups to kill best-effort when the pi process exits. */
 const trackedPids = new Set<number>();
 let exitHookInstalled = false;
+/**
+ * The pending coalesced idle wake, if one is queued. Module-level because the
+ * exit hook has to clear it, and because one burst must never queue two.
+ */
+let wakeTimer: ReturnType<typeof setTimeout> | undefined;
 /**
  * Session whose transcript this process folds, and the owner id its own records
  * carry. Set on `session_start`.
@@ -628,6 +644,12 @@ function ensureExitHook(): void {
 	}
 	exitHookInstalled = true;
 	process.on("exit", () => {
+		// A queued wake must not outlive the process that scheduled it: nothing
+		// could deliver it, and the exit is the last thing this process does.
+		if (wakeTimer !== undefined) {
+			clearTimeout(wakeTimer);
+			wakeTimer = undefined;
+		}
 		// Nothing can be appended to the transcript from here (the session is
 		// already disposed); `session_shutdown` records the same kills while it
 		// still can, and a SIGKILLed process leaves "running" records that the
@@ -1427,8 +1449,9 @@ export default function bgTasks(pi: ExtensionAPI) {
 		rearmLostFallbacks();
 		// Reports that finished after the last boundary: nothing else would
 		// wake the agent, and a run requested from a settled handler starts
-		// after every settled handler completes.
-		flushPending({ wake: true });
+		// after every settled handler completes. The wake is coalesced, so a
+		// completion landing while this settle runs shares this one.
+		scheduleWake();
 		return undefined;
 	});
 
@@ -1616,7 +1639,7 @@ export default function bgTasks(pi: ExtensionAPI) {
 		} else if (busy) {
 			// A run is active: the next actionable boundary carries the report.
 		} else {
-			flushPending({ wake: true });
+			scheduleWake();
 		}
 		task.resolveExited();
 	}
@@ -1754,6 +1777,23 @@ export default function bgTasks(pi: ExtensionAPI) {
 		for (const task of pending) {
 			markSent(task, "wake", text);
 		}
+	}
+
+	/**
+	 * Schedule ONE wake for every report that is pending when it fires. Idempotent
+	 * inside the window, so N completions in the same tick cost one `sendMessage`
+	 * (and `flushPending` drains all of them into one message). A pending wake does
+	 * not keep the process alive.
+	 */
+	function scheduleWake(): void {
+		if (wakeTimer !== undefined) {
+			return;
+		}
+		wakeTimer = setTimeout(() => {
+			wakeTimer = undefined;
+			flushPending({ wake: true });
+		}, WAKE_COALESCE_MS);
+		wakeTimer.unref?.();
 	}
 
 	/**

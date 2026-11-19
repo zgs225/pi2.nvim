@@ -609,4 +609,39 @@ describe("bg-tasks extension contract", function()
         assert.is_truthy(body:find('task.sentVia === "fallback"', 1, true), "only a fallback delivery qualifies")
         assert.is_truthy(body:find("markConfirmed(task)", 1, true), "the helper confirms it")
     end)
+
+    it("coalesces same-tick completions into ONE wake", function()
+        local src = read_extension()
+        assert.is_truthy(src:find("const WAKE_COALESCE_MS", 1, true), "the coalescing window must be a named constant")
+
+        -- ONE scheduler, and the flush happens inside its timer (so N completions
+        -- in one tick cost one sendMessage).
+        local sched_start = assert(src:find("function scheduleWake", 1, true), "scheduleWake must exist")
+        local sched_end = src:find("\n\tfunction ", sched_start + 1, true) or #src
+        local sched = src:sub(sched_start, sched_end)
+        local timer_at = assert(sched:find("setTimeout(", 1, true), "scheduleWake must arm a timer")
+        assert.is_truthy(sched:find("WAKE_COALESCE_MS", 1, true), "the timer must use the coalescing window")
+        assert.is_truthy(
+            sched:sub(timer_at):find("flushPending({ wake: true })", 1, true),
+            "the wake must be flushed from the timer, not at schedule time"
+        )
+
+        -- The idle branch schedules, it does not flush: that is the bug (two
+        -- same-tick exits each sent their own wake).
+        local finish_start = assert(src:find("function finishTask", 1, true), "finishTask must exist")
+        local finish_end = src:find("\n\tfunction ", finish_start + 1, true) or #src
+        local finish = src:sub(finish_start, finish_end)
+        assert.is_truthy(finish:find("scheduleWake()", 1, true), "finishTask's idle branch must schedule the wake")
+        assert.is_nil(
+            finish:find("flushPending({ wake: true })", 1, true),
+            "finishTask must not flush directly: two exits in one tick would send two wakes"
+        )
+
+        -- A queued wake must not outlive the process that scheduled it.
+        local exit_start = assert(src:find('process.on("exit"', 1, true), "the exit hook must exist")
+        local exit_end = src:find("function formatSeconds", exit_start, true) or #src
+        local hook = src:sub(exit_start, exit_end)
+        assert.is_truthy(hook:find("clearTimeout(wakeTimer)", 1, true), "the exit hook must clear the pending wake")
+        assert.is_truthy(hook:find("wakeTimer = undefined", 1, true), "and forget it")
+    end)
 end)

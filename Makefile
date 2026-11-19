@@ -9,6 +9,7 @@
 #   make e2e-bg-stdin — real-pi e2e: a background task keeps its stdin and task_input feeds it (needs pi; fake provider)
 #   make e2e-bg-report — real-pi e2e: a completion report is one structured `<background-task>` block (needs pi; fake provider)
 #   make e2e-bg-fallback — real-pi e2e: an injected report survives a FAILED request and is confirmed by the retry (needs pi; fake provider)
+#   make e2e-bg-wake — real-pi e2e: two same-tick completions send ONE coalesced wake naming both tasks (needs pi; fake provider)
 #   make e2e-bg-ownership — real-pi e2e: a fork does not adopt the parent's tasks, a clean quit records its kills
 #   make e2e-subagent-failure — real-pi e2e: a failed child run reaches the parent as a failed item (needs pi; not CI)
 #   make smoke   — headless end-to-end smoke check (loads the user config, opens the chat)
@@ -26,7 +27,7 @@ MIN_INIT := tests/minimal_init.lua
 STYLUA_BIN ?= stylua
 LUA_LS_BIN ?= lua-language-server
 
-.PHONY: test smoke format style lint docs-links e2e e2e-reaper e2e-bg-delivery e2e-bg-stop e2e-bg-reconcile e2e-bg-stdin e2e-bg-report e2e-bg-fallback e2e-bg-ownership e2e-subagent-failure
+.PHONY: test smoke format style lint docs-links e2e e2e-reaper e2e-bg-delivery e2e-bg-stop e2e-bg-reconcile e2e-bg-stdin e2e-bg-report e2e-bg-fallback e2e-bg-wake e2e-bg-ownership e2e-subagent-failure
 
 test:
 	PLENARY_PATH=$(PLENARY_PATH) $(NVIM_BIN) --headless -u $(MIN_INIT) \
@@ -39,7 +40,7 @@ e2e:
 	done
 
 # Real end-to-end against `pi --mode rpc` (scripts/e2e/). None of these are part
-# of `make test`. The six background-task suites that drive a scripted FAKE
+# of `make test`. The seven background-task suites that drive a scripted FAKE
 # provider run in CI (.github/workflows/e2e.yml); the ones that need a real
 # provider stay manual. See .agents/skills/develop/references/testing.md.
 e2e-reaper:
@@ -80,6 +81,12 @@ e2e-bg-report:
 # in CI.
 e2e-bg-fallback:
 	$(NVIM_BIN) --headless -u $(MIN_INIT) -l scripts/e2e/bg_tasks_fallback.lua
+
+# Real-pi e2e for the coalesced idle wake: two completions in one tick must
+# send ONE report naming both tasks and start ONE turn. Needs the pi binary only
+# — runs in CI.
+e2e-bg-wake:
+	$(NVIM_BIN) --headless -u $(MIN_INIT) -l scripts/e2e/bg_tasks_wake.lua
 
 # Real-pi e2e for ownership: fork inheritance and the clean-quit shutdown record.
 # Needs the pi binary only — runs in CI.
