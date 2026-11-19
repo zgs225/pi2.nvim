@@ -36,7 +36,10 @@
  * `none -> sent -> confirmed`, and only `confirmed` stops further delivery:
  *
  *  1. idle at exit -> `sendMessage(..., { triggerTurn: true })` starts a turn
- *     immediately (the completion is the only thing left to do);
+ *     immediately (the completion is the only thing left to do). The wake is
+ *     COALESCED: a short timer merges every completion of one burst (and of a
+ *     settle that is about to flush anyway) into ONE message and ONE turn,
+ *     instead of one wake per task, each paying a full context read;
  *  2. a run is active -> the next actionable boundary (`turn_end`, then
  *     `agent_before_settle`) appends ONE aggregated `custom_message` entry and
  *     asks for `continue: true`, so the model acts on it in this run. Entries
@@ -47,23 +50,39 @@
  *     handed over is searched for in the message list about to be sent, which
  *     confirms it, and anything still missing is injected before that request.
  *     This is what makes an aborted run cost nothing — the report survives in
- *     the transcript (stage 2) and is injected on the next turn (stage 3);
+ *     the transcript (stage 2) and is injected on the next turn (stage 3). The
+ *     injection is NOT itself a delivery: `event.messages` is a per-request deep
+ *     copy that is never persisted, so a request that fails takes the injected
+ *     text with it. A fallback report therefore stays `sent` and is confirmed
+ *     only by a `turn_end` whose outcome is `completed` — a failed or aborted
+ *     request leaves it `sent`, and the next attempt injects it again;
  *  4. `agent_settled` (with `aborted !== true`) flushes reports that finished
- *     after the last boundary, because nothing else would wake the agent.
+ *     after the last boundary, because nothing else would wake the agent. It
+ *     first RE-ARMS every report whose only carrier was a failed request (stage
+ *     3), because a run that settles without a completed turn — retries
+ *     exhausted, hard provider failure — leaves such a report `sent` and no
+ *     later stage would ever look at it again; re-arming it as `none` lets this
+ *     very settle deliver it as a persisted message. A failed request can delay
+ *     a report, never swallow it.
  *
  * An `agent_settled` for an aborted run deliberately wakes nothing (the user
- * asked for the run to stop); the report waits for stage 3.
+ * asked for the run to stop) and re-arms nothing (the report is read on the next
+ * turn, as before); the report waits for stage 3.
  *
- * The report TEXT is a structured reminder block, not prose, and it is built by
- * one function so the text handed over and the text stage 3 matches are
- * byte-identical. Line 1 is the `[SYSTEM NOTIFICATION - NOT USER INPUT]` banner,
+ * The report TEXT is a structured reminder block, not prose. The exact string
+ * that is handed over is stored on the task (`task.sentText`), and stage 3
+ * compares precisely that string, verbatim, against the message list about to
+ * be sent: the receipt can never match a report built differently. Line 1 is
+ * the `[SYSTEM NOTIFICATION - NOT USER INPUT]` banner,
  * line 2 one prose line, and the payload sits in `<system-reminder>` around one
  * `<background-task id status exit_code signal duration_ms output>` element per
  * task (a single task also carries its output tail; a batch keeps one element
  * per task and omits the tails). Attributes are escaped, because a command is
  * arbitrary shell text: a reader gets the task id, its status, the exit code,
  * the signal and the duration from the element instead of having to parse a
- * sentence.
+ * sentence. Element text (the command, the exit summary, the output tail) is
+ * escaped as TEXT, so a program that prints `</system-reminder>` cannot end the
+ * block or forge a second element.
  *
  * The wake report is why `sleep` must never be the model's waiting primitive:
  * it is delivered mid-run at the next turn boundary, so a model that has other
@@ -90,6 +109,23 @@
  * behaviour is byte-for-byte stock, and a foreground command that outlives its
  * window and detaches has no stdin (`task_input` says so instead of silently
  * dropping what it was given).
+ *
+ * Two NOTIFY-ONLY timers cover the other half of that hole — a task that runs
+ * far longer than anyone expected while the agent simply never hears about it.
+ * (1) `deadline_ms`, the model-facing bash parameter next to
+ * `run_in_background`: when a task BECOMES a background task it is armed, and
+ * on expiry it sends ONE check-in carrying the task id, its elapsed time and an
+ * output tail. (2) An advisory lifetime note, armed for every background task
+ * from `DEFAULT_MAX_LIFETIME_MS` (overridable through the `LIFETIME_ENV`
+ * environment variable, read at arm time), sent once when the cap passes and
+ * saying the process is NOT being killed. Neither timer kills, signals or
+ * finishes anything: killing is `stop_task`'s job and the user's decision, and
+ * the exit report still arrives through the ladder below exactly once. Both are
+ * one-shot (`deadlineNoted` / `lifetimeNoted`), both are unref'd, both are
+ * cleared in `finishTask`, and neither is ever armed for an adopted task. A
+ * check-in is deliberately OUTSIDE the `none -> sent -> confirmed` ladder: it
+ * carries no `details` (so it cannot fabricate a panel row), marks no delivery
+ * state and is best-effort.
  *
  * The task table OUTLIVES the process that built it, and the SESSION TRANSCRIPT
  * is the only place it is written. Every state transition already reaches it as
@@ -134,7 +170,8 @@
  *
  * A load-time `context` handler is the fallback injector for wake reports whose
  * send threw (stale extension ctx); it reads the module-level task table and
- * marks deliveries so nothing is injected twice.
+ * marks what it injects, so an injection is repeated only when the request it
+ * went into failed (an injection is not durable — see stage 3 above).
  *
  * A process.on("exit") hook SIGKILLs every tracked process group best-effort,
  * mirroring core's killTrackedDetachedChildren (that helper is not exported
@@ -218,6 +255,23 @@ const COUNT_LINES_UP_TO_BYTES = 8 * 1024 * 1024;
 /** Bound on the output tail inlined in a wake report. */
 const WAKE_TAIL_LINES = 40;
 const WAKE_TAIL_BYTES = 4 * 1024;
+/** Bound on the output tail inlined in a check-in (smaller: it is advisory). */
+const CHECK_IN_TAIL_LINES = 20;
+const CHECK_IN_TAIL_BYTES = 2 * 1024;
+/**
+ * `deadline_ms` bounds: a deadline produces ONE check-in, never a kill, so the
+ * only thing worth bounding is how far out a model may point it.
+ */
+const MIN_DEADLINE_MS = 500;
+const MAX_DEADLINE_MS = 24 * 60 * 60 * 1000;
+/**
+ * Advisory lifetime cap for every background task: after this, ONE note says
+ * the task is still running and that it is not being killed. Overridable per
+ * process through `LIFETIME_ENV` (milliseconds), which is read LAZILY when a
+ * timer is armed — a child process's environment therefore applies.
+ */
+const DEFAULT_MAX_LIFETIME_MS = 24 * 60 * 60 * 1000;
+const LIFETIME_ENV = "PI_BG_TASK_MAX_LIFETIME_MS";
 /**
  * Grace window for an idle wake: a message sent this recently may still be on
  * its way into context, so the `context` fallback waits one boundary before
@@ -225,6 +279,23 @@ const WAKE_TAIL_BYTES = 4 * 1024;
  * entries are durable and are read from context on the very next request.
  */
 const IDLE_WAKE_GRACE_MS = 5_000;
+/**
+ * How long an idle completion waits for companions. Two tasks that exit in the
+ * same event-loop tick would otherwise send two wakes — two turns, each paying a
+ * full context read for one burst. A short timer merges the burst (and merges it
+ * with a settle that is about to flush anyway); 40 ms is far below the delay a
+ * human or a model can perceive in a wake.
+ */
+const WAKE_COALESCE_MS = 40;
+/**
+ * How many times one report may be re-armed after a run settled carrying it only
+ * through a failed request (see `rearmLostFallbacks`). Bounded on purpose: a
+ * provider that keeps producing new runs without ever accepting a request would
+ * otherwise cycle settle -> re-arm -> wake -> settle with no user input at all.
+ * Past the cap the report stays `sent` and still rides the `context` fallback on
+ * the next user turn, so nothing is lost — only the wake loop is.
+ */
+const MAX_REARMS = 3;
 
 /** How far a completion report has got on its way into model context. */
 type DeliveryState = "none" | "sent" | "confirmed";
@@ -310,6 +381,25 @@ interface BgTaskState {
 	exitUnknown?: boolean;
 	/** Liveness poll for an adopted task; cleared when the task settles. */
 	adoptPoll?: ReturnType<typeof setInterval>;
+	/**
+	 * The one deadline check-in, and the one advisory lifetime note. Both are
+	 * NOTIFY-ONLY, one-shot, unref'd, and cleared in `finishTask`; neither is ever
+	 * armed for an adopted task (its timers died with the process that armed them).
+	 */
+	deadlineTimer?: ReturnType<typeof setTimeout>;
+	lifetimeTimer?: ReturnType<typeof setTimeout>;
+	/** The single deadline check-in has been sent. */
+	deadlineNoted?: boolean;
+	/** The single lifetime note has been sent. */
+	lifetimeNoted?: boolean;
+	/**
+	 * How many times this report has been re-armed because the only carrier it
+	 * ever had was a failed request (`rearmLostFallbacks`). Capped by `MAX_REARMS`
+	 * so a provider that never accepts a request cannot cycle settle -> re-arm ->
+	 * wake -> settle forever; past the cap the report stays `sent` and the next
+	 * user turn's `context` fallback carries it.
+	 */
+	rearmCount?: number;
 	/** The session that produced the record this task was rebuilt from. */
 	sessionId?: string;
 	/**
@@ -337,6 +427,12 @@ const tasks = new Map<string, BgTaskState>();
 /** Background process groups to kill best-effort when the pi process exits. */
 const trackedPids = new Set<number>();
 let exitHookInstalled = false;
+/**
+ * The pending coalesced idle wake, if one is queued. Module-level because the
+ * exit hook and `session_shutdown` have to clear it, and because one burst must
+ * never queue two.
+ */
+let wakeTimer: ReturnType<typeof setTimeout> | undefined;
 /**
  * Session whose transcript this process folds, and the owner id its own records
  * carry. Set on `session_start`.
@@ -611,6 +707,12 @@ function ensureExitHook(): void {
 	}
 	exitHookInstalled = true;
 	process.on("exit", () => {
+		// A queued wake must not outlive the process that scheduled it: nothing
+		// could deliver it, and the exit is the last thing this process does.
+		if (wakeTimer !== undefined) {
+			clearTimeout(wakeTimer);
+			wakeTimer = undefined;
+		}
 		// Nothing can be appended to the transcript from here (the session is
 		// already disposed); `session_shutdown` records the same kills while it
 		// still can, and a SIGKILLed process leaves "running" records that the
@@ -644,7 +746,7 @@ function describeExit(task: BgTaskState): string {
  * `kind` vocabulary (see `reportPanel`, which opens with "started" instead of
  * "running"): this one is the model-facing word for what happened.
  */
-function reportStatus(task: BgTaskState): "running" | "completed" | "failed" | "stopped" {
+function reportStatus(task: BgTaskState): "running" | "completed" | "failed" | "stopped" | "unknown" {
 	if (!task.completed) {
 		return "running";
 	}
@@ -654,6 +756,11 @@ function reportStatus(task: BgTaskState): "running" | "completed" | "failed" | "
 	if (task.signal !== null) {
 		return "stopped";
 	}
+	// An adopted task that vanished unobserved has no exit code and no signal:
+	// calling that "failed" would contradict the prose line right above it.
+	if (task.exitUnknown) {
+		return "unknown";
+	}
 	if (task.exitCode === 0) {
 		return "completed";
 	}
@@ -661,28 +768,35 @@ function reportStatus(task: BgTaskState): "running" | "completed" | "failed" | "
 }
 
 /**
- * Escape a value for the report block — attribute values AND element text,
- * because a command is arbitrary shell text (`awk '{print $1}' && echo
- * "<done>"`) and must not be able to close a tag or smuggle in an attribute.
+ * Escape a value for element TEXT. `&` and `<` are the only characters that can
+ * open or end a tag inside a text node, so `>` and `"` are left alone — real
+ * output (`a > b`, `"quoted"`) stays readable, and nothing can forge the
+ * delimiters around the block.
  */
-function escapeMarkup(value: string): string {
-	return value
-		.replace(/&/g, "&amp;")
-		.replace(/</g, "&lt;")
-		.replace(/>/g, "&gt;")
-		.replace(/"/g, "&quot;");
+function escapeText(value: string): string {
+	return value.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+}
+
+/**
+ * Escape a value for an ATTRIBUTE (or a "…" in the prose line): `escapeText`
+ * plus `>` and `"`. Attribute values are arbitrary shell text too — a command
+ * like `awk '{print $1}' && echo "<done>"` must not be able to close the quote
+ * or the tag.
+ */
+function escapeAttr(value: string): string {
+	return escapeText(value).replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
 /** Attributes of one `<background-task>` element, in a fixed order. */
 function taskAttrs(task: BgTaskState): string {
 	const durationMs = (task.endedAt ?? Date.now()) - task.startedAt;
 	return [
-		`id="${task.taskId}"`,
+		`id="${escapeAttr(task.taskId)}"`,
 		`status="${reportStatus(task)}"`,
-		`exit_code="${task.exitCode ?? ""}"`,
-		`signal="${task.signal ?? ""}"`,
+		`exit_code="${escapeAttr(`${task.exitCode ?? ""}`)}"`,
+		`signal="${escapeAttr(task.signal ?? "")}"`,
 		`duration_ms="${durationMs}"`,
-		`output="${escapeMarkup(task.outputFile)}"`,
+		`output="${escapeAttr(task.outputFile)}"`,
 	].join(" ");
 }
 
@@ -698,8 +812,8 @@ function wrapReminder(body: string): string {
 /**
  * Completion report text for the wake path. Shared by sendMessage and the
  * context fallback so the agent sees exactly the same text either way — stage 3
- * of the ladder above matches it byte-for-byte, so nothing here may vary
- * between the two callers.
+ * of the ladder above compares the `sentText` it stored, so nothing here may
+ * vary between the two callers.
  *
  * The "[SYSTEM NOTIFICATION ...]" banner stays the first line for the same
  * reason Claude Code added it: this lands in the agent's context as a user-role
@@ -712,9 +826,22 @@ function wrapReminder(body: string): string {
 function buildWakeNote(task: BgTaskState): string {
 	const elapsed = formatSeconds((task.endedAt ?? Date.now()) - task.startedAt);
 	const tail = readOutputTail(task.outputFile, WAKE_TAIL_BYTES, WAKE_TAIL_LINES);
-	const head = `Background task ${task.taskId} ("${escapeMarkup(task.command)}") ${describeExit(task)} after ${elapsed}.`;
+	// Every interpolation is escaped: a record FOLDED from a doctored session
+	// transcript carries an id this extension never generated, and an unescaped
+	// one could close the element's attribute or forge a second element.
+	const id = escapeText(task.taskId);
+	const head =
+		`Background task ${id} ("${escapeAttr(task.command)}") ` +
+		`${escapeText(describeExit(task))} after ${elapsed}.`;
+	// Only the TEXT of the tail is escaped (attributes need more): output is
+	// arbitrary program output and may well print `</system-reminder>`.
 	const lines = tail.text.trim()
-		? [`${head} Output tail:`, "", tail.text]
+		? [
+				`${head} Output tail:`,
+				"",
+				escapeText(tail.text),
+				`Full output: ${escapeText(task.outputFile)} (or wait_task ${id}).`,
+			]
 		: [head, "No output tail was read: the output file above is the only copy of its output."];
 	return (
 		`[SYSTEM NOTIFICATION - NOT USER INPUT]\n` +
@@ -738,13 +865,68 @@ function buildBatchNote(batch: BgTaskState[]): string {
 		return buildWakeNote(batch[0]);
 	}
 	const elements = batch.map(
-		(task) => `<background-task ${taskAttrs(task)}>${escapeMarkup(task.command)}</background-task>`,
+		(task) => `<background-task ${taskAttrs(task)}>${escapeText(task.command)}</background-task>`,
 	);
+	// ONE sentence (docs/usage.md and docs/extensions.md both say line 2 is a
+	// single sentence): banner, then this, then the block.
 	const notice =
-		"This is an automated task notification, not a message from the user. " +
-		"Several background tasks finished together; output tails are omitted — read the files " +
-		"(or call wait_task on a task id) if you need the output.";
+		"This is an automated task notification, not a message from the user: several background " +
+		"tasks finished together, and their output tails are omitted — read the files (or call " +
+		"wait_task on a task id) if you need the output.";
 	return `[SYSTEM NOTIFICATION - NOT USER INPUT]\n${notice}\n${wrapReminder(elements.join("\n"))}`;
+}
+
+/**
+ * What a check-in is about: the model-supplied deadline, or the advisory
+ * lifetime cap. Both are NOTIFY-ONLY — nothing is killed on either.
+ */
+type CheckInKind = "deadline" | "lifetime";
+
+/**
+ * Check-in text for a task that is STILL RUNNING.
+ *
+ * A check-in is not a result, and it must not read like one: the second line
+ * says so explicitly, the element carries `check_in` (instead of `exit_code` /
+ * `signal` / `duration_ms`) and `status="running"`, and the whole thing is
+ * built from the same escapers and the same `wrapReminder` as a report, so a
+ * reader cannot be handed a block that looks like an exit it never got. The
+ * output tail is escaped as TEXT for the same reason a report's is: a program
+ * that prints `</system-reminder>` must not be able to end the block.
+ *
+ * Deliberately carries no `details` and no delivery bookkeeping (see
+ * `sendCheckIn`): a check-in is advisory, best-effort, and outside the
+ * `none -> sent -> confirmed` ladder the exit report walks.
+ */
+function buildCheckInNote(task: BgTaskState, kind: CheckInKind): string {
+	const elapsedMs = Date.now() - task.startedAt;
+	const elapsed = formatSeconds(elapsedMs);
+	const tail = readOutputTail(task.outputFile, CHECK_IN_TAIL_BYTES, CHECK_IN_TAIL_LINES);
+	// Same escaping rules as a report: a folded record's id is arbitrary text too.
+	const id = escapeText(task.taskId);
+	const attrs =
+		`id="${escapeAttr(task.taskId)}" status="${reportStatus(task)}" ` +
+		(kind === "deadline" ? 'check_in="deadline"' : 'check_in="lifetime"') +
+		` elapsed_ms="${elapsedMs}" output="${escapeAttr(task.outputFile)}"`;
+	const quoted = `Background task ${id} ("${escapeAttr(task.command)}")`;
+	const head =
+		kind === "deadline"
+			? `${quoted} is still running after ${elapsed}.`
+			: `${quoted} is still running after ${elapsed}: the lifetime cap passed. ` +
+				`It is NOT being killed — stop_task ${id} ends it.`;
+	const lines = tail.text.trim()
+		? [
+				`${head} Output tail:`,
+				"",
+				escapeText(tail.text),
+				`Full output: ${escapeText(task.outputFile)} (or wait_task ${id}).`,
+			]
+		: [head, "No output tail was read: the output file above is the only copy of its output."];
+	return (
+		`[SYSTEM NOTIFICATION - NOT USER INPUT]\n` +
+		"This is an automated task notification, not a message from the user. The task is still running: " +
+		"this is a check-in, not a result, and the process was not touched.\n" +
+		wrapReminder(`<background-task ${attrs}>\n${lines.join("\n")}\n</background-task>`)
+	);
 }
 
 /**
@@ -916,6 +1098,35 @@ function clampStopGrace(timeout: number | undefined): number {
 		return DEFAULT_STOP_GRACE_MS;
 	}
 	return Math.min(MAX_STOP_GRACE_MS, Math.max(MIN_STOP_GRACE_MS, Math.floor(timeout)));
+}
+
+/**
+ * The model-supplied check-in deadline, or `undefined` when none was given.
+ * Unlike the attach and wait windows there is no default: a task without a
+ * `deadline_ms` simply gets no deadline check-in (the lifetime note still runs).
+ */
+function clampDeadlineMs(deadline: number | undefined): number | undefined {
+	if (typeof deadline !== "number" || !Number.isFinite(deadline) || deadline <= 0) {
+		return undefined;
+	}
+	return Math.min(MAX_DEADLINE_MS, Math.max(MIN_DEADLINE_MS, Math.floor(deadline)));
+}
+
+/**
+ * The advisory lifetime cap, read LAZILY at arm time: the process environment is
+ * what a spawned child actually got, and `LIFETIME_ENV` may have changed since
+ * this module loaded. Any positive finite number is accepted; anything else
+ * (unset, empty, `NaN`, `0`, negative) falls back to the default.
+ */
+function lifetimeCapMs(): number {
+	const raw = process.env[LIFETIME_ENV];
+	if (raw !== undefined && raw.trim() !== "") {
+		const value = Number(raw);
+		if (Number.isFinite(value) && value > 0) {
+			return Math.floor(value);
+		}
+	}
+	return DEFAULT_MAX_LIFETIME_MS;
 }
 
 type WaitOutcome = "exited" | "deadline" | "aborted";
@@ -1252,6 +1463,15 @@ export default function bgTasks(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", (event) => {
+		// A wake queued a moment ago belongs to THIS instance. The successor (a
+		// `/new`, a resume, a fork) folds the transcript again and runs its own
+		// ladder, so a timer left behind would fire into it and deliver this
+		// session's report there — or into nothing at all. The exit hook clears the
+		// same timer for the process-level case.
+		if (wakeTimer !== undefined) {
+			clearTimeout(wakeTimer);
+			wakeTimer = undefined;
+		}
 		// This instance is going away — replaced by a reload/session switch, or
 		// followed by the exit hook. Stop polling adopted tasks first: the
 		// successor folds the same records and watches them again, and a stale
@@ -1292,9 +1512,11 @@ export default function bgTasks(pi: ExtensionAPI) {
 	// list about to be sent to the model, so it settles delivery truthfully:
 	// the text we handed over earlier is either in there (confirmed) or it is
 	// not (dropped by an abort, a discarded steering queue, or a stale extension
-	// ctx — inject it now). Nothing is ever injected twice, because a task stops
-	// being a candidate as soon as its text is observed. `event.messages` is a
-	// deep copy; nothing here is persisted.
+	// ctx — inject it now). A task stops being a candidate as soon as its text is
+	// observed in the payload, so a delivered report is never injected twice; a
+	// report injected into a request that then FAILED is still outstanding, and
+	// injecting it again into the retry is exactly the point. `event.messages` is
+	// a deep copy; nothing here is persisted.
 	// ------------------------------------------------------------------
 	pi.on("context", (event) => {
 		const injectedStartup = applyStartupNote(event);
@@ -1338,9 +1560,10 @@ export default function bgTasks(pi: ExtensionAPI) {
 		const text = buildBatchNote(missing);
 		event.messages.push({ role: "user", content: text, timestamp: Date.now() });
 		for (const task of missing) {
-			// Injected into THIS request: the text is by definition delivered.
+			// The injection lives in a per-request deep copy that is never
+			// persisted, so handing it over proves nothing: the report stays
+			// `sent` until a completed `turn_end` shows the request arrived.
 			markSent(task, "fallback", text);
-			markConfirmed(task);
 		}
 		return { messages: event.messages };
 	});
@@ -1358,7 +1581,16 @@ export default function bgTasks(pi: ExtensionAPI) {
 		return undefined;
 	});
 
-	pi.on("turn_end", (event) => deliverAtBoundary(event));
+	pi.on("turn_end", (event) => {
+		// The request this turn belongs to finished, so a report the `context`
+		// fallback injected into it was actually seen. Any other outcome means the
+		// request died (provider error, abort) and took the injection with it;
+		// the report stays `sent` and the next attempt injects it again.
+		if (event.outcome === "completed") {
+			confirmFallbackReports();
+		}
+		return deliverAtBoundary(event);
+	});
 
 	pi.on("agent_before_settle", (event) => deliverAtBoundary(event));
 
@@ -1370,10 +1602,14 @@ export default function bgTasks(pi: ExtensionAPI) {
 			// `context` deliver it. Waking here would fight the abort.
 			return undefined;
 		}
+		// A report that only a failed request ever carried is invisible to both
+		// durable channels; hand it back to them before the flush below.
+		rearmLostFallbacks();
 		// Reports that finished after the last boundary: nothing else would
 		// wake the agent, and a run requested from a settled handler starts
-		// after every settled handler completes.
-		flushPending({ wake: true });
+		// after every settled handler completes. The wake is coalesced, so a
+		// completion landing while this settle runs shares this one.
+		scheduleWake();
 		return undefined;
 	});
 
@@ -1399,6 +1635,7 @@ export default function bgTasks(pi: ExtensionAPI) {
 			};
 		}
 		const task = startTask(command, event.cwd, buildSessionEnv(undefined), { stdin: true });
+		armCheckIns(task);
 		task.panelStarted = true;
 		reportPanel(task);
 		return {
@@ -1552,6 +1789,17 @@ export default function bgTasks(pi: ExtensionAPI) {
 			clearInterval(task.adoptPoll);
 			task.adoptPoll = undefined;
 		}
+		// Both check-in timers are advisory and one-shot: a task that has exited has
+		// nothing left to be checked in about, and a timer that fired after the exit
+		// report would be a stale note about a task that is already done.
+		if (task.deadlineTimer) {
+			clearTimeout(task.deadlineTimer);
+			task.deadlineTimer = undefined;
+		}
+		if (task.lifetimeTimer) {
+			clearTimeout(task.lifetimeTimer);
+			task.lifetimeTimer = undefined;
+		}
 		task.stdinOpen = false;
 		if (task.observers > 0) {
 			// An attached call will return this terminal state itself and mark the
@@ -1561,7 +1809,7 @@ export default function bgTasks(pi: ExtensionAPI) {
 		} else if (busy) {
 			// A run is active: the next actionable boundary carries the report.
 		} else {
-			flushPending({ wake: true });
+			scheduleWake();
 		}
 		task.resolveExited();
 	}
@@ -1581,10 +1829,62 @@ export default function bgTasks(pi: ExtensionAPI) {
 
 	/**
 	 * Stop delivering this report. Set when the text was observed in a `context`
-	 * payload, injected there, or carried by a tool result — never at send time.
+	 * payload or carried by a tool result — never at send time, and never merely
+	 * because it was injected (an injection is not durable).
 	 */
 	function markConfirmed(task: BgTaskState): void {
 		task.delivery = "confirmed";
+	}
+
+	/**
+	 * Confirm reports that only the `context` fallback has carried so far. Called at
+	 * a `turn_end` whose outcome is `completed`: that request — which is the one the
+	 * injection was added to — finished, so the model saw the text. An `error` or
+	 * `aborted` outcome leaves the report `sent` and the next attempt injects it
+	 * again, because nothing about that request survives.
+	 */
+	function confirmFallbackReports(): void {
+		for (const task of tasks.values()) {
+			if (task.delivery === "sent" && task.sentVia === "fallback") {
+				markConfirmed(task);
+			}
+		}
+	}
+
+	/**
+	 * Hand a report whose only carrier was a failed request back to the durable
+	 * channels. An injection is not persisted, and while the run retries the
+	 * `context` handler re-injects it into the next attempt; but a run that settles
+	 * without a `completed` turn_end (retries exhausted, hard provider failure)
+	 * leaves it `sent` and nothing would ever look at it again — `flushPending` and
+	 * `deliverAtBoundary` carry only `none`. Re-arming it as `none` makes the
+	 * settle's own wake deliver it as a persisted message, so a failed request can
+	 * delay a report but never swallow it. Only the `fallback` channel is re-armed:
+	 * a `wake`/`boundary` delivery is already durable.
+	 *
+	 * Bounded by `MAX_REARMS`: every re-arm buys one more wake, and a provider that
+	 * fails in a way that keeps producing FRESH runs would otherwise let one report
+	 * wake the agent forever. Past the cap the report stays `sent`, which is still
+	 * recoverable — `context` injects it before the next user turn.
+	 */
+	function rearmLostFallbacks(): void {
+		for (const task of tasks.values()) {
+			if (task.delivery === "sent" && task.sentVia === "fallback") {
+				if ((task.rearmCount ?? 0) >= MAX_REARMS) {
+					// A provider that never accepts a request can produce settle ->
+					// re-arm -> wake -> settle with no user input at all, so the re-arm
+					// is bounded. The report is NOT lost: `context` still injects a
+					// `sent` report on the next user turn, which is what the whole
+					// ladder exists for; only the self-sustaining wake loop is gone.
+					continue;
+				}
+				task.rearmCount = (task.rearmCount ?? 0) + 1;
+				task.delivery = "none";
+				task.sentText = undefined;
+				task.sentVia = undefined;
+				task.sentAt = undefined;
+			}
+		}
 	}
 
 	/**
@@ -1661,6 +1961,96 @@ export default function bgTasks(pi: ExtensionAPI) {
 		for (const task of pending) {
 			markSent(task, "wake", text);
 		}
+	}
+
+	/**
+	 * Schedule ONE wake for every report that is pending when it fires. Idempotent
+	 * inside the window, so N completions in the same tick cost one `sendMessage`
+	 * (and `flushPending` drains all of them into one message). A pending wake does
+	 * not keep the process alive.
+	 */
+	function scheduleWake(): void {
+		if (wakeTimer !== undefined) {
+			return;
+		}
+		wakeTimer = setTimeout(() => {
+			wakeTimer = undefined;
+			if (busy) {
+				// A run became active inside the window (a user prompt, or another
+				// wake): `triggerTurn` would now queue the report as a FOLLOW-UP TURN
+				// instead of letting it arrive at a boundary of the run that is already
+				// going. Leave the reports `none`; `deliverAtBoundary` (turn_end /
+				// agent_before_settle) carries them inside this run, and the next
+				// `agent_settled` re-arms a wake if the run ends first.
+				return;
+			}
+			flushPending({ wake: true });
+		}, WAKE_COALESCE_MS);
+		wakeTimer.unref?.();
+	}
+
+	/**
+	 * Send ONE advisory check-in for a task that is still running.
+	 *
+	 * It is NOT a report: no `details` (the frontend registry keys on
+	 * `details.taskId`, so a check-in must not fabricate a panel row), no
+	 * `pendingReports` entry and no delivery state — the exit report still
+	 * arrives through the ladder exactly once, and nothing here may mark it. It
+	 * is best-effort by construction: a stale extension ctx (after a reload) must
+	 * not throw into a timer, so the send is wrapped.
+	 */
+	function sendCheckIn(task: BgTaskState, kind: CheckInKind): void {
+		if (task.completed) {
+			return;
+		}
+		const text = buildCheckInNote(task, kind);
+		try {
+			// A check-in is worth a turn only when nothing else is happening; while a
+			// run is active it is appended for the next boundary instead.
+			pi.sendMessage(
+				{ customType: CUSTOM_TYPE, content: text, display: false },
+				busy ? undefined : { triggerTurn: true },
+			);
+		} catch {
+			// Stale ctx after reload: a check-in is advisory, and the exit report is
+			// still coming through the ladder.
+		}
+	}
+
+	/**
+	 * Arm the two NOTIFY-ONLY timers for a task that just became a background
+	 * task: the one deadline check-in (when the model asked for one) and the one
+	 * advisory lifetime note. Neither timer signals, kills or finishes anything;
+	 * both are one-shot, unref'd and cleared in `finishTask`, and an adopted task
+	 * is never armed (its timers died with the process that armed them, and the
+	 * successor would only repeat a note this session already sent).
+	 */
+	function armCheckIns(task: BgTaskState, deadlineMs?: number): void {
+		if (task.adopted || task.completed) {
+			return;
+		}
+		const lifetimeMs = lifetimeCapMs();
+		task.lifetimeTimer = setTimeout(() => {
+			task.lifetimeTimer = undefined;
+			if (task.completed || task.lifetimeNoted) {
+				return;
+			}
+			task.lifetimeNoted = true;
+			sendCheckIn(task, "lifetime");
+		}, lifetimeMs);
+		task.lifetimeTimer.unref?.();
+		if (deadlineMs === undefined) {
+			return;
+		}
+		task.deadlineTimer = setTimeout(() => {
+			task.deadlineTimer = undefined;
+			if (task.completed || task.deadlineNoted) {
+				return;
+			}
+			task.deadlineNoted = true;
+			sendCheckIn(task, "deadline");
+		}, deadlineMs);
+		task.deadlineTimer.unref?.();
 	}
 
 	/**
@@ -1752,12 +2142,21 @@ export default function bgTasks(pi: ExtensionAPI) {
 					"Run the command as a background task instead of staying attached. Use for long-running commands such as dev servers, watchers, long builds, or test suites that take minutes. The command starts immediately, output streams to a log file whose path is returned, and you are notified with the result when it finishes. Do not poll the output file and do not append '&' to background commands. The timeout parameter does not apply to background tasks.",
 			}),
 		),
+		deadline_ms: Type.Optional(
+			Type.Number({
+				description:
+					"For a background task: send ONE 'still running' check-in (with an output tail) once this many milliseconds have passed, and keep running. It does NOT kill the process and it is not a result: the exit report still arrives exactly once when the command finishes. Minimum 500, maximum 86400000.",
+				minimum: MIN_DEADLINE_MS,
+				maximum: MAX_DEADLINE_MS,
+			}),
+		),
 		// The spread above is runtime-exact but types as a plain Record; pin the
-		// static shape so Static<> keeps command/timeout/run_in_background.
+		// static shape so Static<> keeps command/timeout/run_in_background/deadline_ms.
 	}) as unknown as Type.TObject<{
 		command: Type.TString;
 		timeout: Type.TOptional<Type.TNumber>;
 		run_in_background: Type.TOptional<Type.TBoolean>;
+		deadline_ms: Type.TOptional<Type.TNumber>;
 	}>;
 
 	type BgBashParams = Static<typeof bgBashParameters>;
@@ -1785,7 +2184,8 @@ export default function bgTasks(pi: ExtensionAPI) {
 		" If you have other work, do it. If the task's result is all that is left, either end your turn (that is the correct action, not giving up — the wake report starts a new turn) or call wait_task, which blocks until the task exits or its timeout hits and returns the output." +
 		" A wait_task result of \"still running\" is not a failure." +
 		" A task you no longer need — a dev server holding a port, a watcher for a file you already fixed — is stopped with stop_task(task_id), which signals its whole process group; list_tasks shows what is still running." +
-		" A background task keeps its stdin open: if it is waiting on input (a confirmation, a name, a REPL line), answer it with task_input(task_id, data) instead of killing and restarting it.";
+		" A background task keeps its stdin open: if it is waiting on input (a confirmation, a name, a REPL line), answer it with task_input(task_id, data) instead of killing and restarting it." +
+		" deadline_ms gives ONE 'still running' check-in (with an output tail) at the deadline and does NOT kill the process.";
 
 	const { prepareArguments: _unusedPrepareArguments, ...builtinRest } = builtin;
 	void _unusedPrepareArguments; // typed for the old schema; the new schema needs no shim
@@ -1795,7 +2195,7 @@ export default function bgTasks(pi: ExtensionAPI) {
 		description: `${builtin.description}${BG_GUIDE}`,
 		parameters: bgBashParameters,
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
-			const { run_in_background, command, timeout } = params;
+			const { run_in_background, deadline_ms, command, timeout } = params;
 			if (typeof command !== "string" || command.trim() === "") {
 				throw new Error("bg-tasks: 'command' must be a non-empty string");
 			}
@@ -1808,6 +2208,9 @@ export default function bgTasks(pi: ExtensionAPI) {
 			});
 
 			if (run_in_background) {
+				// The task BECOMES a background task here: this is the one place the
+				// model's `deadline_ms` can take effect (see `armCheckIns`).
+				armCheckIns(task, clampDeadlineMs(deadline_ms));
 				task.panelStarted = true;
 				reportPanel(task);
 				return {
@@ -1909,6 +2312,9 @@ export default function bgTasks(pi: ExtensionAPI) {
 			// Deadline: hand the command over to the background instead of
 			// killing it (P0-2). It becomes a visible task and a normal wake
 			// target from here on.
+			// A `timeout` the command outlived is the attach window, not a check-in
+			// deadline: arm only the advisory lifetime note.
+			armCheckIns(task);
 			task.panelStarted = true;
 			reportPanel(task);
 			const soFar = tail.text.trim() ? `\n\nOutput so far:\n${tail.text}` : "";

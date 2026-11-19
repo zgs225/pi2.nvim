@@ -494,11 +494,60 @@ describe("bg-tasks extension contract", function()
 
     it("escapes the command, which is arbitrary shell text", function()
         local src = read_extension()
-        assert.is_truthy(src:find("function escapeMarkup(", 1, true), "escapeMarkup must exist")
+        assert.is_truthy(src:find("function escapeText(", 1, true), "escapeText must exist")
+        assert.is_truthy(src:find("function escapeAttr(", 1, true), "escapeAttr must exist")
+        -- One escaper for element text, one for attributes/prose: a single
+        -- over-escaping helper is what made the output tail a hole.
+        assert.is_nil(src:find("escapeMarkup", 1, true), "escapeMarkup must be gone, with no call sites")
         for _, entity in ipairs({ "&amp;", "&lt;", "&gt;", "&quot;" }) do
-            assert.is_truthy(src:find(entity, 1, true), "escapeMarkup must map to " .. entity)
+            assert.is_truthy(src:find(entity, 1, true), "the escapers must map to " .. entity)
         end
-        assert.is_truthy(src:find("escapeMarkup(task.command)", 1, true), "the command must be escaped")
+        -- `&` first, or `&lt;` would be escaped twice into `&amp;lt;`.
+        local text_start = assert(src:find("function escapeText(", 1, true))
+        local text_body = src:sub(text_start, assert(src:find("function escapeAttr(", text_start, true)))
+        assert.is_true(
+            assert(text_body:find('replace(/&/g, "&amp;")', 1, true))
+                < assert(text_body:find('replace(/</g, "&lt;")', 1, true)),
+            "`&` must be escaped before `<`"
+        )
+        assert.is_truthy(src:find("escapeAttr(task.command)", 1, true), "the quoted command must be escaped")
+        assert.is_truthy(src:find("escapeAttr(task.outputFile)", 1, true), "an attribute value must be escaped")
+    end)
+
+    it("cannot let task output forge the report block", function()
+        local src = read_extension()
+        local wake_start = assert(src:find("function buildWakeNote", 1, true))
+        local wake = src:sub(wake_start, assert(src:find("function buildBatchNote", wake_start, true)))
+        -- The output tail is arbitrary program output: escaped as TEXT, it can
+        -- no longer close </system-reminder> or forge a second element.
+        assert.is_truthy(wake:find("escapeText(tail.text)", 1, true), "the tail must be escaped as text")
+        assert.is_truthy(wake:find("escapeText(describeExit(task))", 1, true), "the exit summary must be escaped")
+        assert.is_truthy(
+            wake:find("Full output: ", 1, true),
+            "a single-task report must still name the full output file"
+        )
+        assert.is_truthy(wake:find("wait_task ", 1, true), "and point at wait_task for the rest of it")
+
+        local batch_start = assert(src:find("function buildBatchNote", 1, true))
+        local batch = src:sub(batch_start, src:find("function messageText", batch_start, true) or #src)
+        -- One element per task: a burst must not collapse into one element.
+        assert.is_truthy(batch:find("batch.map(", 1, true), "the batch builds one element per task")
+        assert.is_truthy(batch:find("<background-task ", 1, true), "each batch element is a task element")
+        assert.is_truthy(batch:find("escapeText(task.command)", 1, true), "element text is escaped as text")
+    end)
+
+    it("reports an exit nobody watched as unknown, not as failed", function()
+        local src = read_extension()
+        local start = assert(src:find("function reportStatus(", 1, true))
+        local stop = assert(src:find("function escapeText(", start, true))
+        local body = src:sub(start, stop)
+        assert.is_truthy(body:find('"unknown"', 1, true), "the union must allow an unknown status")
+        local unknown_at = assert(body:find("task.exitUnknown", 1, true), "exitUnknown must be consulted")
+        assert.is_true(
+            unknown_at < assert(body:find("task.exitCode === 0", 1, true)),
+            "the unknown branch must come before the exit-code tests"
+        )
+        assert.is_truthy(body:sub(unknown_at):find('return "unknown"', 1, true), "and return unknown")
     end)
 
     it("keeps the banner as the first line, ahead of the reminder block", function()
@@ -511,5 +560,303 @@ describe("bg-tasks extension contract", function()
         )
         local block_at = assert(wake:find("wrapReminder(", 1, true), "buildWakeNote must open the block")
         assert.is_true(banner_at < block_at, "the banner must precede the <system-reminder> block")
+    end)
+
+    it("confirms a fallback injection only after a turn completes", function()
+        local src = read_extension()
+        -- The injected text lives in a per-request deep copy that is never
+        -- persisted, so being injected proves nothing: a request that fails
+        -- takes the report with it. Confirming at injection time loses it.
+        local ctx_start = assert(src:find('pi.on("context"', 1, true), "the context handler must exist")
+        local ctx_end = src:find("\n\tpi.on(", ctx_start + 1, true) or #src
+        local ctx_handler = src:sub(ctx_start, ctx_end)
+        local inject_at =
+            assert(ctx_handler:find("buildBatchNote(missing)", 1, true), "the handler must inject the missing reports")
+        assert.is_truthy(ctx_handler:find('markSent(task, "fallback", text)', 1, true), "the injection is recorded")
+        assert.is_nil(
+            ctx_handler:sub(inject_at):find("markConfirmed(", 1, true),
+            "the fallback must not confirm an injection: the request may still fail"
+        )
+        -- The one legitimate confirm left in the handler is the receipt: the
+        -- exact text observed in the outgoing payload.
+        local _, confirms = ctx_handler:gsub("markConfirmed%(", "")
+        assert.are.equal(1, confirms, "only the observed-text receipt confirms")
+        assert.is_true(
+            assert(ctx_handler:find("texts.has(task.sentText)", 1, true)) < inject_at,
+            "the receipt must be the observed-text branch, not the injector"
+        )
+
+        -- `turn_end` carries the outcome of the request the injection went into.
+        local turn_start = assert(src:find('pi.on("turn_end"', 1, true), "turn_end must be registered")
+        local turn_end = src:find("\n\tpi.on(", turn_start + 1, true) or #src
+        local turn_handler = src:sub(turn_start, turn_end)
+        local outcome_at = assert(
+            turn_handler:find('event.outcome === "completed"', 1, true),
+            "confirmation must be gated on a completed turn"
+        )
+        local confirm_at = assert(
+            turn_handler:find("confirmFallbackReports()", 1, true),
+            "the completed turn must confirm the fallback reports"
+        )
+        assert.is_true(outcome_at < confirm_at, "the outcome check must gate the confirmation")
+        assert.is_truthy(turn_handler:find("deliverAtBoundary(event)", 1, true), "the boundary still delivers")
+
+        -- The helper must be narrow: only a report the fallback carried.
+        local fn_start = assert(src:find("function confirmFallbackReports", 1, true), "helper must exist")
+        local fn_end = src:find("\n\tfunction ", fn_start + 1, true) or #src
+        local body = src:sub(fn_start, fn_end)
+        assert.is_truthy(body:find('task.delivery === "sent"', 1, true), "only an unconfirmed report qualifies")
+        assert.is_truthy(body:find('task.sentVia === "fallback"', 1, true), "only a fallback delivery qualifies")
+        assert.is_truthy(body:find("markConfirmed(task)", 1, true), "the helper confirms it")
+    end)
+
+    it("coalesces same-tick completions into ONE wake", function()
+        local src = read_extension()
+        assert.is_truthy(src:find("const WAKE_COALESCE_MS", 1, true), "the coalescing window must be a named constant")
+
+        -- ONE scheduler, and the flush happens inside its timer (so N completions
+        -- in one tick cost one sendMessage).
+        local sched_start = assert(src:find("function scheduleWake", 1, true), "scheduleWake must exist")
+        local sched_end = src:find("\n\tfunction ", sched_start + 1, true) or #src
+        local sched = src:sub(sched_start, sched_end)
+        local timer_at = assert(sched:find("setTimeout(", 1, true), "scheduleWake must arm a timer")
+        assert.is_truthy(sched:find("WAKE_COALESCE_MS", 1, true), "the timer must use the coalescing window")
+        assert.is_truthy(
+            sched:sub(timer_at):find("flushPending({ wake: true })", 1, true),
+            "the wake must be flushed from the timer, not at schedule time"
+        )
+
+        -- The idle branch schedules, it does not flush: that is the bug (two
+        -- same-tick exits each sent their own wake).
+        local finish_start = assert(src:find("function finishTask", 1, true), "finishTask must exist")
+        local finish_end = src:find("\n\tfunction ", finish_start + 1, true) or #src
+        local finish = src:sub(finish_start, finish_end)
+        assert.is_truthy(finish:find("scheduleWake()", 1, true), "finishTask's idle branch must schedule the wake")
+        assert.is_nil(
+            finish:find("flushPending({ wake: true })", 1, true),
+            "finishTask must not flush directly: two exits in one tick would send two wakes"
+        )
+
+        -- A queued wake must not outlive the process that scheduled it.
+        local exit_start = assert(src:find('process.on("exit"', 1, true), "the exit hook must exist")
+        local exit_end = src:find("function formatSeconds", exit_start, true) or #src
+        local hook = src:sub(exit_start, exit_end)
+        assert.is_truthy(hook:find("clearTimeout(wakeTimer)", 1, true), "the exit hook must clear the pending wake")
+        assert.is_truthy(hook:find("wakeTimer = undefined", 1, true), "and forget it")
+    end)
+
+    it("never wakes into a run that became active inside the window", function()
+        local src = read_extension()
+        local sched_start = assert(src:find("function scheduleWake", 1, true), "scheduleWake must exist")
+        local sched_end = src:find("\n\tfunction ", sched_start + 1, true) or #src
+        local sched = src:sub(sched_start, sched_end)
+        local callback_at = assert(sched:find("setTimeout(", 1, true), "scheduleWake must arm a timer")
+        local body = sched:sub(callback_at)
+        local flush_at =
+            assert(body:find("flushPending({ wake: true })", 1, true), "the wake must still be flushed from the timer")
+        -- `triggerTurn` on a run that is already going queues a FOLLOW-UP TURN, so
+        -- the report would not arrive at this run's next boundary: with a run
+        -- active the reports must stay `none` for `deliverAtBoundary` (turn_end /
+        -- agent_before_settle) or the next `agent_settled` to carry them.
+        local busy_at = assert(body:find("if (busy)", 1, true), "the timer must look at the run state")
+        assert.is_true(busy_at < flush_at, "the busy check must gate the flush")
+        assert.is_truthy(
+            body:sub(busy_at, flush_at):find("return", 1, true),
+            "a run that became active must skip the wake, not queue a turn"
+        )
+    end)
+
+    it("drops a queued wake when its session goes away", function()
+        local src = read_extension()
+        local shut_start = assert(src:find('pi.on("session_shutdown"', 1, true), "the shutdown handler must exist")
+        local shut_end = src:find("\n\tpi.on(", shut_start + 1, true) or #src
+        local shutdown = src:sub(shut_start, shut_end)
+        local clear_at =
+            assert(shutdown:find("clearTimeout(wakeTimer)", 1, true), "session_shutdown must clear the pending wake")
+        assert.is_truthy(shutdown:find("wakeTimer = undefined", 1, true), "and forget it")
+        -- Before anything else: the successor (a `/new`, a resume, a fork) would
+        -- otherwise deliver the replaced session's report.
+        local tasks_at = assert(
+            shutdown:find("for (const task of tasks.values())", 1, true),
+            "the handler still walks the task table"
+        )
+        assert.is_true(clear_at < tasks_at, "the timer must be cleared before the handler does its work")
+    end)
+
+    it("escapes the id and the exit status instead of trusting the record", function()
+        local src = read_extension()
+        local attrs_start = assert(src:find("function taskAttrs", 1, true), "taskAttrs must exist")
+        local attrs = src:sub(attrs_start, assert(src:find("function wrapReminder", attrs_start, true)))
+        -- A record FOLDED from a doctored transcript carries an id this extension
+        -- never generated (`b` + 6 hex): interpolated raw it could close the
+        -- attribute or forge a second element.
+        for _, shape in ipairs({ 'id="${escapeAttr(', 'exit_code="${escapeAttr(', 'signal="${escapeAttr(' }) do
+            assert.is_truthy(attrs:find(shape, 1, true), "taskAttrs must emit " .. shape)
+        end
+
+        -- The prose line and the `wait_task` pointer interpolate the id as TEXT.
+        local wake_start = assert(src:find("function buildWakeNote", 1, true))
+        local wake = src:sub(wake_start, assert(src:find("function buildBatchNote", wake_start, true)))
+        assert.is_truthy(wake:find("Background task ${id}", 1, true), "the prose id must be escaped text")
+        assert.is_truthy(wake:find("wait_task ${id}", 1, true), "and so must the wait_task pointer")
+        assert.is_nil(wake:find("${task.taskId}", 1, true), "no raw task id may reach a report")
+
+        -- The check-in note has the same hole and the same fix.
+        local note_start = assert(src:find("function buildCheckInNote", 1, true))
+        local note = src:sub(note_start, assert(src:find("function messageText", note_start, true)))
+        assert.is_truthy(note:find('id="${escapeAttr(', 1, true), "a check-in id must be escaped")
+        assert.is_truthy(note:find("Background task ${id}", 1, true), "its prose id too")
+        assert.is_nil(note:find("${task.taskId}", 1, true), "no raw task id may reach a check-in")
+    end)
+
+    it("bounds the re-arm so a failing provider cannot loop forever", function()
+        local src = read_extension()
+        assert.is_truthy(src:find("rearmCount?: number", 1, true), "the task must count its re-arms")
+        local cap = src:match("const MAX_REARMS = (%d+)")
+        assert.is_truthy(cap, "the cap must be a named constant")
+        assert.is_true(tonumber(cap) > 0 and tonumber(cap) <= 5, "the cap must be a small, finite bound")
+
+        local fn_start = assert(src:find("function rearmLostFallbacks", 1, true), "the helper must exist")
+        local fn_end = src:find("\n\tfunction ", fn_start + 1, true) or #src
+        local body = src:sub(fn_start, fn_end)
+        local guard_at =
+            assert(body:find("task.rearmCount ?? 0) >= MAX_REARMS", 1, true), "the cap must gate the re-arm")
+        assert.is_true(
+            guard_at < assert(body:find('task.delivery = "none"', 1, true)),
+            "the cap must be checked before the report is re-armed"
+        )
+        assert.is_truthy(
+            body:find("task.rearmCount = (task.rearmCount ?? 0) + 1", 1, true),
+            "every re-arm must be counted"
+        )
+    end)
+
+    --- Count plain occurrences of `needle` in `text`.
+    ---@param text string
+    ---@param needle string
+    ---@return integer
+    local function count_occurrences(text, needle)
+        local n, at = 0, 1
+        while true do
+            local found = text:find(needle, at, true)
+            if not found then
+                return n
+            end
+            n = n + 1
+            at = found + #needle
+        end
+    end
+
+    it("offers a deadline_ms bash parameter bounded by named constants", function()
+        local src = read_extension()
+        local params_start = assert(src:find("const bgBashParameters", 1, true), "the bash schema must exist")
+        local params_end = assert(src:find("type BgBashParams", params_start, true), "the static shape follows")
+        local params = src:sub(params_start, params_end)
+        assert.is_truthy(params:find("deadline_ms", 1, true), "deadline_ms must be a bash parameter")
+        assert.is_truthy(params:find("run_in_background", 1, true), "next to run_in_background")
+        -- The inferred Static<> shape has to carry it, or the model-facing type lies.
+        assert.is_truthy(params:find("deadline_ms: Type.TOptional<Type.TNumber>", 1, true), "in the Static<> shape too")
+        assert.is_truthy(params:find("minimum: MIN_DEADLINE_MS", 1, true), "the schema must use the named minimum")
+        assert.is_truthy(params:find("maximum: MAX_DEADLINE_MS", 1, true), "and the named maximum")
+
+        for _, name in ipairs({
+            "MIN_DEADLINE_MS",
+            "MAX_DEADLINE_MS",
+            "DEFAULT_MAX_LIFETIME_MS",
+            "LIFETIME_ENV",
+            "CHECK_IN_TAIL_LINES",
+        }) do
+            assert.is_truthy(src:find("const " .. name, 1, true), name .. " must be a named constant")
+        end
+        assert.is_truthy(src:find('const LIFETIME_ENV = "PI_BG_TASK_MAX_LIFETIME_MS"', 1, true))
+        assert.is_truthy(
+            src:find("const DEFAULT_MAX_LIFETIME_MS = 24 * 60 * 60 * 1000", 1, true),
+            "the default lifetime cap is 24 hours"
+        )
+
+        -- The env var is read LAZILY, when a timer is armed, not at module load:
+        -- a child process's environment only exists at arm time.
+        local cap_start = assert(src:find("function lifetimeCapMs", 1, true), "lifetimeCapMs must exist")
+        local cap_end = src:find("\nfunction ", cap_start + 1, true) or #src
+        local cap = src:sub(cap_start, cap_end)
+        assert.is_truthy(cap:find("process.env[LIFETIME_ENV]", 1, true), "the cap comes from the environment")
+        assert.is_truthy(cap:find("Number.isFinite(value) && value > 0", 1, true), "any positive finite number wins")
+        assert.is_truthy(cap:find("return DEFAULT_MAX_LIFETIME_MS", 1, true), "otherwise the default")
+    end)
+
+    it("checks in with a notify-only message, never a kill", function()
+        local src = read_extension()
+
+        -- One shot per task, so a long-lived task cannot flood the context.
+        assert.is_truthy(src:find("deadlineNoted", 1, true), "the deadline check-in must be one-shot")
+        assert.is_truthy(src:find("lifetimeNoted", 1, true), "the lifetime note must be one-shot")
+
+        -- The note builder: both kinds, same block style, no killing in it.
+        local note_start = assert(src:find("function buildCheckInNote", 1, true), "buildCheckInNote must exist")
+        local note_end = assert(src:find("function messageText", note_start, true), "messageText follows it")
+        local note = src:sub(note_start, note_end)
+        assert.is_truthy(note:find('check_in="deadline"', 1, true), "a deadline check-in says so")
+        assert.is_truthy(note:find('check_in="lifetime"', 1, true), "a lifetime note says so")
+        assert.is_truthy(note:find("[SYSTEM NOTIFICATION - NOT USER INPUT]", 1, true), "banner first")
+        assert.is_truthy(note:find("check-in, not a result", 1, true), "a check-in must not read like a result")
+        assert.is_truthy(note:find("wrapReminder(", 1, true), "the block goes through wrapReminder")
+        assert.is_truthy(note:find("escapeAttr(task.command)", 1, true), "the command is escaped")
+        assert.is_truthy(note:find("escapeText(tail.text)", 1, true), "the tail is escaped as text")
+        assert.is_truthy(note:find("CHECK_IN_TAIL_BYTES, CHECK_IN_TAIL_LINES", 1, true), "the tail is bounded")
+        for _, forbidden in ipairs({ "killProcessGroup", "SIGTERM", "SIGKILL", "finishTask" }) do
+            assert.is_nil(note:find(forbidden, 1, true), "a check-in note must never call " .. forbidden)
+        end
+
+        -- The sender: display:false, NO details (a check-in is not a panel row),
+        -- and outside the delivery ladder.
+        local send_start = assert(src:find("function sendCheckIn", 1, true), "sendCheckIn must exist")
+        -- Slice to the function's own closing brace: the next function starts with
+        -- its doc comment, and that comment talks about `finishTask` by name.
+        local send_end = assert(src:find("\n\t}\n", send_start, true), "sendCheckIn must be closed") + 3
+        local sender = src:sub(send_start, send_end)
+        assert.is_truthy(sender:find("display: false", 1, true), "the check-in is display:false")
+        assert.is_nil(sender:find("details:", 1, true), "and carries NO details: no phantom panel row")
+        assert.is_truthy(
+            sender:find("busy ? undefined : { triggerTurn: true }", 1, true),
+            "a wake only when the session is idle"
+        )
+        assert.is_truthy(sender:find("catch", 1, true), "a stale extension ctx must not throw into a timer")
+        assert.is_nil(sender:find("markSent", 1, true), "a check-in is outside the delivery ladder")
+        assert.is_nil(sender:find("markConfirmed", 1, true), "and must not touch a report's delivery state")
+        assert.is_nil(sender:find("pendingReports", 1, true), "nor the report queue")
+        for _, forbidden in ipairs({ "killProcessGroup", "SIGTERM", "SIGKILL", "finishTask" }) do
+            assert.is_nil(sender:find(forbidden, 1, true), "the check-in path must never call " .. forbidden)
+        end
+
+        -- Both timers are unref'd and unarmed for an adopted task.
+        local arm_start = assert(src:find("function armCheckIns", 1, true), "armCheckIns must exist")
+        local arm_end = src:find("\n\t/**", arm_start + 1, true) or #src
+        local arm = src:sub(arm_start, arm_end)
+        assert.are.equal(2, count_occurrences(arm, ".unref?.()"), "both timers must be unref'd")
+        assert.is_truthy(arm:find("task.adopted", 1, true), "an adopted task must never be armed")
+    end)
+
+    it("disarms both check-in timers when the task finishes", function()
+        local src = read_extension()
+        local finish_start = assert(src:find("function finishTask", 1, true), "finishTask must exist")
+        local finish_end = src:find("\n\tfunction ", finish_start + 1, true) or #src
+        local finish = src:sub(finish_start, finish_end)
+        for _, timer in ipairs({ "task.deadlineTimer", "task.lifetimeTimer" }) do
+            assert.is_truthy(finish:find("clearTimeout(" .. timer .. ")", 1, true), timer .. " must be cleared")
+            assert.is_truthy(finish:find(timer .. " = undefined", 1, true), timer .. " must be forgotten")
+        end
+        assert.is_nil(finish:find("killProcessGroup", 1, true), "finishing a task must not kill anything")
+
+        -- Armed exactly where a task BECOMES a background task: with the model's
+        -- deadline on the run_in_background path, and without one where a
+        -- foreground command detaches (there `timeout` was the attach window).
+        assert.is_true(
+            count_occurrences(src, "armCheckIns(task, clampDeadlineMs(") == 1,
+            "the deadline arms on the run_in_background path"
+        )
+        assert.is_true(
+            count_occurrences(src, "armCheckIns(task)") >= 2,
+            "the lifetime note arms on the detach and the '&' paths"
+        )
     end)
 end)
