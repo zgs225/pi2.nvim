@@ -494,11 +494,60 @@ describe("bg-tasks extension contract", function()
 
     it("escapes the command, which is arbitrary shell text", function()
         local src = read_extension()
-        assert.is_truthy(src:find("function escapeMarkup(", 1, true), "escapeMarkup must exist")
+        assert.is_truthy(src:find("function escapeText(", 1, true), "escapeText must exist")
+        assert.is_truthy(src:find("function escapeAttr(", 1, true), "escapeAttr must exist")
+        -- One escaper for element text, one for attributes/prose: a single
+        -- over-escaping helper is what made the output tail a hole.
+        assert.is_nil(src:find("escapeMarkup", 1, true), "escapeMarkup must be gone, with no call sites")
         for _, entity in ipairs({ "&amp;", "&lt;", "&gt;", "&quot;" }) do
-            assert.is_truthy(src:find(entity, 1, true), "escapeMarkup must map to " .. entity)
+            assert.is_truthy(src:find(entity, 1, true), "the escapers must map to " .. entity)
         end
-        assert.is_truthy(src:find("escapeMarkup(task.command)", 1, true), "the command must be escaped")
+        -- `&` first, or `&lt;` would be escaped twice into `&amp;lt;`.
+        local text_start = assert(src:find("function escapeText(", 1, true))
+        local text_body = src:sub(text_start, assert(src:find("function escapeAttr(", text_start, true)))
+        assert.is_true(
+            assert(text_body:find('replace(/&/g, "&amp;")', 1, true))
+                < assert(text_body:find('replace(/</g, "&lt;")', 1, true)),
+            "`&` must be escaped before `<`"
+        )
+        assert.is_truthy(src:find("escapeAttr(task.command)", 1, true), "the quoted command must be escaped")
+        assert.is_truthy(src:find("escapeAttr(task.outputFile)", 1, true), "an attribute value must be escaped")
+    end)
+
+    it("cannot let task output forge the report block", function()
+        local src = read_extension()
+        local wake_start = assert(src:find("function buildWakeNote", 1, true))
+        local wake = src:sub(wake_start, assert(src:find("function buildBatchNote", wake_start, true)))
+        -- The output tail is arbitrary program output: escaped as TEXT, it can
+        -- no longer close </system-reminder> or forge a second element.
+        assert.is_truthy(wake:find("escapeText(tail.text)", 1, true), "the tail must be escaped as text")
+        assert.is_truthy(wake:find("escapeText(describeExit(task))", 1, true), "the exit summary must be escaped")
+        assert.is_truthy(
+            wake:find("Full output: ", 1, true),
+            "a single-task report must still name the full output file"
+        )
+        assert.is_truthy(wake:find("wait_task ", 1, true), "and point at wait_task for the rest of it")
+
+        local batch_start = assert(src:find("function buildBatchNote", 1, true))
+        local batch = src:sub(batch_start, src:find("function messageText", batch_start, true) or #src)
+        -- One element per task: a burst must not collapse into one element.
+        assert.is_truthy(batch:find("batch.map(", 1, true), "the batch builds one element per task")
+        assert.is_truthy(batch:find("<background-task ", 1, true), "each batch element is a task element")
+        assert.is_truthy(batch:find("escapeText(task.command)", 1, true), "element text is escaped as text")
+    end)
+
+    it("reports an exit nobody watched as unknown, not as failed", function()
+        local src = read_extension()
+        local start = assert(src:find("function reportStatus(", 1, true))
+        local stop = assert(src:find("function escapeText(", start, true))
+        local body = src:sub(start, stop)
+        assert.is_truthy(body:find('"unknown"', 1, true), "the union must allow an unknown status")
+        local unknown_at = assert(body:find("task.exitUnknown", 1, true), "exitUnknown must be consulted")
+        assert.is_true(
+            unknown_at < assert(body:find("task.exitCode === 0", 1, true)),
+            "the unknown branch must come before the exit-code tests"
+        )
+        assert.is_truthy(body:sub(unknown_at):find('return "unknown"', 1, true), "and return unknown")
     end)
 
     it("keeps the banner as the first line, ahead of the reminder block", function()

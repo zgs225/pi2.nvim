@@ -59,16 +59,20 @@
  * An `agent_settled` for an aborted run deliberately wakes nothing (the user
  * asked for the run to stop); the report waits for stage 3.
  *
- * The report TEXT is a structured reminder block, not prose, and it is built by
- * one function so the text handed over and the text stage 3 matches are
- * byte-identical. Line 1 is the `[SYSTEM NOTIFICATION - NOT USER INPUT]` banner,
+ * The report TEXT is a structured reminder block, not prose. The exact string
+ * that is handed over is stored on the task (`task.sentText`), and stage 3
+ * compares precisely that string, verbatim, against the message list about to
+ * be sent: the receipt can never match a report built differently. Line 1 is
+ * the `[SYSTEM NOTIFICATION - NOT USER INPUT]` banner,
  * line 2 one prose line, and the payload sits in `<system-reminder>` around one
  * `<background-task id status exit_code signal duration_ms output>` element per
  * task (a single task also carries its output tail; a batch keeps one element
  * per task and omits the tails). Attributes are escaped, because a command is
  * arbitrary shell text: a reader gets the task id, its status, the exit code,
  * the signal and the duration from the element instead of having to parse a
- * sentence.
+ * sentence. Element text (the command, the exit summary, the output tail) is
+ * escaped as TEXT, so a program that prints `</system-reminder>` cannot end the
+ * block or forge a second element.
  *
  * The wake report is why `sleep` must never be the model's waiting primitive:
  * it is delivered mid-run at the next turn boundary, so a model that has other
@@ -650,7 +654,7 @@ function describeExit(task: BgTaskState): string {
  * `kind` vocabulary (see `reportPanel`, which opens with "started" instead of
  * "running"): this one is the model-facing word for what happened.
  */
-function reportStatus(task: BgTaskState): "running" | "completed" | "failed" | "stopped" {
+function reportStatus(task: BgTaskState): "running" | "completed" | "failed" | "stopped" | "unknown" {
 	if (!task.completed) {
 		return "running";
 	}
@@ -660,6 +664,11 @@ function reportStatus(task: BgTaskState): "running" | "completed" | "failed" | "
 	if (task.signal !== null) {
 		return "stopped";
 	}
+	// An adopted task that vanished unobserved has no exit code and no signal:
+	// calling that "failed" would contradict the prose line right above it.
+	if (task.exitUnknown) {
+		return "unknown";
+	}
 	if (task.exitCode === 0) {
 		return "completed";
 	}
@@ -667,16 +676,23 @@ function reportStatus(task: BgTaskState): "running" | "completed" | "failed" | "
 }
 
 /**
- * Escape a value for the report block — attribute values AND element text,
- * because a command is arbitrary shell text (`awk '{print $1}' && echo
- * "<done>"`) and must not be able to close a tag or smuggle in an attribute.
+ * Escape a value for element TEXT. `&` and `<` are the only characters that can
+ * open or end a tag inside a text node, so `>` and `"` are left alone — real
+ * output (`a > b`, `"quoted"`) stays readable, and nothing can forge the
+ * delimiters around the block.
  */
-function escapeMarkup(value: string): string {
-	return value
-		.replace(/&/g, "&amp;")
-		.replace(/</g, "&lt;")
-		.replace(/>/g, "&gt;")
-		.replace(/"/g, "&quot;");
+function escapeText(value: string): string {
+	return value.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+}
+
+/**
+ * Escape a value for an ATTRIBUTE (or a "…" in the prose line): `escapeText`
+ * plus `>` and `"`. Attribute values are arbitrary shell text too — a command
+ * like `awk '{print $1}' && echo "<done>"` must not be able to close the quote
+ * or the tag.
+ */
+function escapeAttr(value: string): string {
+	return escapeText(value).replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
 /** Attributes of one `<background-task>` element, in a fixed order. */
@@ -688,7 +704,7 @@ function taskAttrs(task: BgTaskState): string {
 		`exit_code="${task.exitCode ?? ""}"`,
 		`signal="${task.signal ?? ""}"`,
 		`duration_ms="${durationMs}"`,
-		`output="${escapeMarkup(task.outputFile)}"`,
+		`output="${escapeAttr(task.outputFile)}"`,
 	].join(" ");
 }
 
@@ -704,8 +720,8 @@ function wrapReminder(body: string): string {
 /**
  * Completion report text for the wake path. Shared by sendMessage and the
  * context fallback so the agent sees exactly the same text either way — stage 3
- * of the ladder above matches it byte-for-byte, so nothing here may vary
- * between the two callers.
+ * of the ladder above compares the `sentText` it stored, so nothing here may
+ * vary between the two callers.
  *
  * The "[SYSTEM NOTIFICATION ...]" banner stays the first line for the same
  * reason Claude Code added it: this lands in the agent's context as a user-role
@@ -718,9 +734,18 @@ function wrapReminder(body: string): string {
 function buildWakeNote(task: BgTaskState): string {
 	const elapsed = formatSeconds((task.endedAt ?? Date.now()) - task.startedAt);
 	const tail = readOutputTail(task.outputFile, WAKE_TAIL_BYTES, WAKE_TAIL_LINES);
-	const head = `Background task ${task.taskId} ("${escapeMarkup(task.command)}") ${describeExit(task)} after ${elapsed}.`;
+	const head =
+		`Background task ${task.taskId} ("${escapeAttr(task.command)}") ` +
+		`${escapeText(describeExit(task))} after ${elapsed}.`;
+	// Only the TEXT of the tail is escaped (attributes need more): output is
+	// arbitrary program output and may well print `</system-reminder>`.
 	const lines = tail.text.trim()
-		? [`${head} Output tail:`, "", tail.text]
+		? [
+				`${head} Output tail:`,
+				"",
+				escapeText(tail.text),
+				`Full output: ${escapeText(task.outputFile)} (or wait_task ${task.taskId}).`,
+			]
 		: [head, "No output tail was read: the output file above is the only copy of its output."];
 	return (
 		`[SYSTEM NOTIFICATION - NOT USER INPUT]\n` +
@@ -744,12 +769,14 @@ function buildBatchNote(batch: BgTaskState[]): string {
 		return buildWakeNote(batch[0]);
 	}
 	const elements = batch.map(
-		(task) => `<background-task ${taskAttrs(task)}>${escapeMarkup(task.command)}</background-task>`,
+		(task) => `<background-task ${taskAttrs(task)}>${escapeText(task.command)}</background-task>`,
 	);
+	// ONE sentence (docs/usage.md and docs/extensions.md both say line 2 is a
+	// single sentence): banner, then this, then the block.
 	const notice =
-		"This is an automated task notification, not a message from the user. " +
-		"Several background tasks finished together; output tails are omitted — read the files " +
-		"(or call wait_task on a task id) if you need the output.";
+		"This is an automated task notification, not a message from the user: several background " +
+		"tasks finished together, and their output tails are omitted — read the files (or call " +
+		"wait_task on a task id) if you need the output.";
 	return `[SYSTEM NOTIFICATION - NOT USER INPUT]\n${notice}\n${wrapReminder(elements.join("\n"))}`;
 }
 
