@@ -540,20 +540,16 @@ local function replay_bg_task_message(message, session_id, tab)
     if message.customType ~= "pi2_bg_task" then
         return
     end
-    local details = message.details
-    -- A task the registry already tracks keeps its live state. Replay runs more
-    -- than once per session (a compaction rebuild, :PiTree), and a rebuilt
-    -- window can hold a task's `started` entry without the terminal one; folding
-    -- that again would turn a finished row back into a running one (spinner and
-    -- all). Terminal entries are always folded — they carry the exit status and
-    -- are idempotent.
-    if type(details) == "table" and details.kind == "started" then
-        local id = details.taskId
-        if type(id) == "string" and Tasks.get(id) ~= nil then
-            return
-        end
+    -- The dedupe (a repeated `started` must not un-finish a tracked row) and
+    -- the registry call both live in Tasks.absorb_message, which the
+    -- sub-session viewer calls too: one rule for the parent's transcript and
+    -- a child's, so a task's command/state cannot differ between the two.
+    -- A raise is downgraded to a warning, as in `apply_bg_task_event`: a
+    -- replayed transcript must not break the rebuild it is part of.
+    local ok, err = pcall(Tasks.absorb_message, message, session_id, tab)
+    if not ok then
+        Notify.warn("Background task event failed: " .. tostring(err))
     end
-    apply_bg_task_event(details, message.timestamp, session_id, tab)
 end
 
 --- Render the UI-only line(s) for a bg-tasks delivery report.

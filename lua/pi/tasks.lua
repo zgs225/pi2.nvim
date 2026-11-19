@@ -565,6 +565,53 @@ function M.handle_event(ev, session_id, tab)
     return false
 end
 
+--- Fold one transcript `pi2_bg_task` record into the registry. Accepts either
+--- wire shape a transcript keeps it in:
+---   * `msg.details` — an RPC `get_messages` message (role="custom");
+---   * `msg.data` — a JSONL `type="custom"` entry's payload.
+---
+--- One fold shared by the parent's transcript replay (sessions/manager.lua)
+--- and the sub-session viewer, so the two tables cannot disagree about a
+--- task's command or state. A record is not conversation content: it renders
+--- nothing, but it is the only place a task's command is written down, and a
+--- tool block replayed later (`wait_task` / `stop_task` / `task_input`) names
+--- the command from this registry — without the fold it falls back to a bare
+--- task id.
+---
+--- A `started` record for a task the registry already tracks is inert: replay
+--- runs more than once per view (a compaction rebuild, :PiTree, a reopened
+--- viewer), and a rebuilt window can hold a task's `started` entry without the
+--- terminal one — folding that again would turn a finished row back into a
+--- running one (spinner and all). Terminal records are always folded: they
+--- carry the exit status and are idempotent.
+---@param msg table? transcript entry carrying a pi2_bg_task payload
+---@param session_id string? owning session id (nil = unknown ownership)
+---@param tab integer? owning tabpage handle (panel display)
+---@return boolean consumed true when the record was folded
+function M.absorb_message(msg, session_id, tab)
+    if type(msg) ~= "table" then
+        return false
+    end
+    local custom_type = msg.customType
+    if custom_type ~= nil and custom_type ~= "pi2_bg_task" then
+        return false
+    end
+    local details = msg.details
+    if type(details) ~= "table" then
+        details = msg.data
+    end
+    if type(details) ~= "table" then
+        return false
+    end
+    if details.kind == "started" then
+        local id = details.taskId
+        if type(id) == "string" and store[id] ~= nil then
+            return true
+        end
+    end
+    return M.handle_event({ type = "pi2_bg_task", details = details, timestamp = msg.timestamp }, session_id, tab)
+end
+
 --- Drop every task owned by the given session (tab closed / session
 --- destroyed, so its rows don't linger as zombies). Returns the number of
 --- removed records; schedules a panel refresh only when something was
