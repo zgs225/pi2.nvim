@@ -492,6 +492,37 @@ describe("bg-tasks extension contract", function()
         end
     end)
 
+    it("lets the panel say a task's exit is unknown", function()
+        local src = read_extension()
+        -- The panel's vocabulary must carry the word the report uses.
+        assert.is_truthy(
+            src:find('kind: "started" | "completed" | "failed" | "stopped" | "unknown"', 1, true),
+            "BgTaskDetails.kind must include `unknown`"
+        )
+        -- Ordering: an exit nobody observed is neither a signal nor a code, so
+        -- the `exitUnknown` test must sit after the signal test and before the
+        -- exit-code test, exactly like `reportStatus`.
+        local panel = assert(src:find("function reportPanel(", 1, true), "reportPanel must exist")
+        local panel_body = src:sub(panel, assert(src:find("function batchDetails(", panel, true)))
+        local unknown_at = assert(panel_body:find("task.exitUnknown", 1, true), "reportPanel must test exitUnknown")
+        local code_at = assert(panel_body:find("task.exitCode === 0", 1, true), "reportPanel must test the exit code")
+        assert.is_true(unknown_at < code_at, "exitUnknown must be tested before the exit code")
+        -- The vanished-record reconcile path must reach the panel too, or a
+        -- resumed session's unadoptable task would simply not exist there.
+        local stale_at = assert(src:find("stale += 1;", 1, true), "the stale reclaim must exist")
+        local stale_end = assert(src:find("continue;", stale_at, true), "the stale branch continues")
+        local stale_block = src:sub(stale_at, stale_end)
+        assert.is_truthy(stale_block:find("task.exitUnknown = true;", 1, true), "the stale reclaim is unknown")
+        local stale_unknown = assert(stale_block:find("task.exitUnknown = true;", 1, true))
+        local stale_panel =
+            assert(stale_block:find("reportPanel(task);", 1, true), "the stale reclaim must report a panel row")
+        assert.is_true(stale_unknown < stale_panel, "the row is reported after it is marked unknown")
+        assert.is_truthy(
+            stale_block:find('task.delivery = "confirmed"', 1, true),
+            "an unknown exit still must not wake the model"
+        )
+    end)
+
     it("escapes the command, which is arbitrary shell text", function()
         local src = read_extension()
         assert.is_truthy(src:find("function escapeText(", 1, true), "escapeText must exist")

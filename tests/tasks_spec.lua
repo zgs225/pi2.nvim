@@ -184,6 +184,28 @@ describe("pi.tasks handle_event", function()
         assert.are.equal(1, Tasks.get("b").exit_code)
     end)
 
+    it("accepts an unknown terminal event without fabricating an exit code", function()
+        -- `unknown` is what the extension reports for a task whose exit nobody
+        -- observed. It must not borrow `failed`'s default exit_code of 1: a
+        -- record that reads "failed" contradicts the report it came from.
+        Tasks.handle_event(started_ev("a", 1000))
+        assert.is_true(Tasks.handle_event(ev("unknown", { taskId = "a" }, 1500)))
+        local t = Tasks.get("a")
+        assert.are.equal("unknown", t.status)
+        assert.are.equal(1500, t.end_time)
+        assert.is_nil(t.exit_code, "an unobserved exit has no code to record")
+        assert.are.equal("unknown", Tasks.build_rows(2000)[1].status_label)
+
+        -- A synthesized record for a task the frontend never saw start follows
+        -- the same rule.
+        assert.is_true(Tasks.handle_event(ev("unknown", { taskId = "ghost" }, 900)))
+        local ghost = Tasks.get("ghost")
+        assert.are.equal("unknown", ghost.status)
+        assert.are.equal(900, ghost.start_time)
+        assert.are.equal(900, ghost.end_time)
+        assert.is_nil(ghost.exit_code)
+    end)
+
     it("keeps an explicit exit_code", function()
         Tasks.handle_event(started_ev("a", 1000))
         Tasks.handle_event(ev("completed", { taskId = "a", exitCode = 3 }, 1500))
@@ -671,6 +693,20 @@ describe("pi.tasks stop escalation", function()
         pump(600) -- four times the escalation window
 
         assert.is_true(alive(pid), "a task the backend already settled must not be SIGKILLed")
+        cleanup(handle, pid)
+    end)
+
+    it("disarms the escalation when the backend says the exit is unknown", function()
+        local handle, pid = spawn_trapper()
+        Tasks.upsert({ id = "trapper", command = "ignore-term", status = "running", start_time = 1, pid = pid })
+        assert.is_true(Tasks.stop("trapper", 100))
+
+        -- `unknown` is an authoritative terminal event too: the process is gone
+        -- (nobody saw how), so escalating a SIGKILL would target a dead group.
+        assert.is_true(Tasks.handle_event(ev("unknown", { taskId = "trapper" }), "sess-A"))
+        pump(600) -- four times the escalation window
+
+        assert.is_true(alive(pid), "an unknown exit still settles the row, so nothing may be killed")
         cleanup(handle, pid)
     end)
 

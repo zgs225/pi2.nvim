@@ -243,6 +243,7 @@ local function set_defaults()
     vim.api.nvim_set_hl(0, "PiTasksListSuccess", { default = true, link = "DiagnosticOk" })
     vim.api.nvim_set_hl(0, "PiTasksListFailure", { default = true, link = "DiagnosticError" })
     vim.api.nvim_set_hl(0, "PiTasksListStopped", { default = true, link = "DiagnosticWarn" })
+    vim.api.nvim_set_hl(0, "PiTasksListUnknown", { default = true, link = "DiagnosticWarn" })
     if cursorline.bg then
         vim.api.nvim_set_hl(0, "PiTasksListCurrent", { default = true, bg = cursorline.bg, bold = true })
     else

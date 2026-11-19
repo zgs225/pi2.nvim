@@ -579,7 +579,12 @@ local function handle_bg_task_message(message, session_id, tab)
     -- focus leaves — never yank a panel the user is reading. pi.ui.tasks is
     -- lazy-required as in the auto-open path.
     if
-        (details.kind == "completed" or details.kind == "failed" or details.kind == "stopped")
+        (
+            details.kind == "completed"
+            or details.kind == "failed"
+            or details.kind == "stopped"
+            or details.kind == "unknown"
+        )
         and tab ~= nil
         and not Tasks.has_running(session_id)
     then

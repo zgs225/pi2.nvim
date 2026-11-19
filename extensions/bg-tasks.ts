@@ -356,7 +356,7 @@ type DeliveryChannel = "boundary" | "wake" | "fallback" | "tool-result";
 
 /** Payload of the display:false custom messages the frontend (pi.nvim) receives. */
 interface BgTaskDetails {
-	kind: "started" | "completed" | "failed" | "stopped";
+	kind: "started" | "completed" | "failed" | "stopped" | "unknown";
 	taskId: string;
 	command: string;
 	pid?: number;
@@ -1469,7 +1469,12 @@ export default function bgTasks(pi: ExtensionAPI) {
 				stale += 1;
 				task.completed = true;
 				task.exitUnknown = true;
+				// `confirmed` keeps the vanished record from waking the model, but the
+				// panel still needs the row: without this the record would not exist
+				// there at all instead of reading `unknown`.
 				task.delivery = "confirmed";
+				task.panelStarted = true;
+				reportPanel(task);
 				rows.push(
 					`- ${task.taskId} ("${command}") was recorded as running, but pid ${record.pid ?? "?"} is gone or no longer runs it, so its exit status is unknown. Output: ${record.outputFile}`,
 				);
@@ -2280,15 +2285,21 @@ export default function bgTasks(pi: ExtensionAPI) {
 	 * instead would strand the panel on "running" for the rest of the run.
 	 */
 	function reportPanel(task: BgTaskState): void {
+		// Same ordering as `reportStatus`, because the panel must not contradict it.
+		// The `exitUnknown` test sits AFTER the signal test and BEFORE the exit-code
+		// test: an adopted task that vanished with nobody watching has no exit code
+		// and no signal, so falling through would export it as `failed`.
 		const kind: BgTaskDetails["kind"] = !task.completed
 			? "started"
 			: task.spawnError
 				? "failed"
 				: task.signal !== null
 					? "stopped"
-					: task.exitCode === 0
-						? "completed"
-						: "failed";
+					: task.exitUnknown
+						? "unknown"
+						: task.exitCode === 0
+							? "completed"
+							: "failed";
 		const details = {
 			kind,
 			taskId: task.taskId,
@@ -2332,13 +2343,17 @@ export default function bgTasks(pi: ExtensionAPI) {
 		const task = batch[0];
 		return {
 			details: {
+				// Mirrors `reportPanel`'s ordering: an exit nobody observed is `unknown`,
+				// never `failed`.
 				kind: task.spawnError
 					? "failed"
 					: task.signal !== null
 						? "stopped"
-						: task.exitCode === 0
-							? "completed"
-							: "failed",
+						: task.exitUnknown
+							? "unknown"
+							: task.exitCode === 0
+								? "completed"
+								: "failed",
 				taskId: task.taskId,
 				command: task.command,
 				pid: task.pid,

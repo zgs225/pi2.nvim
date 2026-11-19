@@ -185,6 +185,7 @@ The dashboard reuses `PiToolHeader` for its section headers, `Comment` for dimme
 | `PiTasksListSuccess` | Status dot of a completed task (dim `◌`; links to `DiagnosticOk`) |
 | `PiTasksListFailure` | Status dot of a failed task (steady red `●`; links to `DiagnosticError`) |
 | `PiTasksListStopped` | Status dot of a stopped task (dim `◌`; links to `DiagnosticWarn`) |
+| `PiTasksListUnknown` | Status dot of a task whose exit nobody observed (dim `◌`; links to `DiagnosticWarn`) |
 | `PiTasksListCurrent` | Window-local background marker under the status dot of every running row (cursorline background + bold) |
 | `PiTasksListDotDim` | Dim phase of the running dot's blink, and the `id · status · duration` subtitle (links to `Comment`) |
 | `PiTasksListFloatTitle` | Float title for the tasks panel window |
