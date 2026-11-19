@@ -878,6 +878,8 @@ describe("subsession batch", function()
         end)
     end)
 
+    -- Nested option tables are replaced, never mutated in place: an in-place write would land in
+    -- the module-local `defaults` through `tbl_deep_extend`'s aliasing (G31).
     describe("dispatch concurrency limit and auto-reap", function()
         local parent
 
@@ -1109,7 +1111,8 @@ describe("subsession batch", function()
         end)
 
         it("does not count alive reuse as a new spawn and does not reap the reuse target during auto-reap", function()
-            Config.options.subagent.max_children = 2
+            Config.options.subagent =
+                vim.tbl_deep_extend("force", vim.deepcopy(Config.options.subagent), { max_children = 2 })
 
             -- C1 is settled-but-alive, and older than C2. C1 is the reuse target.
             Manifest.upsert("child-C1", {
@@ -1196,7 +1199,8 @@ describe("subsession batch", function()
         it(
             "rejects dispatch when active + alive reuse saturates quota and auto-reap cannot reap reuse target",
             function()
-                Config.options.subagent.max_children = 2
+                Config.options.subagent =
+                    vim.tbl_deep_extend("force", vim.deepcopy(Config.options.subagent), { max_children = 2 })
 
                 Manifest.upsert("child-A", {
                     parent_id = "parent-limit-test",
