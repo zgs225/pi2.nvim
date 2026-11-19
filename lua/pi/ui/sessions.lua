@@ -29,16 +29,17 @@ local show_hidden_children = false
 ---@field tab? pi.TabId
 ---@field session_id? string
 ---@field child_id? string Manifest child id when no live session
----@field depth integer 0 = parent tab row, 1 = sub-session
+---@field depth? integer 0 = parent tab row, 1 = sub-session, nil = worktree group header
 ---@field status pi.SessionsListStatus
 ---@field attention integer pending attention request count
 ---@field done boolean last turn finished while the user was elsewhere
 ---@field error boolean last turn failed and the user hasn't seen it yet
----@field name string? display name (nil while still fetching)
----@field title_generating boolean backend auto-title generation in progress
+---@field name? string display name (nil while still fetching)
+---@field title_generating? boolean backend auto-title generation in progress
 ---@field subtitle? string model · thinking badge for sub-rows
 ---@field dormant? boolean process not running (disk only)
 ---@field session? pi.Session live session reference when available
+---@field session_file? string Recorded transcript of a row without a live session object (a disk-only child row).
 ---@field is_current_view? boolean row is the tab's focused session (parent or child)
 ---@field is_tree_parent? boolean parent row shown while viewing a child in the tab
 ---@field marker_col? integer 1-based byte column of the status dot (for current-tab marker)
@@ -46,6 +47,12 @@ local show_hidden_children = false
 ---@field has_children? boolean parent row has visible sub-sessions
 ---@field collapsed? boolean whether child sub-sessions are folded
 ---@field child_count? integer number of visible sub-sessions
+---@field is_group? boolean worktree group header row (not a session)
+---@field group_id? string worktree root of a group header and its members
+---@field worktree? string worktree name shown on a group header / sub-session row
+---@field worktree_path? string display path of a worktree group header (· the assigned
+---   worktree of a sub-session row: another checkout of the *same* repository)
+---@field forked_from? string display name of the session this one was forked from
 
 ---@type integer? shared list buffer
 local buf = nil
@@ -212,7 +219,7 @@ local function parent_key(parent_sess)
         return parent_sess
     end
     local Manifest = require("pi.subsessions.manifest")
-    local lineage = Manifest.lineage_for_session(parent_sess)
+    local lineage = Manifest.lineage_for_session(parent_sess, Manifest.workspace(parent_sess))
     if lineage and lineage ~= "" then
         return lineage
     end
@@ -266,6 +273,344 @@ local function toggle_parent_collapsed(parent_sess, is_active_parent)
     return parent_folds[key]
 end
 
+--- Worktree glyph shared by the group header and the sub-session row suffix.
+local WORKTREE_GLYPH = "󰙅"
+
+---@class pi.SessionsListWorktree
+---@field kind "main"|"linked"
+---@field name string worktree directory name
+---@field path string worktree root
+---@field repo_root? string main checkout root (linked worktrees)
+
+--- Memoized `pi.worktree.detect` per directory. Detection is filesystem-only
+--- (no git), so it is safe on the render path — the blink/spinner timers call
+--- `_render` every 120–500 ms. Dirty/ahead state is Chat-side only.
+---@type table<string, pi.SessionsListWorktree|false>
+local worktree_cache = {}
+
+---@param dir string
+---@return pi.SessionsListWorktree?
+local function detect_worktree(dir)
+    local cached = worktree_cache[dir]
+    if cached ~= nil then
+        return cached or nil
+    end
+    local info = nil
+    local ok, mod = pcall(require, "pi.worktree")
+    if ok and type(mod) == "table" and type(mod.detect) == "function" then
+        local detected = mod.detect(dir)
+        if type(detected) == "table" and type(detected.path) == "string" and type(detected.name) == "string" then
+            info = detected
+        end
+    end
+    worktree_cache[dir] = info or false
+    return info
+end
+
+--- Worktree of a session, keyed by its cwd (nil for non-git directories).
+---@param session pi.Session?
+---@return pi.SessionsListWorktree?
+local function session_worktree(session)
+    local cwd = session and session.cwd
+    if type(cwd) ~= "string" or cwd == "" then
+        return nil
+    end
+    return detect_worktree(cwd)
+end
+
+--- Name and display path of an *assigned* worktree (`{ kind = "linked", path,
+--- name? }`): the checkout a sub-session was handed, which is another checkout of
+--- the same repository as its parent row (assignment is rejected across
+--- repositories). The name is the checkout's own, else its directory name, else
+--- the path itself.
+---@param worktree any
+---@return string? name
+---@return string? path display form (`~/…`)
+local function assigned_worktree_label(worktree)
+    if type(worktree) ~= "table" then
+        return nil, nil
+    end
+    local path = type(worktree.path) == "string" and worktree.path ~= "" and worktree.path or nil
+    local display_path = path and vim.fn.fnamemodify(path, ":~") or nil
+    local name = type(worktree.name) == "string" and worktree.name ~= "" and worktree.name or nil
+    if not name and path then
+        -- `:t` keeps a trailing separator, so trim it before asking for the tail.
+        local trimmed = path:gsub("/+$", "")
+        local base = vim.fn.fnamemodify(trimmed ~= "" and trimmed or path, ":t")
+        name = base ~= "" and base or path
+    end
+    if not name then
+        return nil, nil
+    end
+    return name, display_path
+end
+
+--- Fold-state key of a worktree group header. The `wt:` namespace keeps it
+--- from colliding with a session lineage or session id.
+---@param root string
+---@return string
+local function group_fold_key(root)
+    return "wt:" .. root
+end
+
+--- Fold-state key of any row: a worktree group header uses its own key,
+--- everything else keeps the lineage/session-id key.
+---@param row pi.SessionsListRow
+---@return string?
+local function row_fold_key(row)
+    if row.is_group then
+        return row.group_id and group_fold_key(row.group_id) or nil
+    end
+    return parent_key(row.session) or row.session_id
+end
+
+--- Normalized checkout path, or nil when `path` is not one. Mirrors the resume
+--- picker's partition keys: trailing slashes would split one checkout into two
+--- groups.
+---@param path any
+---@return string?
+local function norm_checkout(path)
+    if type(path) ~= "string" or path == "" then
+        return nil
+    end
+    local normalized = vim.fs.normalize(path):gsub("/+$", "")
+    return normalized ~= "" and normalized or nil
+end
+
+--- Checkout the current tab runs in: the session's own cwd — a worktree session
+--- keeps its checkout while Neovim's cwd does not move — else Neovim's cwd.
+--- The same anchor `:PiResume` uses, so both lists agree on which checkout is
+--- "yours".
+---@return string?
+local function current_checkout()
+    local ok, Sessions = pcall(require, "pi.sessions.manager")
+    local session = ok and type(Sessions) == "table" and type(Sessions.get) == "function" and Sessions.get() or nil
+    local cwd = session and session.cwd
+    if type(cwd) ~= "string" or cwd == "" then
+        cwd = vim.fn.getcwd()
+    end
+    return norm_checkout(cwd)
+end
+
+--- Main work tree of the project the current editor session belongs to — the
+--- group the overview pins first.
+---
+--- Deliberately resolved from `current_checkout()` to the **repository's main
+--- checkout** rather than pinned to that checkout itself: every tab of the same
+--- repository (its main checkout and all its linked worktrees) resolves to the
+--- same main work tree, so moving focus between two worktree tabs cannot
+--- reshuffle the groups. A tab whose checkout is not inside a git repository
+--- pins nothing.
+---@return string? normalized main checkout root
+local function current_main_checkout()
+    local anchor = current_checkout()
+    local info = anchor and detect_worktree(anchor)
+    local repo_root = info and info.repo_root
+    if type(repo_root) ~= "string" or repo_root == "" then
+        return nil
+    end
+    return norm_checkout(repo_root)
+end
+
+--- Activity clock of a list row: the mtime of the session transcript it belongs
+--- to (a disk-only child row uses the file recorded for it). It is the same
+--- signal the resume picker orders its partitions by. 0 when no file is known —
+--- a session that has not reported one yet, or one started without a session
+--- file.
+---@param row pi.SessionsListRow
+---@return integer
+local function row_activity(row)
+    local file = row.session_file
+    local session = row.session
+    if type(file) ~= "string" or file == "" then
+        file = session and session.session_file
+    end
+    if type(file) ~= "string" or file == "" then
+        return 0
+    end
+    local mtime = vim.fn.getftime(file)
+    return mtime > 0 and mtime or 0
+end
+
+--- Group parent rows (and their sub-session rows) by git worktree.
+---
+--- Groups appear only when the rows span at least two distinct worktrees, so a
+--- single-worktree or non-git list keeps exactly the flat shape it has today.
+--- Rows whose session cwd is not a work tree keep their order in a trailing
+--- ungrouped bucket, members keep tabline order inside their group, and a
+--- sub-session row inherits the worktree of the parent row above it (and names
+--- it in its subtitle) — unless the child was *assigned* a worktree of its own
+--- (entry.assigned_worktree, set by `append_child_row`), which is named instead.
+--- A child stays nested under its parent whatever checkout it runs in: the
+--- grouping and the parent's fold count follow the parent row, never the
+--- child's cwd.
+---
+--- Group order follows `:PiResume`'s partition order, with one deliberate
+--- difference: the **main work tree of the project the focused tab belongs to**
+--- comes first (see `current_main_checkout`), never the focused tab's own
+--- checkout, so switching focus between two tabs of one repository's worktrees
+--- never reorders the groups. The rest follow by most recently active groups
+--- (newest transcript mtime anywhere in the group), with equal clocks broken by
+--- worktree name and then path so a redraw never reshuffles ties.
+---@param flat pi.SessionsListRow[]
+---@return pi.SessionsListRow[]
+local function group_by_worktree(flat)
+    ---@type table<string, pi.SessionsListRow[]>
+    local buckets = {}
+    ---@type string[] group roots in first-appearance order (re-ordered below)
+    local order = {}
+    ---@type table<string, pi.SessionsListWorktree>
+    local infos = {}
+    ---@type pi.SessionsListRow[]
+    local ungrouped = {}
+    ---@type string? bucket the last parent row was appended to
+    local bucket = nil
+
+    for _, row in ipairs(flat) do
+        if row.depth and row.depth > 0 then
+            -- Sub-session rows follow the parent row they were emitted under.
+            if bucket and buckets[bucket] then
+                buckets[bucket][#buckets[bucket] + 1] = row
+            else
+                ungrouped[#ungrouped + 1] = row
+            end
+        else
+            local info = session_worktree(row.session)
+            bucket = nil
+            if info then
+                local root = info.path
+                if not buckets[root] then
+                    buckets[root] = {}
+                    order[#order + 1] = root
+                    infos[root] = info
+                end
+                buckets[root][#buckets[root] + 1] = row
+                bucket = root
+            else
+                ungrouped[#ungrouped + 1] = row
+            end
+        end
+    end
+
+    if #order < 2 then
+        return flat
+    end
+
+    -- Pin the main work tree of the focused tab's project: every checkout of
+    -- one repository (main and linked worktrees) resolves to the same root, so
+    -- the pinned group does not depend on which tab has focus.
+    local main = current_main_checkout()
+    local pinned = nil
+    if main then
+        for _, root in ipairs(order) do
+            if norm_checkout(root) == main then
+                pinned = root
+                break
+            end
+        end
+    end
+
+    ---@type table<string, integer>
+    local activity = {}
+    for _, root in ipairs(order) do
+        local newest = 0
+        for _, row in ipairs(buckets[root]) do
+            newest = math.max(newest, row_activity(row))
+        end
+        activity[root] = newest
+    end
+
+    table.sort(order, function(a, b)
+        if (a == pinned) ~= (b == pinned) then
+            return a == pinned
+        end
+        local am, bm = activity[a] or 0, activity[b] or 0
+        if am ~= bm then
+            return am > bm
+        end
+        local an, bn = infos[a].name or "", infos[b].name or ""
+        if an ~= bn then
+            return an < bn
+        end
+        return a < b
+    end)
+
+    ---@type pi.SessionsListRow[]
+    local out = {}
+    for _, root in ipairs(order) do
+        local info = infos[root]
+        local members = buckets[root]
+        local collapsed = parent_folds[group_fold_key(root)] == true
+        -- Fixed structural size of the group: every parent row plus its
+        -- sub-sessions. Taken from the parent rows' own `child_count` rather
+        -- than from the emitted rows, because folding a parent removes its
+        -- child rows from `members` — the group's size must not move when a
+        -- row inside it folds. Only folding the group changes what is shown.
+        local member_count = 0
+        for _, row in ipairs(members) do
+            if not (row.depth and row.depth > 0) then
+                member_count = member_count + 1 + (row.child_count or 0)
+            end
+        end
+        out[#out + 1] = {
+            is_group = true,
+            group_id = root,
+            status = "idle",
+            attention = 0,
+            done = false,
+            error = false,
+            worktree = info.name,
+            worktree_path = vim.fn.fnamemodify(root, ":~"),
+            has_children = true,
+            child_count = member_count,
+            collapsed = collapsed,
+        }
+        if not collapsed then
+            for _, row in ipairs(members) do
+                row.group_id = root
+                if row.depth and row.depth > 0 and not row.worktree then
+                    row.worktree = info.name
+                    row.worktree_path = vim.fn.fnamemodify(root, ":~")
+                end
+                out[#out + 1] = row
+            end
+        end
+    end
+    for _, row in ipairs(ungrouped) do
+        out[#out + 1] = row
+    end
+    return out
+end
+
+--- Format a worktree group header: `▾ 󰙅 name (n) · ~/path`, the member count
+--- shown while collapsed (same convention as a collapsed parent row). The count
+--- sits in front of the path: the list window does not wrap, so the long path
+--- is the part clipped at the right edge, never the fold count.
+---@param row pi.SessionsListRow
+---@return string line
+---@return integer[][] chunks
+function M.format_group_line(row)
+    local prefix = row.collapsed and "▸ " or "▾ "
+    local count = (row.collapsed and row.child_count and row.child_count > 0) and (" (" .. row.child_count .. ")") or ""
+    local name = row.worktree or WORKTREE_GLYPH
+    local path = row.worktree_path or ""
+    local label = name .. count
+    local separator = path ~= "" and (" · " .. path) or ""
+    local line = prefix .. WORKTREE_GLYPH .. " " .. label .. separator
+    local glyph_start = #prefix
+    local label_start = glyph_start + #WORKTREE_GLYPH + 1
+    local chunks = {
+        { 0, #prefix, "PiSessionsListDotDim" },
+        { glyph_start, glyph_start + #WORKTREE_GLYPH, "PiSessionsListWorktree" },
+        { label_start, label_start + #label, "PiSessionsListWorktree" },
+    }
+    if separator ~= "" then
+        local separator_start = label_start + #label
+        chunks[#chunks + 1] = { separator_start, separator_start + #separator, "PiSessionsListDotDim" }
+    end
+    return line, chunks
+end
+
 --- Format a row: the status dot at the left edge, the name right after it.
 --- While the backend generates a title the pending placeholder is animated.
 --- Chunks are byte ranges: { col_start, col_end, hl_group }.
@@ -274,10 +619,21 @@ end
 ---@return string line
 ---@return integer[][] chunks
 function M.format_line(row, tick)
+    if row.is_group then
+        return M.format_group_line(row)
+    end
     local dot = row.dormant and "◌" or "●"
     local name = row.name or "…"
     local pending = row.name == nil
-    local subtitle = (row.subtitle and row.subtitle ~= "") and (" · " .. row.subtitle) or ""
+    local extra = {}
+    if row.subtitle and row.subtitle ~= "" then
+        extra[#extra + 1] = row.subtitle
+    end
+    if row.worktree then
+        extra[#extra + 1] = WORKTREE_GLYPH .. " " .. row.worktree
+    end
+    local subtitle = #extra > 0 and (" · " .. table.concat(extra, " · ")) or ""
+    local forked = row.forked_from and (" ↳ forked from " .. row.forked_from) or ""
     local provisional = pending or name == "(unnamed)"
     local spinner = row.title_generating and provisional and M.spinner_frame(tick)
 
@@ -294,13 +650,16 @@ function M.format_line(row, tick)
         prefix = "  "
     end
 
-    local line = prefix .. dot .. " " .. (spinner and spinner .. " " or "") .. name .. subtitle .. count
+    local line = prefix .. dot .. " " .. (spinner and spinner .. " " or "") .. name .. forked .. subtitle .. count
     local dot_start = #prefix
     local name_start = dot_start + #dot + 1 + (spinner and #spinner + 1 or 0)
     local chunks = {
         { dot_start, dot_start + #dot, M.dot_hl(row, tick) },
-        { name_start, name_start + #name + #subtitle, pending and "PiSessionsListPending" or "Normal" },
+        { name_start, name_start + #name + #forked + #subtitle, pending and "PiSessionsListPending" or "Normal" },
     }
+    if #forked > 0 then
+        chunks[#chunks + 1] = { name_start + #name, name_start + #name + #forked, "PiSessionsListDotDim" }
+    end
     if spinner then
         table.insert(chunks, 2, { name_start - #spinner - 1, name_start - 1, "PiSessionsListSpinner" })
     end
@@ -337,12 +696,13 @@ function M.acknowledge_reported_children(parent)
         return
     end
     local Manifest = require("pi.subsessions.manifest")
-    local lineage = Manifest.lineage_for_session(parent)
+    local cwd = Manifest.workspace(parent)
+    local lineage = Manifest.lineage_for_session(parent, cwd)
     if lineage == "" then
         return
     end
     local changed = false
-    for _, entry in ipairs(Manifest.children_of(lineage)) do
+    for _, entry in ipairs(Manifest.children_of(lineage, cwd)) do
         local child_id = entry._id
         if entry.status == "completed" and entry.reported and type(child_id) == "string" and child_id ~= "" then
             if not child_completion_seen[child_id] then
@@ -381,6 +741,10 @@ local function append_child_row(out, entry, tab, opts)
     local model = cfg.model
     local subtitle = model and (model.id .. (cfg.thinking_level and (" · " .. cfg.thinking_level) or "")) or ""
     local dormant = entry.status == "dormant" or (child and not child.rpc:is_running())
+    -- A child may be assigned its own checkout (sub-agent worktree isolation):
+    -- name that one, never the parent's group worktree it would otherwise
+    -- inherit.
+    local assigned_name, assigned_path = assigned_worktree_label(entry.assigned_worktree)
     out[#out + 1] = {
         tab = tab,
         child_id = child_id,
@@ -397,7 +761,10 @@ local function append_child_row(out, entry, tab, opts)
         subtitle = subtitle,
         dormant = dormant,
         session = child,
+        session_file = type(entry.session_file) == "string" and entry.session_file ~= "" and entry.session_file or nil,
         is_current_view = opts.is_current_view == true,
+        worktree = assigned_name,
+        worktree_path = assigned_path,
     }
 end
 
@@ -489,7 +856,7 @@ local function resolve_child_owners(rows)
     ---@type table<string, pi.SessionsListLineageGroup>
     local groups = {}
     for index, row in ipairs(rows) do
-        local lineage = Manifest.lineage_for_session(row.root)
+        local lineage = Manifest.lineage_for_session(row.root, Manifest.workspace(row.root))
         if lineage ~= "" then
             local group = groups[lineage]
             if not group then
@@ -515,7 +882,9 @@ local function resolve_child_owners(rows)
             owners = owners or {}
             ---@type table<string, string>
             local by_child = {}
-            for _, entry in ipairs(Manifest.children_of(lineage)) do
+            -- Roots of one lineage share the workspace that owns its children.
+            local group_cwd = Manifest.workspace(group.roots[1].session)
+            for _, entry in ipairs(Manifest.children_of(lineage, group_cwd)) do
                 local child_id = entry._id
                 if type(child_id) == "string" and child_id ~= "" then
                     by_child[child_id] = resolve_owner_for_entry(group, entry)
@@ -537,7 +906,9 @@ local function get_visible_children(parent_sess, current_child_id, owned)
         return {}
     end
     local Manifest = require("pi.subsessions.manifest")
-    local lineage = Manifest.lineage_for_session(parent_sess)
+    -- Child rows live in the parent session's workspace manifest.
+    local cwd = Manifest.workspace(parent_sess)
+    local lineage = Manifest.lineage_for_session(parent_sess, cwd)
     if lineage == "" then
         return {}
     end
@@ -545,7 +916,7 @@ local function get_visible_children(parent_sess, current_child_id, owned)
     local ctx = child_filter_ctx()
     local visible_entries = {}
     local hidden_shown = show_hidden_children or (parent_hidden[parent_key(parent_sess) or lineage] == true)
-    for _, entry in ipairs(Manifest.children_of(lineage)) do
+    for _, entry in ipairs(Manifest.children_of(lineage, cwd)) do
         local child_id = entry._id
         local owner = type(child_id) == "string" and owned and owned[child_id] or nil
         -- A child owned by another live session on the same lineage is rendered
@@ -597,6 +968,36 @@ function M.show_hidden_children()
     return show_hidden_children
 end
 
+--- Display name of the session this one was forked from, for the
+--- `↳ forked from …` marker. `session.forked_from` is set client-side by
+--- :PiFork (pi records no lineage in the session file, and the fork RPC
+--- response carries only the message text), so accept a plain string or a
+--- table with a name/label/session-file.
+---@param session pi.Session?
+---@return string?
+local function forked_from_label(session)
+    local from = session and session.forked_from
+    if type(from) == "string" then
+        return from ~= "" and from or nil
+    end
+    if type(from) ~= "table" then
+        return nil
+    end
+    for _, key in ipairs({ "name", "label", "session_name" }) do
+        local value = from[key]
+        if type(value) == "string" and value ~= "" then
+            return value
+        end
+    end
+    -- Worktree forks record the source transcript file; its basename is the
+    -- best available label when no name was captured.
+    local file = from.session_file
+    if type(file) == "string" and file ~= "" then
+        return vim.fn.fnamemodify(file, ":t:r")
+    end
+    return nil
+end
+
 --- Build a parent (depth 0) row for a live session process.
 ---@param out pi.SessionsListRow[]
 ---@param session pi.Session
@@ -621,6 +1022,7 @@ local function append_parent_row(out, session, tab, opts, attention_count, name_
         has_children = opts.has_children == true,
         collapsed = opts.collapsed == true,
         child_count = opts.child_count,
+        forked_from = forked_from_label(session),
     }
 end
 
@@ -688,7 +1090,7 @@ function M.build_rows(sessions, attention_count, name_of, flags_of, generating_o
         local tab = session.tab
         -- Stable key per parent session; a session without an id stays independent.
         local root_key = type(root.id) == "string" and root.id or ("row:" .. tostring(index))
-        local owned = owners and owners[Manifest.lineage_for_session(root)] or nil
+        local owned = owners and owners[Manifest.lineage_for_session(root, Manifest.workspace(root))] or nil
         local visible_children = get_visible_children(root, plan.in_child_view and session.id or nil, owned)
         ---@type { entry: pi.SubsessionManifestEntry, is_current: boolean }[]
         local pending = {}
@@ -732,7 +1134,9 @@ function M.build_rows(sessions, attention_count, name_of, flags_of, generating_o
             end
         end
     end
-    return out
+    -- Group by git worktree only when the rows span at least two distinct
+    -- worktrees; otherwise this returns `out` untouched.
+    return group_by_worktree(out)
 end
 
 -- Turn flags (done / error) -----------------------------------------------------
@@ -1191,9 +1595,11 @@ local HELP_ENTRIES = {
     { "C", "Clone this session (:PiClone)" },
     { "t", "Navigate this session's tree (:PiTree)" },
     { "p", "Preview session (read-only viewer)" },
-    { "x", "Close sub-session process (:PiSubClose)" },
-    { "<Tab>, za", "Fold / unfold sub-sessions" },
-    { "zM, zR", "Collapse / expand all sub-sessions" },
+    { "x", "Close sub-session, session tab, or worktree group" },
+    { "n", "New session in this checkout (new tab)" },
+    { "N", "New worktree or main checkout (new tab)" },
+    { "<Tab>, za", "Fold / unfold worktree groups and sub-sessions" },
+    { "zM, zR", "Collapse / expand all groups and sub-sessions" },
     { "H", "Toggle hidden / prior-conversation sub-sessions (all sessions)" },
     { "h", "Toggle hidden / prior-conversation sub-sessions of this session" },
     { "R", "Refresh the list" },
@@ -1294,6 +1700,222 @@ local function session_for_tab(tab)
         end
     end
     return nil
+end
+
+-- Closing rows (x) -------------------------------------------------------------
+
+--- Confirmation switch of one `x` close scope (`sessions_list.confirm_close_*`).
+---@param kind "child"|"session"|"group"
+---@return boolean confirm
+local function close_needs_confirm(kind)
+    local cfg = Config.options.sessions_list or {}
+    if kind == "child" then
+        return cfg.confirm_close_child ~= false
+    end
+    if kind == "group" then
+        return cfg.confirm_close_group ~= false
+    end
+    return cfg.confirm_close_session ~= false
+end
+
+--- Close one tabpage, restoring the previously focused tab when it survives.
+---
+--- Refuses the last tab (`:tabclose` raises E784) and reports `false` when
+--- Neovim itself refuses the close (a modified buffer without 'hidden', another
+--- window in use, ...): the caller has already stopped the session, so the tab is
+--- simply kept.
+---@param tab pi.TabId?
+---@return boolean closed
+local function close_tab(tab)
+    if type(tab) ~= "number" or not vim.api.nvim_tabpage_is_valid(tab) then
+        return false
+    end
+    if #vim.api.nvim_list_tabpages() <= 1 then
+        return false
+    end
+    local focus = vim.api.nvim_get_current_tabpage()
+    if not pcall(vim.api.nvim_set_current_tabpage, tab) then
+        return false
+    end
+    local closed = pcall(vim.cmd, "tabclose")
+    if focus ~= tab and vim.api.nvim_tabpage_is_valid(focus) then
+        pcall(vim.api.nvim_set_current_tabpage, focus)
+    end
+    return closed
+end
+
+--- Stop the given sessions' RPC processes and close their PiTab.
+---
+--- Stopping goes through `Sessions.close_session`, so the process is killed, the
+--- session unregisters and an *owned* worktree is released exactly as `:PiStop`
+--- does. The session file stays on disk. Sub-session processes of a closed parent
+--- keep running — closing a tab has never stopped them.
+---@param targets { sessions: pi.Session[], tab: pi.TabId? }[]
+local function close_targets(targets)
+    local Sessions = require("pi.sessions.manager")
+    local stopped = {}
+    local closed, kept = 0, 0
+    for _, target in ipairs(targets) do
+        for _, session in ipairs(target.sessions) do
+            if not stopped[session] then
+                stopped[session] = true
+                Sessions.close_session(session)
+            end
+        end
+        local tab = target.tab
+        if type(tab) == "number" and vim.api.nvim_tabpage_is_valid(tab) then
+            if close_tab(tab) then
+                closed = closed + 1
+            else
+                kept = kept + 1
+            end
+        end
+    end
+    if kept > 0 then
+        require("pi.notify").info(
+            string.format("Closed %d session(s); kept %d tab(s) (last tab or unsaved buffer)", closed, kept)
+        )
+    end
+end
+
+--- Sessions a session row's close action covers, and the tab that shows it.
+---
+--- Normally the row's own session and its own tab. A row shown while the tab
+--- views one of its sub-sessions carries the *parent* session with the child
+--- view's tab, which runs that child: both processes belong to the closed PiTab.
+---@param row pi.SessionsListRow
+---@return pi.Session[] sessions
+---@return pi.TabId? tab
+local function session_close_target(row)
+    local sessions, seen = {}, {}
+    local function add(session)
+        if session and not seen[session] then
+            seen[session] = true
+            sessions[#sessions + 1] = session
+        end
+    end
+    add(row.session)
+    local tab = row.tab
+    if type(tab) == "number" and vim.api.nvim_tabpage_is_valid(tab) then
+        add(session_for_tab(tab))
+    else
+        tab = nil
+    end
+    return sessions, tab
+end
+
+--- PiTabs of one worktree group: one entry per live session in that checkout.
+---
+--- Membership is the checkout, not the rendered rows: a folded group renders no
+--- member rows while its live sessions still have to answer for the close. A tab
+--- viewing a sub-session is listed under its parent's row, so it belongs to the
+--- parent's checkout, and its parent process is stopped with it.
+---@param group_id string?
+---@return { sessions: pi.Session[], tab: pi.TabId? }[]
+local function group_close_targets(group_id)
+    local targets = {}
+    if type(group_id) ~= "string" or group_id == "" then
+        return targets
+    end
+    local Sessions = require("pi.sessions.manager")
+    for _, session in ipairs(Sessions.list()) do
+        local root = session
+        if session.view_parent_id then
+            root = Sessions.get_by_id(session.view_parent_id) or session
+        end
+        local info = session_worktree(root)
+        if info and info.path == group_id then
+            local sessions = { session }
+            if root ~= session then
+                sessions[#sessions + 1] = root
+            end
+            targets[#targets + 1] = { sessions = sessions, tab = session.attached_tab or session.tab }
+        end
+    end
+    return targets
+end
+
+--- Ask for confirmation (`sessions_list.confirm_close_*`) and run `fn` on yes.
+---@param kind "child"|"session"|"group"
+---@param opts { title: string, message: string }
+---@param fn fun()
+local function confirm_close(kind, opts, fn)
+    if not close_needs_confirm(kind) then
+        fn()
+        return
+    end
+    require("pi.ui.dialog").confirm(opts, function(confirmed)
+        if confirmed then
+            fn()
+        end
+    end)
+end
+
+--- `x`: close what is under the cursor.
+---
+--- A sub-session row closes that child's RPC process (never a tab: children run
+--- detached), a session row closes its PiTab — the process stops and the tabpage
+--- closes — and a worktree group header closes every PiTab in that checkout.
+---
+--- Each scope has its own confirmation switch (`sessions_list.confirm_close_child`,
+--- `confirm_close_session`, `confirm_close_group`; all on by default), so declining
+--- closes nothing.
+local function close_under_cursor()
+    local row = rows[vim.api.nvim_win_get_cursor(0)[1]]
+    if not row then
+        return
+    end
+    local Notify = require("pi.notify")
+
+    if row.depth and row.depth > 0 then
+        local child_id = row.child_id
+        if type(child_id) ~= "string" or child_id == "" then
+            return
+        end
+        confirm_close("child", {
+            title = "Close sub-session",
+            message = string.format(
+                "Stop the RPC process of '%s'? Its session file stays on disk and the child can be revived later.",
+                row.name or child_id
+            ),
+        }, function()
+            require("pi.subsessions").close(child_id)
+        end)
+        return
+    end
+
+    if row.is_group then
+        local targets = group_close_targets(row.group_id)
+        if #targets == 0 then
+            Notify.info("No live session in this worktree group")
+            return
+        end
+        confirm_close("group", {
+            title = "Close worktree group",
+            message = string.format(
+                "Close all %d π tab(s) in '%s'? Their processes stop and their tabpages close; session files stay on disk and owned worktrees are released as :PiStop does (their sub-sessions keep running).",
+                #targets,
+                row.worktree or row.group_id or "this checkout"
+            ),
+        }, function()
+            close_targets(targets)
+        end)
+        return
+    end
+
+    local sessions, tab = session_close_target(row)
+    if #sessions == 0 and tab == nil then
+        return
+    end
+    confirm_close("session", {
+        title = "Close session",
+        message = string.format(
+            "Close the π tab of '%s'? Its process stops and its tabpage closes; the session file stays on disk (resume it with :PiResume) and its sub-sessions keep running.",
+            row.name or (row.session and row.session.id) or "this session"
+        ),
+    }, function()
+        close_targets({ { sessions = sessions, tab = tab } })
+    end)
 end
 
 --- Row and session under the cursor. nil, nil when the row is gone, its tab
@@ -1519,7 +2141,344 @@ local function preview_under_cursor()
     if not id then
         return
     end
-    require("pi.ui.subsession_viewer").open(id, { name = row.name })
+    -- The row's session knows which workspace owns its manifest row (a child
+    -- carries its parent's workspace), so the viewer does not have to search.
+    local workspace = session and require("pi.subsessions.manifest").workspace(session) or nil
+    require("pi.ui.subsession_viewer").open(id, { name = row.name, cwd = workspace })
+end
+
+--- Checkout path a row belongs to: the worktree group the row is listed under
+--- (`group_id` is set on a group header and on every member row, the main
+--- checkout partition included), else the row session's detected worktree,
+--- else its cwd.
+---
+--- A sub-session row never answers with the checkout it was *assigned*: that
+--- checkout is borrowed, not owned, while every consumer of this path (`n` opens
+--- a fresh session in it, `N` creates a worktree from it) treats it as an owned
+--- top-level checkout a session may later close and delete. The assigned
+--- worktree is shown on the row (and `apply` / `ship` target it); `n` / `N` keep
+--- acting on the workspace the row hangs under — its parent's workspace, which
+--- is what this returned before assignments existed.
+---@param row pi.SessionsListRow?
+---@return string?
+function M.row_checkout(row)
+    if not row then
+        return nil
+    end
+    if type(row.group_id) == "string" and row.group_id ~= "" then
+        return row.group_id
+    end
+    if row.depth and row.depth > 0 then
+        local session = row.session
+        if not session then
+            return nil
+        end
+        -- `manifest_cwd` is the parent workspace the child's rows are owned by,
+        -- even when the child process runs in an assigned checkout.
+        local Manifest = require("pi.subsessions.manifest")
+        local workspace = Manifest.workspace(session)
+        local assigned = type(session.assigned_worktree) == "table" and session.assigned_worktree.path or nil
+        if type(workspace) == "string" and type(assigned) == "string" and assigned ~= "" then
+            if workspace == assigned or vim.fn.resolve(workspace) == vim.fn.resolve(assigned) then
+                -- The only workspace known *is* the borrowed checkout: offer
+                -- nothing rather than hand it to an owning command.
+                return nil
+            end
+        end
+        return workspace
+    end
+    local worktree = row.session and row.session.worktree
+    if type(worktree) == "table" and type(worktree.path) == "string" and worktree.path ~= "" then
+        return worktree.path
+    end
+    local cwd = row.session and row.session.cwd
+    if type(cwd) == "string" and cwd ~= "" then
+        return cwd
+    end
+    return nil
+end
+
+--- Tabpage a session opened in `checkout` belongs after, so its tab stays
+--- with the rest of that worktree's tabs: the list prints a worktree's rows as
+--- one contiguous block, while `tabnew` always appends at the end of the
+--- tabline, so a session opened in a group whose tabs are not the last ones
+--- would land behind every other checkout's tabs.
+---
+--- The anchor is the group's last tab in tabline order, which is also the
+--- group's last row (rows keep tabline order inside a group), so the new tab
+--- joins its group's block in both. Group *order* is not reproduced: the list
+--- orders groups by activity, so only the placement inside a group can be
+--- stable. A folded group renders no member rows, so its live sessions answer
+--- instead.
+---
+--- nil when nothing should move: a flat list keeps tabline order (appending is
+--- already correct), and a checkout with no group yet is listed last — which is
+--- exactly where its new tab lands anyway.
+---@param checkout string? checkout path resolved from the row (`M.row_checkout`)
+---@return pi.TabId?
+function M.tab_anchor(checkout)
+    if type(checkout) ~= "string" or checkout == "" then
+        return nil
+    end
+    -- Grouping is decided per render: without a group id on any row the list is
+    -- flat, and tabline order is the row order.
+    local grouped = false
+    for _, row in ipairs(rows) do
+        if row.group_id ~= nil then
+            grouped = true
+            break
+        end
+    end
+    if not grouped then
+        return nil
+    end
+
+    ---@type table<pi.TabId, integer>
+    local rank = {}
+    for index, tab in ipairs(vim.api.nvim_list_tabpages()) do
+        rank[tab] = index
+    end
+    local anchor, anchor_rank = nil, 0
+    ---@param tab any
+    local function consider(tab)
+        local position = type(tab) == "number" and rank[tab] or nil
+        if position and position > anchor_rank then
+            anchor, anchor_rank = tab, position
+        end
+    end
+    for _, row in ipairs(rows) do
+        if (row.depth == nil or row.depth == 0) and row.group_id == checkout then
+            consider(row.tab)
+        end
+    end
+    if not anchor then
+        -- Collapsed group: its member rows are folded away, so ask the live
+        -- sessions that belong to that checkout instead.
+        for _, session in ipairs(require("pi.sessions.manager").list()) do
+            local info = session_worktree(session)
+            if info and info.path == checkout then
+                consider(session.tab)
+            end
+        end
+    end
+    return anchor
+end
+
+--- Open a fresh π session in a new tab rooted at the checkout under the cursor
+--- (the `n` key). Works on a worktree group header, on any row inside a group
+--- and on a row of the main-checkout partition alike, so the main checkout is
+--- reached through its group id (grouped list) or the row session's cwd (flat
+--- list). The list stays open: a created session refreshes it through the
+--- normal session events.
+local function new_session_in_checkout_under_cursor()
+    local row = rows[vim.api.nvim_win_get_cursor(0)[1]]
+    if not row then
+        return
+    end
+    local Notify = require("pi.notify")
+    local path = M.row_checkout(row)
+    if not path then
+        Notify.warn("Cannot open a new session: this row has no checkout")
+        return
+    end
+    if vim.fn.isdirectory(path) == 0 then
+        Notify.warn("Cannot open a new session: " .. vim.fn.fnamemodify(path, ":~") .. " no longer exists")
+        return
+    end
+    local ok, WorktreeSession = pcall(require, "pi.worktree_session")
+    if not ok or type(WorktreeSession) ~= "table" or type(WorktreeSession.open_existing) ~= "function" then
+        Notify.warn("Cannot open a new session: checkout support is unavailable")
+        return
+    end
+    -- `open_existing` reports its own failures (bad target, busy tab, spawn
+    -- errors), so no callback is needed here. It also accepts the main
+    -- checkout and plain directories, not just linked worktrees. `tab_after`
+    -- keeps the tab next to the rest of the row's worktree group instead of at
+    -- the end of the tabline.
+    WorktreeSession.open_existing({ cwd = path, tab_after = M.tab_anchor(path) })
+end
+
+--- Label the `N` picker shows for one existing worktree: name · ~/path ·
+--- branch (or `detached`). The label is display only — the entry's own `path`
+--- is what the picker opens, so a worktree git manages outside
+--- `<repo>/.worktrees/` is reachable just like a pi-created one.
+---@param entry pi.WorktreeListEntry
+---@return string
+local function worktree_pick_label(entry)
+    local name = type(entry.name) == "string" and entry.name ~= "" and entry.name or vim.fs.basename(entry.path)
+    local parts = { name }
+    if type(entry.path) == "string" and entry.path ~= "" then
+        parts[#parts + 1] = vim.fn.fnamemodify(entry.path, ":~")
+    end
+    local branch = type(entry.branch) == "string" and entry.branch or ""
+    if branch ~= "" then
+        parts[#parts + 1] = branch
+    elseif entry.detached then
+        parts[#parts + 1] = "detached"
+    end
+    return table.concat(parts, " · ")
+end
+
+--- Main checkout marker of the `N` picker label. `git worktree list` omits the
+--- main work tree, so its row is built from the repository root and spelled out;
+--- otherwise it would be indistinguishable from a linked worktree that happens
+--- to carry the repository's name.
+local MAIN_CHECKOUT_LABEL = "main checkout"
+
+--- Label of the main checkout row: name · ~/path · `main checkout`.
+---@param repo_root string
+---@return string
+local function main_checkout_pick_label(repo_root)
+    return table.concat({
+        vim.fs.basename(repo_root),
+        vim.fn.fnamemodify(repo_root, ":~"),
+        MAIN_CHECKOUT_LABEL,
+    }, " · ")
+end
+
+--- Picker entry that switches from an existing checkout to the name input.
+local NEW_WORKTREE_CHOICE = "New worktree…"
+
+--- Start a session in an already existing directory through
+--- `pi.worktree_session.open_existing` (a linked worktree becomes worktree
+--- metadata, the main checkout an ordinary session there). Reports its own
+--- failures, so no callback is needed here.
+---@param opts pi.WorktreeOpenOpts
+---@return boolean started false when checkout support is unavailable (warned)
+local function open_checkout(opts)
+    local Notify = require("pi.notify")
+    local ok, WorktreeSession = pcall(require, "pi.worktree_session")
+    if not ok or type(WorktreeSession) ~= "table" or type(WorktreeSession.open_existing) ~= "function" then
+        Notify.warn("Cannot open a session: checkout support is unavailable")
+        return false
+    end
+    WorktreeSession.open_existing(opts)
+    return true
+end
+
+--- Open a fresh π session in the repository the row under the cursor belongs
+--- to (the `N` key): pick the **main checkout** or an existing worktree of that
+--- repository, or create a new worktree by name. The row's checkout and its
+--- repository root are snapshotted at keypress, before the asynchronous
+--- enumeration, so a cursor move (or a tab switch) while git runs cannot
+--- retarget the session to another repository.
+local function new_worktree_under_cursor()
+    local row = rows[vim.api.nvim_win_get_cursor(0)[1]]
+    local Notify = require("pi.notify")
+    local checkout = M.row_checkout(row)
+    if not checkout then
+        Notify.warn("Cannot create a worktree: this row has no checkout")
+        return
+    end
+    if vim.fn.isdirectory(checkout) == 0 then
+        Notify.warn("Cannot create a worktree: " .. vim.fn.fnamemodify(checkout, ":~") .. " no longer exists")
+        return
+    end
+    local loaded, Worktree = pcall(require, "pi.worktree")
+    if not loaded or type(Worktree) ~= "table" or type(Worktree.detect) ~= "function" then
+        Notify.warn("Cannot create a worktree: worktree support is unavailable")
+        return
+    end
+    local info = Worktree.detect(checkout)
+    local repo_root = type(info) == "table" and info.repo_root or nil
+    if type(repo_root) ~= "string" or repo_root == "" then
+        Notify.warn(
+            "Cannot create a worktree: " .. vim.fn.fnamemodify(checkout, ":~") .. " is not inside a git repository"
+        )
+        return
+    end
+
+    --- Create `name` in the snapshotted repository; nil / blank cancels.
+    ---@param name string?
+    local function create(name)
+        name = type(name) == "string" and vim.trim(name) or ""
+        if name == "" then
+            return
+        end
+        if type(Worktree.validate_name) == "function" then
+            local valid, err = Worktree.validate_name(name)
+            if not valid then
+                Notify.warn(err or ("Cannot create a worktree: invalid name " .. name))
+                return
+            end
+        end
+        open_checkout({ name = name, repo_cwd = repo_root, create = true })
+    end
+
+    local function ask_name()
+        require("pi.ui.dialog").input({
+            title = "New worktree in " .. vim.fn.fnamemodify(repo_root, ":~"),
+        }, create)
+    end
+
+    -- Without an enumerator there is nothing to pick from: straight to the
+    -- name input. Enumeration failures (not a repository, git error) warn
+    -- instead of falling back to the input, so an unusable repository does
+    -- not invite a doomed create.
+    if type(Worktree.list) ~= "function" then
+        ask_name()
+        return
+    end
+    Worktree.list(repo_root, function(entries, err)
+        vim.schedule(function()
+            if err or type(entries) ~= "table" then
+                Notify.warn("Cannot list worktrees: " .. tostring(err or "unknown error"))
+                return
+            end
+            ---@type table<string, { path: string }>
+            local by_label = {}
+            ---@type string[]
+            local options = {}
+            -- The main checkout comes first: `git worktree list` never reports
+            -- it, so without this row there is no way to reach the project's
+            -- own checkout from the picker — only its worktrees.
+            if vim.fn.isdirectory(repo_root) == 1 then
+                local label = main_checkout_pick_label(repo_root)
+                by_label[label] = { path = repo_root }
+                options[#options + 1] = label
+            end
+            for _, entry in ipairs(entries) do
+                local path = type(entry) == "table" and entry.path or nil
+                -- Gone checkouts cannot be opened. A main-checkout record, when
+                -- a caller hands one in, was already covered above.
+                if type(path) == "string" and path ~= "" and entry.missing ~= true and entry.kind ~= "main" then
+                    if vim.fs.normalize(path) ~= vim.fs.normalize(repo_root) then
+                        local label = worktree_pick_label(entry)
+                        if not by_label[label] then
+                            by_label[label] = entry
+                            options[#options + 1] = label
+                        end
+                    end
+                end
+            end
+            if #options == 0 then
+                -- The repository root vanished while git ran: nothing to open,
+                -- so behave like the pre-main-checkout picker and ask for a name.
+                ask_name()
+                return
+            end
+            options[#options + 1] = NEW_WORKTREE_CHOICE
+            require("pi.ui.dialog").select(
+                { title = "Worktree", options = options, kind = "pi-worktree" },
+                function(choice)
+                    if type(choice) ~= "string" or choice == "" then
+                        return
+                    end
+                    if choice == NEW_WORKTREE_CHOICE then
+                        ask_name()
+                        return
+                    end
+                    local entry = by_label[choice]
+                    if entry then
+                        -- Same as `n`: an existing checkout already listed under
+                        -- its own worktree group takes the tab next to its
+                        -- siblings, not at the end of the tabline.
+                        open_checkout({ cwd = entry.path, tab_after = M.tab_anchor(entry.path) })
+                    end
+                end
+            )
+        end)
+    end)
 end
 
 --- Toggle fold/unfold for the session under cursor.
@@ -1534,11 +2493,27 @@ local function toggle_fold_under_cursor()
         return
     end
 
+    if row.is_group then
+        -- Worktree group header: fold its session rows; keep the cursor on it.
+        local key = row_fold_key(row)
+        if key then
+            parent_folds[key] = not (row.collapsed == true)
+            M._render()
+            for new_lnum, r in ipairs(rows) do
+                if r.is_group and r.group_id == row.group_id then
+                    pcall(vim.api.nvim_win_set_cursor, cur_win, { new_lnum, 0 })
+                    break
+                end
+            end
+        end
+        return
+    end
+
     if row.depth and row.depth > 0 then
         local parent_row = nil
         local parent_lnum = nil
         for p = lnum - 1, 1, -1 do
-            if rows[p] and (rows[p].depth == nil or rows[p].depth == 0) then
+            if rows[p] and not rows[p].is_group and (rows[p].depth == nil or rows[p].depth == 0) then
                 parent_row = rows[p]
                 parent_lnum = p
                 break
@@ -1552,7 +2527,7 @@ local function toggle_fold_under_cursor()
             local Sessions = require("pi.sessions.manager")
             parent_sess = Sessions.get_by_id(parent_row.session_id)
         end
-        local key = parent_key(parent_sess) or parent_row.session_id
+        local key = row_fold_key(parent_row)
         if key then
             parent_folds[key] = true
             M._render()
@@ -1577,7 +2552,7 @@ local function toggle_fold_under_cursor()
             local Sessions = require("pi.sessions.manager")
             parent_sess = Sessions.get_by_id(row.session_id)
         end
-        local key = parent_key(parent_sess) or row.session_id
+        local key = row_fold_key(row)
         if key then
             local current = row.collapsed == true
             parent_folds[key] = not current
@@ -1634,7 +2609,7 @@ local function collapse_all_folds()
     local parent_to_target = nil
     if cur_row and cur_row.depth and cur_row.depth > 0 then
         for p = vim.api.nvim_win_get_cursor(cur_win)[1] - 1, 1, -1 do
-            if rows[p] and (rows[p].depth == nil or rows[p].depth == 0) then
+            if rows[p] and not rows[p].is_group and (rows[p].depth == nil or rows[p].depth == 0) then
                 parent_to_target = rows[p].session_id
                 break
             end
@@ -1643,7 +2618,7 @@ local function collapse_all_folds()
 
     for _, r in ipairs(rows) do
         if r.has_children then
-            local key = parent_key(r.session) or r.session_id
+            local key = row_fold_key(r)
             if key then
                 parent_folds[key] = true
             end
@@ -1684,7 +2659,7 @@ local function expand_all_folds()
     end
     for _, r in ipairs(rows) do
         if r.has_children then
-            local key = parent_key(r.session) or r.session_id
+            local key = row_fold_key(r)
             if key then
                 parent_folds[key] = false
             end
@@ -1758,12 +2733,24 @@ local function ensure_buf()
         preview_under_cursor,
         vim.tbl_extend("force", map_opts, { desc = "Preview session (read-only viewer)" })
     )
-    vim.keymap.set("n", "x", function()
-        local row = rows[vim.api.nvim_win_get_cursor(0)[1]]
-        if row and row.child_id then
-            require("pi.subsessions").close(row.child_id)
-        end
-    end, vim.tbl_extend("force", map_opts, { desc = "Close sub-session process" }))
+    vim.keymap.set(
+        "n",
+        "x",
+        close_under_cursor,
+        vim.tbl_extend("force", map_opts, { desc = "Close sub-session, session tab, or worktree group" })
+    )
+    vim.keymap.set(
+        "n",
+        "n",
+        new_session_in_checkout_under_cursor,
+        vim.tbl_extend("force", map_opts, { desc = "New session in this checkout (new tab)" })
+    )
+    vim.keymap.set(
+        "n",
+        "N",
+        new_worktree_under_cursor,
+        vim.tbl_extend("force", map_opts, { desc = "New worktree or main checkout (new tab)" })
+    )
     vim.keymap.set(
         "n",
         "<Tab>",
@@ -1795,6 +2782,9 @@ local function ensure_buf()
     )
     vim.keymap.set("n", "R", function()
         name_cache = setmetatable({}, { __mode = "k" })
+        -- A repository can appear (git init / worktree add) while the list is
+        -- open; R re-detects the worktrees along with the names.
+        worktree_cache = {}
         M._render()
     end, vim.tbl_extend("force", map_opts, { desc = "Refresh session list" }))
     vim.keymap.set("n", "q", function()
@@ -2065,6 +3055,7 @@ function M._reset()
     child_completion_seen = {}
     parent_folds = {}
     parent_hidden = {}
+    worktree_cache = {}
 end
 
 return M

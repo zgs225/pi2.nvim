@@ -1116,6 +1116,7 @@ end
 ---@field inline? boolean|fun(args: table?): boolean  render as a single line (no header/footer)
 ---@field display_name? fun(args: table?): string?  user-facing tool label (defaults to RPC tool name)
 ---@field inline_text? fun(history: pi.ChatHistory, args: table?): string?  text to show after tool name
+---@field inline_result_text? fun(args: table?, result: table?, is_error: boolean?): string?  detail to render instead of `inline_text`'s once the result is known (rewrites the inline row's detail when it differs)
 ---@field inline_status? fun(result: table?, is_error: boolean?): string?  extra text next to status icon
 
 --- Rows kept by codemode's live call list while the script runs (the most
@@ -1676,18 +1677,20 @@ local renderers = {
         end,
         inline_text = function(_, args)
             if SubToolUi.dispatch_inline(args) then
-                local item = args and args.items and args.items[1]
-                if not item then
-                    return nil
-                end
-                local label = SubToolUi.item_label(item)
-                local cfg = SubToolUi.item_config_label(item)
-                if cfg then
-                    return label .. " (" .. cfg .. ")"
-                end
-                return label
+                return SubToolUi.dispatch_inline_detail(args)
             end
             return SubToolUi.dispatch_header_detail(args)
+        end,
+        -- A single item with `wait: true` stays inline, so its row is written
+        -- before the batch result exists and `inline_text` can only show the
+        -- item's *request* (a borrowed path, or `+new` / a requested name for
+        -- `worktree.create`, which has no checkout yet). Once the result lands
+        -- the row is rewritten to the checkout the child actually got.
+        inline_result_text = function(args, result)
+            if not SubToolUi.dispatch_inline(args) then
+                return nil
+            end
+            return SubToolUi.dispatch_inline_detail(args, SubToolUi.result_details(result))
         end,
         inline_status = function(result)
             return SubToolUi.batch_status_text(SubToolUi.result_details(result))

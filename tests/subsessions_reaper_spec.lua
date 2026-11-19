@@ -433,4 +433,65 @@ describe("subsession idle reaper", function()
             assert.are.equal(10, Config.options.subagent.reap_sweep_minutes)
         end)
     end)
+
+    -- The sweep is the only automatic cleanup left for checkouts recorded by an
+    -- older version (per-child worktrees are gone): it releases a checkout whose
+    -- child no live session owns, and leaves a live one alone.
+    describe("worktree backstop", function()
+        local function record_worktree(id, path)
+            Manifest.upsert(id, {
+                parent_id = "lineage-a",
+                parent_epoch = 0,
+                name = "worker",
+                task_prompt = "t",
+                config = {},
+                status = "completed",
+                reported = false,
+                created_at = "2024-01-01T00:00:00Z",
+                last_active_at = "2024-01-01T00:00:00Z",
+            })
+            Manifest.patch(id, { worktree = { kind = "linked", name = "sub-x", path = path } })
+        end
+
+        local function with_release_stub(fn)
+            local real = Subsessions.release_worktree
+            local released = {}
+            Subsessions.release_worktree = function(child_id)
+                released[#released + 1] = child_id
+                return true
+            end
+            local ok, err = pcall(fn, released)
+            Subsessions.release_worktree = real
+            assert(ok, err)
+        end
+
+        it("releases the checkout of a child no live session owns", function()
+            local dir = vim.fn.tempname()
+            vim.fn.mkdir(dir, "p")
+            record_worktree("orphan-1", dir)
+            with_release_stub(function(released)
+                assert.are.equal(1, Reaper.release_orphaned_worktrees())
+                assert.are.same({ "orphan-1" }, released)
+            end)
+        end)
+
+        it("keeps the checkout of a live child", function()
+            local dir = vim.fn.tempname()
+            vim.fn.mkdir(dir, "p")
+            add_child("live-1", "completed")
+            Manifest.patch("live-1", { worktree = { kind = "linked", name = "sub-x", path = dir } })
+            with_release_stub(function(released)
+                assert.are.equal(0, Reaper.release_orphaned_worktrees())
+                assert.are.same({}, released)
+            end)
+        end)
+
+        it("skips a row whose checkout is already gone", function()
+            record_worktree("gone-1", vim.fn.tempname() .. "-missing")
+            with_release_stub(function(released)
+                assert.are.equal(0, Reaper.release_orphaned_worktrees())
+                assert.are.same({}, released)
+            end)
+        end)
+    end)
 end)

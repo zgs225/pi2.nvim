@@ -32,7 +32,7 @@ local function seed(fields)
         id = "t1",
         command = "echo hi",
         status = "running",
-        start_time = now_ms() - 60_000,
+        start_time = now_ms() - 60000,
     }, fields)
     Tasks.upsert(task)
     return task
@@ -104,7 +104,7 @@ describe("tasks preview multiline command", function()
             id = "ml1",
             command = MULTILINE,
             status = "running",
-            start_time = now_ms() - 60_000,
+            start_time = now_ms() - 60000,
             output_file = path,
         })
 
@@ -124,8 +124,8 @@ describe("tasks preview multiline command", function()
             id = "ml1",
             command = MULTILINE,
             status = "running",
-            pid = 987_654_321,
-            start_time = now_ms() - 60_000,
+            pid = 987654321,
+            start_time = now_ms() - 60000,
         })
 
         open_on_row("ml1")

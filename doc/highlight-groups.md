@@ -96,6 +96,7 @@ Inspect what a block actually uses with `:Inspect` over the coloured text, or li
 | `PiFloatBorder` | Border for π float windows |
 | `PiChatHistoryWinbar` | Winbar background for the history panel (side layout) |
 | `PiChatHistoryWinbarTitle` | Winbar title for the history panel (side layout) |
+| `PiChatHistoryWorktree` | Git worktree badge (`󰙅 <name>`, with `*` when dirty/ahead) in the history title — winbar and float title. A session whose cwd differs from Neovim's renders the badge in `PiStatusLineWarning` instead. |
 | `PiChatPromptWinbar` | Winbar background for the prompt panel (side layout) |
 | `PiChatPromptWinbarTitle` | Winbar title for the prompt panel (side layout) |
 | `PiChatPromptWinbarAttentionTitle` | Winbar title for the prompt panel when attention is pending |
@@ -175,6 +176,7 @@ The dashboard reuses `PiToolHeader` for its section headers, `Comment` for dimme
 | `PiSessionsListDotDim` | Dim phase of blinking dots |
 | `PiSessionsListCurrent` | Marks the current tab's own session dot in the agent color |
 | `PiSessionsListFloatTitle` | Float title for the sessions list window |
+| `PiSessionsListWorktree` | Worktree group header in `:PiSessions` (`󰙅 name · ~/path`) and the partition title in the `:PiResume` picker (`󰙅 name` for a linked worktree, the project name for the main checkout) |
 
 ## Background tasks panel
 

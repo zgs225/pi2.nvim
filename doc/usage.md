@@ -38,6 +38,8 @@ The chat is rendered in one of two layouts.
 
 Pick a default with `layout.default = "side" | "float"`, or override per-invocation with `:Pi layout=side` / `:Pi layout=float`. Side dimensions live under `layout.side` (`position` is `"left"`, `"right"`, or `"bottom"`, plus `width`); float dimensions live under `layout.float` (`width`, `height`, `border`). Both `side` and `float` also accept a function returning the table, which lets you compute size based on screen dimensions or other state at open time.
 
+A second start flag selects the *workspace*: `:Pi worktree=<name>` / `:PiNewTab worktree=<name>` opens a **fresh** conversation in a managed worktree (`<repo>/.worktrees/<name>`, see [Worktrees](worktrees.md)). A name that does not exist yet is **created** (a fresh conversation — use `pi.worktree_fork()` from Lua when the current conversation should be carried along); an existing checkout is opened as it stands, never reset. `worktree=` names complete in both commands. `:PiNewTab` always opens a new tab; `:Pi` uses the current tab and refuses while it already runs a session (the message points at `:PiNewTab`), and that check runs **before** any creation, so a taken tab never leaves an empty checkout behind. `:PiContinue` / `:PiResume` reject the flag, because they pick their own workspace.
+
 Each chat contains three panels:
 
 | Panel | Filetype | Role |
@@ -189,7 +191,7 @@ Every prompt you submit is recorded (raw, before `@mention` expansion) so you ca
 
 Walking up stashes whatever you're currently typing; walking back down past the newest entry restores that draft. Editing the buffer by hand leaves browse mode, so a stray `<Down>` never clobbers your typing. Recall is a no-op while the completion menu is open.
 
-History is scoped **per workspace** — the directory the session started in. Each workspace keeps its own file under `stdpath("data")/pi/history/` (named by a hash of the normalized cwd, with an `index.json` mapping hash to path), written atomically and surviving restarts. Recalling in one project never shows prompts submitted in another. Configure it under `prompt.history`:
+History is scoped **per workspace** — the directory the session runs in (Neovim's cwd for an ordinary session, the checkout for a [worktree session](worktrees.md#what-a-worktree-session-is)). Each workspace keeps its own file under `stdpath("data")/pi/history/` (named by a hash of the normalized cwd, with an `index.json` mapping hash to path), written atomically and surviving restarts. Recalling in one project never shows prompts submitted in another. Configure it under `prompt.history`:
 
 ```lua
 require("pi").setup({
@@ -232,7 +234,7 @@ The file content itself is **not inlined**. Pi assumes the agent has a `read` to
 1. **Inlined code has no context.** Dropping a snippet into the prompt strips it from its surroundings — the agent loses imports, neighboring functions, the rest of the file, the rest of the project. A reference, on the other hand, lets the agent open the file itself and decide how much context it actually needs.
 2. **Mentions are usually woven into a sentence.** A typical prompt looks like _"check if the usage of `Foo` defined at @path/to/foo.rs#L5 makes sense in the function at @path/to/fn.rs#L120-150"_. If every mention expanded into an inline code block, the sentence would fall apart and the agent would have to reconstruct what referred to what. Keeping mentions as references preserves the natural flow of the prompt.
 
-Mentions are validated against the filesystem at send time. Paths are resolved relative to the current working directory. Anything that doesn't resolve to an existing file or directory is sent through unchanged, so a stray `@todo` in your message stays a stray `@todo`.
+Mentions are validated against the filesystem at send time. Paths are resolved relative to the **session's workspace** — the directory its pi process runs in, which is Neovim's cwd for an ordinary session and the checkout's own path for a [worktree session](worktrees.md#what-a-worktree-session-is). A path that lives inside the workspace is rendered relative to it (`@lua/pi/init.lua`), matching how pi resolves the mention, even when Neovim's cwd differs. Anything that doesn't resolve to an existing file or directory is sent through unchanged, so a stray `@todo` in your message stays a stray `@todo`.
 
 Trailing punctuation works the way you'd expect: `(@lua/pi/init.lua)` and `Look at @lua/pi/init.lua.` both expand cleanly without dragging the punctuation into the path.
 
@@ -259,6 +261,8 @@ Some context is not a file — it is generated on demand: the current diff, rece
 | `@git-log` | `git log --oneline -20` (recent commits) |
 | `@lsp-errors` | all LSP diagnostics with ERROR severity, as `path:lnum:col: message` lines |
 | `@quickfix` | the current quickfix list (title + `path:lnum:col: text` entries) |
+
+The two git providers run in the **session's workspace**, not Neovim's cwd: `@git-diff` in a [worktree session](worktrees.md#what-a-worktree-session-is) shows that checkout's changes, which is precisely what the agent is working on.
 
 Unlike file mentions, a dynamic mention is lifted out of your sentence: its content is appended to the end of the message as a fenced `<context>` block. _"review @git-diff please"_ reaches the agent as `review please` followed by a block with the actual diff. A mention whose provider produces nothing (clean tree, empty quickfix, no errors) vanishes silently. Mentioning the same provider twice attaches it only once.
 
@@ -351,7 +355,7 @@ The π prompt buffer ships with completion for both `@mentions` and `/commands` 
 
 This is the default Vim user-defined completion key. It will:
 
-- Complete `@path` mentions against project files (resolved relative to the current working directory), plus [dynamic mention providers](#dynamic-mentions) (`@git-diff`, `@git-log`, `@lsp-errors`, `@quickfix`, and any custom `mention_providers`) ahead of file matches.
+- Complete `@path` mentions against the project files of the session's workspace (resolved relative to the session cwd, so a [worktree session](worktrees.md) completes against its checkout), plus [dynamic mention providers](#dynamic-mentions) (`@git-diff`, `@git-log`, `@lsp-errors`, `@quickfix`, and any custom `mention_providers`) ahead of file matches.
 - Complete `/commands` against the backend's command list — but only when the cursor is on the first line of the prompt and that line starts with `/`.
 
 The completion popup shows source metadata for `/commands` (`extension`, `prompt`, `skill`) and the command description when available.
@@ -723,7 +727,7 @@ It recognizes a bare path (the tool body lines contain the path — shortened as
 
 ## Quickfix
 
-When the `grep` tool finishes, its matches are parsed (`path:line[:col]: text`) and loaded into the quickfix list, so you can jump between them with `:cnext` / `:cprev`. The `find` tool's file list can be loaded the same way (disabled by default; `glob` is accepted as an alias for older pi versions that named the tool `glob`).
+When the `grep` tool finishes, its matches are parsed (`path:line[:col]: text`) and loaded into the quickfix list, so you can jump between them with `:cnext` / `:cprev`. The `find` tool's file list can be loaded the same way (disabled by default; `glob` is accepted as an alias for older pi versions that named the tool `glob`). Reported paths are relative to the **session's workspace**, so they are resolved against the session cwd — a [worktree session](worktrees.md#what-a-worktree-session-is) (or a session resumed from another directory) loads entries for the files it actually searched, not for a same-named file in your own cwd.
 
 The quickfix window is **never opened automatically** — use `:copen` to see it. Each list is titled `pi <tool>: <pattern>` (or `pi <tool>` when there is no pattern). Errors are never loaded, and an empty match list leaves your current quickfix state untouched.
 
@@ -1046,7 +1050,7 @@ require("pi").setup({
 })
 ```
 
-A buffer is considered *modified* when `vim.bo[buf].modified` is true (i.e. the user has unsaved changes). pi2.nvim never overwrites unsaved work — modified buffers are always skipped regardless of mode. Paths are canonicalized (symlinks resolved) before matching, so a file reported through a symlinked path still hits the right buffer.
+A buffer is considered *modified* when `vim.bo[buf].modified` is true (i.e. the user has unsaved changes). pi2.nvim never overwrites unsaved work — modified buffers are always skipped regardless of mode. Paths are canonicalized (symlinks resolved) before matching, and a relative path is resolved against the **session's workspace** rather than Neovim's cwd, so a [worktree session](worktrees.md) reloads the file it actually edited.
 
 ## Startup block
 
