@@ -1,0 +1,4 @@
+# Fixtures are deliberately malformed (that is the point of a gate fixture):
+# `bad/` does not parse at all, `good/` exercises LuaJIT-only syntax stylua's
+# default Luau grammar rejects. They are inputs to `scripts/checks`, never code.
+scripts/checks/fixtures/

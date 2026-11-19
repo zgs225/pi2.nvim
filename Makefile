@@ -1,6 +1,9 @@
 # pi.nvim development helpers.
 #
 #   make test    — run the plenary unit test suite (hermetic, -u tests/minimal_init.lua)
+#   make check   — static gates: LuaJIT parse (G24) + docs sync; `check-selftest`
+#                  proves each gate can still fail. Needs `luajit` (mise install)
+#                  and python3; see .mise.toml.
 #   make e2e     — run headless end-to-end scripts (tests/*_e2e.lua)
 #   make e2e-reaper — real-pi e2e: subagent idle reaper + max_children cap (needs pi binary + provider; not CI)
 #   make e2e-bg-delivery — real-pi e2e: background bash completion delivery into agent context (needs pi + provider; not CI)
@@ -15,12 +18,16 @@
 # it stays fast and deterministic; PLENARY_PATH overrides the plenary location.
 
 NVIM_BIN ?= nvim
+PYTHON_BIN ?= python3
+LUAJIT_BIN ?= luajit
 PLENARY_PATH ?= $(HOME)/.local/share/nvim/lazy/plenary.nvim
 MIN_INIT := tests/minimal_init.lua
 STYLUA_BIN ?= stylua
 LUA_LS_BIN ?= lua-language-server
 
-.PHONY: test smoke format style lint docs-links e2e e2e-reaper e2e-bg-delivery e2e-subagent-failure
+export LUAJIT_BIN
+
+.PHONY: test smoke format style lint docs-links check check-selftest check-list parse e2e e2e-reaper e2e-bg-delivery e2e-subagent-failure
 
 test:
 	PLENARY_PATH=$(PLENARY_PATH) $(NVIM_BIN) --headless -u $(MIN_INIT) \
@@ -76,3 +83,21 @@ lint:
 
 docs-links:
 	python3 scripts/check_docs_links.py
+
+# Static gates that can be decided by a machine (scripts/checks/): the LuaJIT
+# parse gate, docs sync, and every rule added later. `check-selftest` proves the
+# gates can still fail (fixtures), which is the guard against a check that
+# reports green because it never matches anything.
+check:
+	$(PYTHON_BIN) -m scripts.checks
+
+check-selftest:
+	$(PYTHON_BIN) -m scripts.checks --self-test
+
+check-list:
+	$(PYTHON_BIN) -m scripts.checks --list
+
+# LuaJIT syntax gate alone (G24): the cheapest way to answer "does this load on
+# Neovim stable". Any LuaJIT 2.1 build works; mise pins one for parity.
+parse:
+	$(PYTHON_BIN) -m scripts.checks --only parse-luajit

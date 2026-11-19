@@ -1,2 +1,4 @@
 /.agents/gigs/
 /.agents/notes/
+__pycache__/
+*.pyc
