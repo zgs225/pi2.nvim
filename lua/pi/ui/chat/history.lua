@@ -2613,6 +2613,49 @@ function History:append_custom_block(block)
     end)
 end
 
+--- Append ONE dim system-note line to the history.
+---
+--- `chunks` describes that single line as `{text, hl}` pairs, highlighted
+--- exactly like a custom block's line. Unlike `append_custom_block` this must
+--- not assume the conversation has started: a background-task note can be the
+--- very FIRST content in a fresh history (the extension's startup orphan
+--- summary), so the note finalizes the placeholder itself.
+---@param chunks table[] list of `{text, hl?}` pairs for one line
+function History:append_system_note(chunks)
+    self:_seal_stream_text()
+    vim.schedule(function()
+        if not self._buf or not vim.api.nvim_buf_is_valid(self._buf) then
+            return
+        end
+        self:_pop_text_batch()
+        if not chunks or #chunks == 0 then
+            return
+        end
+        -- No-op once the history has conversation content; on an empty history
+        -- it marks the first content and drops the loading placeholder.
+        self:_begin_conversation_content()
+
+        local parts = {} ---@type string[]
+        for _, chunk in ipairs(chunks) do
+            parts[#parts + 1] = chunk[1] or ""
+        end
+        local row = self:_append_lines({ table.concat(parts) })
+
+        local col = 0
+        for _, chunk in ipairs(chunks) do
+            local chunk_text = chunk[1] or ""
+            local hl = chunk[2]
+            if hl and #chunk_text > 0 then
+                vim.api.nvim_buf_set_extmark(self._buf, ns, row, col, {
+                    end_col = col + #chunk_text,
+                    hl_group = hl,
+                })
+            end
+            col = col + #chunk_text
+        end
+    end)
+end
+
 ---@param tool_name string
 ---@param tool_call_id string
 ---@param tool_input? table

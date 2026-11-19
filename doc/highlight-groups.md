@@ -15,6 +15,7 @@ All highlight groups are defined with `default = true`, so they can be overridde
 | `PiStartupDetail` | Detail lines inside the startup block |
 | `PiStartupError` | Error lines inside the startup block |
 | `PiSystemErrorIcon` | Icon for system-error entries in the history |
+| `PiSystemNote` | One dim line per background-task delivery report in the history (links to `Comment`) |
 | `PiErrorRail` | Vertical rail drawn alongside hard-wrapped error lines |
 | `PiCompactionLabel` | Icon label for compaction summaries |
 | `PiCompactionText` | Body text inside compaction summaries |
