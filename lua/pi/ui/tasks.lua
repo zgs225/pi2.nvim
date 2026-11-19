@@ -154,7 +154,7 @@ local function format_ago(ms)
 end
 
 --- Highlight group of a row's status dot at a given animation tick. Running
---- blinks every tick; failure is a steady red, success/stopped a dim ◌.
+--- blinks every tick; failure is a steady red, success/stopped/unknown a dim ◌.
 ---@param row pi.TasksRow
 ---@param tick integer
 ---@return string
@@ -168,6 +168,9 @@ function M.dot_hl(row, tick)
     end
     if status == "completed" then
         return "PiTasksListSuccess"
+    end
+    if status == "unknown" then
+        return "PiTasksListUnknown"
     end
     return "PiTasksListStopped"
 end
@@ -195,7 +198,7 @@ function M.format_line(row, tick, width, now_ms, current_session_id)
     now_ms = now_ms or uv.now()
     local task = row.task
     local running = task.status == "running"
-    local dot = (task.status == "completed" or task.status == "stopped") and "◌" or "●"
+    local dot = (task.status == "completed" or task.status == "stopped" or task.status == "unknown") and "◌" or "●"
     local spinner = running and M.spinner_frame(tick) or nil
     local foreign = current_session_id ~= nil and task.session_id ~= nil and task.session_id ~= current_session_id
 
@@ -433,13 +436,13 @@ function M._render()
         end
     end
 
-    -- Title counts cover the filtered rows; terminal = completed/failed/stopped.
+    -- Title counts cover the filtered rows; terminal = completed/failed/stopped/unknown.
     local running, finished = 0, 0
     for _, row in ipairs(rows) do
         local status = row.task.status
         if status == "running" then
             running = running + 1
-        elseif status == "completed" or status == "failed" or status == "stopped" then
+        elseif status == "completed" or status == "failed" or status == "stopped" or status == "unknown" then
             finished = finished + 1
         end
     end
@@ -761,6 +764,12 @@ local function preview_status(task)
     end
     if task.status == "failed" then
         return task.exit_code and ("failed (exit " .. task.exit_code .. ")") or "failed"
+    end
+    -- Before the signal fallback: an unknown task has no signal, so it would
+    -- otherwise read as `stopped` — the very contradiction this status exists
+    -- to avoid.
+    if task.status == "unknown" then
+        return "exit status unknown"
     end
     if task.signal then
         return "stopped (signal " .. task.signal .. ")"

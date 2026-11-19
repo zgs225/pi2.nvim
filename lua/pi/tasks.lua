@@ -12,7 +12,7 @@ local M = {}
 ---@class pi.Task
 ---@field id string            e.g. "b3f2a1"
 ---@field command string       full command line
----@field status "running"|"completed"|"failed"|"stopped"
+---@field status "running"|"completed"|"failed"|"stopped"|"unknown"
 ---@field start_time integer   ms timestamp (from the event payload)
 ---@field end_time integer|nil ms timestamp
 ---@field exit_code integer|nil
@@ -27,7 +27,7 @@ local M = {}
 
 ---@class pi.TasksRow
 ---@field task pi.Task
----@field status_label "running"|"done"|"failed"|"stopped"
+---@field status_label "running"|"done"|"failed"|"stopped"|"unknown"
 ---@field duration_ms integer|nil running = now-start_time; done = end-start
 
 ---@type table<string, pi.Task>
@@ -335,12 +335,13 @@ function M.list(session_id)
     return tasks
 end
 
----@type table<string, "running"|"done"|"failed"|"stopped">
+---@type table<string, "running"|"done"|"failed"|"stopped"|"unknown">
 local STATUS_LABELS = {
     running = "running",
     completed = "done",
     failed = "failed",
     stopped = "stopped",
+    unknown = "unknown",
 }
 
 --- Build the panel rows: one per task in list() order, with a display label
@@ -434,6 +435,11 @@ end
 ---   {kind="completed", taskId, command?, pid?, outputFile?, exitCode?, signal?}
 ---   {kind="failed",    taskId, command?, pid?, outputFile?, exitCode?, signal?}
 ---   {kind="stopped",   taskId, command?, pid?, outputFile?, exitCode?, signal?}
+---   {kind="unknown",   taskId, command?, pid?, outputFile?, exitCode?, signal?}
+---
+--- An `unknown` terminal event carries NO exit code: the exit nobody observed
+--- is genuinely unknowable, so the record keeps exit_code nil rather than
+--- borrowing `failed`'s default of 1.
 ---@param ev table
 ---@param session_id string? Owning session id (event routing; nil = unknown ownership)
 ---@param tab integer? Owning tabpage handle (panel display)
@@ -490,7 +496,7 @@ function M.handle_event(ev, session_id, tab)
         return true
     end
 
-    if d.kind == "completed" or d.kind == "failed" then
+    if d.kind == "completed" or d.kind == "failed" or d.kind == "unknown" then
         -- A JSON null decodes to vim.NIL, which is truthy: a bare
         -- `d.exitCode or fallback` would keep the NIL instead of falling back.
         local exit_code = non_null(d.exitCode)
@@ -514,7 +520,15 @@ function M.handle_event(ev, session_id, tab)
         merge_terminal_fields(task, d)
         task.status = d.kind
         task.end_time = ts
-        task.exit_code = exit_code or (d.kind == "completed" and 0 or 1)
+        -- Only the kinds that actually observed an exit may fabricate a code:
+        -- `completed` without one defaulted to 0 and `failed` to 1, but an
+        -- `unknown` event means nobody saw the exit — defaulting it would
+        -- spell "failed" for a task whose exit status is simply unknowable.
+        if d.kind == "completed" then
+            task.exit_code = exit_code or 0
+        elseif d.kind == "failed" then
+            task.exit_code = exit_code or 1
+        end
         -- The authoritative terminal state: a stop that was still escalating
         -- has succeeded (or was never needed).
         cancel_escalation(id)
@@ -549,6 +563,53 @@ function M.handle_event(ev, session_id, tab)
     end
 
     return false
+end
+
+--- Fold one transcript `pi2_bg_task` record into the registry. Accepts either
+--- wire shape a transcript keeps it in:
+---   * `msg.details` — an RPC `get_messages` message (role="custom");
+---   * `msg.data` — a JSONL `type="custom"` entry's payload.
+---
+--- One fold shared by the parent's transcript replay (sessions/manager.lua)
+--- and the sub-session viewer, so the two tables cannot disagree about a
+--- task's command or state. A record is not conversation content: it renders
+--- nothing, but it is the only place a task's command is written down, and a
+--- tool block replayed later (`wait_task` / `stop_task` / `task_input`) names
+--- the command from this registry — without the fold it falls back to a bare
+--- task id.
+---
+--- A `started` record for a task the registry already tracks is inert: replay
+--- runs more than once per view (a compaction rebuild, :PiTree, a reopened
+--- viewer), and a rebuilt window can hold a task's `started` entry without the
+--- terminal one — folding that again would turn a finished row back into a
+--- running one (spinner and all). Terminal records are always folded: they
+--- carry the exit status and are idempotent.
+---@param msg table? transcript entry carrying a pi2_bg_task payload
+---@param session_id string? owning session id (nil = unknown ownership)
+---@param tab integer? owning tabpage handle (panel display)
+---@return boolean consumed true when the record was folded
+function M.absorb_message(msg, session_id, tab)
+    if type(msg) ~= "table" then
+        return false
+    end
+    local custom_type = msg.customType
+    if custom_type ~= nil and custom_type ~= "pi2_bg_task" then
+        return false
+    end
+    local details = msg.details
+    if type(details) ~= "table" then
+        details = msg.data
+    end
+    if type(details) ~= "table" then
+        return false
+    end
+    if details.kind == "started" then
+        local id = details.taskId
+        if type(id) == "string" and store[id] ~= nil then
+            return true
+        end
+    end
+    return M.handle_event({ type = "pi2_bg_task", details = details, timestamp = msg.timestamp }, session_id, tab)
 end
 
 --- Drop every task owned by the given session (tab closed / session

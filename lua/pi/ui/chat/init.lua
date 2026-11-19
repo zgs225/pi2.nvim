@@ -1988,6 +1988,13 @@ function Chat:append_custom_block(block)
     self._history:append_custom_block(block)
 end
 
+--- Append ONE dim system-note line to the chat history (the UI-only mirror of
+--- a background-task report the model already received).
+---@param chunks table[] list of `{text, hl?}` pairs for one line
+function Chat:append_system_note(chunks)
+    self._history:append_system_note(chunks)
+end
+
 ---@param summary string
 ---@param tokens_before integer
 function Chat:append_compaction_summary(summary, tokens_before)

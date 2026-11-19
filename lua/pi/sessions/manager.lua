@@ -840,20 +840,43 @@ local function replay_bg_task_message(message, session_id, tab)
     if message.customType ~= "pi2_bg_task" then
         return
     end
-    local details = message.details
-    -- A task the registry already tracks keeps its live state. Replay runs more
-    -- than once per session (a compaction rebuild, :PiTree), and a rebuilt
-    -- window can hold a task's `started` entry without the terminal one; folding
-    -- that again would turn a finished row back into a running one (spinner and
-    -- all). Terminal entries are always folded — they carry the exit status and
-    -- are idempotent.
-    if type(details) == "table" and details.kind == "started" then
-        local id = details.taskId
-        if type(id) == "string" and Tasks.get(id) ~= nil then
-            return
-        end
+    -- The dedupe (a repeated `started` must not un-finish a tracked row) and
+    -- the registry call both live in Tasks.absorb_message, which the
+    -- sub-session viewer calls too: one rule for the parent's transcript and
+    -- a child's, so a task's command/state cannot differ between the two.
+    -- A raise is downgraded to a warning, as in `apply_bg_task_event`: a
+    -- replayed transcript must not break the rebuild it is part of.
+    local ok, err = pcall(Tasks.absorb_message, message, session_id, tab)
+    if not ok then
+        Notify.warn("Background task event failed: " .. tostring(err))
     end
-    apply_bg_task_event(details, message.timestamp, session_id, tab)
+end
+
+--- Render the UI-only line(s) for a bg-tasks delivery report.
+---
+--- The `pi2_bg_task` message is model-facing: it lands in the transcript and in
+--- the agent's context, and the frontend deliberately renders no custom message
+--- as conversation content. This helper derives ONE dim line per reported task
+--- from that same content (`pi.tasks_note`), so the user sees what the model was
+--- told without anything being added to the context and without a second
+--- delivery channel. Panel pings and other customTypes yield no lines, and a
+--- detached session has no chat to draw into.
+---
+--- Runs on the RPC callback thread; rendering is scheduled inside the history.
+---@param message table custom message object (role="custom")
+---@param chat pi.Chat? owning chat (nil = detached session, nothing to draw)
+local function render_bg_task_note(message, chat)
+    if message.customType ~= "pi2_bg_task" or not chat then
+        return
+    end
+    local ok, err = pcall(function()
+        for _, line in ipairs(require("pi.tasks_note").lines(message.content)) do
+            chat:append_system_note({ { line, "PiSystemNote" } })
+        end
+    end)
+    if not ok then
+        Notify.warn("Background task note failed: " .. tostring(err))
+    end
 end
 
 --- Consume a pi2_bg_task custom message pushed by the bg-tasks extension:
@@ -879,7 +902,12 @@ local function handle_bg_task_message(message, session_id, tab)
     -- focus leaves — never yank a panel the user is reading. pi.ui.tasks is
     -- lazy-required as in the auto-open path.
     if
-        (details.kind == "completed" or details.kind == "failed" or details.kind == "stopped")
+        (
+            details.kind == "completed"
+            or details.kind == "failed"
+            or details.kind == "stopped"
+            or details.kind == "unknown"
+        )
         and tab ~= nil
         and not Tasks.has_running(session_id)
     then
@@ -1447,13 +1475,17 @@ function M.handle_event(session, msg)
     elseif t == "message_start" then
         local message = msg.message
         if type(message) == "table" and message.role == "custom" then
-            -- Custom extension messages never render in chat history. The
-            -- bg-tasks extension's pi2_bg_task lifecycle feeds the task
-            -- registry (and the :PiTasks panel) instead; other customTypes
-            -- are dropped, matching the previous de-facto behavior.
+            -- Custom extension messages never render as a user/assistant block.
+            -- The bg-tasks extension's pi2_bg_task lifecycle feeds the task
+            -- registry (and the :PiTasks panel) instead, and its DELIVERY
+            -- reports (completions, check-ins, the startup orphan summary)
+            -- leave one dim UI-only line per task, derived from the very text
+            -- the model already got. Other customTypes are dropped, matching
+            -- the previous de-facto behavior.
             if message.customType == "pi2_bg_task" then
                 handle_bg_task_message(message, session.id, session.attached_tab)
             end
+            render_bg_task_note(message, chat)
         elseif chat then
             chat:on_message_start(msg)
         end
@@ -2119,15 +2151,19 @@ local function replay_messages(session, messages)
             session.chat:on_bash_replay(msg)
         elseif role == "custom" then
             -- Extension lifecycle entries (the bg-tasks extension's
-            -- pi2_bg_task messages) render nothing, but they carry the task
-            -- table: fold them in transcript order so a tool block replayed
-            -- from here — wait_task's body leads with the command the task
-            -- runs — resolves the command instead of a bare id. Folding in
-            -- order also means the terminal entries that follow a `started`
-            -- one land on the same record, exactly as in the live path, and
-            -- pending_agent_end is left alone: a custom entry is not a
-            -- conversation turn.
+            -- pi2_bg_task messages) never render as conversation content, but
+            -- they carry two things: the task table, which is folded in
+            -- transcript order so a tool block replayed from here —
+            -- wait_task's body leads with the command the task runs — resolves
+            -- the command instead of a bare id (folding in order also means
+            -- the terminal entries that follow a `started` one land on the same
+            -- record, exactly as in the live path, and pending_agent_end is
+            -- left alone: a custom entry is not a conversation turn), and a
+            -- delivery report, whose one dim UI-only line is rendered from the
+            -- same content the resumed model sees. Every caller starts from a
+            -- cleared buffer, so the lines are drawn once per report.
             replay_bg_task_message(msg, session.id, session.attached_tab or session.tab)
+            render_bg_task_note(msg, session.chat)
         end
     end
     -- Flush any remaining pending agent_end

@@ -237,6 +237,12 @@ The dot colors are driven by `PiSessionsList*` highlight groups (`Busy`, `Compac
 
 While the backend is generating a session name (see [Auto session titles](#auto-session-titles)), the session's row animates a spinner between the status dot and the displayed name. The label under the dot stays provisional (the pending placeholder or `(unnamed)`) — the first-message fallback is held back during generation, so the row makes exactly **one** visible change: `(unnamed)` → the generated title (or → the fallback, when generation fails).
 
+### Inside the viewer
+
+The read-only viewer replays a session the way the chat does, so a background-task tool block inside it names the command it waits on, stops, or feeds exactly like the parent's own chat — `npm run dev · b3f2a1`, never a bare `b3f2a1` — for a live child and for one whose process is gone, because the `pi2_bg_task` records that carry the command are folded out of the transcript before the blocks that name them: a dormant session's JSONL entries in a pre-pass over the file, a live session's `get_messages` messages in transcript order as they are replayed. A child's blocks read the same after a restart or a resume. The viewer draws the transcript's conversation, not its side notes — the dim `⚑` report line a background-task report leaves in the parent chat is not re-drawn here.
+
+Those records land in the same task table that backs `:PiTasks`, but stamped with the **viewed** session's id: a child's rows never reach the parent's panel (the current-session view is unchanged), they appear only in the all-sessions view (`A`), and the viewer itself opens and closes nothing. One known limitation follows from that scoping: a child has no tab attachment of its own, so closing the child does not reclaim its rows — they stay in the all-sessions view until Neovim exits.
+
 ## Auto session titles
 
 pi itself does not name sessions: `session_info.name` is only written when someone calls `setSessionName`. With `title` enabled (on by default), pi2.nvim injects a small extension (`extensions/title.ts`) into every RPC process that closes this gap: once per session, right after the **first turn** of a run, it asks the session's own model for a short title and persists it with `pi.setSessionName()`. The name then flows through the normal `session_info_changed` path — `:PiSessions` / `:PiResume` pick it up with no extra plumbing.

@@ -12,6 +12,7 @@ local Render = require("pi.ui.render")
 local Manifest = require("pi.subsessions.manifest")
 local Sessions = require("pi.sessions.manager")
 local Read = require("pi.subsessions.read")
+local Tasks = require("pi.tasks")
 local Vision = require("pi.vision")
 local Stats = require("pi.stats")
 local TodoToolUi = require("pi.todo.tool_ui")
@@ -427,11 +428,27 @@ local function set_replaying(history, replaying)
     end
 end
 
+--- Fold one `pi2_bg_task` record into the task registry, containing a failure.
+---
+--- The fold is a side effect of drawing a transcript, so a raise in the
+--- registry must never abort the replay (or the pre-pass) it is part of: it is
+--- downgraded to a warning, exactly as the parent's transcript fold does
+--- (`sessions/manager.lua`, `replay_bg_task_message`).
+---@param record table? transcript entry carrying a pi2_bg_task payload
+---@param session_id string? id of the viewed session (task-record ownership)
+local function fold_task_record(record, session_id)
+    local ok, err = pcall(Tasks.absorb_message, record, session_id, nil)
+    if not ok then
+        Notify.warn("Background task record failed: " .. tostring(err))
+    end
+end
+
 --- Replay structured messages into the viewer's history instance.
 --- Mirrors replay_messages from lua/pi/sessions/manager.lua.
 ---@param history pi.ChatHistory
 ---@param messages table[]
-local function replay(history, messages)
+---@param session_id string? id of the viewed session (task-record ownership)
+local function replay(history, messages, session_id)
     if not history or not history:buf() or not vim.api.nvim_buf_is_valid(history:buf()) then
         return
     end
@@ -561,6 +578,16 @@ local function replay(history, messages)
                 pending_agent_end = false
             end
             history:on_bash_replay(msg)
+        elseif role == "custom" then
+            -- A bg-tasks lifecycle entry renders nothing, but it is where a
+            -- task's command is written down: fold it in transcript order so a
+            -- `wait_task` / `stop_task` / `task_input` block replayed below
+            -- names the command instead of a bare id. `tab` is nil on purpose
+            -- — the viewed session is a child, whose rows must never be
+            -- attributed to the parent's tabpage. The fold is id-keyed, so a
+            -- repeated replay is harmless, and `pending_agent_end` is left
+            -- alone: a custom entry is not a conversation turn.
+            fold_task_record(msg, session_id)
         end
     end
 
@@ -732,6 +759,29 @@ local function load_messages_from_jsonl(path)
     end
     file:close()
     return messages, session_name, status, entries
+end
+
+--- Fold a dormant session's background-task records into the task registry.
+---
+--- The transcript replayed below holds only `role="message"` conversation
+--- entries, while a task's lifecycle lives in `custom_message` entries (and, in
+--- older files, `type="custom"` ones with the payload under `data`) — both
+--- keyed by the task id. Folding them in a pre-pass, in file order, therefore
+--- cannot mis-order them against the `wait_task` block that names the task,
+--- and folding twice is harmless because the fold is id-keyed (a repeated
+--- `started` is inert, a terminal record is idempotent). Panel side effects are
+--- deliberately absent: opening a viewer must not pop panels.
+---@param entries table[] decoded JSONL entries, in file order
+---@param session_id string? id of the viewed session (task-record ownership)
+local function fold_task_entries(entries, session_id)
+    if type(entries) ~= "table" then
+        return
+    end
+    for _, entry in ipairs(entries) do
+        if type(entry) == "table" and (entry.type == "custom" or entry.type == "custom_message") then
+            fold_task_record(entry, session_id)
+        end
+    end
 end
 
 --- Resolve the current todo snapshot: a live session (RPC running) reads the
@@ -1309,6 +1359,11 @@ function M.open(child_id, opts)
     local session = Sessions.get_by_id(child_id)
     local is_live = session ~= nil and session.rpc ~= nil and session.rpc:is_running()
     local status = (entry and entry.status) or (is_live and "active" or "dormant")
+    -- The viewed session's id, resolved once for both paths: a live session's
+    -- registry id is the id the viewer was opened for, and a dormant session is
+    -- known only by that same id. Background-task records folded by the replay
+    -- below are stamped with it.
+    local viewed_session_id = (session and session.id) or child_id
 
     if session then
         local pin = session.pinned_config
@@ -1357,6 +1412,9 @@ function M.open(child_id, opts)
         local msgs, session_name, jsonl_status, entries = load_messages_from_jsonl(path)
         dormant_messages = msgs
         viewer_todo_entries = entries
+        -- Task records first: the replayed `wait_task` blocks read their
+        -- command from the registry, so the fold has to land before replay.
+        fold_task_entries(entries, viewed_session_id)
         session_cwd = (jsonl_status and jsonl_status.cwd) or session_cwd or recorded_worktree_cwd(entry)
         -- The JSONL fallback only applies while no name is known yet.
         if session_name and session_name ~= "" and not opts_name and not entry_name then
@@ -1668,7 +1726,7 @@ function M.open(child_id, opts)
                         resolve_context_window(viewer_status.model_id, viewer_status.model_provider)
                 end
                 M.update_statusline()
-                replay(history, messages)
+                replay(history, messages, viewed_session_id)
                 viewer_loading = false
                 local queue = viewer_event_queue or {}
                 viewer_event_queue = nil
@@ -1686,7 +1744,7 @@ function M.open(child_id, opts)
             Notify.error("Failed to request messages from subsession RPC")
         end
     else
-        replay(history, dormant_messages or {})
+        replay(history, dormant_messages or {}, viewed_session_id)
     end
 end
 
@@ -1703,8 +1761,9 @@ end
 
 ---@param history pi.ChatHistory
 ---@param messages table[]
-function M._replay(history, messages)
-    replay(history, messages)
+---@param session_id? string id of the viewed session (task-record ownership)
+function M._replay(history, messages, session_id)
+    replay(history, messages, session_id)
 end
 
 ---@param path string
