@@ -277,8 +277,8 @@ require("pi").setup({
     title = {
         enabled = true,
         max_chars = 40, -- hard cap on generated titles (truncated with …)
-        -- lang = "zh-CN", -- nil (default) = title language follows the conversation
-        -- model = "openai/gpt-4o-mini", -- pinned generation model; nil = the session's own model
+        lang = nil, -- nil (default) = title language follows the conversation, e.g. "zh-CN"
+        model = nil, -- pinned generation model ("provider/modelId"); nil = the session's own model
     },
 
     -- Session todo list. When enabled (default), pi2.nvim injects the bundled
