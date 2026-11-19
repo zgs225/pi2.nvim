@@ -4,9 +4,9 @@ Three design rules, all of them consequences of past fake-green incidents
 (gotcha G25):
 
 * **A missing tool is an error, not a skip.** `run()` raises `CheckError` when a
-  binary it needs is absent; the runner exits 2 and prints the remedy. Skipping
-  a check because a tool vanished is how a suite reports green while checking
-  nothing.
+  binary it needs is absent; that error is reported and makes the run exit 2.
+  Skipping a check because a tool vanished is how a suite reports green while
+  checking nothing.
 * **Every rule ships a failing fixture.** `self_test()` refuses to pass a rule
   that declares no fixture or whose fixtures do not include both a clean tree
   and a tree that must produce findings. If the gate has never been seen to
@@ -18,11 +18,13 @@ Three design rules, all of them consequences of past fake-green incidents
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Sequence
+from typing import Iterator, Mapping, Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -67,12 +69,21 @@ class Fixture:
 
     `expect = 0` proves the rule does not fire on compliant code; `expect > 0`
     proves it fires on the defect it exists for. Both are mandatory.
+
+    Two optional knobs cover tools that must be *refused* rather than exercised:
+    `env` is applied to `os.environ` only while this fixture runs (so a rule can
+    be pointed at a specific binary without leaking into other fixtures), and
+    `expect_error` means the fixture passes only if `run()` raises `CheckError`
+    instead of returning findings. An `expect_error` fixture counts as neither a
+    clean nor a failing fixture for the meta-rule.
     """
 
     name: str
     root: Path
     expect: int
     what: str
+    env: dict[str, str] = field(default_factory=dict)
+    expect_error: bool = False
 
 
 class Check:
@@ -97,8 +108,22 @@ class Check:
     def finding(self, message: str, path: str = "", line: int = 0, severity: str = "error") -> Finding:
         return Finding(check=self.name, message=message, path=path, line=line, severity=severity)
 
-    def fixture(self, name: str, expect: int, what: str) -> Fixture:
-        return Fixture(name=name, root=FIXTURES / self.name / name, expect=expect, what=what)
+    def fixture(
+        self,
+        name: str,
+        expect: int,
+        what: str,
+        env: dict[str, str] | None = None,
+        expect_error: bool = False,
+    ) -> Fixture:
+        return Fixture(
+            name=name,
+            root=FIXTURES / self.name / name,
+            expect=expect,
+            what=what,
+            env=dict(env or {}),
+            expect_error=expect_error,
+        )
 
 
 def load_checks() -> list[Check]:
@@ -129,11 +154,33 @@ def run_checks(root: Path, only: Sequence[str] | None = None) -> tuple[list[Find
     return findings, errors, len(checks)
 
 
+@contextlib.contextmanager
+def env_overrides(env: Mapping[str, str]) -> Iterator[None]:
+    """Apply `env` to `os.environ` for the duration of the block, then restore.
+
+    Keys that were absent before are deleted again, so a fixture cannot leak a
+    `LUAJIT_BIN` (or anything else) into the next fixture or the caller.
+    """
+    saved = {key: os.environ.get(key) for key in env}
+    os.environ.update(env)
+    try:
+        yield
+    finally:
+        for key, previous in saved.items():
+            if previous is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = previous
+
+
 def self_test() -> int:
     """Prove each rule both passes clean trees and fails dirty ones.
 
     Also enforces the meta-rule: a rule with no fixtures, or with fixtures that
-    never exercise the failure path, is itself a failure.
+    never exercise the failure path, is itself a failure. Fixtures marked
+    `expect_error` prove the opposite direction — that the rule refuses an input
+    (e.g. an untrustworthy parser binary) instead of trusting it — and count as
+    neither clean nor failing for the meta-rule.
     """
     failures: list[str] = []
     checks = load_checks()
@@ -146,9 +193,10 @@ def self_test() -> int:
         if not fixtures:
             failures.append(f"[{check.name}] declares no fixtures — a gate that cannot fail is not a gate (G25)")
             continue
-        if not any(fx.expect == 0 for fx in fixtures):
+        scored = [fx for fx in fixtures if not fx.expect_error]
+        if not any(fx.expect == 0 for fx in scored):
             failures.append(f"[{check.name}] has no clean fixture (expect=0): cannot prove it stays quiet")
-        if not any(fx.expect > 0 for fx in fixtures):
+        if not any(fx.expect > 0 for fx in scored):
             failures.append(f"[{check.name}] has no failing fixture (expect>0): cannot prove it can fire")
 
         for fx in fixtures:
@@ -156,9 +204,18 @@ def self_test() -> int:
                 failures.append(f"[{check.name}] fixture '{fx.name}' missing: {fx.root}")
                 continue
             try:
-                got = check.run(fx.root)
+                with env_overrides(fx.env):
+                    got = check.run(fx.root)
             except CheckError as exc:
+                if fx.expect_error:
+                    continue
                 failures.append(f"[{check.name}] fixture '{fx.name}' could not run: {exc}")
+                continue
+            if fx.expect_error:
+                failures.append(
+                    f"[{check.name}] fixture '{fx.name}': expected CheckError, but the gate reported "
+                    f"{len(got)} finding(s) instead of refusing the input ({fx.what})"
+                )
                 continue
             if len(got) != fx.expect:
                 rendered = "; ".join(f.render() for f in got) or "none"
