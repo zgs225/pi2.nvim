@@ -77,10 +77,17 @@ class ParseLuajit(Check):
         self._probed: set[str] = set()
 
     def run(self, root: Path) -> list[Finding]:
+        # Same contract as every other rule: only a missing subject tree is a
+        # harness problem (exit 2); a tree whose `lua/` is merely empty is a fact
+        # about that tree and is reported as a warning (exit 1).
+        if not (root / "lua").is_dir():
+            raise CheckError(f"no lua/ directory under {root} — wrong tree?")
         exe = self._luajit()
         self._probe(exe)
         findings: list[Finding] = []
+        parsed = 0
         for path in self._files(root):
+            parsed += 1
             proc = subprocess.run(
                 [exe, "-bl", str(path)],
                 stdout=subprocess.DEVNULL,
@@ -90,6 +97,17 @@ class ParseLuajit(Check):
             if proc.returncode == 0:
                 continue
             findings.append(self._to_finding(root, path, proc.stderr))
+        if not parsed:
+            # A consequence of the scan, not a second directory check: nothing
+            # compiled is not the same as everything compiling. Silence here
+            # would read as "syntax is fine" on a tree that has no code.
+            findings.append(
+                self.finding(
+                    f"no *.lua file under {root / 'lua'} — nothing to parse on this tree",
+                    "lua",
+                    severity="warn",
+                )
+            )
         return findings
 
     def fixtures(self) -> list[Fixture]:
@@ -112,6 +130,19 @@ class ParseLuajit(Check):
                 "accepts everything; the probe must refuse it instead of trusting it",
                 env={"LUAJIT_BIN": str(FIXTURES / self.name / "always-accept.sh")},
                 expect_error=True,
+            ),
+            self.fixture(
+                "no-lua",
+                0,
+                "no lua/ directory at all: the subject tree is missing, so the rule refuses the input with a "
+                "CheckError (exit 2) instead of reporting a clean run",
+                expect_error=True,
+            ),
+            self.fixture(
+                "empty",
+                1,
+                "lua/ exists but holds no *.lua file: nothing parsed is not the same as everything parsing, "
+                "so the rule warns instead of reporting a clean run",
             ),
         ]
 
