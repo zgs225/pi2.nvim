@@ -12,8 +12,8 @@ it is "everything is green while the defect ships" (G25).
 
 | Gate | Command | Needs | CI |
 |------|---------|-------|----|
-| Formatting | `make style` | `stylua` | `style` job |
-| Types / undefined symbols | `make lint` | `lua-language-server` | `lint` job |
+| Formatting | `make style` | `stylua`, `ruff` | `style` job |
+| Types / undefined symbols / Python smells | `make lint` | `lua-language-server`, `ruff` | `lint` job |
 | LuaJIT parse (G24) + docs sync | `make check` | `luajit`, `python3` | `checks` job |
 | Prove the gates can fail | `make check-selftest` | same as above | `checks` job (runs first) |
 | Doc links + anchors | `make docs-links` | `python3` | `checks` job |
@@ -31,11 +31,16 @@ lives**:
 [tools]
 stylua = "2.5.2"
 "aqua:LuaLS/lua-language-server" = "3.18.2"
+ruff = "0.17.5"
 luajit = "2.1.1744318430"
 ```
 
-- `.github/workflows/lint.yml` parses this file for the stylua and
-  lua-language-server versions, so local and CI cannot drift.
+- `.github/workflows/lint.yml` parses this file for the stylua, lua-language-server
+  and ruff versions, so local and CI cannot drift.
+- **The Python is gated too** (`ruff`, config `ruff.toml`): until that landed, the
+  check harness itself — the most-edited code in the repo — had no formatter and
+  no linter, because stylua only reads Lua and lua-language-server only reads
+  `lua/`. `make style` runs `ruff format --check`, `make lint` runs `ruff check`.
 - `mise install` (after a one-time `mise trust`) is the whole setup. No global
   installs, no version managers per tool, same on Linux and macOS (aqua backend
   ships official release binaries).
@@ -43,8 +48,9 @@ luajit = "2.1.1744318430"
   Any LuaJIT 2.1 build is the same authority on Lua 5.3 syntax, so a distro
   package is fine; CI uses `apt install luajit` rather than mise.
 - Deliberately not pinned: **nvim** (the test layers must run on the editor you
-  actually use the plugin in), **python3** (the checks are stdlib-only, 3.8+),
-  and **gt** (gitea-cli, the issue tracker workflow tool — see `gitea.md`).
+  actually use the plugin in), **python3** (the checks are stdlib-only and run on
+  3.8+ — the *linter* is pinned, the interpreter is not the contract), and
+  **gt** (gitea-cli, the issue tracker workflow tool — see `gitea.md`).
 
 ## Architecture
 
@@ -147,7 +153,9 @@ tracks the coverage gaps the audit found.
 - **`warn` rules that block merges.** A heuristic (fast-event detection, hot-path
   API bans) is `severity="warn"` and must say so in its docstring; only rules with
   no false positives get to fail CI.
-- **Adopting a linter because it exists.** No luacheck/selene/ast-grep: the gates
-  stay stdlib-only Python plus binaries we already need, which keeps CI
-  dependency-free and identical across Linux and macOS. Revisit `ast-grep` only
-  when a rule needs structural matching tokens cannot express.
+- **Adopting a linter because it exists.** No luacheck/selene/ast-grep: the
+  *checks* stay stdlib-only Python (no third-party packages at runtime) plus
+  binaries the gates already need. `ruff` is the one added linter, and it exists
+  because its absence was a measured hole, not a preference — the Python had no
+  formatter and no linter at all. Revisit `ast-grep` only when a rule needs
+  structural matching tokens cannot express.

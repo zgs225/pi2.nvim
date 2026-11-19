@@ -25,7 +25,7 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Iterator, List
+from typing import Iterator
 
 from ..framework import Check, CheckError, Finding, Fixture
 
@@ -39,9 +39,9 @@ class ParseLuajit(Check):
     summary = "every Lua file parses under LuaJIT 2.1, the parser Neovim ships (G24)"
     requires = ("luajit",)
 
-    def run(self, root: Path) -> List[Finding]:
+    def run(self, root: Path) -> list[Finding]:
         exe = self._luajit()
-        findings: List[Finding] = []
+        findings: list[Finding] = []
         for path in self._files(root):
             proc = subprocess.run(
                 [exe, "-bl", str(path)],
@@ -54,7 +54,7 @@ class ParseLuajit(Check):
             findings.append(self._to_finding(root, path, proc.stderr))
         return findings
 
-    def fixtures(self) -> List[Fixture]:
+    def fixtures(self) -> list[Fixture]:
         return [
             self.fixture(
                 "good",
@@ -84,8 +84,7 @@ class ParseLuajit(Check):
         for dirname in LUA_DIRS:
             base = root / dirname
             if base.is_dir():
-                for path in sorted(base.rglob("*.lua")):
-                    yield path
+                yield from sorted(base.rglob("*.lua"))
 
     def _to_finding(self, root: Path, path: Path, stderr: str) -> Finding:
         rel = path.relative_to(root).as_posix()

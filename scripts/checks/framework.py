@@ -22,7 +22,7 @@ import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Sequence
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -87,10 +87,10 @@ class Check:
     summary: str = ""
     requires: Sequence[str] = ()
 
-    def run(self, root: Path) -> List[Finding]:  # pragma: no cover - interface
+    def run(self, root: Path) -> list[Finding]:  # pragma: no cover - interface
         raise NotImplementedError
 
-    def fixtures(self) -> List[Fixture]:
+    def fixtures(self) -> list[Fixture]:
         return []
 
     # -- helpers ---------------------------------------------------------
@@ -101,14 +101,14 @@ class Check:
         return Fixture(name=name, root=FIXTURES / self.name / name, expect=expect, what=what)
 
 
-def load_checks() -> List[Check]:
+def load_checks() -> list[Check]:
     """Import the rule list. Explicit, not discovery-based: reviewers see it."""
     from .rules import ALL
 
     return list(ALL)
 
 
-def run_checks(root: Path, only: Optional[Sequence[str]] = None) -> "tuple[List[Finding], List[str], int]":
+def run_checks(root: Path, only: Sequence[str] | None = None) -> tuple[list[Finding], list[str], int]:
     """Run every (or the selected) check. Returns (findings, errors, checks_run)."""
     checks = load_checks()
     if only:
@@ -117,8 +117,8 @@ def run_checks(root: Path, only: Optional[Sequence[str]] = None) -> "tuple[List[
             return [], [f"unknown check(s): {', '.join(unknown)} (known: {', '.join(c.name for c in checks)})"], 0
         checks = [c for c in checks if c.name in set(only)]
 
-    findings: List[Finding] = []
-    errors: List[str] = []
+    findings: list[Finding] = []
+    errors: list[str] = []
     for check in checks:
         try:
             findings.extend(check.run(root))
@@ -135,7 +135,7 @@ def self_test() -> int:
     Also enforces the meta-rule: a rule with no fixtures, or with fixtures that
     never exercise the failure path, is itself a failure.
     """
-    failures: List[str] = []
+    failures: list[str] = []
     checks = load_checks()
     if not checks:
         print("self-test: no checks registered", file=sys.stderr)
@@ -178,7 +178,7 @@ def self_test() -> int:
     return 0
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python3 -m scripts.checks",
         description="Static gates for pi.nvim. Exit 0 = clean, 1 = findings, 2 = broken gate.",

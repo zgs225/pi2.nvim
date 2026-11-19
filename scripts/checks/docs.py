@@ -9,9 +9,8 @@ defined in one place.
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
-from typing import Dict, List, Match, Pattern, Tuple
+from typing import Match, Pattern
 
 DOC_GLOBS = ("README.md", "doc/*.md")
 
@@ -21,15 +20,15 @@ class Docs:
 
     def __init__(self, root: Path) -> None:
         self.root = root
-        self.files: Dict[str, str] = {}
+        self.files: dict[str, str] = {}
         for pattern in DOC_GLOBS:
             for path in sorted(root.glob(pattern)):
                 if path.is_file():
                     self.files[path.relative_to(root).as_posix()] = path.read_text(encoding="utf-8", errors="replace")
 
-    def find(self, pattern: Pattern[str]) -> List[Tuple[str, int, Match[str]]]:
+    def find(self, pattern: Pattern[str]) -> list[tuple[str, int, Match[str]]]:
         """All matches as (relative path, 1-based line, match object)."""
-        hits: List[Tuple[str, int, Match[str]]] = []
+        hits: list[tuple[str, int, Match[str]]] = []
         for rel, text in self.files.items():
             for lineno, line in enumerate(text.splitlines(), 1):
                 for match in pattern.finditer(line):

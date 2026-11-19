@@ -62,7 +62,7 @@ In a worktree, `make test` and headless e2e under `-u tests/minimal_init.lua` ex
 
 | Layer | Command | Sees | Cannot see |
 |-------|---------|------|------------|
-| Static gates | `make style` / `make lint` / `make check` / `make docs-links` | formatting, undefined symbols, LuaJIT parse errors (G24), docs drift | anything about runtime behaviour |
+| Static gates | `make style` / `make lint` / `make check` / `make docs-links` | formatting (Lua + Python), undefined symbols, LuaJIT parse errors (G24), docs drift | anything about runtime behaviour |
 | Unit (plenary) | `make test` | pure-Lua logic, config resolution | buffers, windows, keys, rendering |
 | Headless e2e | `make smoke` / `nvim --headless -l script.lua` | plugin load, RPC, buffer/extmark wiring | visual rendering, real key events |
 | GUI automation | `scripts/gui_launch.sh` + `gui_harness.sh` (macOS: `scripts/macos/`) | real keybindings, insert mode, **pixels** | — (top layer, slow) |
@@ -72,7 +72,7 @@ Details, pitfalls, isolation recipe, and script usage: `references/testing.md`. 
 
 ## CI verification
 
-A feature is **not complete until the CI run for its merge commit is green** — local green ≠ CI green (the runner is a different, clean environment). `.github/workflows/lint.yml` runs `make style` + `make lint` + `make check` on every push to `main` and on PRs; it is self-contained (downloads stylua + lua-language-server, `apt install luajit`, no Neovim needed) and derives the two release versions from `.mise.toml`. `make test` is **not** in CI yet — keep running it locally (tracked in the test-coverage issue).
+A feature is **not complete until the CI run for its merge commit is green** — local green ≠ CI green (the runner is a different, clean environment). `.github/workflows/lint.yml` runs `make style` + `make lint` + `make check` on every push to `main` and on PRs; it is self-contained (downloads stylua + lua-language-server + ruff, `apt install luajit`, no Neovim needed) and derives the three release versions from `.mise.toml`. `make test` is **not** in CI yet — keep running it locally (tracked in the test-coverage issue).
 
 - The repo is public, so run status is readable without auth:
   `curl -s "https://api.github.com/repos/zgs225/pi2.nvim/actions/runs?branch=main&per_page=5"` (or `gh run list` when logged in).

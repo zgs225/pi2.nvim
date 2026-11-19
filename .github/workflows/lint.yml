@@ -6,15 +6,15 @@
 # so the workflow stays self-contained (no third-party actions, no Neovim).
 #
 # Three jobs, all required to merge:
-#   style    — `make style`  (stylua --check)
-#   lint     — `make lint`   (lua-language-server --check)
+#   style    — `make style`  (stylua --check for Lua, ruff format --check for Python)
+#   lint     — `make lint`   (lua-language-server --check for lua/, ruff check for scripts/)
 #   checks   — `make check`  (LuaJIT parse gate, docs sync; scripts/checks/)
 #              preceded by `make check-selftest`, which proves every gate in
 #              `make check` can still FAIL. A gate nobody has seen fail is not a
 #              gate — see gotcha G25. `make docs-links` rides along here.
 #
-# The stylua / lua-language-server versions are read out of `.mise.toml`, the
-# same file developers get their pinned toolchain from, so a version bump
+# The stylua / lua-language-server / ruff versions are read out of `.mise.toml`,
+# the same file developers get their pinned toolchain from, so a version bump
 # happens in exactly one place.
 #
 # `make test` (the plenary suite) is NOT run here yet — it needs Neovim plus
@@ -30,7 +30,7 @@ on:
 
 jobs:
   style:
-    name: stylua (make style)
+    name: formatters (make style)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -44,14 +44,34 @@ jobs:
           unzip -o /tmp/stylua.zip -d /tmp/stylua-bin
           install -m 0755 /tmp/stylua-bin/stylua /usr/local/bin/stylua
           stylua --version
+      - name: Install ruff
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^ruff = "\(.*\)"$/\1/p' .mise.toml)
+          test -n "$version" || { echo "no ruff pin in .mise.toml"; exit 1; }
+          curl -fsSL -o /tmp/ruff.tar.gz \
+            "https://github.com/astral-sh/ruff/releases/download/${version}/ruff-x86_64-unknown-linux-gnu.tar.gz"
+          tar -xzf /tmp/ruff.tar.gz -C /tmp
+          install -m 0755 /tmp/ruff-x86_64-unknown-linux-gnu/ruff /usr/local/bin/ruff
+          ruff --version
       - name: Check formatting
         run: make style
 
   lint:
-    name: lua-language-server (make lint)
+    name: static analysis (make lint)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install ruff
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^ruff = "\(.*\)"$/\1/p' .mise.toml)
+          test -n "$version" || { echo "no ruff pin in .mise.toml"; exit 1; }
+          curl -fsSL -o /tmp/ruff.tar.gz \
+            "https://github.com/astral-sh/ruff/releases/download/${version}/ruff-x86_64-unknown-linux-gnu.tar.gz"
+          tar -xzf /tmp/ruff.tar.gz -C /tmp
+          install -m 0755 /tmp/ruff-x86_64-unknown-linux-gnu/ruff /usr/local/bin/ruff
+          ruff --version
       - name: Install lua-language-server
         run: |
           set -euo pipefail

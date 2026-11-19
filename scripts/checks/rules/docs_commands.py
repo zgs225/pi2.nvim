@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Dict, List, Tuple
 
 from .. import lua
 from ..docs import Docs
@@ -39,7 +38,7 @@ class DocsCommands(Check):
     summary = "every :Pi* command is documented, and every :Pi* mention in the docs exists"
     requires = ("python3",)
 
-    def run(self, root: Path) -> List[Finding]:
+    def run(self, root: Path) -> list[Finding]:
         commands, dynamic = _commands(root)
         if not commands and not dynamic:
             raise CheckError(f"found no `{CREATE_CALL}(` under {root / 'lua'} — wrong tree, or the extractor broke")
@@ -47,7 +46,7 @@ class DocsCommands(Check):
         if not docs.files:
             raise CheckError(f"no documentation found under {root} (expected README.md and/or doc/*.md)")
 
-        findings: List[Finding] = [
+        findings: list[Finding] = [
             self.finding(
                 f"command name is not a string literal (`{expr}`): docs sync cannot be verified statically — "
                 "use a literal name in `nvim_create_user_command`",
@@ -88,7 +87,7 @@ class DocsCommands(Check):
 
         return findings
 
-    def fixtures(self) -> List[Fixture]:
+    def fixtures(self) -> list[Fixture]:
         return [
             self.fixture(
                 "good",
@@ -103,10 +102,10 @@ class DocsCommands(Check):
         ]
 
 
-def _commands(root: Path) -> Tuple[Dict[str, Tuple[str, int]], List[Tuple[str, int, str]]]:
+def _commands(root: Path) -> tuple[dict[str, tuple[str, int]], list[tuple[str, int, str]]]:
     """Map command name -> (path, line); plus names that are not literals."""
-    found: Dict[str, Tuple[str, int]] = {}
-    dynamic: List[Tuple[str, int, str]] = []
+    found: dict[str, tuple[str, int]] = {}
+    dynamic: list[tuple[str, int, str]] = []
     source_root = root / "lua"
     if not source_root.is_dir():
         return found, dynamic
@@ -135,7 +134,7 @@ def _commands(root: Path) -> Tuple[Dict[str, Tuple[str, int]], List[Tuple[str, i
     return found, dynamic
 
 
-def _closest(name: str, commands: Dict[str, Tuple[str, int]]) -> str:
+def _closest(name: str, commands: dict[str, tuple[str, int]]) -> str:
     """Cheap "did you mean" for the finding message: nearest name by prefix length."""
     best = max(commands, key=lambda candidate: _common_prefix(candidate, name), default="")
     return f":{best}" if best else "none"

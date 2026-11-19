@@ -22,11 +22,17 @@
 #   python3   — `scripts/checks/**` is stdlib-only and runs on 3.8+; a system
 #               python (or the one CI ships) is enough, and pinning an
 #               interpreter for a 500-line linter is not worth the install cost.
-#   tea       — Gitea workflow tool, not a build dependency. See
-#               .agents/skills/develop/references/gitea.md.
+#               The *linter* is pinned (`ruff` below) — the interpreter is not the
+#               contract, the gate is.
+#   gt        — gitea-cli, the issue-tracker workflow tool, not a build
+#               dependency. See .agents/skills/develop/references/gitea.md.
 [tools]
 stylua = "2.5.2"
 "aqua:LuaLS/lua-language-server" = "3.18.2"
+# ruff — formats and lints the Python under `scripts/` (the gates themselves).
+# Without it the newest, most-edited code in the repo had no gate at all:
+# stylua only sees Lua and lua-language-server only sees `lua/`.
+ruff = "0.17.5"
 # LuaJIT 2.1 — the parser family Neovim embeds, and therefore the authority for
 # "does this file load on Neovim stable" (gotcha G24): it rejects the Lua 5.3
 # operators (`&`, `|`, `~`, `<<`, `>>`, `//`) that a newer Lua parser would let

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import string
 from dataclasses import dataclass
-from typing import Iterator, List, Optional
+from typing import Iterator
 
 NAME_START = frozenset(string.ascii_letters + "_")
 NAME_CHARS = NAME_START | frozenset(string.digits)
@@ -67,7 +67,7 @@ class Token:
     kind: str  # name | number | string | punct | comment
     text: str
     line: int
-    value: Optional[str] = None
+    value: str | None = None
 
     def is_punct(self, text: str) -> bool:
         return self.kind == "punct" and self.text == text
@@ -76,7 +76,7 @@ class Token:
         return self.kind == "name" and self.text == text
 
 
-def _long_bracket_open(src: str, i: int) -> "tuple[Optional[int], int]":
+def _long_bracket_open(src: str, i: int) -> tuple[int | None, int]:
     """If `src[i] == '['` opens a long bracket, return (content_start, level)."""
     j = i + 1
     level = 0
@@ -112,7 +112,7 @@ _SIMPLE_ESCAPES = {
 
 def _decode(body: str) -> str:
     """Best-effort unescape. Command names are plain ASCII; this is for safety."""
-    out: List[str] = []
+    out: list[str] = []
     i = 0
     while i < len(body):
         ch = body[i]
@@ -150,9 +150,9 @@ def _decode(body: str) -> str:
     return "".join(out)
 
 
-def tokenize(src: str) -> List[Token]:
+def tokenize(src: str) -> list[Token]:
     """Lex `src`. Never raises: malformed input yields tokens up to the damage."""
-    tokens: List[Token] = []
+    tokens: list[Token] = []
     i = 0
     line = 1
     n = len(src)
@@ -203,7 +203,7 @@ def tokenize(src: str) -> List[Token]:
             quote = ch
             start = i
             j = i + 1
-            buf: List[str] = []
+            buf: list[str] = []
             while j < n:
                 c = src[j]
                 if c == "\\" and j + 1 < n:
@@ -277,7 +277,7 @@ def tokenize(src: str) -> List[Token]:
     return tokens
 
 
-def code_tokens(src: str) -> List[Token]:
+def code_tokens(src: str) -> list[Token]:
     """Tokens with comments dropped — everything a rule should ever match on."""
     return [t for t in tokenize(src) if t.kind != "comment"]
 
@@ -288,7 +288,7 @@ def mask(src: str) -> str:
     Useful for rules that want line-oriented context (e.g. "is this call at the
     top level?") without re-implementing the lexer in regex form.
     """
-    out: List[str] = []
+    out: list[str] = []
     i = 0
     for token in tokenize(src):
         idx = src.find(token.text, i)
@@ -305,5 +305,5 @@ def mask(src: str) -> str:
     return "".join(out)
 
 
-def iter_names(tokens: List[Token]) -> Iterator[Token]:
+def iter_names(tokens: list[Token]) -> Iterator[Token]:
     return (t for t in tokens if t.kind == "name")

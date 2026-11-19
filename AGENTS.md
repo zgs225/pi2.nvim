@@ -63,12 +63,12 @@ Key source files (under `$(npm root -g)/@earendil-works/pi-coding-agent/`):
 - **Scheduling**: any code touching Neovim UI from an RPC callback must be wrapped in `vim.schedule()`.
 - **Config access**: always go through `require("pi.config").options`, never cache config values at module load time.
 - **No globals**: all state lives in module-level locals or class fields.
-- **Formatting**: stylua, configured in `.stylua.toml` (4-space indent, double quotes, 120 cols). Run `make format` to apply and `make style` to check. stylua's built-in default indent is **Tabs**, so the config file pins Spaces — never run a bare `stylua .` without it.
+- **Formatting**: Lua via stylua (`.stylua.toml`: 4-space indent, double quotes, 120 cols), Python under `scripts/` via ruff (`ruff.toml`: same 4/120/double-quote conventions). Run `make format` to apply and `make style` to check. stylua's built-in default indent is **Tabs**, so the config file pins Spaces — never run a bare `stylua .` without it.
 
 ## Verification
 
 - Four layers, all documented in `.agents/skills/develop/` (`references/testing.md`, `references/checks.md`, `references/gotchas.md`): hermetic plenary unit tests (`make test`), a headless boot check (`make smoke`), an xdotool/wezterm + RPC GUI-automation stack for real keybindings and pixels, and the static gates below. Verify changes at the cheapest layer that can observe the behavior, and escalate to a GUI screenshot for anything visual.
-- Static gates, all mandatory before pushing: `make style` (stylua `--check`), `make lint` (lua-language-server `--check` over `lua/`, config `.luarc.json`), `make check` (the LuaJIT parse gate for G24 plus the docs-sync rules under `scripts/checks/`), `make docs-links`. `make check-selftest` must pass whenever `scripts/checks/` changes — it proves every check can still fail. CI (`.github/workflows/lint.yml`) runs the same commands; `make lint` is environment-independent (bundled luv types only, no vim runtime dependency).
+- Static gates, all mandatory before pushing: `make style` (stylua + `ruff format --check`), `make lint` (lua-language-server `--check` over `lua/` + `ruff check` over `scripts/`, configs `.luarc.json` / `ruff.toml`), `make check` (the LuaJIT parse gate for G24 plus the docs-sync rules under `scripts/checks/`), `make docs-links`. `make check-selftest` must pass whenever `scripts/checks/` changes — it proves every check can still fail. CI (`.github/workflows/lint.yml`) runs the same commands; `make lint` is environment-independent (bundled luv types only, no vim runtime dependency).
 - Tool versions come from `.mise.toml` (`mise install` once; CI reads the same file), so the gates behave identically on every machine.
 - A rule a machine can decide belongs in `scripts/checks/rules/` with fixtures, not only in prose here — see `references/checks.md`. Prose states the rule; the check enforces it.
 - Reading files or reviewing diffs is not verification.

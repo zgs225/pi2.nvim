@@ -9,9 +9,9 @@
 #   make e2e-bg-delivery — real-pi e2e: background bash completion delivery into agent context (needs pi + provider; not CI)
 #   make e2e-subagent-failure — real-pi e2e: a failed child run reaches the parent as a failed item (needs pi; not CI)
 #   make smoke   — headless end-to-end smoke check (loads the user config, opens the chat)
-#   make format  — reformat lua/ and tests/ in place with stylua
-#   make style   — check formatting only (stylua --check); non-zero exit on drift, for CI/hooks
-#   make lint    — static/type check lua/ with lua-language-server (--check); non-zero on problems
+#   make format  — reformat in place: stylua (Lua) + ruff format (Python under scripts/)
+#   make style   — check formatting only (stylua --check + ruff format --check); for CI/hooks
+#   make lint    — static analysis: lua-language-server over lua/ + ruff check over scripts/
 #   make docs-links — validate relative links and anchors in README.md and doc/*.md
 #
 # The suite is intentionally runnable without the user's full Neovim config so
@@ -24,6 +24,7 @@ PLENARY_PATH ?= $(HOME)/.local/share/nvim/lazy/plenary.nvim
 MIN_INIT := tests/minimal_init.lua
 STYLUA_BIN ?= stylua
 LUA_LS_BIN ?= lua-language-server
+RUFF_BIN ?= ruff
 
 export LUAJIT_BIN
 
@@ -71,18 +72,26 @@ smoke:
 format:
 	$(STYLUA_BIN) .
 	$(STYLUA_BIN) .
+	$(RUFF_BIN) format scripts
+	$(RUFF_BIN) check --fix scripts
 
+# Formatting only. Ruff sees `scripts/` — the check harness itself, which had no
+# gate at all before ruff (stylua only reads Lua, lua-language-server only reads
+# lua/). Config: ruff.toml.
 style:
 	$(STYLUA_BIN) --check .
+	$(RUFF_BIN) format --check scripts
 
 # lua-language-server exits non-zero when diagnostics are found, so this gates
 # directly. Config is .luarc.json (portable: bundled luv types only; vim runtime
 # types are intentionally not loaded so the check is environment-independent).
+# ruff check is the analysis half for Python (imports, unused names, bug patterns).
 lint:
 	$(LUA_LS_BIN) --check lua --configpath $(CURDIR)/.luarc.json --loglevel error
+	$(RUFF_BIN) check scripts
 
 docs-links:
-	python3 scripts/check_docs_links.py
+	$(PYTHON_BIN) scripts/check_docs_links.py
 
 # Static gates that can be decided by a machine (scripts/checks/): the LuaJIT
 # parse gate, docs sync, and every rule added later. `check-selftest` proves the
