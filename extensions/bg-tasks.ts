@@ -70,6 +70,23 @@
  * so the exit a stop causes is reported by the stop's own tool result instead of
  * arriving later as a wake for a result nobody asked for.
  *
+ * The task table OUTLIVES the process that built it (P0-1). Every state change
+ * snapshots it to `join(tmpdir(), "pi-bash-tasks-<sessionId>.json")`, and the
+ * next instance — a `/reload`, or a resumed session after a crash — reconciles
+ * against that file on `session_start`: records that are already terminal are
+ * restored as terminal (their report was delivered by a process that is gone),
+ * and a record still marked running is ADOPTED when its pid is alive and still
+ * runs the same command, so `wait_task` / `stop_task` / `list_tasks` keep
+ * working on a task nobody remembers starting. Adoption polls the pid (a
+ * record written by a dead process has no exit event left to fire) and reports
+ * the exit with an honest "status unknown" when the process disappears. The
+ * pid is verified against `ps` first, because a recorded pid can be recycled by
+ * an unrelated process between the crash and the reconcile — signalling or
+ * waiting on that one would be worse than forgetting the task. One summary
+ * message tells the model what was found, so a reload does not cost it the
+ * knowledge of what is still running; `list_tasks` remains the authoritative
+ * view either way.
+ *
  * Panel reporting is separate from the wake path and never triggers a turn:
  * the frontend (`:PiTasks`) needs the exit status even when a tool call already
  * consumed the result, so `started` / terminal events are pushed as
@@ -101,9 +118,19 @@
 import type { ExtensionAPI, ExtensionContext, UserBashEventResult } from "@earendil-works/pi-coding-agent";
 import { createBashToolDefinition, getShellConfig } from "@earendil-works/pi-coding-agent";
 import type { BashToolDetails, BashToolInput, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { closeSync, createWriteStream, openSync, readSync, statSync, unlinkSync } from "node:fs";
+import {
+	closeSync,
+	createWriteStream,
+	openSync,
+	readFileSync,
+	readSync,
+	renameSync,
+	statSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { Type, type Static, type TSchema } from "typebox";
@@ -129,6 +156,24 @@ const STOP_KILL_SETTLE_MS = 5_000;
 const MAX_LISTED_TASKS = 40;
 /** Longest command quoted in a `list_tasks` row. */
 const LISTED_COMMAND_WIDTH = 120;
+/**
+ * Task-table persistence. The snapshot is debounced (a burst of starts and
+ * exits must not rewrite the file per event) and bounded (the table grows for
+ * the life of the process).
+ */
+const TASK_FILE_PREFIX = "pi-bash-tasks-";
+const TASK_FILE_VERSION = 1;
+const PERSIST_DEBOUNCE_MS = 250;
+const MAX_PERSISTED_TASKS = 60;
+/**
+ * How long a record may sit in the file before it is no longer adopted. A pid
+ * recycled after a day is far more likely to belong to something else, and an
+ * adopted task only exists to keep `wait_task`/`stop_task` usable across a
+ * reload or a crash.
+ */
+const MAX_ADOPT_AGE_MS = 24 * 60 * 60 * 1000;
+/** Liveness poll interval for an adopted task (there is no `close` event left). */
+const ADOPT_POLL_MS = 1_000;
 /** Model-facing output cap per call (matches pi's built-in bash). */
 const MAX_OUTPUT_BYTES = 50 * 1024;
 const MAX_OUTPUT_LINES = 2000;
@@ -164,6 +209,13 @@ interface BgTaskDetails {
 	outputFile: string;
 	exitCode?: number | null;
 	signal?: string | null;
+	/**
+	 * When the process actually started (epoch ms). The message that carries
+	 * this is stamped when it is SENT, so an adopted task — one whose process
+	 * started minutes ago, in another pi process — would otherwise be rendered
+	 * as if it had just started.
+	 */
+	startedAt?: number;
 }
 
 /** Module-level task table; read by the context handler and the renderers. */
@@ -201,15 +253,222 @@ interface BgTaskState {
 	sentAt?: number;
 	/** Which channel carried `sentText`. */
 	sentVia?: DeliveryChannel;
+	/**
+	 * Whether this record was rebuilt from a snapshot written by an earlier pi
+	 * process (a `/reload`, or a resume after a crash). An adopted task has no
+	 * `ChildProcess` behind it, so its exit is discovered by polling and its
+	 * status can be genuinely unknown.
+	 */
+	adopted?: boolean;
+	/** The process is gone but nobody saw it exit, so the status is unknowable. */
+	exitUnknown?: boolean;
+	/** Liveness poll for an adopted task; cleared when the task settles. */
+	adoptPoll?: ReturnType<typeof setInterval>;
 	/** Resolves exactly once, when the process closes or spawn fails. */
 	exited: Promise<void>;
 	resolveExited: () => void;
+}
+
+/**
+ * The durable half of a task record — what a later pi process needs to rebuild
+ * the table. Runtime bookkeeping (`delivery`, `observers`, promises) is
+ * deliberately absent: delivery state belongs to the process that had the
+ * report, and a restored record is never re-delivered.
+ */
+interface PersistedTask {
+	taskId: string;
+	command: string;
+	cwd: string;
+	outputFile: string;
+	startedAt: number;
+	endedAt?: number;
+	pid?: number;
+	completed: boolean;
+	exitCode: number | null;
+	signal: string | null;
+	exitUnknown?: boolean;
+	spawnError?: string;
 }
 
 const tasks = new Map<string, BgTaskState>();
 /** Background process groups to kill best-effort when the pi process exits. */
 const trackedPids = new Set<number>();
 let exitHookInstalled = false;
+/**
+ * Session whose snapshot file this process writes. Set on `session_start`; the
+ * file is per session (not per process) so a resume finds what a crash left.
+ */
+let currentSessionId: string | undefined;
+let persistTimer: ReturnType<typeof setTimeout> | undefined;
+
+function taskFilePath(sessionId: string): string {
+	return join(tmpdir(), `${TASK_FILE_PREFIX}${sessionId}.json`);
+}
+
+function serializeTask(task: BgTaskState): PersistedTask {
+	const record: PersistedTask = {
+		taskId: task.taskId,
+		command: task.command,
+		cwd: task.cwd,
+		outputFile: task.outputFile,
+		startedAt: task.startedAt,
+		completed: task.completed,
+		exitCode: task.exitCode,
+		signal: task.signal,
+	};
+	if (task.endedAt !== undefined) {
+		record.endedAt = task.endedAt;
+	}
+	if (task.pid !== undefined) {
+		record.pid = task.pid;
+	}
+	if (task.exitUnknown) {
+		record.exitUnknown = true;
+	}
+	if (task.spawnError !== undefined) {
+		record.spawnError = task.spawnError;
+	}
+	return record;
+}
+
+/**
+ * Write the snapshot NOW. Synchronous on purpose: the exit hook and
+ * `session_shutdown` run when there is no later turn of the event loop to be
+ * called back on. Never throws — a read-only tmpdir must not break a session.
+ */
+function persistNow(): void {
+	if (persistTimer) {
+		clearTimeout(persistTimer);
+		persistTimer = undefined;
+	}
+	const sessionId = currentSessionId;
+	if (!sessionId) {
+		return;
+	}
+	const file = taskFilePath(sessionId);
+	const records = [...tasks.values()]
+		.sort((a, b) => b.startedAt - a.startedAt)
+		.slice(0, MAX_PERSISTED_TASKS)
+		.map(serializeTask);
+	const body = JSON.stringify({
+		version: TASK_FILE_VERSION,
+		sessionId,
+		updatedAt: Date.now(),
+		tasks: records,
+	});
+	try {
+		const temporary = `${file}.tmp`;
+		writeFileSync(temporary, body, { mode: 0o600 });
+		// Rename rather than write in place: a process killed mid-write must leave
+		// the previous snapshot intact, not half of a new one.
+		renameSync(temporary, file);
+	} catch {
+		// Best effort: the task table is runtime state, the file only a hint for
+		// the next process. `list_tasks` still answers within this one.
+	}
+}
+
+/** Coalesce a burst of state changes into one snapshot write. */
+function schedulePersist(): void {
+	if (persistTimer) {
+		return;
+	}
+	persistTimer = setTimeout(() => {
+		persistTimer = undefined;
+		persistNow();
+	}, PERSIST_DEBOUNCE_MS);
+	// A pending snapshot must not keep the process alive on its own.
+	persistTimer.unref?.();
+}
+
+function isPersistedTask(value: unknown): value is PersistedTask {
+	if (value === null || typeof value !== "object") {
+		return false;
+	}
+	const record = value as Partial<PersistedTask>;
+	return (
+		typeof record.taskId === "string" &&
+		/^b[0-9a-f]+$/.test(record.taskId) &&
+		typeof record.command === "string" &&
+		typeof record.cwd === "string" &&
+		typeof record.outputFile === "string" &&
+		typeof record.startedAt === "number" &&
+		typeof record.completed === "boolean"
+	);
+}
+
+/**
+ * Read the snapshot a previous process left for this session. Anything that does
+ * not look like one of our records is dropped rather than trusted: this file
+ * lives in the world-writable temp dir.
+ */
+function readPersistedTasks(sessionId: string): PersistedTask[] {
+	let raw: string;
+	try {
+		raw = readFileSync(taskFilePath(sessionId), "utf8");
+	} catch {
+		return [];
+	}
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		return [];
+	}
+	const body = parsed as { version?: unknown; tasks?: unknown };
+	if (body?.version !== TASK_FILE_VERSION || !Array.isArray(body.tasks)) {
+		return [];
+	}
+	const scratch = tmpdir();
+	return body.tasks
+		.filter(isPersistedTask)
+		// Only our own log directory: a tampered path must not become a file the
+		// model is told to read.
+		.filter((record) => record.outputFile.startsWith(scratch))
+		.sort((a, b) => b.startedAt - a.startedAt)
+		.slice(0, MAX_PERSISTED_TASKS);
+}
+
+/** Whether a pid is still in the process table (EPERM means alive, not ours). */
+function pidAlive(pid: number): boolean {
+	if (!Number.isInteger(pid) || pid <= 1) {
+		return false;
+	}
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "EPERM";
+	}
+}
+
+/**
+ * Whether a live pid still runs the command it was recorded with.
+ *
+ * A pid recorded by a dead process can be recycled by anything, and acting on
+ * the new owner (a SIGKILL from `stop_task`, a `wait_task` that never settles)
+ * is worse than admitting the record is stale. `ps` is the portable-enough
+ * check: every task is spawned through a shell, so the command's first token
+ * appears in the process's command line for both `shell -c "npm run dev"` and
+ * the exec'd form `node …/npm run dev`.
+ */
+function pidMatchesCommand(pid: number, command: string): boolean {
+	const first = command.trim().split(/\s+/)[0] ?? "";
+	if (first === "") {
+		return false;
+	}
+	try {
+		const out = execFileSync("ps", ["-o", "command=", "-p", String(pid)], {
+			encoding: "utf8",
+			timeout: 2_000,
+			stdio: ["ignore", "pipe", "ignore"],
+		});
+		return out.includes(first);
+	} catch {
+		// No `ps`, or the pid is gone: do not adopt.
+		return false;
+	}
+}
 /**
  * Whether an agent run is active. `turn_end` / `agent_before_settle` fire while
  * it is true, so a completion only needs the idle wake when it is false. Kept
@@ -257,9 +516,23 @@ function ensureExitHook(): void {
 	}
 	exitHookInstalled = true;
 	process.on("exit", () => {
+		// The kill below is the last thing that will ever happen to these tasks,
+		// and their `close` events will never run: record the terminal state we
+		// are imposing, or the next process would adopt a corpse as "running".
+		const now = Date.now();
+		for (const task of tasks.values()) {
+			if (!task.completed && task.pid !== undefined && trackedPids.has(task.pid)) {
+				task.completed = true;
+				task.endedAt = now;
+				task.signal = "SIGKILL";
+				task.exitCode = null;
+			}
+		}
 		for (const pid of trackedPids) {
 			killProcessGroup(pid);
 		}
+		// Synchronous: the event loop is over, a debounced write would never run.
+		persistNow();
 	});
 }
 
@@ -271,6 +544,9 @@ function formatSeconds(ms: number): string {
 function describeExit(task: BgTaskState): string {
 	if (task.spawnError) {
 		return `failed to start: ${task.spawnError}`;
+	}
+	if (task.exitUnknown) {
+		return "is no longer running (its exit status is unknown: it was started by an earlier pi process)";
 	}
 	if (task.signal !== null) {
 		return `was stopped (signal ${task.signal})`;
@@ -577,6 +853,205 @@ function attachWait(task: BgTaskState, options: AttachOptions): Promise<WaitOutc
 
 export default function bgTasks(pi: ExtensionAPI) {
 	// ------------------------------------------------------------------
+	// Reconciling with a previous pi process (P0-1). `session_start` fires for
+	// every kind of start — including the one right after `/reload`, where the
+	// processes are still running but their `ChildProcess` handles died with the
+	// old module instance — so this is where a snapshot written earlier becomes
+	// usable task records again.
+	// ------------------------------------------------------------------
+	/** Summary of what the snapshot contained, delivered once (not per request). */
+	let startupNote: { text: string } | undefined;
+
+	function restoreTask(record: PersistedTask): BgTaskState {
+		let resolveExited = (): void => {};
+		const exited = new Promise<void>((resolve) => {
+			resolveExited = resolve;
+		});
+		const task: BgTaskState = {
+			taskId: record.taskId,
+			command: record.command,
+			cwd: record.cwd,
+			outputFile: record.outputFile,
+			startedAt: record.startedAt,
+			completed: record.completed,
+			exitCode: record.exitCode ?? null,
+			signal: record.signal ?? null,
+			// A restored terminal record was reported by the process that owned it;
+			// re-delivering that report now would be a stale wake. Its state is
+			// visible through `list_tasks`, which is the authoritative view.
+			delivery: record.completed ? "confirmed" : "none",
+			panelStarted: false,
+			observers: 0,
+			adopted: true,
+			exited,
+			resolveExited: () => resolveExited(),
+		};
+		if (record.endedAt !== undefined) {
+			task.endedAt = record.endedAt;
+		}
+		if (record.pid !== undefined) {
+			task.pid = record.pid;
+		}
+		if (record.exitUnknown) {
+			task.exitUnknown = true;
+		}
+		if (record.spawnError !== undefined) {
+			task.spawnError = record.spawnError;
+		}
+		return task;
+	}
+
+	/**
+	 * Poll an adopted task's pid: an adopted task has no `ChildProcess`
+	 * (`close` event) left to fire, so its exit has to be discovered. Reported as
+	 * an unknown status — nobody can know the code of a process that was reaped
+	 * while no pi process was watching it.
+	 */
+	function watchAdopted(task: BgTaskState): void {
+		const pid = task.pid;
+		if (pid === undefined) {
+			return;
+		}
+		const timer = setInterval(() => {
+			if (task.completed) {
+				clearInterval(timer);
+				return;
+			}
+			if (pidAlive(pid)) {
+				return;
+			}
+			clearInterval(timer);
+			task.adoptPoll = undefined;
+			// With a call attached, that call owns the account of the exit (it is
+			// the one that signalled); only an unobserved disappearance is unknown.
+			if (task.observers === 0) {
+				task.exitUnknown = true;
+			}
+			finishTask(task, null, null);
+		}, ADOPT_POLL_MS);
+		timer.unref?.();
+		task.adoptPoll = timer;
+	}
+
+	function reconcileSession(ctx: ExtensionContext): void {
+		const sessionId = ctx.sessionManager.getSessionId();
+		if (!sessionId || sessionId === currentSessionId) {
+			return;
+		}
+		if (currentSessionId !== undefined) {
+			// Switching sessions keeps the process-level tasks; flush them under the
+			// session we are leaving before the writer moves to the new file.
+			persistNow();
+		}
+		currentSessionId = sessionId;
+		const records = readPersistedTasks(sessionId);
+		if (records.length === 0) {
+			return;
+		}
+
+		const now = Date.now();
+		const rows: string[] = [];
+		let adopted = 0;
+		let restored = 0;
+		let stale = 0;
+		for (const record of records) {
+			if (tasks.has(record.taskId)) {
+				continue;
+			}
+			const task = restoreTask(record);
+			tasks.set(task.taskId, task);
+			const command = record.command.replace(/\s+/g, " ").trim();
+			if (record.completed) {
+				restored += 1;
+				const span = formatSeconds((task.endedAt ?? task.startedAt) - task.startedAt);
+				rows.push(`- ${task.taskId} ("${command}") ${describeExit(task)} after ${span}. Output: ${task.outputFile}`);
+				continue;
+			}
+			const adoptable =
+				record.pid !== undefined &&
+				record.startedAt > now - MAX_ADOPT_AGE_MS &&
+				pidAlive(record.pid) &&
+				pidMatchesCommand(record.pid, record.command);
+			if (!adoptable) {
+				stale += 1;
+				task.completed = true;
+				task.exitUnknown = true;
+				task.delivery = "confirmed";
+				rows.push(
+					`- ${task.taskId} ("${command}") was recorded as running, but pid ${record.pid ?? "?"} is gone or no longer runs it, so its exit status is unknown. Output: ${task.outputFile}`,
+				);
+				continue;
+			}
+			adopted += 1;
+			task.adopted = true;
+			watchAdopted(task);
+			rows.push(
+				`- ${task.taskId} ("${command}") is STILL RUNNING (pid ${record.pid}, started ${formatSeconds(now - record.startedAt)} ago). Output: ${task.outputFile}`,
+			);
+			// Give the human a panel row too: `x` must be able to stop a task that
+			// outlived the process that started it.
+			task.panelStarted = true;
+			reportPanel(task);
+		}
+		if (rows.length === 0) {
+			return;
+		}
+
+		const counts = [
+			adopted > 0 ? `${adopted} still running` : "",
+			restored > 0 ? `${restored} already finished` : "",
+			stale > 0 ? `${stale} unverifiable` : "",
+		].filter((part) => part !== "");
+		const shown = rows.slice(0, MAX_LISTED_TASKS);
+		const hidden =
+			rows.length > shown.length ? `\n(${rows.length - shown.length} older record(s) not shown; list_tasks sees all of them.)` : "";
+		startupNote = {
+			text:
+				`[SYSTEM NOTIFICATION - NOT USER INPUT]\n[Background bash tasks recorded by an earlier pi process in this session: ${rows.length} — ${counts.join(", ")}]\n` +
+				`${shown.join("\n")}${hidden}\n` +
+				"This is an automated startup report, not a message from the user. These tasks were started before this process: wait_task, stop_task and list_tasks work on them exactly as on a task you start now, and an adopted task's exit is reported when its pid disappears. The exit status of a task that vanished while no pi process was watching it is unknown. Do not start a second copy of something listed above as still running.",
+		};
+		try {
+			pi.sendMessage({ customType: CUSTOM_TYPE, content: startupNote.text, display: false }, undefined);
+		} catch {
+			// Not deliverable yet: the `context` handler injects it before the first
+			// request instead (the same fallback the wake reports use).
+		}
+		schedulePersist();
+	}
+
+	/**
+	 * Push the startup summary into the request about to be sent, unless it is
+	 * already there (the `sendMessage` on session_start landed). Exactly one of
+	 * the two channels carries it.
+	 */
+	function applyStartupNote(event: { messages: unknown[] }): boolean {
+		if (!startupNote) {
+			return false;
+		}
+		const note = startupNote;
+		startupNote = undefined;
+		if (event.messages.some((message) => messageText(message) === note.text)) {
+			return false;
+		}
+		event.messages.push({ role: "user", content: note.text, timestamp: Date.now() });
+		return true;
+	}
+
+	pi.on("session_start", (_event, ctx) => {
+		reconcileSession(ctx);
+		return undefined;
+	});
+
+	pi.on("session_shutdown", () => {
+		// The instance is going away. On `quit` the exit hook flushes again after
+		// recording the kills it is about to issue; on `reload` the processes stay
+		// alive and their records stay "running" for the replacement to adopt.
+		persistNow();
+		return undefined;
+	});
+
+	// ------------------------------------------------------------------
 	// Delivery receipt + last-resort injector. `context` is the exact message
 	// list about to be sent to the model, so it settles delivery truthfully:
 	// the text we handed over earlier is either in there (confirmed) or it is
@@ -586,9 +1061,10 @@ export default function bgTasks(pi: ExtensionAPI) {
 	// deep copy; nothing here is persisted.
 	// ------------------------------------------------------------------
 	pi.on("context", (event) => {
+		const injectedStartup = applyStartupNote(event);
 		const outstanding = pendingReports();
 		if (outstanding.length === 0) {
-			return undefined;
+			return injectedStartup ? { messages: event.messages } : undefined;
 		}
 		const texts = new Set<string>();
 		for (const message of event.messages) {
@@ -760,6 +1236,10 @@ export default function bgTasks(pi: ExtensionAPI) {
 			trackedPids.add(child.pid);
 			ensureExitHook();
 		}
+		// Synchronous, not debounced, and AFTER the pid is known: the record that
+		// matters most is the one a crash leaves behind, and a task can start and
+		// die inside the coalescing window. Finishes are coalesced instead.
+		persistNow();
 		child.stdout?.on("data", (data: Buffer) => {
 			log.write(data);
 		});
@@ -805,6 +1285,10 @@ export default function bgTasks(pi: ExtensionAPI) {
 		if (task.panelStarted) {
 			reportPanel(task);
 		}
+		if (task.adoptPoll) {
+			clearInterval(task.adoptPoll);
+			task.adoptPoll = undefined;
+		}
 		if (task.observers > 0) {
 			// An attached call will return this terminal state itself and mark the
 			// report confirmed. Leave it pending rather than "consumed": a call
@@ -816,6 +1300,7 @@ export default function bgTasks(pi: ExtensionAPI) {
 			flushPending({ wake: true });
 		}
 		task.resolveExited();
+		schedulePersist();
 	}
 
 	/** Outstanding reports: completed and not yet confirmed in model context. */
@@ -940,6 +1425,9 @@ export default function bgTasks(pi: ExtensionAPI) {
 			outputFile: task.outputFile,
 			exitCode: task.exitCode,
 			signal: task.signal,
+			// The message is stamped when it is sent, so an adopted task would
+			// otherwise render as if it had just started.
+			startedAt: task.startedAt,
 		} satisfies BgTaskDetails;
 		try {
 			pi.sendMessage({
@@ -1419,6 +1907,13 @@ export default function bgTasks(pi: ExtensionAPI) {
 			const elapsed = formatSeconds((task.endedAt ?? Date.now()) - task.startedAt);
 
 			if (task.completed) {
+				// An adopted task has no ChildProcess to report the signal it died
+				// from; the one this call sent is the only truthful account, and the
+				// liveness poll cannot know it.
+				if (task.adopted && task.signal === null) {
+					task.signal = escalated ? "SIGKILL" : "SIGTERM";
+					task.exitUnknown = undefined;
+				}
 				// This result carries the terminal state: suppress the wake report.
 				markConfirmed(task);
 				const how = escalated ? "was SIGKILLed (it ignored SIGTERM)" : describeExit(task);
@@ -1478,7 +1973,11 @@ export default function bgTasks(pi: ExtensionAPI) {
 		if (command.length > LISTED_COMMAND_WIDTH - 3) {
 			command = `${command.substring(0, LISTED_COMMAND_WIDTH - 3)}...`;
 		}
-		const state = task.completed ? describeExit(task) : "running";
+		const state = task.completed
+			? describeExit(task)
+			: task.adopted
+				? "running (adopted from an earlier pi process)"
+				: "running";
 		return `- ${task.taskId} [${state}] ${elapsed} "${command}" (output: ${task.outputFile})`;
 	}
 
@@ -1486,7 +1985,7 @@ export default function bgTasks(pi: ExtensionAPI) {
 		name: "list_tasks",
 		label: "List background tasks",
 		description:
-			"List the background bash tasks of this pi process: task id, state, elapsed time, command and output file. Use it to find the id of a task you started earlier in the session (before stopping it with stop_task or waiting on it with wait_task) instead of guessing ids.",
+			"List the background bash tasks of this session: task id, state, elapsed time, command and output file. It also lists tasks an earlier pi process left behind (they are marked as adopted, and their exit status may be unknown). Use it to find the id of a task you started earlier in the session (before stopping it with stop_task or waiting on it with wait_task) instead of guessing ids.",
 		promptSnippet: "List this session's background bash tasks with their ids and states",
 		promptGuidelines: [
 			"Call list_tasks when you need a task id you no longer have in front of you; do not guess ids — wait_task and stop_task reject unknown ones.",
@@ -1506,8 +2005,8 @@ export default function bgTasks(pi: ExtensionAPI) {
 						{
 							type: "text" as const,
 							text: params.include_finished
-								? "No background tasks in this pi process. Start one with bash(run_in_background: true)."
-								: "No running background tasks in this pi process.",
+								? "No background tasks in this session. Start one with bash(run_in_background: true)."
+								: "No running background tasks in this session.",
 						},
 					],
 					details: { total: 0, running: 0, listed: 0 },

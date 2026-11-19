@@ -129,6 +129,31 @@ describe("pi.tasks handle_event", function()
         assert.is_true(t.start_time >= before, "start_time must come from vim.uv.now()")
     end)
 
+    it("prefers the payload's startedAt over the message timestamp", function()
+        -- An adopted task — a snapshot record from an earlier pi process,
+        -- reported again on session start — is stamped with the moment it was
+        -- REPORTED. Its real start is in the payload; without this the panel's
+        -- clock restarts at zero for a process that has run for minutes.
+        local started_at = os.time() * 1000 - 180000
+        Tasks.handle_event(started_ev("a", os.time() * 1000, { startedAt = started_at }))
+        local t = Tasks.get("a")
+        local expected_age = 180000
+        local age = vim.uv.now() - t.start_time
+        assert.is_true(
+            math.abs(age - expected_age) <= 2000,
+            "start_time must come from details.startedAt, got age " .. age
+        )
+
+        -- A terminal event for a task the frontend never saw start is
+        -- synthesized from the same fields, so it must agree.
+        Tasks.handle_event(ev("completed", { taskId = "b", startedAt = started_at }, os.time() * 1000))
+        local synthetic_age = vim.uv.now() - Tasks.get("b").start_time
+        assert.is_true(
+            math.abs(synthetic_age - expected_age) <= 2000,
+            "a synthesized record must use details.startedAt too, got age " .. synthetic_age
+        )
+    end)
+
     it("rebases Unix-epoch timestamps onto the uv clock", function()
         -- Core stamps custom messages with Date.now(); storing it verbatim
         -- makes age math (uv.now() - end_time) go negative and clamp to zero.

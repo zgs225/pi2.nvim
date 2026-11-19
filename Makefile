@@ -5,6 +5,7 @@
 #   make e2e-reaper — real-pi e2e: subagent idle reaper + max_children cap (needs pi binary + provider; not CI)
 #   make e2e-bg-delivery — real-pi e2e: background bash completion delivery into agent context (needs pi + provider; not CI)
 #   make e2e-bg-stop — real-pi e2e: stop_task kills the process group, list_tasks sees it (needs pi; fake provider, no account)
+#   make e2e-bg-reconcile — real-pi e2e: the task table survives a SIGKILLed pi and is adopted by the next run (needs pi; fake provider)
 #   make e2e-subagent-failure — real-pi e2e: a failed child run reaches the parent as a failed item (needs pi; not CI)
 #   make smoke   — headless end-to-end smoke check (loads the user config, opens the chat)
 #   make format  — reformat lua/ and tests/ in place with stylua
@@ -21,7 +22,7 @@ MIN_INIT := tests/minimal_init.lua
 STYLUA_BIN ?= stylua
 LUA_LS_BIN ?= lua-language-server
 
-.PHONY: test smoke format style lint docs-links e2e e2e-reaper e2e-bg-delivery e2e-bg-stop e2e-subagent-failure
+.PHONY: test smoke format style lint docs-links e2e e2e-reaper e2e-bg-delivery e2e-bg-stop e2e-bg-reconcile e2e-subagent-failure
 
 test:
 	PLENARY_PATH=$(PLENARY_PATH) $(NVIM_BIN) --headless -u $(MIN_INIT) \
@@ -49,6 +50,11 @@ e2e-bg-delivery:
 # real extension against a real process tree. Needs the pi binary only.
 e2e-bg-stop:
 	$(NVIM_BIN) --headless -u $(MIN_INIT) -l scripts/e2e/bg_tasks_stop.lua
+
+# Real-pi e2e for the task-table snapshot: run pi, start a background task, SIGKILL
+# pi, then start pi again on the same session and let it adopt the orphan.
+e2e-bg-reconcile:
+	$(NVIM_BIN) --headless -u $(MIN_INIT) -l scripts/e2e/bg_tasks_reconcile.lua
 
 # Real-pi e2e for a failed child run (quota/auth/network error) surfacing as a
 # failed batch item with the provider reason instead of an empty `ok`. Uses a

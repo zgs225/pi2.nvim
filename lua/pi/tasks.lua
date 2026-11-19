@@ -291,6 +291,12 @@ function M.handle_event(ev, session_id, tab)
         return false
     end
     local ts = normalize_ts(ev.timestamp)
+    -- An adopted task (one a previous pi process started, reported again on
+    -- session start) would otherwise be timestamped at the moment the message
+    -- was sent, so the panel's clock would restart at zero for a process that
+    -- has been running for minutes. The payload's own `startedAt` wins.
+    local started = non_null(d.startedAt)
+    local start_ts = type(started) == "number" and started > 0 and normalize_ts(started) or ts
 
     if d.kind == "started" then
         -- A fresh start for an id with a stop in flight replaces the record.
@@ -300,7 +306,7 @@ function M.handle_event(ev, session_id, tab)
             id = id,
             command = non_null(d.command) or "",
             status = "running",
-            start_time = ts,
+            start_time = start_ts,
             pid = non_null(d.pid),
             output_file = merge_output_file(nil, d.outputFile),
             session_id = session_id,
@@ -324,7 +330,7 @@ function M.handle_event(ev, session_id, tab)
                 id = id,
                 command = non_null(d.command) or "",
                 status = "running",
-                start_time = ts,
+                start_time = start_ts,
                 session_id = session_id,
                 tab = tab,
             }
