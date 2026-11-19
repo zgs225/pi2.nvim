@@ -270,6 +270,7 @@ require("pi").setup({
             height = 0.75,            -- lines (>=1) or fraction of editor height (<1, default 0.75)
             border = "rounded",       -- float border style (default "rounded")
             statusline = true,        -- show statusline in float footer (context, model, thinking level)
+            worktree = true,          -- show which checkout the viewed session ran in as a `󰙅 <name>` footer badge (linked worktrees only; `statusline = false` hides it too)
             todo = {
                 enabled = true,       -- show the todo footer chunk and the `T` panel
                 auto_open = false,    -- auto-open the panel when todos first appear (empty → non-empty)

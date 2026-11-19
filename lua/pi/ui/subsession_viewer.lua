@@ -24,6 +24,7 @@ local TodoToolUi = require("pi.todo.tool_ui")
 ---@field height? number Height in lines (>=1) or fraction of editor height (<1)
 ---@field border? string|string[] Float border style
 ---@field statusline? boolean Whether to show statusline in viewer footer
+---@field worktree? string Display name of the worktree the viewed session ran in (the `:PiSessions` row's own label). nil falls back to detecting the checkout from the session cwd
 
 ---@class pi.SubsessionViewerStatus
 ---@field model_id string?
@@ -32,6 +33,7 @@ local TodoToolUi = require("pi.todo.tool_ui")
 ---@field model_reasoning boolean?
 ---@field thinking_level string?
 ---@field context_tokens integer?
+---@field worktree_name? string Linked worktree the viewed session ran in; renders as the `󰙅 name` footer badge
 
 -- Module state
 ---@type integer?
@@ -279,6 +281,34 @@ local function build_todo_chunk(details)
     return { ("○ %d/%d"):format(completed, total), "PiTodoPending" }
 end
 
+-- Nerd-font worktree glyph, the same one the `:PiSessions` group header, a
+-- sub-session row's subtitle and the chat title badge carry.
+local WORKTREE_GLYPH = "󰙅"
+
+--- Whether the footer carries the worktree badge (`subagent.viewer.worktree`).
+--- Default on: the row already names its checkout, so a viewer that hides it
+--- again would silently drop information the keypress carried in.
+---@return boolean
+local function viewer_worktree_enabled()
+    local viewer_cfg = (Config.options.subagent or {}).viewer or {}
+    return viewer_cfg.worktree ~= false
+end
+
+--- Footer badge naming the checkout the viewed session ran in: `󰙅 <name>`.
+--- The title only carries the display name and the status, so without this the
+--- viewer of a worktree session — or of a child *assigned* another checkout —
+--- says nothing about which working tree the conversation actually visited.
+--- Styled like the `:PiSessions` worktree header so both read as the same fact.
+---@param status pi.SubsessionViewerStatus
+---@return string[]? chunk { text, highlight }
+local function build_worktree_chunk(status)
+    local name = status.worktree_name
+    if type(name) ~= "string" or name == "" then
+        return nil
+    end
+    return { WORKTREE_GLYPH .. " " .. name, "PiSessionsListWorktree" }
+end
+
 --- Build statusline chunks and plain text for subsession viewer footer.
 ---@param status pi.SubsessionViewerStatus
 ---@return string[][]? chunks
@@ -289,6 +319,15 @@ local function format_statusline(status)
     end
 
     local items = {}
+    -- Which checkout comes first: it is the one part of the footer that never
+    -- changes while the session streams, so it stays scannable at a fixed spot
+    -- however the token count and model move.
+    if viewer_worktree_enabled() then
+        local w = build_worktree_chunk(status)
+        if w then
+            items[#items + 1] = w
+        end
+    end
     local c = build_context_chunk(status)
     if c then
         items[#items + 1] = c
@@ -583,6 +622,40 @@ local function recorded_worktree_cwd(entry)
         return path
     end
     return nil
+end
+
+--- Worktree the viewer badges in its footer, resolved once when the float
+--- opens (never from the statusline rebuild path, which runs on every streamed
+--- event).
+---
+--- The row's own label wins: `:PiSessions` already resolved it, an assigned
+--- child checkout included. Otherwise the checkout is detected from the cwd the
+--- session actually ran in (`Worktree.detect` is a cached, filesystem-only read
+--- — no git subprocess — so one call per open is free). Only a *linked*
+--- worktree is badged: a session in the repository's main checkout gets no
+--- badge, exactly like the chat title's.
+---@param opts pi.SubsessionViewerOpts
+---@param cwd string? workspace the viewed session ran in
+---@return string?
+local function resolve_worktree_name(opts, cwd)
+    if type(opts.worktree) == "string" and opts.worktree ~= "" then
+        return opts.worktree
+    end
+    if type(cwd) ~= "string" or cwd == "" then
+        return nil
+    end
+    local loaded, Worktree = pcall(require, "pi.worktree")
+    if not loaded or type(Worktree) ~= "table" or type(Worktree.detect) ~= "function" then
+        return nil
+    end
+    local ok, info = pcall(Worktree.detect, cwd)
+    if not ok or type(info) ~= "table" or info.kind ~= "linked" then
+        return nil
+    end
+    if type(info.name) ~= "string" or info.name == "" then
+        return nil
+    end
+    return info.name
 end
 
 ---@param path string
@@ -922,6 +995,7 @@ function M.close()
         model_reasoning = nil,
         thinking_level = nil,
         context_tokens = nil,
+        worktree_name = nil,
     }
 
     if viewer_win == nil and viewer_history == nil then
@@ -1217,6 +1291,7 @@ function M.open(child_id, opts)
         model_reasoning = nil,
         thinking_level = nil,
         context_tokens = nil,
+        worktree_name = nil,
     }
 
     if entry and entry.config then
@@ -1307,6 +1382,11 @@ function M.open(child_id, opts)
         viewer_status.model_context_window =
             resolve_context_window(viewer_status.model_id, viewer_status.model_provider)
     end
+
+    -- Worktree badge: resolved once, from the row's own label or the checkout
+    -- the session actually ran in (the transcript cwd is the freshest value —
+    -- an owned child checkout can outlive the manifest row's record).
+    viewer_status.worktree_name = resolve_worktree_name(opts, session_cwd)
 
     -- Todo snapshot for the footer chunk and the `T` panel: the per-session
     -- mirror for a live session, the decoded JSONL entries otherwise.

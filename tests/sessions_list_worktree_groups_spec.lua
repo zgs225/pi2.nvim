@@ -579,4 +579,42 @@ describe(":PiSessions worktree grouping", function()
             end)
         end)
     end)
+
+    describe("preview", function()
+        it("forwards the row's worktree label to the viewer", function()
+            local main = fake_session({ id = "A", tab = vim.api.nvim_get_current_tabpage(), cwd = "/repo/main" })
+            local linked = fake_session({ id = "B", tab = vim.api.nvim_get_current_tabpage() + 1, cwd = "/repo/wt" })
+
+            local real_viewer = package.loaded["pi.ui.subsession_viewer"]
+            local opened = {}
+            package.loaded["pi.ui.subsession_viewer"] = {
+                open = function(id, opts)
+                    opened[#opened + 1] = { id = id, opts = opts }
+                end,
+            }
+            local ok, err = pcall(function()
+                with_manager({ main, linked }, function()
+                    SessionList.open()
+                    -- rows: header(/repo/main), A, header(/repo/wt), B (names are
+                    -- fetched asynchronously, so pin the headers instead).
+                    local lines = buffer_lines()
+                    assert.are.equal(4, #lines)
+                    assert.is_truthy(lines[1]:find(GLYPH .. " main", 1, true))
+                    assert.is_truthy(lines[3]:find(GLYPH .. " wt", 1, true))
+                    vim.api.nvim_win_set_cursor(0, { 4, 0 })
+                    press_key("p")
+                end)
+            end)
+            package.loaded["pi.ui.subsession_viewer"] = real_viewer
+            if not ok then
+                error(err)
+            end
+
+            assert.are.equal(1, #opened)
+            assert.are.equal("B", opened[1].id)
+            -- The label the row already resolved (a grouped row inherits its
+            -- group's name), not a re-detection the viewer would have to do.
+            assert.are.equal("wt", opened[1].opts.worktree)
+        end)
+    end)
 end)
