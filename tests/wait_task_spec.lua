@@ -512,4 +512,52 @@ describe("bg-tasks extension contract", function()
         local block_at = assert(wake:find("wrapReminder(", 1, true), "buildWakeNote must open the block")
         assert.is_true(banner_at < block_at, "the banner must precede the <system-reminder> block")
     end)
+
+    it("confirms a fallback injection only after a turn completes", function()
+        local src = read_extension()
+        -- The injected text lives in a per-request deep copy that is never
+        -- persisted, so being injected proves nothing: a request that fails
+        -- takes the report with it. Confirming at injection time loses it.
+        local ctx_start = assert(src:find('pi.on("context"', 1, true), "the context handler must exist")
+        local ctx_end = src:find("\n\tpi.on(", ctx_start + 1, true) or #src
+        local ctx_handler = src:sub(ctx_start, ctx_end)
+        local inject_at =
+            assert(ctx_handler:find("buildBatchNote(missing)", 1, true), "the handler must inject the missing reports")
+        assert.is_truthy(ctx_handler:find('markSent(task, "fallback", text)', 1, true), "the injection is recorded")
+        assert.is_nil(
+            ctx_handler:sub(inject_at):find("markConfirmed(", 1, true),
+            "the fallback must not confirm an injection: the request may still fail"
+        )
+        -- The one legitimate confirm left in the handler is the receipt: the
+        -- exact text observed in the outgoing payload.
+        local _, confirms = ctx_handler:gsub("markConfirmed%(", "")
+        assert.are.equal(1, confirms, "only the observed-text receipt confirms")
+        assert.is_true(
+            assert(ctx_handler:find("texts.has(task.sentText)", 1, true)) < inject_at,
+            "the receipt must be the observed-text branch, not the injector"
+        )
+
+        -- `turn_end` carries the outcome of the request the injection went into.
+        local turn_start = assert(src:find('pi.on("turn_end"', 1, true), "turn_end must be registered")
+        local turn_end = src:find("\n\tpi.on(", turn_start + 1, true) or #src
+        local turn_handler = src:sub(turn_start, turn_end)
+        local outcome_at = assert(
+            turn_handler:find('event.outcome === "completed"', 1, true),
+            "confirmation must be gated on a completed turn"
+        )
+        local confirm_at = assert(
+            turn_handler:find("confirmFallbackReports()", 1, true),
+            "the completed turn must confirm the fallback reports"
+        )
+        assert.is_true(outcome_at < confirm_at, "the outcome check must gate the confirmation")
+        assert.is_truthy(turn_handler:find("deliverAtBoundary(event)", 1, true), "the boundary still delivers")
+
+        -- The helper must be narrow: only a report the fallback carried.
+        local fn_start = assert(src:find("function confirmFallbackReports", 1, true), "helper must exist")
+        local fn_end = src:find("\n\tfunction ", fn_start + 1, true) or #src
+        local body = src:sub(fn_start, fn_end)
+        assert.is_truthy(body:find('task.delivery === "sent"', 1, true), "only an unconfirmed report qualifies")
+        assert.is_truthy(body:find('task.sentVia === "fallback"', 1, true), "only a fallback delivery qualifies")
+        assert.is_truthy(body:find("markConfirmed(task)", 1, true), "the helper confirms it")
+    end)
 end)

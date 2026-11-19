@@ -47,7 +47,12 @@
  *     handed over is searched for in the message list about to be sent, which
  *     confirms it, and anything still missing is injected before that request.
  *     This is what makes an aborted run cost nothing — the report survives in
- *     the transcript (stage 2) and is injected on the next turn (stage 3);
+ *     the transcript (stage 2) and is injected on the next turn (stage 3). The
+ *     injection is NOT itself a delivery: `event.messages` is a per-request deep
+ *     copy that is never persisted, so a request that fails takes the injected
+ *     text with it. A fallback report therefore stays `sent` and is confirmed
+ *     only by a `turn_end` whose outcome is `completed` — a failed or aborted
+ *     request leaves it `sent`, and the next attempt injects it again;
  *  4. `agent_settled` (with `aborted !== true`) flushes reports that finished
  *     after the last boundary, because nothing else would wake the agent.
  *
@@ -134,7 +139,8 @@
  *
  * A load-time `context` handler is the fallback injector for wake reports whose
  * send threw (stale extension ctx); it reads the module-level task table and
- * marks deliveries so nothing is injected twice.
+ * marks what it injects, so an injection is repeated only when the request it
+ * went into failed (an injection is not durable — see stage 3 above).
  *
  * A process.on("exit") hook SIGKILLs every tracked process group best-effort,
  * mirroring core's killTrackedDetachedChildren (that helper is not exported
@@ -1292,9 +1298,11 @@ export default function bgTasks(pi: ExtensionAPI) {
 	// list about to be sent to the model, so it settles delivery truthfully:
 	// the text we handed over earlier is either in there (confirmed) or it is
 	// not (dropped by an abort, a discarded steering queue, or a stale extension
-	// ctx — inject it now). Nothing is ever injected twice, because a task stops
-	// being a candidate as soon as its text is observed. `event.messages` is a
-	// deep copy; nothing here is persisted.
+	// ctx — inject it now). A task stops being a candidate as soon as its text is
+	// observed in the payload, so a delivered report is never injected twice; a
+	// report injected into a request that then FAILED is still outstanding, and
+	// injecting it again into the retry is exactly the point. `event.messages` is
+	// a deep copy; nothing here is persisted.
 	// ------------------------------------------------------------------
 	pi.on("context", (event) => {
 		const injectedStartup = applyStartupNote(event);
@@ -1338,9 +1346,10 @@ export default function bgTasks(pi: ExtensionAPI) {
 		const text = buildBatchNote(missing);
 		event.messages.push({ role: "user", content: text, timestamp: Date.now() });
 		for (const task of missing) {
-			// Injected into THIS request: the text is by definition delivered.
+			// The injection lives in a per-request deep copy that is never
+			// persisted, so handing it over proves nothing: the report stays
+			// `sent` until a completed `turn_end` shows the request arrived.
 			markSent(task, "fallback", text);
-			markConfirmed(task);
 		}
 		return { messages: event.messages };
 	});
@@ -1358,7 +1367,16 @@ export default function bgTasks(pi: ExtensionAPI) {
 		return undefined;
 	});
 
-	pi.on("turn_end", (event) => deliverAtBoundary(event));
+	pi.on("turn_end", (event) => {
+		// The request this turn belongs to finished, so a report the `context`
+		// fallback injected into it was actually seen. Any other outcome means the
+		// request died (provider error, abort) and took the injection with it;
+		// the report stays `sent` and the next attempt injects it again.
+		if (event.outcome === "completed") {
+			confirmFallbackReports();
+		}
+		return deliverAtBoundary(event);
+	});
 
 	pi.on("agent_before_settle", (event) => deliverAtBoundary(event));
 
@@ -1581,10 +1599,26 @@ export default function bgTasks(pi: ExtensionAPI) {
 
 	/**
 	 * Stop delivering this report. Set when the text was observed in a `context`
-	 * payload, injected there, or carried by a tool result — never at send time.
+	 * payload or carried by a tool result — never at send time, and never merely
+	 * because it was injected (an injection is not durable).
 	 */
 	function markConfirmed(task: BgTaskState): void {
 		task.delivery = "confirmed";
+	}
+
+	/**
+	 * Confirm reports that only the `context` fallback has carried so far. Called at
+	 * a `turn_end` whose outcome is `completed`: that request — which is the one the
+	 * injection was added to — finished, so the model saw the text. An `error` or
+	 * `aborted` outcome leaves the report `sent` and the next attempt injects it
+	 * again, because nothing about that request survives.
+	 */
+	function confirmFallbackReports(): void {
+		for (const task of tasks.values()) {
+			if (task.delivery === "sent" && task.sentVia === "fallback") {
+				markConfirmed(task);
+			}
+		}
 	}
 
 	/**
