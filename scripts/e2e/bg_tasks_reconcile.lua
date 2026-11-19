@@ -6,10 +6,11 @@
 --   run A  bash(run_in_background: true) starts a shell plus a long-lived
 --          grandchild, then the transcript settles. The pi process is then
 --          SIGKILLed — no exit hook, so the detached process tree survives and
---          the snapshot file still says "running".
---   run B  starts on the same session. It must reconcile that snapshot:
+--          the transcript still says "running".
+--   run B  starts on the same session. It must fold that transcript:
 --
---   A1 the snapshot file exists in tmpdir and records the task as running
+--   A1 the transcript holds a `pi2_bg_task` started record for the task, owned
+--      by this session, with no terminal record after it
 --   A2 the orphan tree (shell + grandchild) is alive after the kill — the
 --      thing the snapshot is supposed to describe
 --   A3 run B's FIRST provider request already carries the leftover summary,
@@ -18,8 +19,8 @@
 --   A5 stop_task works on it: the whole group dies
 --   A6 the exit the stop causes is carried by its own tool result — no wake
 --      report for an adopted task
---   A7 the summary is delivered exactly once (not echoed per request) and the
---      snapshot ends up recording the task as completed
+--   A7 the summary is delivered exactly once (not echoed per request), the
+--      transcript ends up recording the stop, and NOTHING is written to tmpdir
 --
 -- Needs the pi binary, nothing else (the provider is fake). NOT part of
 -- `make test`/CI:
@@ -35,8 +36,6 @@ local RUN_ROOT = vim.fn.tempname() .. "-bg-reconcile"
 
 local PROVIDER = "e2ereconcile"
 local MODEL_ID = "e2e-model"
---- Unique per run: the snapshot file is keyed by session id, so a leftover
---- file from an earlier run must not be mistaken for this run's snapshot.
 local SESSION_ID = ("e2e-bg-reconcile-%d"):format(uv.hrtime() % 1000000)
 
 io.stdout:setvbuf("no")
@@ -455,27 +454,36 @@ local function transcript(session_dir)
     return table.concat(out, "\n")
 end
 
---- Snapshot files our extension has written, by absolute path.
----@return table<string, boolean>
-local function task_files()
-    local found = {}
-    for _, name in ipairs(vim.fn.readdir(uv.os_tmpdir())) do
-        if name:match("^pi%-bash%-tasks%-.*%.json$") then
-            found[uv.os_tmpdir() .. "/" .. name] = true
+--- The single session file a run left in its session dir.
+---@param session_dir string
+---@return string
+local function session_file(session_dir)
+    for _, name in ipairs(vim.fn.readdir(session_dir)) do
+        if name:match("%.jsonl$") then
+            return session_dir .. "/" .. name
         end
     end
-    return found
+    error("no session file in " .. session_dir, 0)
 end
 
----@param before table<string, boolean>
----@return string
-local function new_task_file(before)
-    for path in pairs(task_files()) do
-        if not before[path] then
-            return path
+--- Append one entry to a session file the way pi would (chained to the last id).
+---@param path string
+---@param entry table
+local function append_session_entry(path, entry)
+    local body = read_file(path) or ""
+    local last_id = ""
+    for line in body:gmatch("[^\n]+") do
+        local ok, decoded = pcall(vim.json.decode, line)
+        if ok and type(decoded) == "table" and type(decoded.id) == "string" then
+            last_id = decoded.id
         end
     end
-    error("the extension wrote no task snapshot to tmpdir", 0)
+    entry.id = entry.id or ("e2e" .. tostring(uv.hrtime()):sub(-8))
+    entry.parentId = last_id ~= "" and last_id or nil
+    entry.timestamp = entry.timestamp or os.date("!%Y-%m-%dT%H:%M:%S.000Z")
+    local f = assert(io.open(path, "a"))
+    f:write(vim.json.encode(entry) .. "\n")
+    f:close()
 end
 
 -- ---------------------------------------------------------------------------
@@ -492,6 +500,13 @@ local function main()
     vim.env.PI_CODING_AGENT_DIR = agent_dir
     vim.env.PI_OFFLINE = "1"
 
+    local STRAY_BEFORE = 0
+    for _, name in ipairs(vim.fn.readdir(uv.os_tmpdir())) do
+        if name:match("^pi%-bash%-tasks%-.*%.json$") then
+            STRAY_BEFORE = STRAY_BEFORE + 1
+        end
+    end
+
     local provider = start_fake_provider(gc_path)
     local addr = provider.server:getsockname()
     local port = type(addr) == "table" and addr.port or nil
@@ -500,7 +515,6 @@ local function main()
     step(("fake provider on 127.0.0.1:%d"):format(port))
 
     -- ---------------- run A: start a task, then die without a shutdown -----
-    local snapshots_before = task_files()
     local backend_a = start_backend(session_dir, cwd, SESSION_ID)
     pin_model(backend_a)
     run_prompt(backend_a, "Start the server in the background.", 180000)
@@ -515,19 +529,29 @@ local function main()
         )
     )
 
-    local snapshot = new_task_file(snapshots_before)
-    local snapshot_body = read_file(snapshot) or ""
+    local sfile = session_file(session_dir)
+    local sbody = read_file(sfile) or ""
     check(
-        snapshot_body:find(provider.task_id or "", 1, true) ~= nil,
-        "A1 the snapshot records the task",
-        { path = snapshot }
+        sbody:find('"customType":"pi2_bg_task"', 1, true) ~= nil,
+        "A1 the transcript carries a bg-task record",
+        { path = sfile }
     )
     check(
-        snapshot_body:find('"completed":false', 1, true) ~= nil,
-        "A1 the snapshot records it as still running",
-        { path = snapshot, body = snapshot_body:sub(1, 400) }
+        sbody:find('"taskId":"' .. (provider.task_id or "") .. '"', 1, true) ~= nil,
+        "A1 the transcript records the task",
+        { path = sfile }
     )
-    step("A1 snapshot " .. vim.fn.fnamemodify(snapshot, ":t"))
+    check(
+        sbody:find('"sessionId":"' .. SESSION_ID .. '"', 1, true) ~= nil,
+        "A1 the record names its owning session",
+        { body = sbody:sub(1, 800) }
+    )
+    check(
+        sbody:find('"kind":"stopped"', 1, true) == nil and sbody:find('"kind":"completed"', 1, true) == nil,
+        "A1 no terminal record yet: the task is still running",
+        { path = sfile }
+    )
+    step("A1 transcript " .. vim.fn.fnamemodify(sfile, ":t"))
 
     -- SIGKILL: no exit hook, no session_shutdown, no graceful anything. The
     -- detached process tree is exactly what a crash leaves behind.
@@ -558,29 +582,30 @@ local function main()
     })
     step("A2 orphan tree survived the SIGKILL (pi pid " .. tostring(pid) .. ")")
 
-    -- A8 setup: a record with a LIVE pid that is not ours — this e2e's own nvim.
-    -- A recycled pid must not be adopted, waited on, or signalled; the snapshot
-    -- is a hint, not an authority.
+    -- A8 setup: a transcript record with a LIVE pid that is not ours — this
+    -- e2e's own nvim. A recycled pid must not be adopted, waited on or
+    -- signalled; the transcript is history, not an authority on pid ownership.
     local ghost_id = "bdead01"
     local ghost_pid = vim.fn.getpid()
-    local snapshot_data = vim.json.decode(read_file(snapshot) or "{}")
-    snapshot_data.tasks[#snapshot_data.tasks + 1] = {
-        taskId = ghost_id,
-        command = "npm run ghost",
-        cwd = cwd,
-        outputFile = uv.os_tmpdir() .. "/pi-bash-" .. ghost_id .. ".log",
-        startedAt = os.time() * 1000,
-        completed = false,
-        exitCode = vim.NIL,
-        signal = vim.NIL,
-        pid = ghost_pid,
-    }
-    local handle = assert(io.open(snapshot, "w"))
-    handle:write(vim.json.encode(snapshot_data))
-    handle:close()
+    local sid = sbody:match('"sessionId":"([^"]+)"') or SESSION_ID
+    append_session_entry(sfile, {
+        type = "custom_message",
+        customType = "pi2_bg_task",
+        content = "[Background task " .. ghost_id .. " started]",
+        display = false,
+        details = {
+            kind = "started",
+            taskId = ghost_id,
+            command = "npm run ghost",
+            pid = ghost_pid,
+            outputFile = uv.os_tmpdir() .. "/pi-bash-" .. ghost_id .. ".log",
+            startedAt = os.time() * 1000,
+            sessionId = sid,
+        },
+    })
     step(("A8 forged record %s -> nvim pid %d"):format(ghost_id, ghost_pid))
 
-    -- ---------------- run B: same session, reconciling that snapshot --------
+    -- ---------------- run B: same session, folding that transcript ----------
     provider.phase = "B"
     provider.turn = 0
     local bodies_before = #provider.bodies
@@ -593,7 +618,7 @@ local function main()
     -- A3: the summary is in the FIRST request of the new process.
     local first_body = provider.bodies[bodies_before + 1] or ""
     check(
-        first_body:find("[Background bash tasks recorded by an earlier pi process", 1, true) ~= nil,
+        first_body:find("[Background bash tasks found in this session's transcript", 1, true) ~= nil,
         "A3 run B's first request carries the reconcile summary",
         { head = first_body:sub(1, 300) }
     )
@@ -674,33 +699,35 @@ local function main()
     end
 
     -- A7: delivered once, and the snapshot ends up terminal.
-    local first = text:find("[Background bash tasks recorded by an earlier pi process", 1, true)
+    local first = text:find("[Background bash tasks found in this session's transcript", 1, true)
     check(first ~= nil, "A3 the summary is in the transcript")
     check(
-        text:find("[Background bash tasks recorded by an earlier pi process", first + 1, true) == nil,
+        text:find("[Background bash tasks found in this session's transcript", first + 1, true) == nil,
         "A7 the summary is delivered exactly once"
     )
-    local final_snapshot = read_file(snapshot) or ""
     check(
-        -- The finish is a coalesced write, so give it its debounce window.
-        vim.wait(3000, function()
-            local body = read_file(snapshot) or ""
-            return body:find('"completed":true', 1, true) ~= nil
-        end, 50),
-        "A7 the snapshot records the stopped task as terminal",
-        { path = snapshot, body = final_snapshot:sub(1, 400) }
+        (read_file(sfile) or ""):find('"kind":"stopped"', 1, true) ~= nil,
+        "A7 the transcript records the stop",
+        { path = sfile }
+    )
+    -- The whole point of the fold: there is no sidecar to go stale.
+    local stray = {}
+    for _, name in ipairs(vim.fn.readdir(uv.os_tmpdir())) do
+        if name:match("^pi%-bash%-tasks%-.*%.json$") then
+            stray[#stray + 1] = name
+        end
+    end
+    check(
+        #stray <= STRAY_BEFORE,
+        "A7 no new task snapshot may be written to tmpdir",
+        { count = #stray, before = STRAY_BEFORE }
     )
     step("A5/A6/A7 stop, no wake, single summary")
 
     stop_backend(backend_b)
-    -- Leave no snapshot behind for the next run (and none in the user's tmpdir).
-    vim.wait(1000, function()
-        return false
-    end, 500)
-    pcall(os.remove, snapshot)
 
     print(
-        ("ALL bg-tasks reconcile cases passed (snapshot, SIGKILL orphan, adoption, stop across processes) in %.2fs"):format(
+        ("ALL bg-tasks reconcile cases passed (transcript fold, SIGKILL orphan, adoption, stop across processes) in %.2fs"):format(
             (uv.hrtime() - run_started) / 1e9
         )
     )
