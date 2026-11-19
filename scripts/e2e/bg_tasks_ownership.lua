@@ -28,8 +28,8 @@
 --   B5 a clean quit appends the shutdown record with the killed task ids
 --   B6 the next run on that session does not adopt it and reports the stop
 --
--- Needs the pi binary, nothing else (the provider is fake). NOT part of
--- `make test`/CI:
+-- Needs the pi binary, nothing else (the provider is fake), which is why it runs
+-- in CI (.github/workflows/e2e.yml). Not part of `make test`:
 --
 --   make e2e-bg-ownership
 --   (nvim --headless -u tests/minimal_init.lua -l scripts/e2e/bg_tasks_ownership.lua)

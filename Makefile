@@ -36,9 +36,10 @@ e2e:
 		$(NVIM_BIN) --headless -u $(MIN_INIT) -l $$f || exit 1; \
 	done
 
-# Real end-to-end against `pi --mode rpc` + live provider calls (scripts/e2e/).
-# Deliberately excluded from CI and `make test`: needs the pi binary and a
-# configured provider. See .agents/skills/develop/references/testing.md.
+# Real end-to-end against `pi --mode rpc` (scripts/e2e/). None of these are part
+# of `make test`. The four background-task suites that drive a scripted FAKE
+# provider run in CI (.github/workflows/e2e.yml); the ones that need a real
+# provider stay manual. See .agents/skills/develop/references/testing.md.
 e2e-reaper:
 	$(NVIM_BIN) --headless -u $(MIN_INIT) -l scripts/e2e/reaper.lua
 
@@ -49,20 +50,24 @@ e2e-bg-delivery:
 	$(NVIM_BIN) --headless -u $(MIN_INIT) -l scripts/e2e/bg_tasks_delivery.lua
 
 # Real-pi e2e for `stop_task` / `list_tasks`: a scripted fake provider drives the
-# real extension against a real process tree. Needs the pi binary only.
+# real extension against a real process tree. Needs the pi binary only — runs in
+# CI.
 e2e-bg-stop:
 	$(NVIM_BIN) --headless -u $(MIN_INIT) -l scripts/e2e/bg_tasks_stop.lua
 
 # Real-pi e2e for the task-table snapshot: run pi, start a background task, SIGKILL
 # pi, then start pi again on the same session and let it adopt the orphan.
+# Needs the pi binary only — runs in CI.
 e2e-bg-reconcile:
 	$(NVIM_BIN) --headless -u $(MIN_INIT) -l scripts/e2e/bg_tasks_reconcile.lua
 
 # Real-pi e2e for stdin: a background shell reads a line, `task_input` writes it.
+# Needs the pi binary only — runs in CI.
 e2e-bg-stdin:
 	$(NVIM_BIN) --headless -u $(MIN_INIT) -l scripts/e2e/bg_tasks_stdin.lua
 
 # Real-pi e2e for ownership: fork inheritance and the clean-quit shutdown record.
+# Needs the pi binary only — runs in CI.
 e2e-bg-ownership:
 	$(NVIM_BIN) --headless -u $(MIN_INIT) -l scripts/e2e/bg_tasks_ownership.lua
 

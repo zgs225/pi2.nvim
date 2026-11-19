@@ -23,8 +23,8 @@
 --   A4 the write did not turn into a wake report (the wait owned the exit)
 --   A5 a foreground task that detached has NO stdin, and task_input says why
 --
--- Needs the pi binary, nothing else (the provider is fake). NOT part of
--- `make test`/CI:
+-- Needs the pi binary, nothing else (the provider is fake), which is why it runs
+-- in CI (.github/workflows/e2e.yml). Not part of `make test`:
 --
 --   make e2e-bg-stdin
 --   (nvim --headless -u tests/minimal_init.lua -l scripts/e2e/bg_tasks_stdin.lua)

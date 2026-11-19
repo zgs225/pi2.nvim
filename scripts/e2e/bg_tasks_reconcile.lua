@@ -22,8 +22,8 @@
 --   A7 the summary is delivered exactly once (not echoed per request), the
 --      transcript ends up recording the stop, and NOTHING is written to tmpdir
 --
--- Needs the pi binary, nothing else (the provider is fake). NOT part of
--- `make test`/CI:
+-- Needs the pi binary, nothing else (the provider is fake), which is why it runs
+-- in CI (.github/workflows/e2e.yml). Not part of `make test`:
 --
 --   make e2e-bg-reconcile
 --   (nvim --headless -u tests/minimal_init.lua -l scripts/e2e/bg_tasks_reconcile.lua)
