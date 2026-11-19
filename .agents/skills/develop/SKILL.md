@@ -40,7 +40,7 @@ flowchart TD
 | Branch | Create a **git worktree** on `feat/<short-kebab-name>` and develop there — never in the live `lazy/pi2.nvim` checkout. Baseline `make test` green before starting. |
 | Implement | Follow the **standard places** checklist below. Config knobs touch **three** spots in `config.lua` (G19). |
 | Test | Cheapest layer that can observe the behavior. State what was verified and what was not, and end the final report's verification section with a copy-pasteable manual-test nvim command (`PI_DEV_DIR` gate for worktree code — references/testing.md § Verification discipline). |
-| PR | Push branch → implementation comment → `pr:awaiting-review`. CI runs on the push; confirm the run is green before review. |
+| PR | Push branch → implementation comment → `pr:awaiting-review`. CI triggers on a PR and on the merge commit to `main` (a plain branch push does **not** trigger it — `.github/workflows/lint.yml` has `on: push: branches: [main]` + `pull_request`), so the authoritative run is the one after merge; open a PR if you want the jobs green before review. |
 | Review | `pr:changes-requested` → fix → re-push → back to `pr:awaiting-review`. `pr:approved` → merge. |
 | Docs gate | Merge 前必须通过 **docs sync gate**：`make docs-links` + `make check` 绿；逐项核对用户可见变更（commands / keymaps / config / highlight groups / public API / documented behavior）已在**同一变更**里同步到 `README.md` 与 `doc/*.md`（几何上可由 `scripts/checks/` 判定的部分已自动判定，其余靠人）；`CHANGELOG.md` 有当日条目。不一致 → 回到 Implement 补齐后重新走 review。详见下方 "Docs sync gate (before merge)"。 |
 | Merge | In the **main checkout**: `git merge --no-ff`, push main, delete remote+local branch, `git worktree remove`. **Verify the CI run for the merge commit is green** (see CI verification below), then close issue. |
