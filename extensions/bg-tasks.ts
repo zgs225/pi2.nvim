@@ -70,6 +70,16 @@
  * so the exit a stop causes is reported by the stop's own tool result instead of
  * arriving later as a wake for a result nobody asked for.
  *
+ * A background task keeps its STDIN OPEN (P0-3), and `task_input` writes to it.
+ * `stdio: ["ignore", …]` — stock pi's answer — means a command that asks a
+ * question gets EOF instead of an answer: an interactive tool (`npm init`, a
+ * prompt, a REPL, anything waiting on a TTY-less read) either aborts or blocks
+ * forever, which is exactly the "never exits, never notifies" hole. Only the
+ * background paths get a pipe: a foreground command keeps `ignore`, so its
+ * behaviour is byte-for-byte stock, and a foreground command that outlives its
+ * window and detaches has no stdin (`task_input` says so instead of silently
+ * dropping what it was given).
+ *
  * The task table OUTLIVES the process that built it (P0-1). Every state change
  * snapshots it to `join(tmpdir(), "pi-bash-tasks-<sessionId>.json")`, and the
  * next instance — a `/reload`, or a resumed session after a crash — reconciles
@@ -133,6 +143,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import type { Writable } from "node:stream";
 import { Type, type Static, type TSchema } from "typebox";
 
 const CUSTOM_TYPE = "pi2_bg_task";
@@ -264,6 +275,14 @@ interface BgTaskState {
 	exitUnknown?: boolean;
 	/** Liveness poll for an adopted task; cleared when the task settles. */
 	adoptPoll?: ReturnType<typeof setInterval>;
+	/**
+	 * The child's stdin pipe. Only background paths get one (a foreground command
+	 * keeps stock behaviour, where stdin is ignored); an adopted task never has
+	 * one, because the pipe died with the process that owned it.
+	 */
+	stdin?: Writable;
+	/** Whether that pipe can still be written to. */
+	stdinOpen: boolean;
 	/** Resolves exactly once, when the process closes or spawn fails. */
 	exited: Promise<void>;
 	resolveExited: () => void;
@@ -1162,7 +1181,7 @@ export default function bgTasks(pi: ExtensionAPI) {
 				},
 			};
 		}
-		const task = startTask(command, event.cwd, buildSessionEnv(undefined));
+		const task = startTask(command, event.cwd, buildSessionEnv(undefined), { stdin: true });
 		task.panelStarted = true;
 		reportPanel(task);
 		return {
@@ -1180,7 +1199,12 @@ export default function bgTasks(pi: ExtensionAPI) {
 	// decides how long to stay attached. Completion reporting happens in
 	// the close/error handlers.
 	// ------------------------------------------------------------------
-	function startTask(command: string, cwd: string, env: NodeJS.ProcessEnv): BgTaskState {
+	function startTask(
+		command: string,
+		cwd: string,
+		env: NodeJS.ProcessEnv,
+		options?: { stdin?: boolean },
+	): BgTaskState {
 		const taskId = "b" + randomUUID().replace(/-/g, "").substring(0, 6);
 		const outputFile = join(tmpdir(), `pi-bash-${taskId}.log`);
 		let resolveExited = (): void => {};
@@ -1199,6 +1223,7 @@ export default function bgTasks(pi: ExtensionAPI) {
 			delivery: "none",
 			panelStarted: false,
 			observers: 0,
+			stdinOpen: false,
 			exited,
 			resolveExited: () => resolveExited(),
 		};
@@ -1222,7 +1247,9 @@ export default function bgTasks(pi: ExtensionAPI) {
 				cwd,
 				env,
 				detached: true,
-				stdio: ["ignore", "pipe", "pipe"],
+				// `ignore` for a foreground command (stock pi), a pipe when the task is
+				// meant to be fed — see `task_input`.
+				stdio: [options?.stdin ? "pipe" : "ignore", "pipe", "pipe"],
 				windowsHide: true,
 			});
 		} catch (error) {
@@ -1235,6 +1262,17 @@ export default function bgTasks(pi: ExtensionAPI) {
 		if (child.pid) {
 			trackedPids.add(child.pid);
 			ensureExitHook();
+		}
+		if (child.stdin) {
+			task.stdin = child.stdin;
+			task.stdinOpen = true;
+			// A command that closes its stdin (or dies) must not turn the next
+			// `task_input` into an unhandled stream error.
+			child.stdin.on("error", () => {
+				task.stdinOpen = false;
+			});
+			// The pipe must not keep the pi process alive on its own.
+			(child.stdin as { unref?: () => void }).unref?.();
 		}
 		// Synchronous, not debounced, and AFTER the pid is known: the record that
 		// matters most is the one a crash leaves behind, and a task can start and
@@ -1289,6 +1327,7 @@ export default function bgTasks(pi: ExtensionAPI) {
 			clearInterval(task.adoptPoll);
 			task.adoptPoll = undefined;
 		}
+		task.stdinOpen = false;
 		if (task.observers > 0) {
 			// An attached call will return this terminal state itself and mark the
 			// report confirmed. Leave it pending rather than "consumed": a call
@@ -1518,7 +1557,8 @@ export default function bgTasks(pi: ExtensionAPI) {
 		" Never wait with `sleep` and never poll a task's output file: you are told the task id, and when the process exits with nobody attached you are woken with its status and output tail." +
 		" If you have other work, do it. If the task's result is all that is left, either end your turn (that is the correct action, not giving up — the wake report starts a new turn) or call wait_task, which blocks until the task exits or its timeout hits and returns the output." +
 		" A wait_task result of \"still running\" is not a failure." +
-		" A task you no longer need — a dev server holding a port, a watcher for a file you already fixed — is stopped with stop_task(task_id), which signals its whole process group; list_tasks shows what is still running.";
+		" A task you no longer need — a dev server holding a port, a watcher for a file you already fixed — is stopped with stop_task(task_id), which signals its whole process group; list_tasks shows what is still running." +
+		" A background task keeps its stdin open: if it is waiting on input (a confirmation, a name, a REPL line), answer it with task_input(task_id, data) instead of killing and restarting it.";
 
 	const { prepareArguments: _unusedPrepareArguments, ...builtinRest } = builtin;
 	void _unusedPrepareArguments; // typed for the old schema; the new schema needs no shim
@@ -1533,7 +1573,12 @@ export default function bgTasks(pi: ExtensionAPI) {
 				throw new Error("bg-tasks: 'command' must be a non-empty string");
 			}
 			void toolCallId;
-			const task = startTask(command, ctx?.cwd ?? process.cwd(), buildSessionEnv(ctx));
+			const task = startTask(command, ctx?.cwd ?? process.cwd(), buildSessionEnv(ctx), {
+				// A foreground command keeps stock behaviour: no stdin pipe, so nothing
+				// waits on input that will never come. If it outlives its window it
+				// detaches without one and `task_input` says so.
+				stdin: Boolean(run_in_background),
+			});
 
 			if (run_in_background) {
 				task.panelStarted = true;
@@ -1955,6 +2000,127 @@ export default function bgTasks(pi: ExtensionAPI) {
 	});
 
 	// ------------------------------------------------------------------
+	// task_input: the write half of a background task's stdin. A command that
+	// asks a question has no other way to be answered once it is backgrounded —
+	// with stdin ignored it sees EOF and aborts, and with a pipe nobody writes to
+	// it blocks forever (the "never exits, never notifies" hole).
+	// ------------------------------------------------------------------
+	const taskInputParameters = Type.Object({
+		task_id: Type.String({
+			description: 'Task id returned by a bash call (e.g. "b3f2a1").',
+		}),
+		data: Type.String({
+			description: "Text to write to the task's standard input.",
+		}),
+		newline: Type.Optional(
+			Type.Boolean({
+				description:
+					"Append a newline after `data` — pressing Enter, which is what a line-oriented prompt expects (default true). Pass false to send raw characters, e.g. a single key or a partial line.",
+			}),
+		),
+	});
+
+	type TaskInputParams = Static<typeof taskInputParameters>;
+
+	interface TaskInputDetails {
+		taskId: string;
+		command: string;
+		status: "written" | "no_stdin" | "exited";
+		/** Bytes written, including the newline. */
+		bytes?: number;
+		outputFile: string;
+	}
+
+	pi.registerTool({
+		name: "task_input",
+		label: "Feed a background task",
+		description:
+			"Write text to a running background bash task's standard input, then return the output it produced so far. Use it to answer a command that is waiting on input — a confirmation, a name, a password prompt, a REPL line — instead of starting it again. Only tasks you started in the background have a stdin; a foreground command that outlived its window and detached does not.",
+		promptSnippet: "Write text to a background task's stdin (answer a prompt, feed a REPL)",
+		promptGuidelines: [
+			"Use task_input when a background task is waiting for input; do not kill and restart it just to answer a prompt.",
+			"`newline` defaults to true (pressing Enter). Pass false for a single key or a line you are still composing.",
+			"The call returns the output so far; the task keeps running and is reported when it exits.",
+		],
+		parameters: taskInputParameters,
+		async execute(toolCallId, params) {
+			void toolCallId;
+			const task = tasks.get(params.task_id);
+			if (!task) {
+				const known = [...tasks.values()].map((candidate) => candidate.taskId);
+				const knownNote = known.length > 0 ? ` Known task ids in this session: ${known.join(", ")}.` : "";
+				throw new Error(`task_input: unknown task id "${params.task_id}".${knownNote} Task ids come from bash results.`);
+			}
+
+			const detailsOf = (status: TaskInputDetails["status"], bytes?: number): TaskInputDetails => ({
+				taskId: task.taskId,
+				command: task.command,
+				status,
+				bytes,
+				outputFile: task.outputFile,
+			});
+
+			if (task.completed) {
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: `Task ${task.taskId} ${describeExit(task)} — its stdin is gone, so there is nothing to write to. Its output is in ${task.outputFile}.`,
+						},
+					],
+					details: detailsOf("exited"),
+					isError: true,
+				};
+			}
+
+			const stdin = task.stdin;
+			if (!stdin || !task.stdinOpen) {
+				const why = task.stdin
+					? `it closed its stdin (it may have finished reading input, or it is exiting)`
+					: `it was started without a stdin pipe — only run_in_background (or a \`&\` command in the prompt) keeps one open, and a foreground command that outlived its attach window has none`;
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: `Task ${task.taskId} has no usable stdin: ${why}. Its output is in ${task.outputFile}; the task is still running and is reported when it exits.`,
+						},
+					],
+					details: detailsOf("no_stdin"),
+					isError: true,
+				};
+			}
+
+			const newline = params.newline !== false;
+			const payload = !newline || params.data.endsWith("\n") ? params.data : `${params.data}\n`;
+			try {
+				stdin.write(payload);
+			} catch (error) {
+				task.stdinOpen = false;
+				return {
+					content: [
+						{
+							type: "text" as const,
+							text: `Task ${task.taskId} could not be written to: ${error instanceof Error ? error.message : String(error)}. Its output is in ${task.outputFile}.`,
+						},
+					],
+					details: detailsOf("no_stdin"),
+					isError: true,
+				};
+			}
+
+			const tail = readOutputTail(task.outputFile, WAKE_TAIL_BYTES, WAKE_TAIL_LINES);
+			const head = `Wrote ${Buffer.byteLength(payload, "utf8")} byte(s) to task ${task.taskId}'s stdin.`;
+			const body = tail.text.trim()
+				? `${head}\n\nOutput so far:\n${tail.text}`
+				: `${head} It has not produced output since this write — it may still be reading, or waiting for another line.`;
+			return {
+				content: [{ type: "text" as const, text: body }],
+				details: detailsOf("written", Buffer.byteLength(payload, "utf8")),
+			};
+		},
+	});
+
+	// ------------------------------------------------------------------
 	// list_tasks: the model's view of the task table. Cheap and bounded — the
 	// table grows for the life of the process, so the output is capped.
 	// ------------------------------------------------------------------
@@ -1978,7 +2144,9 @@ export default function bgTasks(pi: ExtensionAPI) {
 			: task.adopted
 				? "running (adopted from an earlier pi process)"
 				: "running";
-		return `- ${task.taskId} [${state}] ${elapsed} "${command}" (output: ${task.outputFile})`;
+		// Only a live background task can be fed, and the model can only see that here.
+		const stdin = !task.completed && task.stdinOpen ? ", stdin open" : "";
+		return `- ${task.taskId} [${state}${stdin}] ${elapsed} "${command}" (output: ${task.outputFile})`;
 	}
 
 	pi.registerTool({

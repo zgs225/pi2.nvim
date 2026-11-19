@@ -318,6 +318,69 @@ describe("stop_task / list_tasks renderer", function()
     end)
 end)
 
+describe("task_input renderer", function()
+    it("gives the tool its own glyph instead of the generic fallback", function()
+        assert.are.equal(vim.fn.nr2char(0xF030C, 1), Tools.get_tool_icon("task_input"))
+    end)
+
+    it("names the task and quotes the line it wrote", function()
+        Tasks._reset()
+        register_task("b3f2a1", "npm run dev")
+        local h = History.new(TAB)
+        h:on_tool_start("task_input", "ti1", { task_id = "b3f2a1", data = "y" })
+        pump(50)
+        local buf = h:buf()
+        assert.is_true(#rows_with(buf, "npm run dev · b3f2a1") == 1, table.concat(lines_of(buf), "\n"))
+        assert.is_true(#rows_with(buf, "→ y") == 1, table.concat(lines_of(buf), "\n"))
+        delete(h)
+        Tasks._reset()
+    end)
+
+    it("flags a raw write and stays silent when the bytes landed", function()
+        Tasks._reset()
+        register_task("b3f2a1", "npm run dev")
+        local h = History.new(TAB)
+        h:on_tool_start("task_input", "ti2", { task_id = "b3f2a1", data = "x", newline = false })
+        pump(50)
+        assert.is_true(#rows_with(h:buf(), "(no newline)") == 1, table.concat(lines_of(h:buf()), "\n"))
+        h:on_tool_end("task_input", "ti2", {
+            content = { { type = "text", text = "Wrote 1 byte(s) to task b3f2a1's stdin." } },
+            details = { taskId = "b3f2a1", status = "written", bytes = 1 },
+        }, false)
+        pump(60)
+        assert.is_false(has_badge(h, "no stdin"))
+        assert.is_false(has_badge(h, "already exited"))
+        delete(h)
+        Tasks._reset()
+    end)
+
+    it("badges a task that has no stdin, and one that already exited", function()
+        local h = History.new(TAB)
+        h:on_tool_start("task_input", "ti3", { task_id = "bdead1", data = "y" })
+        pump(50)
+        h:on_tool_end("task_input", "ti3", {
+            content = {
+                { type = "text", text = "Task bdead1 has no usable stdin: it was started without a stdin pipe" },
+            },
+            details = { taskId = "bdead1", status = "no_stdin" },
+        }, true)
+        pump(60)
+        assert.is_true(has_badge(h, "no stdin"), table.concat(header_virt(h), "|"))
+        delete(h)
+
+        local h2 = History.new(TAB)
+        h2:on_tool_start("task_input", "ti4", { task_id = "bdead2", data = "y" })
+        pump(50)
+        h2:on_tool_end("task_input", "ti4", {
+            content = { { type = "text", text = "Task bdead2 exited with code 0 — its stdin is gone" } },
+            details = { taskId = "bdead2", status = "exited" },
+        }, true)
+        pump(60)
+        assert.is_true(has_badge(h2, "already exited"), table.concat(header_virt(h2), "|"))
+        delete(h2)
+    end)
+end)
+
 describe("bg-tasks extension contract", function()
     it("registers a wait_task tool and points bash at it", function()
         local src = read_extension()
