@@ -1,0 +1,117 @@
+# Unit-test gate: runs the plenary suite (`make test`) so a broken spec can no
+# longer merge just because CI never looked at it. Until this file existed the
+# header of lint.yml said so in as many words ("`make test` ... is NOT run here
+# yet"), which made a green check mean "the code compiles and parses", not "the
+# tests pass".
+#
+# The assertion is the EXIT CODE of `make test`, nothing else. Two gotchas
+# earned that rule:
+#   G25 — never grep the (ANSI-coloured) output for "Success"/"Failed": a driver
+#         that stops early, a target that never ran, and a suite that silently
+#         skipped can all leave a green grep behind. plenary's harness exits
+#         non-zero if ANY child spec failed (test_harness.lua collects every
+#         job's code in parallel mode), so the code is the whole answer.
+#   G33 — a child nvim that dies before busted runs prints no `Testing:` line at
+#         all, i.e. one fewer `Testing:` than there are spec files. A count that
+#         matches is the only cheap proof the suite was actually entered; that is
+#         what the failure diagnostics below compare. They are diagnostics only,
+#         never the gate.
+#
+# The toolchain is pinned in `env:` for the same reason e2e.yml pins it: the
+# suite asserts behaviour of a specific Neovim (and of specific plugin APIs), so
+# an upstream release must not silently change what this gate means. Versions are
+# plain release tags / commits and every tool is installed by direct download —
+# no third-party action beyond `actions/checkout`, no package manager, no Node.
+#
+# Lives under .github/workflows/ so it runs on GitHub Actions and is also picked
+# up by Gitea Actions (which reads .github/workflows/ by default) on the
+# canonical Gitea mirror. That is why the log is kept as a file in the runner
+# rather than uploaded as an artifact: `actions/upload-artifact` support on Gitea
+# Actions is unverified, and this repo's convention is "nothing but checkout".
+
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unit:
+    name: unit suite (make test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # Pinned on purpose: the specs assert Neovim-version-specific behaviour and
+      # a render-contract spec that tracks render-markdown.nvim's internals, so a
+      # bump upstream must not silently change what this gate means. Bump all
+      # three together, with a local `make test` run on the new versions.
+      NVIM_VERSION: "v0.12.6"
+      PLENARY_COMMIT: "74b06c6c75e4eeb3108ec01852001636d85a932b"
+      # Resolved from the local lazy.nvim checkout's HEAD and confirmed to be on
+      # upstream `main` (`git branch -r --contains` reported `origin/main`), so
+      # `git checkout` finds it in a fresh clone.
+      RENDER_MARKDOWN_COMMIT: "a67f826164c38c836fc6060f32b275c4c43317a7"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Neovim
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/nvim.tar.gz \
+            "https://github.com/neovim/neovim/releases/download/${NVIM_VERSION}/nvim-linux-x86_64.tar.gz"
+          sudo tar -xzf /tmp/nvim.tar.gz -C /opt
+          sudo ln -sf /opt/nvim-linux-x86_64/bin/nvim /usr/local/bin/nvim
+          nvim --version | head -1
+
+      - name: Install plenary.nvim
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.local/share/nvim/lazy
+          git clone --quiet https://github.com/nvim-lua/plenary.nvim \
+            ~/.local/share/nvim/lazy/plenary.nvim
+          git -C ~/.local/share/nvim/lazy/plenary.nvim checkout --quiet "${PLENARY_COMMIT}"
+          git -C ~/.local/share/nvim/lazy/plenary.nvim rev-parse HEAD
+
+      # Optional for the suite as a whole, required for tests/render_contract_spec.lua:
+      # tests/minimal_init.lua prepends it to 'runtimepath' only when the path
+      # exists, and the spec skips itself otherwise. Installing it means the
+      # contract is actually asserted here instead of skipped into a false green.
+      - name: Install render-markdown.nvim
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.local/share/nvim/lazy
+          git clone --quiet https://github.com/MeanderingProgrammer/render-markdown.nvim \
+            ~/.local/share/nvim/lazy/render-markdown.nvim
+          git -C ~/.local/share/nvim/lazy/render-markdown.nvim checkout --quiet "${RENDER_MARKDOWN_COMMIT}"
+          git -C ~/.local/share/nvim/lazy/render-markdown.nvim rev-parse HEAD
+
+      # `tee` exists so the diagnostics step has something to read on failure;
+      # `pipefail` (part of `set -euo pipefail`, spelled out again next to the
+      # pipe that needs it) keeps `make test` — not `tee` — authoritative. The
+      # Makefile passes PLENARY_PATH / RENDER_MARKDOWN_PATH explicitly to the
+      # harness, and the harness runs every tests/*_spec.lua in parallel children.
+      - name: Run unit suite
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          make test 2>&1 | tee /tmp/make-test.log
+
+      # Diagnostics only — never the gate (see the header). plenary's summary is
+      # printed with ANSI escapes even when headless, so strip them before
+      # matching. A `Testing:` count below the spec-file count means a child nvim
+      # died before busted started (G33) and its file's result is missing.
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          set -uo pipefail
+          echo "=== tail of /tmp/make-test.log"
+          tail -100 /tmp/make-test.log || true
+          plain=/tmp/make-test.plain.log
+          sed -e 's/\x1b\[[0-9;]*m//g' /tmp/make-test.log > "$plain" || true
+          echo "=== spec coverage"
+          echo "Testing: lines : $(grep -c 'Testing:' "$plain" || true)"
+          echo "spec files     : $(find tests -maxdepth 1 -name '*_spec.lua' | wc -l)"
+          echo "=== non-zero summary lines (Failed / Errors)"
+          grep -E '^(Failed|Errors)[[:space:]]*:[[:space:]]*[1-9]' "$plain" || echo "(none)"

@@ -1,6 +1,8 @@
 # pi.nvim development helpers.
 #
 #   make test    — run the plenary unit test suite (hermetic, -u tests/minimal_init.lua).
+#                  This is the CI unit gate (`.github/workflows/tests.yml`, pushed to
+#                  main + every PR, judged by exit code only).
 #                  Files run in parallel, 120 s per file: tests/worktree_git_spec.lua
 #                  alone spends ~50 s on real git commits at APFS fsync speed, which
 #                  plenary's 50 s default would kill under parallel load.
@@ -9,7 +11,9 @@
 #   make check   — static gates: LuaJIT parse (G24) + docs sync; `check-selftest`
 #                  proves each gate can still fail. Needs `luajit` (mise install)
 #                  and python3; see .mise.toml.
-#   make e2e     — run headless end-to-end scripts (tests/*_e2e.lua)
+#   make e2e     — run headless end-to-end scripts (tests/*_e2e.lua); stops at the
+#                  FIRST failing script (`|| exit 1`), so triage a red run one file
+#                  at a time — everything after the first failure never ran
 #   make e2e-reaper — real-pi e2e: subagent idle reaper + max_children cap (needs pi binary + provider; not CI)
 #   make e2e-worktrees — real-git e2e: worktree create/apply/remove/ship/release (needs pi binary; no provider calls)
 #   make e2e-bg-delivery — real-pi e2e: background bash completion delivery into agent context (needs pi + provider; not CI)
