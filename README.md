@@ -361,7 +361,7 @@ Everything below is present in `pi2.nvim` and **not** in upstream `alex35mil/pi.
 
 **Developer infrastructure**
 
-- A hermetic plenary test suite (`make test`) plus a headless boot check (`make smoke`), and a static-gate harness (`make check`: LuaJIT parse gate + docs-sync rules, with `make check-selftest` proving each gate can fail) whose toolchain is pinned in `.mise.toml` and mirrored by CI. An agent "develop" skill documents the test stack, the gates, and the Neovim-Lua gotchas.
+- A hermetic plenary test suite (`make test`) plus a headless boot check (`make smoke`), and a static-gate harness — `make check` (LuaJIT parse gate + docs-sync rules, with `make check-selftest` proving each gate can fail), `make lint` over `lua/` strictly and over `tests/` + `scripts/e2e/` with a documented narrower config, and a parse gate that probes the LuaJIT binary actually rejects Lua 5.3 syntax (exit 2 with the remedy) instead of trusting the binary's name or version — whose toolchain is pinned in `.mise.toml` and mirrored by CI. An agent "develop" skill documents the test stack, the gates, and the Neovim-Lua gotchas.
 
 ## License
 

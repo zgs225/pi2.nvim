@@ -93,8 +93,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install luajit
-        # Any LuaJIT 2.1 build is the authority for "loads on Neovim stable":
-        # it rejects Lua 5.3-only syntax the way Neovim's embedded LuaJIT does.
+        # A LuaJIT 2.1 build is the authority for "loads on Neovim stable" when
+        # it rejects Lua 5.3-only syntax, which is not a property of the version
+        # number: `parse-luajit` probes the binary before scanning and fails with
+        # exit 2 if it accepts `&`, `|`, `<<`, `>>`, `~` or `//`. The distro
+        # build installed here passes that probe (`make check` is green).
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends luajit

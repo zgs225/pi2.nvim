@@ -6,9 +6,11 @@ LuaJIT accepts a newer grammar) and dies on Neovim stable with
 parse error one message up. The plugin promises Neovim 0.10+, so "parses on my
 machine" is not the bar — "parses under LuaJIT 2.1" is.
 
-The gate is the compiler itself, not a regex: any LuaJIT 2.1 build rejects the
+The gate is the compiler itself, not a regex: a LuaJIT 2.1 build rejects the
 Lua 5.3 operators (`&`, `|`, `<<`, `>>`, `//`, `~`) and accepts the extensions
-this repo actually uses (`goto` + `::label::`). Regex approximations of this rule
+this repo actually uses (`goto` + `::label::`); the probe below exists because
+not every build that calls itself 2.1 still does the first part. Regex
+approximations of this rule
 were measured to produce five hits on this repo, none of them real (see
 `gotchas.md` G24 and the rationale in `lua.py`).
 
@@ -28,9 +30,11 @@ lenient parser cannot answer the only question this rule asks: *does this load
 on Neovim stable?*
 
 Scope: `lua/` only — the code that ships and must load inside the user's
-Neovim. `tests/` and `scripts/` are developer-run and already use a grammar
-newer than Neovim 0.10's LuaJIT (e.g. `180_000`), so gating them here would
-flag code that is nobody's runtime constraint.
+Neovim. `tests/` and `scripts/` are developer-run, so their grammar is nobody's
+runtime constraint and they stay out of this gate; they are type-checked
+instead (`make lint` with `.luarc-tests.json`), which is what caught the
+digit-separator literals that made two specs unparseable under the pinned
+LuaJIT.
 """
 
 from __future__ import annotations
@@ -154,7 +158,8 @@ class ParseLuajit(Check):
             where = f"LUAJIT_BIN={configured!r} is not an executable" if configured else "luajit is not on PATH"
             raise CheckError(
                 f"{where} — run `mise install` in the repo root, or set "
-                "LUAJIT_BIN=/path/to/luajit (any LuaJIT 2.1 build rejects Lua 5.3 syntax)"
+                "LUAJIT_BIN=/path/to/luajit (the gate probes it: a build that accepts Lua 5.3 syntax is "
+                "refused)"
             )
         return exe
 

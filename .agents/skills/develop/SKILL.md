@@ -62,11 +62,11 @@ In a worktree, `make test` and headless e2e under `-u tests/minimal_init.lua` ex
 
 | Layer | Command | Sees | Cannot see |
 |-------|---------|------|------------|
-| Static gates | `make style` / `make lint` / `make check` / `make docs-links` | formatting (Lua + Python), undefined symbols, LuaJIT parse errors (G24), docs drift | anything about runtime behaviour |
+| Static gates | `make style` / `make lint` / `make check` / `make docs-links` | formatting (Lua + Python), undefined symbols (`lua/` strictly, `tests/` + `scripts/e2e/` with `.luarc-tests.json`), LuaJIT parse errors (G24, after probing that the parser really rejects Lua 5.3 syntax), docs drift | anything about runtime behaviour |
 | Unit (plenary) | `make test` | pure-Lua logic, config resolution | buffers, windows, keys, rendering |
 | Headless e2e | `make smoke` / `nvim --headless -l script.lua` | plugin load, RPC, buffer/extmark wiring | visual rendering, real key events |
 | GUI automation | `scripts/gui_launch.sh` + `gui_harness.sh` (macOS: `scripts/macos/`) | real keybindings, insert mode, **pixels** | — (top layer, slow) |
-| CI gate | `.github/workflows/lint.yml` (auto on push/PR) | `make style` + `make lint` + `make check` (self-test first) + `make docs-links` on a clean runner | plugin runtime (`make test` is not in CI yet) |
+| CI gate | `.github/workflows/lint.yml` (auto on push/PR) | `make style` + `make lint` (three lua-language-server passes) + `make check` (self-test first) + `make docs-links` on a clean runner | plugin runtime (`make test` is not in CI yet) |
 
 Details, pitfalls, isolation recipe, and script usage: `references/testing.md`. The static-gate architecture (how to add a check, what is not checkable): `references/checks.md`.
 

@@ -115,6 +115,8 @@ check-list:
 	$(PYTHON_BIN) -m scripts.checks --list
 
 # LuaJIT syntax gate alone (G24): the cheapest way to answer "does this load on
-# Neovim stable". Any LuaJIT 2.1 build works; mise pins one for parity.
+# Neovim stable". The binary is probed first — a build that accepts Lua 5.3
+# syntax is refused with exit 2 instead of reporting green — so any LuaJIT 2.1
+# build works exactly when it passes that probe; mise pins one for parity.
 parse:
 	$(PYTHON_BIN) -m scripts.checks --only parse-luajit
