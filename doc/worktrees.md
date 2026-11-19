@@ -45,7 +45,7 @@ A worktree session is an ordinary π session whose process runs with the **workt
 | `pi.worktree_new({ name?, layout? })` | The Lua form, always in a new tabpage. Without a name the checkout gets a generated one. |
 | `pi.worktree_fork({ name?, layout? })` | Same, but the new process is bootstrapped from this conversation with `--fork <session file>`: the new session starts with this conversation's active branch (history) and continues in the worktree. The parent session file is not modified, and the sessions list marks the child `↳ forked from <name>`. |
 
-There is no `:PiWorktree*` command: the flag is the user entry point, the `pi.worktree_*` functions are the API, and binding one is a keymap:
+There is no worktree-verb user command (the `PiWorktree*` commands were removed): the flag is the user entry point, the `pi.worktree_*` functions are the API, and binding one is a keymap:
 
 ```lua
 vim.keymap.set("n", "<leader>aw", function() require("pi").worktree_new() end)
