@@ -45,7 +45,7 @@ flowchart TD
 | Docs gate | Merge 前必须通过 **docs sync gate**：`make docs-links` + `make check` 绿；逐项核对用户可见变更（commands / keymaps / config / highlight groups / public API / documented behavior）已在**同一变更**里同步到 `README.md` 与 `doc/*.md`（几何上可由 `scripts/checks/` 判定的部分已自动判定，其余靠人）；`CHANGELOG.md` 有当日条目。不一致 → 回到 Implement 补齐后重新走 review。详见下方 "Docs sync gate (before merge)"。 |
 | Merge | In the **main checkout**: `git merge --no-ff`, push main, delete remote+local branch, `git worktree remove`. **Verify the CI run for the merge commit is green** (see CI verification below), then close issue. |
 
-Gitea: 所有 issue 交互统一使用 `tea` CLI（eos-bootstrap 安装，login `yuez`），**不要**手写 curl 调 API，也**不要**在 GitHub 上开 issue —— GitHub 只是公开镜像，issue 只在 Gitea。issue 生命周期命令速查见 `references/gitea.md`。如果误开在 GitHub 上，按 `references/gitea.md` 的 "Migrate from GitHub" 迁回并删除。
+Gitea: 所有 issue 交互统一使用 `gt` CLI（gitea-cli，`/usr/bin/gt`，keyring 认证；`tea` 已被 gitea-cli 取代，不要再用），**不要**手写 curl 调 API，也**不要**在 GitHub 上开 issue —— GitHub 只是公开镜像，issue 只在 Gitea。issue 生命周期命令速查见 `references/gitea.md`。如果误开在 GitHub 上，按 `references/gitea.md` 的 "Migrate from GitHub" 迁回并删除。
 
 ## Worktree workflow
 
@@ -120,6 +120,6 @@ G1–G31 are indexed in the quick-reference table at the top of `references/gotc
 - `references/testing.md` — layer details, pitfalls, isolation recipe, verification discipline, script usage.
 - `references/gotchas.md` — quick-reference table + full 现象/根因/修法 for G1–G31 with minimal reproductions.
 - `references/checks.md` — the static gates: `scripts/checks/` architecture, the fixture contract, how to add a rule, the pinned toolchain (`.mise.toml`), and what is deliberately not a static check.
-- `references/gitea.md` — issue lifecycle on Gitea: `tea` when installed, `scripts/gitea_issue.py` otherwise (create / comment / label / close).
+- `references/gitea.md` — issue lifecycle on Gitea via `gt` (gitea-cli): auth/keyring, the `GITEA_TOKEN` pitfall, create / comment / label / close.
 - `AGENTS.md` — architecture charter, style, type-annotation conventions.
 - `.agents/skills/commit/SKILL.md` — Conventional Commit format, CHANGELOG rules, breaking-change policy.

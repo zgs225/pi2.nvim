@@ -44,7 +44,7 @@ luajit = "2.1.1744318430"
   package is fine; CI uses `apt install luajit` rather than mise.
 - Deliberately not pinned: **nvim** (the test layers must run on the editor you
   actually use the plugin in), **python3** (the checks are stdlib-only, 3.8+),
-  and **tea** (workflow tool, see `gitea.md`).
+  and **gt** (gitea-cli, the issue tracker workflow tool — see `gitea.md`).
 
 ## Architecture
 
