@@ -718,3 +718,110 @@ describe("pi.tasks _reset", function()
         assert.are.equal(0, calls, "listeners registered before _reset must not fire")
     end)
 end)
+
+describe("pi.tasks idle-wake policy file", function()
+    local path
+
+    before_each(function()
+        Tasks._reset()
+        path = vim.fn.tempname()
+        Tasks._set_path(path)
+    end)
+
+    after_each(function()
+        Tasks._set_path(nil)
+        pcall(vim.fn.delete, path)
+    end)
+
+    it("uses a per-process, overridable path", function()
+        Tasks._set_path(nil)
+        local p = Tasks.state_path()
+        assert.is_truthy(p:find("bg-tasks", 1, true), "the file name must name the feature")
+        assert.is_truthy(p:find(tostring(vim.fn.getpid()), 1, true), "two nvim instances must not share one file")
+        Tasks._set_path(path)
+        assert.are.equal(path, Tasks.state_path())
+    end)
+
+    it("publishes the defaults the extension falls back to", function()
+        Tasks.publish(nil)
+        local published = Tasks.published()
+        assert.are.equal("budgeted", published.wake_on_idle)
+        assert.are.equal(2, published.wake_budget)
+        assert.are.equal(300000, published.wake_cache_window_ms)
+        -- Headless (`-l`, `:embed`) has no UI a human could be present at.
+        assert.is_false(published.present)
+        assert.is_false(Tasks.present())
+    end)
+
+    it("clamps what it publishes, so the file means what the backend will do", function()
+        Tasks.publish({ wake_on_idle = "never", wake_budget = 99, wake_cache_window_ms = -5 })
+        local published = Tasks.published()
+        assert.are.equal("never", published.wake_on_idle)
+        assert.are.equal(10, published.wake_budget)
+        assert.are.equal(0, published.wake_cache_window_ms)
+
+        Tasks.publish({ wake_on_idle = "sometimes", wake_budget = 1.6, wake_cache_window_ms = 999999999999 })
+        published = Tasks.published()
+        assert.are.equal("budgeted", published.wake_on_idle, "an unknown policy falls back, never guesses")
+        assert.are.equal(1, published.wake_budget)
+        assert.are.equal(86400000, published.wake_cache_window_ms)
+    end)
+
+    it("keeps the last config when republishing for a focus change", function()
+        Tasks.publish({ wake_on_idle = "never", wake_budget = 0, wake_cache_window_ms = 0 })
+        Tasks.publish() -- a focus change publishes `present` alone
+        local published = Tasks.published()
+        assert.are.equal("never", published.wake_on_idle)
+        assert.are.equal(0, published.wake_budget)
+    end)
+
+    it("returns nil for a missing or corrupt file", function()
+        assert.is_nil(Tasks.published())
+        local f = assert(io.open(path, "w"))
+        f:write("{not json")
+        f:close()
+        assert.is_nil(Tasks.published())
+    end)
+end)
+
+describe("pi.tasks held report events", function()
+    before_each(function()
+        Tasks._reset()
+    end)
+
+    it("records the hold reason without touching the terminal state", function()
+        Tasks.handle_event(started_ev("h1", 1000), "s1", 1)
+        Tasks.handle_event({
+            type = "pi2_bg_task",
+            timestamp = 2000,
+            details = { kind = "completed", taskId = "h1", exitCode = 0 },
+        }, "s1", 1)
+        local before = Tasks.get("h1")
+
+        local calls = 0
+        Tasks.on_refresh(function()
+            calls = calls + 1
+        end)
+        local consumed = Tasks.handle_event({
+            type = "pi2_bg_task",
+            timestamp = 3000,
+            details = { kind = "completed", taskId = "h1", held = "cache" },
+        }, "s1", 1)
+
+        assert.is_true(consumed)
+        local after = Tasks.get("h1")
+        assert.are.equal("cache", after.held_reason)
+        assert.are.equal("completed", after.status)
+        assert.are.equal(before.end_time, after.end_time, "a hold is not a second exit")
+        pump(50)
+        assert.are.equal(1, calls, "the panel must redraw to show the hold")
+    end)
+
+    it("ignores a hold for an unknown task and still consumes the event", function()
+        assert.is_true(Tasks.handle_event({
+            type = "pi2_bg_task",
+            details = { kind = "completed", taskId = "nope", held = "budget" },
+        }, "s1", 1))
+        assert.is_nil(Tasks.get("nope"))
+    end)
+end)

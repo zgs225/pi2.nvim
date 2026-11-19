@@ -1,13 +1,19 @@
 # pi.nvim development helpers.
 #
 #   make test    — run the plenary unit test suite (hermetic, -u tests/minimal_init.lua).
+#                  This is the CI unit gate (`.github/workflows/tests.yml`, pushed to
+#                  main + every PR, judged by exit code only).
 #                  Files run in parallel, 120 s per file: tests/worktree_git_spec.lua
 #                  alone spends ~50 s on real git commits at APFS fsync speed, which
 #                  plenary's 50 s default would kill under parallel load.
+#                  render-markdown.nvim is OPTIONAL (RENDER_MARKDOWN_PATH): the
+#                  render-contract spec skips itself when the checkout is missing.
 #   make check   — static gates: LuaJIT parse (G24) + docs sync; `check-selftest`
 #                  proves each gate can still fail. Needs `luajit` (mise install)
 #                  and python3; see .mise.toml.
-#   make e2e     — run headless end-to-end scripts (tests/*_e2e.lua)
+#   make e2e     — run headless end-to-end scripts (tests/*_e2e.lua); stops at the
+#                  FIRST failing script (`|| exit 1`), so triage a red run one file
+#                  at a time — everything after the first failure never ran
 #   make e2e-reaper — real-pi e2e: subagent idle reaper + max_children cap (needs pi binary + provider; not CI)
 #   make e2e-worktrees — real-git e2e: worktree create/apply/remove/ship/release (needs pi binary; no provider calls)
 #   make e2e-bg-delivery — real-pi e2e: background bash completion delivery into agent context (needs pi + provider; not CI)
@@ -17,6 +23,7 @@
 #   make e2e-bg-report — real-pi e2e: a completion report is one structured `<background-task>` block (needs pi; fake provider)
 #   make e2e-bg-fallback — real-pi e2e: BOTH fallback scenarios — a failed injection retried until the request succeeds, and a run that gives up delivering it yet still wakes with the report (needs pi; fake provider)
 #   make e2e-bg-wake — real-pi e2e: two same-tick completions send ONE coalesced wake naming both tasks (needs pi; fake provider)
+#   make e2e-bg-wake-gate — real-pi e2e: a held completion starts no turn, says why, and rides the next prompt exactly once (needs pi; fake provider)
 #   make e2e-bg-deadline — real-pi e2e: deadline_ms and the lifetime cap send ONE notify-only check-in each, no kill (needs pi; fake provider)
 #   make e2e-bg-ownership — real-pi e2e: a fork does not adopt the parent's tasks, a clean quit records its kills
 #   make e2e-subagent-failure — real-pi e2e: a failed child run reaches the parent as a failed item (needs pi; not CI)
@@ -35,6 +42,9 @@ NVIM_BIN ?= nvim
 PYTHON_BIN ?= python3
 LUAJIT_BIN ?= luajit
 PLENARY_PATH ?= $(HOME)/.local/share/nvim/lazy/plenary.nvim
+# OPTIONAL: render-markdown.nvim, used only by tests/render_contract_spec.lua.
+# When the checkout is absent, minimal_init skips it and that spec skips itself.
+RENDER_MARKDOWN_PATH ?= $(HOME)/.local/share/nvim/lazy/render-markdown.nvim
 MIN_INIT := tests/minimal_init.lua
 STYLUA_BIN ?= stylua
 LUA_LS_BIN ?= lua-language-server
@@ -42,10 +52,10 @@ RUFF_BIN ?= ruff
 
 export LUAJIT_BIN
 
-.PHONY: test smoke format style lint docs-links check check-selftest check-list parse e2e e2e-reaper e2e-worktrees e2e-bg-delivery e2e-bg-stop e2e-bg-reconcile e2e-bg-stdin e2e-bg-report e2e-bg-ownership e2e-subagent-failure e2e-subagent-worktree e2e-bg-fallback e2e-bg-wake e2e-bg-deadline
+.PHONY: test smoke format style lint docs-links check check-selftest check-list parse e2e e2e-reaper e2e-worktrees e2e-bg-delivery e2e-bg-stop e2e-bg-reconcile e2e-bg-stdin e2e-bg-report e2e-bg-ownership e2e-subagent-failure e2e-subagent-worktree e2e-bg-fallback e2e-bg-wake e2e-bg-wake-gate e2e-bg-deadline
 
 test:
-	PLENARY_PATH=$(PLENARY_PATH) $(NVIM_BIN) --headless -u $(MIN_INIT) \
+	PLENARY_PATH=$(PLENARY_PATH) RENDER_MARKDOWN_PATH=$(RENDER_MARKDOWN_PATH) $(NVIM_BIN) --headless -u $(MIN_INIT) \
 		-c "lua require('plenary.test_harness').test_directory('tests', { minimal_init = '$(MIN_INIT)', timeout = 120000 })"
 
 e2e:
@@ -55,7 +65,7 @@ e2e:
 	done
 
 # Real end-to-end against `pi --mode rpc` (scripts/e2e/). None of these are part
-# of `make test`. The eight background-task suites that drive a scripted FAKE
+# of `make test`. The nine background-task suites that drive a scripted FAKE
 # provider run in CI (.github/workflows/e2e.yml); the ones that need a real
 # provider stay manual. See .agents/skills/develop/references/testing.md.
 e2e-reaper:
@@ -105,6 +115,13 @@ e2e-bg-fallback:
 # — runs in CI.
 e2e-bg-wake:
 	$(NVIM_BIN) --headless -u $(MIN_INIT) -l scripts/e2e/bg_tasks_wake.lua
+
+# Real-pi e2e for the idle-wake COST GATE: a completion that would otherwise
+# start its own turn is held (`never`, or a spent budget), the hold is announced
+# with its reason, the report is not persisted or woken, and it rides the next
+# user prompt exactly once. Needs the pi binary only — runs in CI.
+e2e-bg-wake-gate:
+	$(NVIM_BIN) --headless -u $(MIN_INIT) -l scripts/e2e/bg_tasks_wake_gate.lua
 
 # Real-pi e2e for the two NOTIFY-ONLY timers: `deadline_ms` sends ONE
 # `check_in="deadline"` message (with an output tail) before the task's exit

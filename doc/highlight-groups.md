@@ -176,7 +176,7 @@ The dashboard reuses `PiToolHeader` for its section headers, `Comment` for dimme
 | `PiSessionsListDotDim` | Dim phase of blinking dots |
 | `PiSessionsListCurrent` | Marks the current tab's own session dot in the agent color |
 | `PiSessionsListFloatTitle` | Float title for the sessions list window |
-| `PiSessionsListWorktree` | Worktree group header in `:PiSessions` (`󰙅 name · ~/path`) and the partition title in the `:PiResume` picker (`󰙅 name` for a linked worktree, the project name for the main checkout) |
+| `PiSessionsListWorktree` | Worktree group header in `:PiSessions` (`󰙅 name · ~/path`), the partition title in the `:PiResume` picker (`󰙅 name` for a linked worktree, the project name for the main checkout), and the `󰙅 name` badge in the sub-session viewer footer |
 
 ## Background tasks panel
 

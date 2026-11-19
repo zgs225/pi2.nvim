@@ -214,6 +214,12 @@ function M.format_line(row, tick, width, now_ms, current_session_id)
         end
         subtitle = subtitle .. " · " .. time
     end
+    -- A finished task whose report is waiting for the next user prompt says so
+    -- (`held (cache)`): the wake gate spends no turn on it, so the row is the
+    -- only place the user can see that the result is sitting there undelivered.
+    if task.held_reason then
+        subtitle = subtitle .. " · held (" .. task.held_reason .. ")"
+    end
 
     local prefix = dot .. " " .. (spinner and spinner .. " " or "")
     local sep = " · "

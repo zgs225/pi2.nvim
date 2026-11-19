@@ -8,13 +8,15 @@ The repo ships `tests/minimal_init.lua` and a `Makefile` with `test` (hermetic p
 
 **What it's for:** pure Lua with no UI — stores, parsers, config resolution, pure transforms. Examples in repo: `tests/prompt_history_spec.lua`, `tests/draft_spec.lua`, `tests/render_spec.lua`, `tests/sanity_spec.lua`.
 
-**How it runs:** `make test` → `nvim --headless -u tests/minimal_init.lua -c "...test_directory('tests'...)"`. `minimal_init.lua` prepends plenary + the repo root to `runtimepath` *without* loading the user's config, so it is fast and deterministic. `PLENARY_PATH` overrides the plenary location. Because the repo root is resolved from `minimal_init.lua`'s **own file path**, this layer runs against the current **worktree's** code — it is worktree-safe (G23).
+**How it runs:** `make test` → `nvim --headless -u tests/minimal_init.lua -c "...test_directory('tests'...)"`. `minimal_init.lua` prepends plenary + the repo root to `runtimepath` *without* loading the user's config, so it is fast and deterministic. `PLENARY_PATH` overrides the plenary location. Because the repo root is resolved from `minimal_init.lua`'s **own file path**, this layer runs against the current **worktree's** code — it is worktree-safe (G23). It is also the **CI unit gate**: `.github/workflows/tests.yml` runs `make test` on every push to `main` and on every PR, judged by **exit code only** (never by grepping the coloured output — G25) with a pinned toolchain (Neovim v0.12.6, plenary / render-markdown.nvim commits), because the specs assert version-specific behaviour.
 
 **Rules / pitfalls:**
 - `before_each` / `after_each` **must be inside a `describe`**. At the top level they silently no-op *and* the run exits non-zero (`make: Error 1`) with no clear message — the spec just never executes (G14). Always wrap.
 - Make stateful modules testable: a `_reset()` to clear singletons and a path-override hook (`_set_path`) so tests use a `vim.fn.tempname()` file, never the real `stdpath`. See `draft.lua` / `prompt_history.lua`.
 - Don't name a Makefile variable `NVIM` — nvim injects `$NVIM` (its server socket) into the environment and `?=` won't override it; use `NVIM_BIN` (G15).
 - Assert with `assert.are.equal` / `assert.are.same` / `assert.is_nil` / `assert.is_true`. Keep each `it` focused on one behavior.
+- **Budget every polled assertion for a loaded machine.** `make test` starts **one child nvim per spec file** (~170 files in parallel, two cores on the CI runner), so a `vim.wait(…, pred, …)` window that is comfortable standalone is a flake in the full run — and CI sees only the flake. Use `vim.wait(10000, pred, 5)`, never 100–500 ms. `tests/render_contract_spec.lua` uses this for the async treesitter render (G9).
+- **render-markdown.nvim is an *optional* test dependency.** `tests/minimal_init.lua` prepends it to `runtimepath` only when the checkout exists (`RENDER_MARKDOWN_PATH`, default `~/.local/share/nvim/lazy/render-markdown.nvim`), the `Makefile`'s `test` target exports that variable, and a spec that needs it skips itself with `pending()` when the checkout is absent — verified: `RENDER_MARKDOWN_PATH=/nonexistent` gives 2 successes + 4 pending and exit 0, and CI installs the pinned commit so "we cannot test this here" never silently reads as green. Plenary's child nvims run with `--noplugin`, so being on `runtimepath` is *not* the same as being loaded: a spec must call `require("render-markdown").setup{...}` and `require("render-markdown.core.manager").init()` itself (G8), and must set `Config.options.render.engine` **before** the chat opens, because the layout reads the engine when it creates the history window (G7).
 
 **Template:** `scripts/unit_spec_template.lua`.
 
@@ -41,6 +43,8 @@ The repo ships `tests/minimal_init.lua` and a `Makefile` with `test` (hermetic p
 - **You cannot see rendering.** Treesitter/extmark *counts* are observable (`nvim_buf_get_extmarks`), but whether it *looks right* is not. Visual proof is Layer 3 only (G6).
 - **`vim.keycode`/`nvim_replace_termcodes` for a special key, returned from an `<expr>` mapping, inserts raw bytes** (`\x80ku`) as text in this environment. The correct fallback return is the literal angle-bracket string `"<Up>"` (G2). A headless e2e that types into a multi-line prompt and presses `<Up>` on line 2 is exactly the test that catches this.
 
+**Committed headless e2e scripts.** The key/ordering gotchas are pinned in-tree, not only described: `make e2e` runs every `tests/*_e2e.lua` under `nvim --headless -u tests/minimal_init.lua -l <file>` (worktree-safe, no user config). `tests/prompt_up_e2e.lua` drives the real prompt buffer for G5/G2 (`"i" .. vim.keycode("<Up>")` in ONE `nvim_feedkeys(..., "x", false)` call: a 3-line draft stays byte-identical, the cursor moves up, no `\x80ku` appears, and on line 1 the same key recalls the newest history entry), and `tests/side_focus_e2e.lua` pins both halves of G11. Both isolate themselves **before `require("pi")`** (`PI_CODING_AGENT_DIR`, `pi.prompt_history._set_base_dir`, `pi.draft._set_path` on temp dirs, backend send stubbed), so a `make e2e` run leaves the user's `~/.pi/agent/sessions` untouched (G17/G18). **Triage by file, not by run:** the `e2e` loop ends each script with `|| exit 1`, so it stops at the FIRST failing script and every later script is neither run nor reported — run `tests/*_e2e.lua` individually when one is red.
+
 **Template:** `scripts/headless_e2e_template.lua`.
 
 ## Layer 3 — GUI automation (xdotool + wmctrl + maim + RPC)
@@ -58,7 +62,8 @@ The repo ships `tests/minimal_init.lua` and a `Makefile` with `test` (hermetic p
 - `find_buf <filetype>` — bufnr or `-1`.
 - `send <keys>` / `type_text <text>` — xdotool to `$WIN` with inter-key delays.
 - `normal` — send `Esc` until mode is normal/visual (G12: the prompt is in insert mode, so any leader/normal key needs this first).
-- `shot <name>` — `maim -i $WIN`.
+- `shot <name>` — `maim -i $WIN`. Every success increments `SHOTS_OK`; every failure branch (maim error, a missing/unmapped window, or a **blank-file floor**: fewer than 20000 bytes means the capture is an all-one-color PNG) increments `SHOTS_FAIL` and returns nonzero — on **both** the Linux and the macOS harness (G27).
+- `summary` — prints `PASS=<n> FAIL=<n> SHOTS_OK=<n> SHOTS_FAIL=<n>` and **returns nonzero when `SHOTS_FAIL > 0`**, so a run whose screenshots all failed can no longer end green. A run that legitimately takes zero screenshots stays green (no shot attempted, no failure). Every run script must therefore end with `summary || exit 1` — that line is the accounting's only teeth.
 - `check <name> <got> <want>` / `wait_for '<lua-bool>' <tries>`.
 
 **Isolation recipe (do this, every GUI run, or you corrupt the user's data — G17):**
@@ -75,7 +80,7 @@ The repo ships `tests/minimal_init.lua` and a `Makefile` with `test` (hermetic p
 **Driving real keybindings — the gotchas that matter here:**
 - Leader is whatever `vim.g.mapleader` is (in the user's config it is `,`); send it as `comma`. Always `normal` (Esc) first (G12).
 - lazy may only *load* the plugin on the first keypress; `wait_for` the `pi-chat-prompt` buffer instead of assuming the toggle completed (G13).
-- side layout's WinEnter redirect (G11): to focus history programmatically without a bounce, enter it from the prompt window; or use the real `<C-g>h` binding which the user presses from the prompt anyway.
+- side layout's `WinEnter` redirect (G11) is created by `Chat:_set_keymaps` in `lua/pi/ui/chat/init.lua`, **not** by the layout module: to focus history programmatically without a bounce, enter it from the prompt window (that is the `prev == pwin` exemption; float layout is exempt entirely); or use the real `<C-g>h` binding which the user presses from the prompt anyway.
 - `gf` and other normal-mode keys on the history buffer: the history window has `winfixbuf`, so never `:edit` *inside* it in a test; the jump code switches to a non-pi window first.
 
 **Reading a screenshot as proof.** Open the `maim` PNG and confirm the *rendered* form, not the source: headings show as styled text with the `##` concealed; `**bold**`/`*italic*` show as bold/italic with markers gone; list lines show bullets; a fenced block shows a language label + box with the fence concealed; links show an icon + label with the `(...)` gone. If any raw markdown punctuation is visible, rendering did not engage for that region.
@@ -100,7 +105,7 @@ Same topology, same RPC ground truth, same isolation recipe (G17) and verificati
 - **Screen Recording** — required for `shot` *and* for the CGWindowID lookup. Probe: `screencapture -x -R0,0,50,50 /tmp/probe.png` (errors when denied; the window list silently hides other apps' windows when denied).
 - Accessibility is **not** needed: input goes through the mux socket, not System Events (G28).
 
-Degradation is deliberate and loud: without Screen Recording everything except `shot` still works — launch prints the remedy, `shot` SKIP/FAILs, and a tiny-file check rejects blank PNGs. Screenshots are also 2x pixels on Retina displays.
+Degradation is deliberate and loud: without Screen Recording everything except `shot` still works — launch prints the remedy, `shot` SKIP/FAILs, and a tiny-file check rejects blank PNGs. Screenshots are also 2x pixels on Retina displays. The accounting is the same as on Linux and is what makes "every screenshot silently failed" impossible to report green: `shot()` increments `SHOTS_FAIL` on each of its three failure branches (no CGWindowID, `screencapture` error, a file under the 20000-byte floor — the floor exists in both variants) and `SHOTS_OK` on success, `summary()` prints `PASS=/FAIL=/SHOTS_OK=/SHOTS_FAIL=` and returns nonzero when `SHOTS_FAIL > 0`, and run scripts end with `summary || exit 1`. Verified by eight stubbed scenarios (success / capture error / blank file / no shot, per harness) driving the real `shot()`/`summary()` with fake `maim`/`screencapture`/`stat`; a real macOS pixel capture is still unverified.
 
 **Templates (macOS):** `scripts/macos/gui_harness.sh`, `scripts/macos/gui_launch.sh`, `scripts/macos/gui_cleanup.sh`.
 
@@ -128,7 +133,7 @@ When in doubt, add the cheaper test *and* the GUI screenshot; the screenshot is 
      ```
      (requires the one-time `dir = vim.env.PI_DEV_DIR or nil` line in the user's pi lazy spec — present in this setup). Mention that a plain `nvim` (no `PI_DEV_DIR`) shows the pre-change behavior for comparison.
    - Change already **merged to `main`** → plain `nvim` (the live lazy checkout tracks `main`; restart nvim so lazy reloads, G21).
-8. **Confirm CI is green post-merge.** After pushing `main`, check the GitHub Actions run for the merge commit (`make style` + `make lint` + `make check` + `make docs-links`). The runner is a clean environment, so a local pass does not guarantee a CI pass — the run is the authoritative reproducibility gate, and the feature is not done until it is green. Commands in `SKILL.md` § CI verification.
+8. **Confirm CI is green post-merge.** After pushing `main`, check the GitHub Actions runs for the merge commit — `.github/workflows/lint.yml` (`make style` + `make lint` + `make check` + `make docs-links`) **and** `.github/workflows/tests.yml` (`make test`, the unit gate). The runner is a clean environment, so a local pass does not guarantee a CI pass — the run is the authoritative reproducibility gate, and the feature is not done until it is green. Commands in `SKILL.md` § CI verification.
 
 ## How to use the bundled scripts
 

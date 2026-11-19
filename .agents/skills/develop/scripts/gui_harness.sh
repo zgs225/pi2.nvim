@@ -8,6 +8,11 @@
 #   RUN=/tmp/my_run bash run.sh
 # Defaults to /tmp/pi_dev_test. Override SOCK / WIN / SHOTDIR individually if needed.
 #
+# End every run script with `summary || exit 1`. summary returns nonzero when
+# any screenshot failed (SHOTS_FAIL>0, G27), so a run whose pixels were never
+# captured cannot exit green. A run that takes ZERO screenshots (RPC-only
+# assertions) is still green: only a failed shot is fatal.
+#
 # WHY each helper looks the way it does (see references/gotchas.md / testing.md):
 #   * Lua is executed by writing it to a file and :luafile-ing it over RPC
 #     (qlua/runlua) — this dodges shell-quoting hell entirely. Prefer these over
@@ -24,7 +29,7 @@ SHOTDIR=${SHOTDIR:-$RUN/shots}
 CMD=${RUN}.cmd.lua
 OUT=${RUN}.out
 mkdir -p "$SHOTDIR"
-PASS=0; FAIL=0
+PASS=0; FAIL=0; SHOTS_OK=0; SHOTS_FAIL=0
 
 _exec() { nvim --server "$SOCK" --remote-expr 'execute("luafile '"$CMD"'")' >/dev/null 2>&1; }
 
@@ -60,7 +65,24 @@ LUA
 
 send() { xdotool key --window "$WIN" --delay 40 "$@"; sleep 0.4; }
 type_text() { xdotool type --window "$WIN" --delay 25 -- "$@"; sleep 0.4; }
-shot() { maim -i "$WIN" "$SHOTDIR/$1.png" 2>/dev/null && echo "  screenshot: $SHOTDIR/$1.png"; }
+shot() {
+  local out="$SHOTDIR/$1.png"
+  if ! maim -i "$WIN" "$out" 2>/dev/null; then
+    echo "  [shot FAIL] maim errored for window '$WIN' — is it still mapped? (G27)"
+    SHOTS_FAIL=$((SHOTS_FAIL+1))
+    return 1
+  fi
+  # Blank sanity: a broken capture can still yield a tiny all-one-color PNG. A
+  # real 200-col nvim UI is far bigger than this floor (same check as macOS).
+  local sz; sz=$(stat -c%s "$out" 2>/dev/null || echo 0)
+  if [ "$sz" -lt 20000 ]; then
+    echo "  [shot WARN] $out is only ${sz}B — looks blank (G27)"
+    SHOTS_FAIL=$((SHOTS_FAIL+1))
+    return 1
+  fi
+  SHOTS_OK=$((SHOTS_OK+1))
+  echo "  screenshot: $out"
+}
 
 check() {
   if [ "$2" = "$3" ]; then echo "[PASS] $1"; PASS=$((PASS+1));
@@ -107,4 +129,13 @@ RESULT = (n >= 2) and (e[n - 1] .. " | " .. e[n]) or ("ONLY:" .. table.concat(e,
 LUA
 }
 
-summary() { echo "=================================="; echo "PASS=$PASS FAIL=$FAIL"; echo "=================================="; }
+summary() {
+  echo "=================================="
+  echo "PASS=$PASS FAIL=$FAIL SHOTS_OK=$SHOTS_OK SHOTS_FAIL=$SHOTS_FAIL"
+  echo "=================================="
+  if [ "$SHOTS_FAIL" -gt 0 ]; then
+    echo "$SHOTS_FAIL screenshot(s) were SKIPped/failed — no pixels captured (G27)" >&2
+    return 1
+  fi
+  return 0
+}

@@ -20,7 +20,7 @@ Each entry is a real defect or trap encountered while adding features to this pl
 | G8 | render-markdown auto-attach needs `plugin/` sourced (lazy does this) |
 | G9 | Headless: force `render-markdown.render({ buf = buf })` |
 | G10 | markview ignores `buftype=nofile`; prefer render-markdown |
-| G11 | Enter history window from prompt to avoid WinEnter redirect |
+| G11 | Side layout's `WinEnter` redirect lives in `Chat:_set_keymaps` (`ui/chat/init.lua`), not the layout — enter history from the prompt; float is exempt |
 | G12 | Send `Esc` before normal/leader keys (prompt auto-inserts) |
 | G13 | lazy loads on first key; `wait_for` the buffer |
 | G14 | `before_each`/`after_each` must be inside a `describe` |
@@ -35,8 +35,8 @@ Each entry is a real defect or trap encountered while adding features to this pl
 | G23 | In a worktree, `make smoke`/GUI load the MAIN checkout (lazy path), not your code; verify with `make test` + `-u tests/minimal_init.lua` |
 | G24 | No Lua 5.3-only syntax (`&` `\|` `~` `<<` `>>`, `//`) and no newer-grammar numerals (`1_000`) — the LuaJIT Neovim embeds rejects them; `make parse` is the gate |
 | G25 | Prove a gate can fail before trusting it; never grep coloured test output. `make check-selftest` institutionalises this |
-| G26 | uv callbacks (`vim.system`, timers) are fast events — `vim.schedule` any editor work; `repeat = 0` is one-shot; hold timer objects or they are GC'd |
-| G31 | `Config.setup()` shares nested tables with the module-local `defaults` (`tbl_deep_extend` keeps references) — never mutate `options.subagent` in place in specs; deepcopy first |
+| G26 | uv callbacks (`vim.system`, timers) are fast events — `vim.schedule` any editor work; `repeat = 0` is one-shot; hold timer handles anyway (reuse after `stop()`, teardown) — GC does **not** collect an armed one |
+| G31 | root-fixed: `Config.setup()` deepcopies `defaults` before merging, so nested option tables are no longer aliased to the defaults; replacing a nested table whole is still good hygiene |
 | G32 | macOS: `tempname()` is `/var/…` (symlink to `/private/var/…`) while the code reports real paths ⇒ canonicalize the temp root in specs (`fs_realpath` after `mkdir`) and derive node `sessionsDir` from `process.cwd()`, or expectations never match |
 | G33 | Plenary's default 50 s per-file timeout silently kills `worktree_git_spec.lua` on a real (APFS-fsync) disk: no output, `make test` exits 2; pass `timeout = 120000` |
 
@@ -71,6 +71,7 @@ Each entry is a real defect or trap encountered while adding features to this pl
 - **现象:** An `<expr>` mapping calls a function that does `nvim_buf_set_lines(...)`; the buffer does not change, no error.
 - **根因:** Neovim forbids mutating the buffer while an `<expr>` mapping's expression is being evaluated; the change is dropped silently.
 - **修法:** Defer the mutation: set a flag, return `""` from the expr, and do the `set_lines` inside `vim.schedule`. The plain (non-expr) mappings are unaffected by the schedule, so it is safe to use unconditionally.
+- **回归守护:** `tests/prompt_recall_spec.lua` (`G1: defers the draft edit and appends the cursor past a multi-line draft`) — the draft edit must land and the cursor must end up past it.
 
 ### G2 — `<expr>` fallback inserts raw bytes (`<80>ku`) as text
 - **现象:** An insert-mode `<expr>` mapping that wants to *pass through* `<Up>` returns `vim.keycode("<Up>")` (or `nvim_replace_termcodes("<Up>", true, false, true)`); instead of moving the cursor, the literal bytes `\x80ku` get inserted into the buffer.
@@ -81,11 +82,13 @@ Each entry is a real defect or trap encountered while adding features to this pl
   -- variant that works:           return "<Up>"
   ```
   A GUI/headless test that puts the cursor on line 2 of a multi-line prompt and presses `<Up>` (which must *move*, not recall) is the regression check: assert the buffer text is unchanged.
+- **回归守护:** `tests/prompt_recall_spec.lua` (`G2: <Up> off the top line passes through as the literal string`, `G2/G5: <Up> on the top line recalls the newest entry`) and `tests/prompt_up_e2e.lua` on the real prompt buffer. Mutation-proven: changing the `<Up>` map's `return "<Up>"` to `return vim.keycode("<Up>")` makes the pass-through case fail with `got '\x80ku'`.
 
 ### G3 — History recall works once, then can't walk further back
 - **现象:** First `<C-p>` shows the newest entry; a second `<C-p>` shows the newest entry *again* instead of the older one. Navigation state reads `navigating() == false` right after the first recall.
 - **根因:** `TextChangedI` is a **deferred** event. The naive guard is a boolean `_applying_history` set true around the programmatic edit and cleared in a `vim.schedule` right after `set_lines`. But the deferred `TextChangedI` fires *after* that clearing schedule, so the "manual-edit resets navigation" autocmd sees the flag already false and wipes navigation. (Caught only at the GUI layer; unit + headless passed because they don't fire the deferred event the same way.)
 - **修法:** Don't use a timing flag. Record the exact text you wrote (`self._last_applied_prompt = text`); in the reset autocmd, compare the current buffer text to it — equal ⇒ programmatic recall (skip reset), different ⇒ genuine manual edit (reset). This is independent of schedule/deferred ordering.
+- **回归守护:** `tests/prompt_recall_spec.lua` (`G3: a second recall walks back instead of repeating the newest entry`, `G3: a manual edit resets navigation`, `G3: a simulated recall edit keeps navigation`). Mutation-proven: changing the reset autocmd's `if cur == self._last_applied_prompt then` to `if false then` makes `G3: a simulated recall edit keeps navigation` fail — that case *is* the deferred-`TextChangedI` ordering bug this entry documents.
 
 ### G4 — Headless e2e: the `TextChanged` save hook never fires
 - **现象:** A debounced "persist on edit" autocmd works interactively but the headless `-l` test sees the file unchanged after `nvim_buf_set_lines`.
@@ -96,26 +99,35 @@ Each entry is a real defect or trap encountered while adding features to this pl
 - **现象:** `feedkeys("<Up>")` then `wait` leaves the buffer unchanged; diagnostics show mode `n` at the moment the key is processed.
 - **根因:** Insert mode does not persist across separate `feedkeys`/`wait` calls in headless; by the time the key is handled the mode reverted to normal, and the mapping is insert-only.
 - **修法:** Feed the whole sequence in one call (`vim.api.nvim_feedkeys("i" .. vim.keycode("<Up>"), "x", false)`), or bind the key in `{ "i", "n" }` so it works in both modes (the recall keys do this).
+- **回归守护:** `tests/prompt_up_e2e.lua` (headless e2e: the `"i" .. vim.keycode("<Up>")` sequence in ONE `nvim_feedkeys(..., "x", false)` call) — on line 2 of a 3-line draft the text must stay byte-identical, the cursor must move up, no `\x80ku` may appear, and on line 1 the same key must recall the newest history entry. Mutation-proven with the same `vim.keycode` swap as G2. The spec-level half is `tests/prompt_recall_spec.lua` (`G2/G5` case).
 
 ### G6 — "I can't verify the markdown looks right" headless
 - **现象:** Extmark counts are non-zero, text is intact, no errors — but you cannot tell if headings/bold/code chrome actually render.
 - **根因:** Headless has no display; rendering correctness is a visual property.
 - **修法:** A GUI `maim` screenshot is the *only* proof. Open the PNG and confirm the *rendered* form (markers concealed, chrome drawn). See `testing.md` "Reading a screenshot as proof".
+- **回归守护:** the mechanical half only — `tests/render_contract_spec.lua` pins `conceallevel`, attachment and extmark counts; pixels still need a screenshot, so a green suite here is not evidence that it looks right.
 
 ### G7 — Builtin code-block chrome looks redundant / breaks tool output
 - **现象:** Adding a language label + box around fenced blocks in the builtin renderer either shows the box *and* the raw ` ```lua ` line (redundant) or, if you conceal the fence, mangles tool output that contains fence-like lines.
 - **根因:** The history window is intentionally `conceallevel=0` (so tool output stays verbatim). Pretty chrome needs conceal, which directly conflicts; and you can't visually verify the result headless.
 - **修法:** Don't add conceal-based chrome to builtin. Deliver rich chrome via the opt-in `render-markdown` engine (`render.engine = "render-markdown"`), which already draws language labels + boxes correctly (confirmed by screenshot).
+- **回归守护:** `tests/render_contract_spec.lua` (builtin cases) — the side **and** float history windows are at `conceallevel = 0`, asserted only after checking `filetype == "pi-chat-history"` and `buftype == "nofile"`, so the assertion cannot silently target the wrong buffer. Mutation-proven on both layout branches (`conceallevel` 0→2 fails).
 
 ### G8 — render-markdown "doesn't attach" in a spike
 - **现象:** After `require("render-markdown").setup{ file_types = {"pi-chat-history"} }`, `manager.attached(buf)` is false.
 - **根因:** Auto-attach is registered by `plugin/render-markdown.lua` calling `manager.init()` (a global `FileType` autocmd). lazy.nvim sources `plugin/` on load; a runtime `vim.opt.runtimepath:prepend(...)` does **not**, so the autocmd is never created.
-- **修法:** In a spike, call `require("render-markdown.core.manager").init()` explicitly after setup. In production (lazy install) it just works.
+- **修法:** In a spike, call `require("render-markdown.core.manager").init()` explicitly after setup. In production (lazy install) it just works. Any spec that asserts attachment must do the same, and the rest of the wiring is non-obvious:
+  - render-markdown.nvim is an **optional test dependency**. `tests/minimal_init.lua` prepends it to `runtimepath` only when the checkout exists (`RENDER_MARKDOWN_PATH`, default `~/.local/share/nvim/lazy/render-markdown.nvim`), the `Makefile`'s `test` target exports that variable, and a spec skips itself (`pending`) when the checkout is absent — so `RENDER_MARKDOWN_PATH=/nonexistent make test` stays green.
+  - Plenary's child nvims run with `--noplugin`, so the plugin's own `plugin/` file never runs: the spec must call `require("render-markdown").setup{ file_types = { "pi-chat-history" } }` **and** `require("render-markdown.core.manager").init()` itself (plus `core.log.init()`, whose table the render path logs into).
+  - `Config.options.render.engine` must be set **before** the chat opens: the layout reads the engine when it creates the history window, so setting it afterwards leaves a builtin window attached to nothing.
+  - CI installs the pinned checkout for exactly this reason — a skipped contract must not read as a green one.
+- **回归守护:** `tests/render_contract_spec.lua` (render-markdown cases): `state.file_types` contains `pi-chat-history` (pi's handshake), `conceallevel == 2`, `manager.attached(hbuf)`. `tests/render_pause_spec.lua` was corrected for the same wiring — its old premise ("render-markdown is not on the test runtimepath, so the require fails") became false, so it now pins the safe no-op behaviour for every case and forces the genuinely-missing-engine path with `package.preload["render-markdown"] = function() error("not installed") end`, including the warn-once guard.
 
 ### G9 — render-markdown renders nothing on injected text, headless
 - **现象:** Buffer attached, `enabled` true, window present, but after injecting markdown and waiting, the render-markdown namespace has 0 extmarks; a manual forced render produces them.
 - **根因:** render-markdown's render is an async treesitter parse driven by its event hooks; headless's passive `TextChanged` path doesn't drive it the way an interactive event loop does.
 - **修法:** In tests, force `require("render-markdown").render({ buf = buf, event = "Api" })` (public API). Interactively, its own `TextChanged`/`CursorMoved` hooks handle streaming — that is the mechanism codecompanion.nvim relies on too. (Don't add a competing pi-owned debounced re-render: it races with render-markdown's async pass and can *clear* a forced render in headless.)
+- **回归守护:** `tests/render_contract_spec.lua` (render-markdown cases) — after a forced `require("render-markdown").render({ buf = hbuf })`, the namespace `"render-markdown.nvim"` must hold non-zero extmarks. Mutation-proven.
 
 ### G10 — markview ignores the history buffer
 - **现象:** markview attaches nowhere on the history buffer by default.
@@ -124,8 +136,9 @@ Each entry is a real defect or trap encountered while adding features to this pl
 
 ### G11 — Programmatic focus of the history window bounces to the prompt
 - **现象:** `nvim_set_current_win(history_win)` from an editor window ends with focus on the prompt; in a test, a subsequent key lands in the prompt.
-- **根因:** Side layout's `WinEnter` autocmd on the history buffer redirects focus to the prompt when the *previous* window was not the prompt.
-- **修法:** Enter history from the prompt window (real users do this via the focus binding), or expect/await the redirect. The `goto_path_at_cursor` flow avoids the issue by switching to a non-pi window *before* `:edit`.
+- **根因:** Side layout's `WinEnter` autocmd on the history buffer redirects focus to the prompt when the *previous* window was not the prompt. The autocmd is created in `Chat:_set_keymaps` — `lua/pi/ui/chat/init.lua`, around line 323 — **not** in `lua/pi/ui/chat/layout.lua` (that module only supplies `mode()` and `prompt_win()`). It returns early for two reasons: the float layout (`self._layout:mode() == "float"`), and `prev == pwin` (entering the history window FROM the prompt).
+- **修法:** Neither half is a bug — it is a two-part contract. Enter history from the prompt (real users do this via the focus binding, `<C-g>h`): `prev == pwin`, so focus stays. Enter it from a plain editor window (a stray click, a `:wincmd`) and the redirect bounces you back to the prompt. A test must therefore expect the redirect *only* in the second case, and the float layout never redirects. The `goto_path_at_cursor` flow also avoids the issue by switching to a non-pi window *before* `:edit`.
+- **回归守护:** `tests/side_focus_e2e.lua` pins both halves: prompt → history is NOT bounced, plain editor window → history IS redirected to the prompt.
 
 ### G12 — A leader/normal key "types a comma" into the prompt
 - **现象:** Sending `,ap` (or `gf`) while the chat is open inserts a literal comma / does nothing useful.
@@ -156,6 +169,7 @@ Each entry is a real defect or trap encountered while adding features to this pl
 - **现象:** After a test, the user's `prompt_history.json` contains the test's sentinel prompts, or their unsent draft is overwritten; worse, two pi instances writing the same file race and clobber each other.
 - **根因:** A test instance and the user's live instance share `stdpath("data")/pi/...`.
 - **修法:** Redirect the test instance: `require("pi.config").options.prompt.history.path = "/tmp/<run>/history.json"` (set before the first send/recall; the store is lazy) and `require("pi.draft")._set_path("/tmp/<run>/draft.txt")`. Move the user's `draft.txt` aside before the chat opens (so `restore_once` can't pull a real draft into the test prompt) and restore it after. Assert the user's files are untouched and residue-free at the end.
+- **回归守护:** the committed headless e2e scripts isolate themselves before `require("pi")` — `tests/prompt_up_e2e.lua` and `tests/side_focus_e2e.lua` set `PI_CODING_AGENT_DIR`, `pi.prompt_history._set_base_dir` and `pi.draft._set_path` to temp paths and stub `_agent.send`, so a `make e2e` run touches nothing of the user's: the author's `~/.pi/agent/sessions` count was unchanged across both runs (4688 → 4688).
 
 ### G18 — You almost delete a real session file
 - **现象:** `grep -rl "first prompt" ~/.pi/agent/sessions/` returns files that look like test sessions but are actually large real work sessions.
@@ -208,23 +222,22 @@ Each entry is a real defect or trap encountered while adding features to this pl
 ### G25 — A failure-counting grep that never matches reports "all green" on a failing suite
 - **现象:** A verification loop reported `make test` green three runs in a row; the suite actually contained a failing spec. The failing test was merged into main and needed a follow-up fix commit (`33d26fa`, after the #32 stream-coalescing merge).
 - **根因:** Plenary's colored failure line is `Fail\x1b[0m\t||` — between `Fail` and `||` sit the 4-byte ANSI reset **and** a tab. The checker's pattern `Fail.\{0,3\}\|\|` allowed at most 3 characters in that gap, so it matched nothing on *any* run — including runs with real failures. Counting "zero matches" as success without ever proving the pattern matches a failure inverted the check into unconditional success.
-- **修法:** Before trusting any pattern that counts failures, prove it against a synthetic failure: `printf 'Fail\x1b[0m\t||\tx\n' | grep -c '<pattern>'` must print 1. Better, don't regex across colored output at all — assert on the literal summary lines plenary always prints: `grep -E 'Failed : |Errors : ' out.txt | grep -v $'\t0'` must be empty, and the `Success\x1b[0m` count must equal the known assertion total. A check that cannot fail is worse than no check: it manufactures confidence.
+- **修法:** Before trusting any pattern that counts failures, prove it against a synthetic failure: `printf 'Fail\x1b[0m\t||\tx\n' | grep -c '<pattern>'` must print 1. Better, don't regex across colored output at all — assert on the literal summary lines plenary always prints: `grep -E 'Failed : |Errors : ' out.txt | grep -v $'\t0'` must be empty, and the `Success\x1b[0m` count must equal the known assertion total. A check that cannot fail is worse than no check: it manufactures confidence. The suite gate applies the same lesson at the next level up: `.github/workflows/tests.yml` judges `make test` by **exit code only**, and its ANSI-stripped greps run under `if: failure()` as *diagnostics*, never as the gate.
 - **元教训:** Verification code is code and needs its own test. When a gate reports success, the first question is "have I seen it fail?" — if not, the gate is untested. `make check-selftest` exists so every static gate answers that question with a fixture instead of a promise.
 
 ### G26 — libuv callbacks are fast events; timers are one-shot by default and GC-fragile
 - **现象:** Inside a `vim.system(..., callback)` or `vim.uv.new_timer()` callback, editor calls throw `E5560: nvim_buf_get_lines must not be called in a lua loop callback`. Separately: a periodic flush fires exactly once, or silently stops working after a while.
-- **根因:** Three distinct traps, all from the libuv layer. (1) uv callbacks run in **fast-event context**: most `vim.api`/`vim.fn` calls are forbidden there (pure-Lua state mutation is fine). (2) `timer:start(timeout, repeat, cb)` with `repeat = 0` means *fire once* — a periodic tick needs `repeat > 0`. (3) uv handles are held weakly from Lua: a timer referenced only by a local that goes out of scope is garbage-collected, and its callbacks stop with no error.
-- **修法:** Wrap callback bodies that touch the editor in `vim.schedule(function() ... end)` (or `vim.schedule_wrap`); keep pure-Lua bookkeeping in the fast path if you want to. Store timer objects in module-level locals or class fields for as long as they must run, and `stop()`/`close()` them explicitly on teardown. Pass the interval as the second `start()` argument for repeating timers. These constraints shaped the 30ms coalescing flush in `history.lua` (#32) and the deferred-spawn async refresh in `pi/cache/files.lua` (#34).
+- **根因:** Three traps from one layer. (1) uv callbacks run in **fast-event context**: most `vim.api`/`vim.fn` calls are forbidden there (pure-Lua state mutation is fine). (2) `timer:start(timeout, repeat, cb)` with `repeat = 0` means *fire once* — a periodic tick needs `repeat > 0`. (3) the folklore says uv handles are held weakly from Lua, so a timer referenced only by a local is garbage-collected and its callbacks stop with no error. **Measured correction (nvim 0.12.6, bundled luv): that is not reproducible** — an *active* uv handle is referenced by the event loop, so a `do ... end`-local timer kept firing (1 → 41 ticks) across two full `collectgarbage("collect")` cycles, and a weak-value table still held the userdata. The rule stays, for a different reason: the handle belongs in a module-level local or class field because reusing it after `stop()` and closing it on teardown are impossible without it.
+- **修法:** Pass the interval as the second `start()` argument for repeating timers. Wrap fast-event callbacks that touch the editor in `vim.schedule(function() ... end)` (or `vim.schedule_wrap`); keep pure-Lua bookkeeping in the fast path. Hold the timer handle for the life of the component (reuse/teardown), and `stop()`/`close()` it explicitly. These constraints shaped the 30ms coalescing flush in `history.lua` (#32) and the deferred-spawn async refresh in `pi/cache/files.lua` (#34).
+- **排查方法:** When a timer "silently stops", check the three traps in order and do not start with GC: the `repeat` argument (a `0` there is a one-shot), then whether an editor call inside the callback threw (`vim.schedule` it and `v:errmsg` stays empty — that is the observable), then `get_repeat()` on the live handle to confirm the interval landed in the `repeat` slot. A debug `print` inside the callback is useless in a fast event; record the tick count in a plain Lua number and read it from a scheduled context.
+- **回归守护:** `tests/uv_fast_event_spec.lua` — a repeating timer fires ≥3×, `repeat = 0` is a one-shot, editor work behind `vim.schedule` leaves `v:errmsg` empty with no notify, and the real `Reaper.start()` sweep timer reports `get_repeat() == 300000` (so the interval really is passed as `repeat`) and is still armed after two `collectgarbage("collect")` cycles.
 
-### G31 — Mutating `config.options` in specs pollutes the module-local `defaults` for the rest of the run
+### G31 — `config.options` used to be aliased to the module-local `defaults` (root-fixed)
 - **现象:** A spec sets `Config.options.subagent.reap_after_minutes = 0` to exercise the disabled path; from then on, every later `Config.setup({})` in the same headless run — which should reset options to defaults — still reads `0`, and the leak crosses spec files.
-- **根因:** `M.options = vim.tbl_deep_extend("force", defaults, opts or {})` copies scalars but **keeps references** to nested tables present only in the first source: after `setup()`, `M.options.subagent` *is* `defaults.subagent`. Any in-place write to a nested field lands directly in `defaults`, and the next `setup()` re-derives options from the polluted defaults. Verified headlessly (feat/subagent-reaper): set `reap_after_minutes = 0`, `setup({})`, read back → still `0`.
-- **修法:** Never mutate nested `options` tables in place in specs. Either replace the whole nested table with a deepcopy first —
-  ```lua
-  Config.options.subagent = vim.tbl_deep_extend("force", vim.deepcopy(Config.options.subagent), { reap_after_minutes = 0 })
-  ```
-  — or point `Config.options` at a hand-built table and restore the original afterwards. Top-level scalar writes are safe (`options.foo = 1` copies by value); only nested tables alias.
-- **元教训:** "setup resets state" is only true when setup's source of truth was never mutated. After changing global config in a test, ask: did I just write through into the defaults?
+- **根因:** `M.setup()` passed the module-local `defaults` straight into `vim.tbl_deep_extend("force", defaults, opts or {})`, and `tbl_deep_extend` copies scalars but **keeps references** to the first source's nested tables: after `setup()`, `M.options.subagent` *was* `defaults.subagent`. Any in-place write to a nested field landed directly in `defaults` and survived every later `setup()`. Measured before the fix: `setup({})` → 5, write 2, `setup({})` → still 2; after the fix: → 5. `M.setup()` now merges a copy — `M.options = vim.tbl_deep_extend("force", vim.deepcopy(defaults), opts or {})` — because `setup()` runs once per session.
+- **修法:** Nothing has to be worked around any more: writing `pi.config.options.subagent.max_children = 2` and calling `setup({})` restores the documented default, and each `setup()` hands back fresh nested tables. The decouple idiom (`Config.options.subagent = vim.deepcopy(...)`) is no longer *required*, but it is still good hygiene — it keeps a spec independent of how `setup()` merges — and `tests/subsessions_reaper_spec.lua` keeps it as belt-and-braces; `tests/subsessions_batch_spec.lua` now **replaces** the subagent table at its two sites instead of mutating it. Top-level scalar writes were always safe (`options.foo = 1` copies by value).
+- **元教训:** "setup resets state" is only true when setup's source of truth is never aliased into the options it hands out. Here the aliasing was the *product's* bug, not each spec's — so the fix belongs in `setup()`, not in a rule every future spec author has to remember and every new author will get wrong.
+- **回归守护:** `tests/config_contract_spec.lua` (4 cases): an in-place write is restored to the documented 5 by the next `setup({})`; `rawequal` proves two `setup()` calls hand back different nested tables; a write to one nested subtable does not leak into a sibling; both `options` and `options.subagent` are fresh objects on every call.
 
 ### G32 — macOS: `tempname()` is a symlinked path, so path-equality specs fail only on the author's laptop
 - **现象:** `make test` had 9 red specs on macOS (`tests/worktree_spec.lua` 6, `tests/subagent_worktree_protocol_spec.lua` 3) that were green in CI and green on any Linux box. The worktree ones diff `/private/var/folders/…/repo/.worktrees/wt-1` against `/var/folders/…/repo/.worktrees/wt-1`; the protocol ones reported `subagents = {}` and `session file not found` for every read, although the driver had just written the manifest.
@@ -245,5 +258,7 @@ Each entry is a real defect or trap encountered while adding features to this pl
   ```bash
   grep -c 'Testing:' out.txt; ls tests/*_spec.lua | wc -l   # the two counts must match
   ```
+  The same too-tight-budget mistake bites *assertions*, not just files: `make test` runs **one child nvim per spec file** (~170 files in parallel), so a polled assertion needs `vim.wait(10000, pred, 5)` — never 100–500 ms, which passes standalone and flakes inside the full run (CI would only ever see the flake). This gate is now real: `.github/workflows/tests.yml` runs `make test` on every push to `main` and on every PR, judged by **exit code only**, and its failure diagnostics strip ANSI, print the `Testing:` count beside the number of `tests/*_spec.lua` files (that mismatch is *this* entry) and print the non-zero `Failed :` / `Errors :` lines. Toolchain pinned so the gate means the same thing over time: Neovim v0.12.6, plenary `74b06c6c75e4eeb3108ec01852001636d85a932b`, render-markdown.nvim `a67f826164c38c836fc6060f32b275c4c43317a7`.
 - **排查方法:** Do not guess which child died — patch a copy of plenary's `test_harness.lua` to print `code`/`signal` per job (`j.nvim_busted_path`), or read the `Scheduling:` lines and diff them against the `Testing:` headers. A child that exits **2** is different: that is `#results.errs ~= 0`, i.e. the file failed to *load* (see G24 — a `1_000`-style digit separator breaks the whole file this way, printing `FAILED TO LOAD FILE` and `malformed number near '1_000'`).
 - **元教训:** Exit status is the assertion; the summary lines only describe the specs that got far enough to print them. Always check `make test`'s exit code and the `Testing:` count alongside `Failed : 0`.
+- **回归守护:** the workflow itself — `.github/workflows/tests.yml` is the spec-file-count-vs-`Testing:`-count diagnostic in a form that runs on every PR.

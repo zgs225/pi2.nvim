@@ -270,6 +270,7 @@ require("pi").setup({
             height = 0.75,            -- lines (>=1) or fraction of editor height (<1, default 0.75)
             border = "rounded",       -- float border style (default "rounded")
             statusline = true,        -- show statusline in float footer (context, model, thinking level)
+            worktree = true,          -- show which checkout the viewed session ran in as a `󰙅 <name>` footer badge (linked worktrees only; `statusline = false` hides it too)
             todo = {
                 enabled = true,       -- show the todo footer chunk and the `T` panel
                 auto_open = false,    -- auto-open the panel when todos first appear (empty → non-empty)
@@ -392,6 +393,25 @@ require("pi").setup({
         auto_open = false,
         -- Note: the float layout is fixed (editor-centered at 0.5 x 0.4 with a
         -- rounded border); width/height/position apply to the side layout only.
+    },
+
+    -- Idle-wake policy for the background-bash extension. A completion that
+    -- lands while the agent is idle normally starts a turn of its own; that
+    -- turn is priced by the whole conversation, so it is spent under a policy
+    -- rather than per event. See doc/extensions.md#the-idle-wake-gate.
+    background_tasks = {
+        -- May an idle completion start a turn? "budgeted" (default) allows
+        -- `wake_budget` wakes per user prompt and holds the rest for the next
+        -- prompt; "always" wakes on every completion; "never" only ever
+        -- delivers at a turn boundary or on the next user prompt.
+        wake_on_idle = "budgeted",
+        -- Idle wakes allowed per user prompt under "budgeted" (0…10).
+        -- Replenished by the next user input, not by a clock.
+        wake_budget = 2,
+        -- Hold a wake when the last request is older than this, because it
+        -- would re-read the conversation uncached. Default 300000 = the
+        -- 5-minute prompt-cache lifetime; 0 disables the window.
+        wake_cache_window_ms = 300000,
     },
 
     -- Session diff review (:PiDiff): one floating panel — an outer border
