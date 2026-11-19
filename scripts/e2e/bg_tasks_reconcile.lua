@@ -104,6 +104,25 @@ local function parent_of(pid)
     return tonumber(vim.trim(out or ""))
 end
 
+--- One row of a reconcile summary, cut at the end of that row.
+---
+--- The provider body is JSON, so the line breaks inside the summary are the two
+--- characters `\n`; cutting there keeps an assertion about one task from
+--- matching text that belongs to another. A bare id is not enough to find the
+--- row either — the same transcript is replayed into the request, so the id also
+--- appears in the replayed messages.
+---@param text string
+---@param id string
+---@return string
+local function summary_row(text, id)
+    local at = text:find("- " .. id .. " ", 1, true)
+    if at == nil then
+        return ""
+    end
+    local stop = text:find("\\n", at, true) or (#text + 1)
+    return text:sub(at, stop - 1)
+end
+
 -- ---------------------------------------------------------------------------
 -- Scripted fake provider (OpenAI chat-completions, streamed).
 -- ---------------------------------------------------------------------------
@@ -605,6 +624,30 @@ local function main()
     })
     step(("A8 forged record %s -> nvim pid %d"):format(ghost_id, ghost_pid))
 
+    -- A8b setup: the same live pid, but with a command line that MATCHES and a
+    -- start-time fingerprint that does not. That is the shape a recycled pid
+    -- has — the text is a coincidence, the identity is wrong. The old
+    -- command-line heuristic adopted this; identity has to be the fingerprint.
+    local ghost2_id = "bdead02"
+    local ghost2_command = (vim.fn.system({ "ps", "-o", "command=", "-p", tostring(ghost_pid) }) or ""):gsub("%s+$", "")
+    append_session_entry(sfile, {
+        type = "custom_message",
+        customType = "pi2_bg_task",
+        content = "[Background task " .. ghost2_id .. " started]",
+        display = false,
+        details = {
+            kind = "started",
+            taskId = ghost2_id,
+            command = ghost2_command ~= "" and ghost2_command or "nvim --headless",
+            pid = ghost_pid,
+            pidStartTime = "0", -- deliberately not the live process's start time
+            outputFile = uv.os_tmpdir() .. "/pi-bash-" .. ghost2_id .. ".log",
+            startedAt = os.time() * 1000,
+            sessionId = sid,
+        },
+    })
+    step(("A8b forged record %s -> nvim pid %d with a stale fingerprint"):format(ghost2_id, ghost_pid))
+
     -- ---------------- run B: same session, folding that transcript ----------
     provider.phase = "B"
     provider.turn = 0
@@ -615,38 +658,48 @@ local function main()
     check(provider.turn == 3, "run B ran its three scripted turns", { turn = provider.turn })
     check(provider.missing_task_id == nil, "run B found the adopted task id", { turn = provider.turn })
 
-    -- A3: the summary is in the FIRST request of the new process.
+    -- A3: the summary is in the FIRST request of the new process. Everything
+    -- below is asserted against the summary section alone: the transcript is
+    -- replayed into this request, so a bare id would also match a replayed
+    -- message and pass for the wrong reason.
     local first_body = provider.bodies[bodies_before + 1] or ""
+    local summary_at = first_body:find("[Background bash tasks found in this session's transcript", 1, true)
+    check(summary_at ~= nil, "A3 run B's first request carries the reconcile summary", {
+        head = first_body:sub(1, 300),
+    })
+    local summary = first_body:sub(summary_at)
     check(
-        first_body:find("[Background bash tasks found in this session's transcript", 1, true) ~= nil,
-        "A3 run B's first request carries the reconcile summary",
-        { head = first_body:sub(1, 300) }
-    )
-    check(
-        first_body:find(provider.task_id or "", 1, true) ~= nil,
+        summary:find(provider.task_id or "", 1, true) ~= nil,
         "A3 the summary names the leftover task",
         { id = provider.task_id }
     )
     check(
-        first_body:find("STILL RUNNING", 1, true) ~= nil,
+        summary:find("STILL RUNNING", 1, true) ~= nil,
         "A3 the summary says the task is still running",
-        { stderr = backend_b.stderr:sub(1, 600) }
+        { summary = summary:sub(1, 600), stderr = backend_b.stderr:sub(1, 600) }
     )
     step("A3 summary reached the model on the first request")
 
     -- A8: the live-but-unrelated pid was NOT adopted, and the summary says so.
+    local ghost_row = summary_row(summary, ghost_id)
+    check(ghost_row ~= "", "A8 the summary mentions the unverifiable record", { summary = summary:sub(1, 400) })
     check(
-        first_body:find(ghost_id, 1, true) ~= nil,
-        "A8 the summary mentions the unverifiable record",
-        { stderr = backend_b.stderr:sub(1, 600) }
-    )
-    check(
-        first_body:find("no longer runs it", 1, true) ~= nil,
+        ghost_row:find("no longer runs it", 1, true) ~= nil,
         "A8 a live pid running a different command is not adopted",
-        { stderr = backend_b.stderr:sub(1, 600) }
+        { row = ghost_row }
     )
     check(alive(ghost_pid), "A8 the unrelated process was left alone", { pid = ghost_pid })
     step("A8 unverifiable record refused, nvim untouched")
+
+    -- A8b: a MATCHING command line with a WRONG start time is still refused —
+    -- the fingerprint, not the text, is what proves identity.
+    local ghost2_row = summary_row(summary, ghost2_id)
+    check(ghost2_row ~= "", "A8b the summary lists the stale-fingerprint record", { summary = summary:sub(1, 400) })
+    check(
+        ghost2_row:find("no longer runs it", 1, true) ~= nil,
+        "A8b a matching command line does not make a recycled pid adoptable",
+        { row = ghost2_row }
+    )
 
     -- A4: list_tasks reports it as adopted rather than as a task of this process.
     local second_body = provider.bodies[bodies_before + 2] or ""

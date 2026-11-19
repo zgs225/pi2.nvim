@@ -445,4 +445,14 @@ describe("bg-tasks extension contract", function()
         assert.is_truthy(signal_at, "stop_task must signal the group")
         assert.is_true(attach_at < signal_at, "the lease must be taken before the signal")
     end)
+
+    it("identifies an adopted pid by its start time, not by its command line", function()
+        local src = read_extension()
+        -- A shell execs the last command of its `-c` script, so the recorded
+        -- command text and the live command line routinely disagree; identity
+        -- has to be the pid's start time. Text matching must not come back.
+        assert.is_truthy(src:find("pidStartTime", 1, true), "adoption must record a start-time fingerprint")
+        assert.is_truthy(src:find("/proc/", 1, true), "the fingerprint comes from the process table")
+        assert.is_nil(src:find("pidMatchesCommand", 1, true), "a command line is not identity")
+    end)
 end)

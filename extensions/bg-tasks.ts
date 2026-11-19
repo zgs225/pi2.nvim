@@ -82,18 +82,21 @@
  *
  * The task table OUTLIVES the process that built it, and the SESSION TRANSCRIPT
  * is the only place it is written. Every state transition already reaches it as
- * a `pi2_bg_task` custom message (`started` carries command/pid/outputFile/
- * startedAt/sessionId, a terminal one the exit status), so `session_start`
- * folds those entries back into the table: no sidecar file, nothing to keep in
- * sync, and the history travels with the session wherever it is copied,
- * exported or forked. Records rebuilt this way are ADOPTED when their pid is
- * alive and still runs the recorded command (verified against `ps`, because a
- * recorded pid can be recycled), and an adopted task is polled — the
- * `ChildProcess` died with the process that owned it, so no `close` event is
- * coming — with its exit reported as `was stopped (signal …)` when a `stop_task`
- * caused it and as an explicit *status unknown* when it vanished unobserved.
- * One summary message tells the model what the fold found; `list_tasks` remains
- * the authoritative view.
+ * a `pi2_bg_task` custom message (`started` carries command/pid/pidStartTime/
+ * outputFile/startedAt/sessionId, a terminal one the exit status), so
+ * `session_start` folds those entries back into the table: no sidecar file,
+ * nothing to keep in sync, and the history travels with the session wherever it
+ * is copied, exported or forked. Records rebuilt this way are ADOPTED when the
+ * pid is alive AND is still the same process — identity is the pid's start time,
+ * recorded when it was spawned (`pidStartTime`), because a pid alone is recycled
+ * by the kernel and the command line is not identity either (a shell execs the
+ * last command of its `-c` script, so a recorded `sh -c '… sleep 900'` is a live
+ * `sleep 900`). A record without that fingerprint is refused, not guessed at.
+ * An adopted task is polled — the `ChildProcess` died with the process that
+ * owned it, so no `close` event is coming — with its exit reported as `was
+ * stopped (signal …)` when a `stop_task` caused it and as an explicit *status
+ * unknown* when it vanished unobserved. One summary message tells the model what
+ * the fold found; `list_tasks` remains the authoritative view.
  *
  * Ownership is the SESSION ID that produced a record, never the pid. pi copies
  * every entry when a session is forked or cloned, so a fork can read the
@@ -144,7 +147,7 @@ import { createBashToolDefinition, getShellConfig } from "@earendil-works/pi-cod
 import type { BashToolDetails, BashToolInput, SessionEntry, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { closeSync, createWriteStream, openSync, readSync, statSync, unlinkSync } from "node:fs";
+import { closeSync, createWriteStream, openSync, readFileSync, readSync, statSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { Writable } from "node:stream";
@@ -223,6 +226,13 @@ interface BgTaskDetails {
 	taskId: string;
 	command: string;
 	pid?: number;
+	/**
+	 * Identity of the process `pid` names, read when it was spawned (see
+	 * `pidStartTime`). A pid alone cannot be trusted across a crash — the kernel
+	 * recycles it — so adoption verifies that the pid is still the *same*
+	 * process, not merely a live one.
+	 */
+	pidStartTime?: string;
 	outputFile: string;
 	exitCode?: number | null;
 	signal?: string | null;
@@ -250,6 +260,8 @@ interface BgTaskState {
 	startedAt: number;
 	endedAt?: number;
 	pid?: number;
+	/** The spawned process's start time, the identity check for an adopted pid. */
+	pidStartTime?: string;
 	completed: boolean;
 	exitCode: number | null;
 	signal: string | null;
@@ -330,6 +342,8 @@ interface FoldedTask {
 	startedAt?: number;
 	endedAt?: number;
 	pid?: number;
+	/** The identity of that pid, recorded when the task was spawned. */
+	pidStartTime?: string;
 	completed: boolean;
 	exitCode: number | null;
 	signal: string | null;
@@ -392,6 +406,9 @@ function foldTaskEntries(
 			}
 			if (record.pid === undefined && typeof details.pid === "number") {
 				record.pid = details.pid;
+			}
+			if (record.pidStartTime === undefined && typeof details.pidStartTime === "string") {
+				record.pidStartTime = details.pidStartTime;
 			}
 			if (record.sessionId === undefined && typeof details.sessionId === "string") {
 				record.sessionId = details.sessionId;
@@ -477,31 +494,64 @@ function pidAlive(pid: number): boolean {
 }
 
 /**
- * Whether a live pid still runs the command it was recorded with.
+ * Start time of a live process — its identity, as far as adoption cares.
  *
  * A pid recorded by a dead process can be recycled by anything, and acting on
  * the new owner (a SIGKILL from `stop_task`, a `wait_task` that never settles)
- * is worse than admitting the record is stale. `ps` is the portable-enough
- * check: every task is spawned through a shell, so the command's first token
- * appears in the process's command line for both `shell -c "npm run dev"` and
- * the exec'd form `node …/npm run dev`.
+ * is worse than admitting the record is stale. The pid's start time is the
+ * cheap, exact discriminator: it is stable for the life of the process (an
+ * exec does not change it) and differs for every later process reusing the
+ * number.
+ *
+ * Reading it from the command line instead (what this used to do) is *not*
+ * exact: a shell execs the last command of its `-c` script, so the recorded
+ * `sh -c 'build && serve'` becomes a live `serve` — nothing on the command
+ * line matches the text that was recorded. Identity must not depend on how the
+ * shell chose to exec.
+ *
+ * `/proc` is Linux-only; elsewhere `ps -o lstart=` is the same field, and both
+ * sides of the comparison go through this function so the format always agrees.
  */
-function pidMatchesCommand(pid: number, command: string): boolean {
-	const first = command.trim().split(/\s+/)[0] ?? "";
-	if (first === "") {
-		return false;
+function pidStartTime(pid: number): string | undefined {
+	if (!Number.isInteger(pid) || pid <= 1) {
+		return undefined;
 	}
 	try {
-		const out = execFileSync("ps", ["-o", "command=", "-p", String(pid)], {
+		const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+		// `comm` (field 2) is parenthesised and may itself contain ")" or spaces,
+		// so the fields after it are counted from the LAST ")" — the first one
+		// after that is field 3, which makes starttime (field 22) index 19.
+		const after = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+		const start = after[19];
+		return start === undefined || start === "" ? undefined : start;
+	} catch {
+		// No `/proc` (macOS/BSD), or the pid is gone: fall back to `ps` below.
+	}
+	try {
+		const out = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
 			encoding: "utf8",
 			timeout: 2_000,
 			stdio: ["ignore", "pipe", "ignore"],
 		});
-		return out.includes(first);
+		const trimmed = out.trim();
+		return trimmed === "" ? undefined : trimmed;
 	} catch {
-		// No `ps`, or the pid is gone: do not adopt.
+		return undefined;
+	}
+}
+
+/**
+ * Whether `pid` is still the very process whose start time was recorded.
+ *
+ * A record with no fingerprint (written by an older pi, or by a session that
+ * never got a pid) is refused rather than guessed at: adopting the wrong
+ * process is the one outcome this check exists to prevent.
+ */
+function pidIsRecordedProcess(pid: number, recorded: string | undefined): boolean {
+	if (recorded === undefined) {
 		return false;
 	}
+	return pidStartTime(pid) === recorded;
 }
 /**
  * Whether an agent run is active. `turn_end` / `agent_before_settle` fire while
@@ -921,6 +971,9 @@ export default function bgTasks(pi: ExtensionAPI) {
 		if (record.pid !== undefined) {
 			task.pid = record.pid;
 		}
+		if (record.pidStartTime !== undefined) {
+			task.pidStartTime = record.pidStartTime;
+		}
 		if (record.exitUnknown) {
 			task.exitUnknown = true;
 		}
@@ -1049,7 +1102,7 @@ export default function bgTasks(pi: ExtensionAPI) {
 				record.startedAt !== undefined &&
 				record.startedAt > now - MAX_ADOPT_AGE_MS &&
 				pidAlive(record.pid) &&
-				pidMatchesCommand(record.pid, record.command);
+				pidIsRecordedProcess(record.pid, record.pidStartTime);
 			if (!adoptable) {
 				stale += 1;
 				task.completed = true;
@@ -1349,6 +1402,7 @@ export default function bgTasks(pi: ExtensionAPI) {
 
 		task.pid = child.pid;
 		if (child.pid) {
+			task.pidStartTime = pidStartTime(child.pid);
 			trackedPids.add(child.pid);
 			ensureExitHook();
 		}
@@ -1554,6 +1608,7 @@ export default function bgTasks(pi: ExtensionAPI) {
 			taskId: task.taskId,
 			command: task.command,
 			pid: task.pid,
+			pidStartTime: task.pidStartTime,
 			outputFile: task.outputFile,
 			exitCode: task.exitCode,
 			signal: task.signal,
