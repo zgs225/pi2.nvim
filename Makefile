@@ -7,6 +7,7 @@
 #   make e2e-bg-stop — real-pi e2e: stop_task kills the process group, list_tasks sees it (needs pi; fake provider, no account)
 #   make e2e-bg-reconcile — real-pi e2e: the task table survives a SIGKILLed pi and is adopted by the next run (needs pi; fake provider)
 #   make e2e-bg-stdin — real-pi e2e: a background task keeps its stdin and task_input feeds it (needs pi; fake provider)
+#   make e2e-bg-report — real-pi e2e: a completion report is one structured `<background-task>` block (needs pi; fake provider)
 #   make e2e-bg-ownership — real-pi e2e: a fork does not adopt the parent's tasks, a clean quit records its kills
 #   make e2e-subagent-failure — real-pi e2e: a failed child run reaches the parent as a failed item (needs pi; not CI)
 #   make smoke   — headless end-to-end smoke check (loads the user config, opens the chat)
@@ -24,7 +25,7 @@ MIN_INIT := tests/minimal_init.lua
 STYLUA_BIN ?= stylua
 LUA_LS_BIN ?= lua-language-server
 
-.PHONY: test smoke format style lint docs-links e2e e2e-reaper e2e-bg-delivery e2e-bg-stop e2e-bg-reconcile e2e-bg-stdin e2e-bg-ownership e2e-subagent-failure
+.PHONY: test smoke format style lint docs-links e2e e2e-reaper e2e-bg-delivery e2e-bg-stop e2e-bg-reconcile e2e-bg-stdin e2e-bg-report e2e-bg-ownership e2e-subagent-failure
 
 test:
 	PLENARY_PATH=$(PLENARY_PATH) $(NVIM_BIN) --headless -u $(MIN_INIT) \
@@ -65,6 +66,12 @@ e2e-bg-reconcile:
 # Needs the pi binary only — runs in CI.
 e2e-bg-stdin:
 	$(NVIM_BIN) --headless -u $(MIN_INIT) -l scripts/e2e/bg_tasks_stdin.lua
+
+# Real-pi e2e for the shape of a completion report: the banner, the
+# `<system-reminder>` / `<background-task …>` block, its attributes, and that the
+# model's next request actually carries it. Needs the pi binary only — runs in CI.
+e2e-bg-report:
+	$(NVIM_BIN) --headless -u $(MIN_INIT) -l scripts/e2e/bg_tasks_report.lua
 
 # Real-pi e2e for ownership: fork inheritance and the clean-quit shutdown record.
 # Needs the pi binary only — runs in CI.

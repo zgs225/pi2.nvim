@@ -455,4 +455,61 @@ describe("bg-tasks extension contract", function()
         assert.is_truthy(src:find("/proc/", 1, true), "the fingerprint comes from the process table")
         assert.is_nil(src:find("pidMatchesCommand", 1, true), "a command line is not identity")
     end)
+
+    it("wraps every report in one structured reminder block", function()
+        local src = read_extension()
+        -- ONE helper builds the block, so the single and the batched form cannot
+        -- drift apart (a reader looks for the same wrapper either way).
+        local _, wrap_defs = src:gsub("function wrapReminder%(", "")
+        assert.are.equal(1, wrap_defs, "wrapReminder must be defined exactly once")
+        assert.is_truthy(src:find("<system-reminder>", 1, true))
+        assert.is_truthy(src:find("</system-reminder>", 1, true))
+        assert.is_truthy(src:find("<background-task ", 1, true), "each task is one element")
+        local wake_start = assert(src:find("function buildWakeNote", 1, true), "buildWakeNote must exist")
+        local batch_start = assert(src:find("function buildBatchNote", wake_start, true), "buildBatchNote follows")
+        local batch_end = src:find("function messageText", batch_start, true) or #src
+        assert.is_truthy(
+            src:sub(wake_start, batch_start):find("wrapReminder(", 1, true),
+            "the single-task note must go through wrapReminder"
+        )
+        assert.is_truthy(
+            src:sub(batch_start, batch_end):find("wrapReminder(", 1, true),
+            "the batch note must go through wrapReminder"
+        )
+    end)
+
+    it("carries the status in machine-readable attributes", function()
+        local src = read_extension()
+        assert.is_truthy(src:find("function reportStatus(", 1, true), "reportStatus must exist")
+        for _, status in ipairs({ '"running"', '"completed"', '"failed"', '"stopped"' }) do
+            assert.is_truthy(src:find(status, 1, true), "reportStatus must be able to say " .. status)
+        end
+        local start = assert(src:find("function taskAttrs", 1, true), "taskAttrs must exist")
+        local stop = assert(src:find("function wrapReminder", start, true), "wrapReminder follows taskAttrs")
+        local body = src:sub(start, stop)
+        for _, attr in ipairs({ 'id="', 'status="', 'exit_code="', 'signal="', 'duration_ms="', 'output="' }) do
+            assert.is_truthy(body:find(attr, 1, true), "taskAttrs must emit " .. attr)
+        end
+    end)
+
+    it("escapes the command, which is arbitrary shell text", function()
+        local src = read_extension()
+        assert.is_truthy(src:find("function escapeMarkup(", 1, true), "escapeMarkup must exist")
+        for _, entity in ipairs({ "&amp;", "&lt;", "&gt;", "&quot;" }) do
+            assert.is_truthy(src:find(entity, 1, true), "escapeMarkup must map to " .. entity)
+        end
+        assert.is_truthy(src:find("escapeMarkup(task.command)", 1, true), "the command must be escaped")
+    end)
+
+    it("keeps the banner as the first line, ahead of the reminder block", function()
+        local src = read_extension()
+        local wake_start = assert(src:find("function buildWakeNote", 1, true))
+        local wake = src:sub(wake_start, assert(src:find("function buildBatchNote", wake_start, true)))
+        local banner_at = assert(
+            wake:find("[SYSTEM NOTIFICATION - NOT USER INPUT]", 1, true),
+            "the banner literal must be in buildWakeNote itself"
+        )
+        local block_at = assert(wake:find("wrapReminder(", 1, true), "buildWakeNote must open the block")
+        assert.is_true(banner_at < block_at, "the banner must precede the <system-reminder> block")
+    end)
 end)
