@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ..framework import Check
+from .config_three_spots import ConfigThreeSpots
 from .docs_api import DocsApi
 from .docs_commands import DocsCommands
 from .docs_config import DocsConfig
@@ -12,6 +13,7 @@ from .parse_luajit import ParseLuajit
 
 ALL: list[Check] = [
     ParseLuajit(),
+    ConfigThreeSpots(),
     DocsCommands(),
     DocsConfig(),
     DocsHighlights(),
