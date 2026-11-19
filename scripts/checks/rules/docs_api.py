@@ -37,11 +37,46 @@ The failure kinds answer different questions, so this rule uses both:
 A warn is never emitted together with error findings: "nothing to verify" and
 "this is wrong" cannot both be true, and mixing them makes the count
 meaningless.
+
+Shorthand and module paths
+--------------------------
+`doc/api.md` legitimately writes three different things that look alike, and
+only two of them are API mentions:
+
+  `pi.worktree_new(...)`  a plain mention: one doc symbol, one definition.
+  `pi.worktree_*`         a FAMILY claim — "every function whose name starts
+                          with `worktree_`". It is shorthand, not a stale name,
+                          but it is still a claim about the code and must fail
+                          when the family is gone: a mention immediately
+                          followed by `*` is valid only if at least one defined
+                          `function M.<prefix>...` starts with that prefix, and
+                          in the forward direction a definition counts as
+                          documented when it matches exactly or falls under a
+                          documented `prefix*` shorthand. `docs_commands.py`
+                          accepts `:PiSub` as a family shorthand for the same
+                          reason.
+  `require("pi.worktree")` a MODULE PATH, not the `pi.worktree()` API. It names
+                          a Lua module, so it is not a mention of anything the
+                          module table exposes. A mention must therefore start a
+                          token (no word character, `.`, `/`, `"` or `'` right
+                          before `pi`), and must not continue into a field path:
+                          `require("pi.worktree")`, `pi.foo.bar` and `xpi.foo`
+                          are all excluded by the regex.
+
+A module path can also appear *bare* — `` `pi.worktree` also exposes `_reset`
+`` — which no lookbehind can catch, because it is textually identical to a
+mention. So a bare `pi.<name>` (no call parens) that names a published submodule
+(`lua/pi/<name>.lua`, e.g. `worktree`) is read as a module reference, not a
+stale API name. A *call* `pi.<name>(...)` stays an API claim even then, so
+removing a function that shares a submodule's name is still caught; the only
+miss is a stale bare reference to an existing submodule, which is the cheaper
+error — a false positive here blocks the gate for a doc style that is correct.
 """
 
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 from .. import lua
@@ -51,7 +86,26 @@ API_SOURCE = "lua/pi/init.lua"
 API_DOC = "doc/api.md"
 # `pi.<name>` — in a fenced block as `pi.name(args?)`, in prose as `` `pi.name(...)` ``.
 # Docs are text, so a regex is the right tool here (unlike the Lua side).
-MENTION_RE = re.compile(r"pi\.([a-z_][a-z0-9_]*)")
+#
+# `(?<![\w./"'])` keeps module paths out: `require("pi.worktree")` is a Lua
+# module, not the `pi.worktree()` API, and `xpi.foo` is a different symbol.
+# `(?!\w|\.)` stops a mention from continuing into a field path (`pi.foo.bar`).
+# The trailing `(\*?)` captures family shorthand (`pi.worktree_*`), `(\(?)`
+# records whether the mention is a call (`pi.foo(`) or a bare name (`pi.foo`).
+MENTION_RE = re.compile(r"(?<![\w./\"'])pi\.([a-z_][a-z0-9_]*)(\*?)(\(?)(?!\w|\.)")
+
+
+@dataclass(frozen=True)
+class _Mention:
+    """One `pi.<name>` mention: the name, family shorthand, call form, and line."""
+
+    name: str
+    family: bool
+    called: bool
+    line: int
+
+    def render(self) -> str:
+        return f"pi.{self.name}*" if self.family else f"pi.{self.name}"
 
 
 class DocsApi(Check):
@@ -96,30 +150,52 @@ class DocsApi(Check):
                 )
             ]
 
-        documented = _mentions(_read(root, API_DOC))
+        mentions = _mentions(_read(root, API_DOC))
+        documented = {mention.name for mention in mentions if not mention.family}
+        families = {mention.name for mention in mentions if mention.family}
+        # Submodule stems are module paths, not API names (see the module docstring).
+        modules = _modules(root) - set(definitions)
         findings: list[Finding] = []
 
         for name, line in definitions.items():
-            if name not in documented:
-                findings.append(
-                    self.finding(
-                        f"`M.{name}` is a public API function but `pi.{name}` is never documented in {API_DOC} "
-                        "(user-visible changes update the docs in the same change)",
-                        API_SOURCE,
-                        line,
-                    )
+            if name in documented:
+                continue
+            if any(name.startswith(prefix) for prefix in families):
+                continue
+            findings.append(
+                self.finding(
+                    f"`M.{name}` is a public API function but `pi.{name}` is never documented in {API_DOC} "
+                    "(user-visible changes update the docs in the same change)",
+                    API_SOURCE,
+                    line,
                 )
+            )
 
-        for name, line in documented.items():
-            if name not in definitions:
+        for mention in mentions:
+            if mention.family:
+                if any(name.startswith(mention.name) for name in definitions):
+                    continue
                 findings.append(
                     self.finding(
-                        f"`pi.{name}` is documented in {API_DOC} but no `function M.{name}` exists in "
-                        f"{API_SOURCE} (stale doc mention)",
+                        f"`{mention.render()}` documents a family but no `function M.{mention.name}...` exists "
+                        f"in {API_SOURCE} (stale doc mention)",
                         API_DOC,
-                        line,
+                        mention.line,
                     )
                 )
+                continue
+            if mention.name in definitions:
+                continue
+            if not mention.called and mention.name in modules:
+                continue  # `pi.worktree` = the published `lua/pi/worktree.lua` module
+            findings.append(
+                self.finding(
+                    f"`{mention.render()}` is documented in {API_DOC} but no `function M.{mention.name}` exists "
+                    f"in {API_SOURCE} (stale doc mention)",
+                    API_DOC,
+                    mention.line,
+                )
+            )
 
         return findings
 
@@ -134,6 +210,17 @@ class DocsApi(Check):
                 "bad",
                 2,
                 "one public function with no doc mention + one stale `pi.gone(` mention",
+            ),
+            self.fixture(
+                "family",
+                0,
+                "family shorthand `pi.worktree_*` plus a `require()` module path and a bare submodule mention: "
+                "none of them is drift, so nothing fires",
+            ),
+            self.fixture(
+                "family-stale",
+                1,
+                "`pi.gone_*` names a family that no longer exists: the shorthand is a claim and must fail once",
             ),
             self.fixture(
                 "empty",
@@ -194,10 +281,37 @@ def _member_at(tokens: list[lua.Token], index: int) -> lua.Token | None:
     return name if name.kind == "name" else None
 
 
-def _mentions(text: str) -> dict[str, int]:
-    """Map documented name -> line of its first `pi.<name>` mention, in file order."""
-    found: dict[str, int] = {}
+def _mentions(text: str) -> list[_Mention]:
+    """Every `pi.<name>` (or `pi.<prefix>*`) mention, deduplicated, in file order.
+
+    One entry per name: the first line it appears on, and `called` true when *any*
+    occurrence is a call (`pi.foo(`) — one call makes the name an API claim even
+    if another line mentions it bare as a module path.
+    """
+    seen: dict[tuple[str, bool], _Mention] = {}
     for lineno, line in enumerate(text.splitlines(), 1):
         for match in MENTION_RE.finditer(line):
-            found.setdefault(match.group(1), lineno)
+            key = (match.group(1), bool(match.group(2)))
+            called = bool(match.group(3))
+            previous = seen.get(key)
+            if previous is None:
+                seen[key] = _Mention(key[0], key[1], called, lineno)
+            elif called and not previous.called:
+                seen[key] = _Mention(previous.name, previous.family, True, previous.line)
+    return list(seen.values())
+
+
+def _modules(root: Path) -> set[str]:
+    """Stems of the published submodules (`lua/pi/<name>.lua`), e.g. `worktree`.
+
+    Real trees ship modules like `pi.worktree` that `doc/api.md` mentions on
+    purpose; those are module paths, not functions the module table exposes.
+    """
+    found: set[str] = set()
+    source = root / "lua" / "pi"
+    if not source.is_dir():
+        return found
+    for path in sorted(source.glob("*.lua")):
+        if path.stem != "init":
+            found.add(path.stem)
     return found
