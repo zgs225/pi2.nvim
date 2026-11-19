@@ -2016,6 +2016,34 @@ local function tree_under_cursor()
     require("pi").tree()
 end
 
+--- Worktree label a previewed row hands to the viewer: the row's own badge
+--- first (a sub-session's *assigned* checkout), else the checkout its worktree
+--- group is listed under — a parent row inside a group deliberately does not
+--- repeat the name in its subtitle, and the group header is not part of the
+--- preview.
+---
+--- Only a *linked* worktree is named: a row in the repository's main checkout
+--- gets no badge, exactly like the chat title's (the group header for that
+--- partition still shows the project name).
+---@param row pi.SessionsListRow
+---@return string?
+local function row_worktree_label(row)
+    if type(row.worktree) == "string" and row.worktree ~= "" then
+        return row.worktree
+    end
+    local group = row.group_id
+    if type(group) ~= "string" or group == "" then
+        return nil
+    end
+    -- Cached per directory (`worktree_cache`): one filesystem read on the
+    -- keypress, never a git subprocess.
+    local info = detect_worktree(group)
+    if type(info) ~= "table" or info.kind ~= "linked" then
+        return nil
+    end
+    return type(info.name) == "string" and info.name ~= "" and info.name or nil
+end
+
 --- Preview the session under the cursor in the read-only sub-session viewer.
 --- Works on any row: parent/tab rows and sub-session rows alike. The row's
 --- already-resolved display name is forwarded so the viewer titles its float
@@ -2024,6 +2052,12 @@ end
 --- is the freshest value and survives the tmp-N → real-id migration
 --- (manager.migrate_session_id); `session_id` stays as a fallback for rows
 --- whose session object is already gone.
+---
+--- The row's worktree label travels along so the viewer can badge the checkout
+--- in its footer: a child row carries the checkout it was *assigned*, a parent
+--- row the one its group is listed under (its own subtitle omits it — the header
+--- above carries it — so the viewer footer is the only place inside the float
+--- that answers "which checkout did this conversation run in").
 ---@return nil
 local function preview_under_cursor()
     local row, session = row_session_under_cursor()
@@ -2037,7 +2071,11 @@ local function preview_under_cursor()
     -- The row's session knows which workspace owns its manifest row (a child
     -- carries its parent's workspace), so the viewer does not have to search.
     local workspace = session and require("pi.subsessions.manifest").workspace(session) or nil
-    require("pi.ui.subsession_viewer").open(id, { name = row.name, cwd = workspace })
+    require("pi.ui.subsession_viewer").open(id, {
+        name = row.name,
+        cwd = workspace,
+        worktree = row_worktree_label(row),
+    })
 end
 
 --- Checkout path a row belongs to: the worktree group the row is listed under

@@ -317,6 +317,7 @@
 ---@field height? number Height in lines (>=1) or fraction of editor height (<1, default 0.75)
 ---@field border? string|string[] Float border style (default "rounded")
 ---@field statusline? boolean Show statusline in viewer footer (default true)
+---@field worktree? boolean Show the viewed session's worktree in that footer as a `󰙅 <name>` badge — the checkout the conversation ran in, which the title (display name + status) and the token/model chunks cannot say. Only a *linked* worktree is badged, and only the footer carries it, so `statusline = false` hides it too (default true).
 ---@field todo? pi.SubagentViewerTodoConfig Todo footer chunk and `T` list panel inside the viewer
 
 ---@class pi.SubagentViewerTodoConfig
@@ -557,6 +558,7 @@ local defaults = {
             height = 0.75,
             border = "rounded",
             statusline = true,
+            worktree = true,
             todo = {
                 enabled = true,
                 auto_open = false,
