@@ -12,6 +12,15 @@
 -- own results buffer. It then selects a worktree row and asserts the backend
 -- process really runs inside that checkout (/proc/<pid>/cwd on Linux).
 --
+-- Ordering: the picker pins the checkout Neovim is running in first, then
+-- sorts the remaining partitions by newest session (`aff2403`, see
+-- `lua/pi/sessions/resume_layout.lua: current_partition_key`). This script
+-- `cd`s into the fixture's main checkout, so `main` leads even though the
+-- externally created checkout holds the newest session. The pure-recency order
+-- (no anchor hit) is pinned at the unit layer, in
+-- `tests/resume_layout_spec.lua: keeps the recency order when the current
+-- directory is outside every checkout` — neither layer may lose that half.
+--
 -- Requires: git, and telescope.nvim on disk. The open assertion additionally
 -- needs the pi binary; without it the script skips that part and still verifies
 -- the picker. Missing prerequisites skip cleanly (exit 0), keeping CI on the
@@ -241,16 +250,18 @@ local ok, err = pcall(function()
     check("externally created checkout gets a title row", title_ext ~= nil, table.concat(rows, " | "))
     check("main checkout title row", title_main ~= nil)
 
-    -- Ordering: external (newest) → polish → fix-auth → main.
+    -- Ordering: main is the checkout this Neovim runs in (the fixture `cd`s
+    -- there), so it is pinned first; the rest follow by newest session:
+    -- main → external (newest) → polish → fix-auth.
     check(
-        "partitions ordered by newest session",
+        "partitions pin the current checkout first, then newest session",
         title_ext ~= nil
             and title_polish ~= nil
             and title_auth ~= nil
             and title_main ~= nil
+            and title_main < title_ext
             and title_ext < title_polish
             and title_polish < title_auth
-            and title_auth < title_main
     )
 
     -- A snapshot-recoverable checkout whose only transcript is a child row is
@@ -396,6 +407,16 @@ local ok, err = pcall(function()
         )
         check("no child row from inside a linked checkout", find_row(rows2, "2026-01-05  dead child") == nil)
         check("the linked checkout itself is a partition", find_row(rows2, "󰙅 fix-auth") ~= nil)
+        -- The same pin, seen from the other side: fix-auth is now the checkout
+        -- Neovim runs in, so it leads and the recency tail follows unchanged.
+        local auth_at = find_row(rows2, "󰙅 fix-auth")
+        local ext_at = find_row(rows2, "󰙅 external-checkout")
+        local polish_at = find_row(rows2, "󰙅 polish")
+        check(
+            "the linked checkout leads its own picker, then newest session",
+            auth_at ~= nil and ext_at ~= nil and polish_at ~= nil and auth_at < ext_at and ext_at < polish_at,
+            table.concat(rows2, " | ")
+        )
         pcall(vim.cmd, "silent! bwipeout! " .. prompt2)
     end
     vim.cmd("cd " .. vim.fn.fnameescape(repo))

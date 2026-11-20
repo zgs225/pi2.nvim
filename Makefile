@@ -16,9 +16,10 @@
 #   make check   — static gates: LuaJIT parse (G24) + docs sync; `check-selftest`
 #                  proves each gate can still fail. Needs `luajit` (mise install)
 #                  and python3; see .mise.toml.
-#   make e2e     — run headless end-to-end scripts (tests/*_e2e.lua); stops at the
-#                  FIRST failing script (`|| exit 1`), so triage a red run one file
-#                  at a time — everything after the first failure never ran
+#   make e2e     — run headless end-to-end scripts (tests/*_e2e.lua). Runs EVERY
+#                  script, prints each one's exit code, and fails only at the end:
+#                  a first-failure abort hid a broken assertion for a month
+#                  (Gitea #121), so triage is driven by the summary now
 #   make e2e-reaper — real-pi e2e: subagent idle reaper + max_children cap (needs pi binary + provider; not CI)
 #   make e2e-worktrees — real-git e2e: worktree create/apply/remove/ship/release (needs pi binary; no provider calls)
 #   make e2e-bg-delivery — real-pi e2e: background bash completion delivery into agent context (needs pi + provider; not CI)
@@ -70,10 +71,20 @@ test:
 		$(NVIM_BIN) --headless -u NONE -l scripts/run_tests.lua
 
 e2e:
-	@for f in tests/*_e2e.lua; do \
-		echo "e2e: $$f"; \
-		$(NVIM_BIN) --headless -u $(MIN_INIT) -l $$f || exit 1; \
-	done
+	@failed=0; total=0; \
+	for f in tests/*_e2e.lua; do \
+		total=$$((total + 1)); \
+		printf '%s\n' "e2e: $$f"; \
+		$(NVIM_BIN) --headless -u $(MIN_INIT) -l $$f; \
+		code=$$?; \
+		printf '%s\n' "e2e: $$f exit=$$code"; \
+		if [ $$code -ne 0 ]; then failed=$$((failed + 1)); fi; \
+	done; \
+	if [ $$failed -ne 0 ]; then \
+		printf 'e2e: %d of %d script(s) FAILED\n' "$$failed" "$$total"; \
+		exit 1; \
+	fi; \
+	printf 'e2e: all %d script(s) passed\n' "$$total"
 
 # Real end-to-end against `pi --mode rpc` (scripts/e2e/). None of these are part
 # of `make test`. The nine background-task suites that drive a scripted FAKE

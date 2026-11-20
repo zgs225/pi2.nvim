@@ -113,6 +113,25 @@ describe("subsession batch", function()
         assert.equals(2, snap.summary.ok)
     end)
 
+    it("does not claim a settle for a row with no run generation", function()
+        -- Rows written before the `run_generation` watermark existed cannot be
+        -- matched to a batch item generation, so the settle must refuse the row
+        -- (return false) rather than complete whichever item is running now.
+        Manifest.upsert("child-legacy", {
+            parent_id = "parent-1",
+            name = "legacy",
+            task_prompt = "t",
+            config = {},
+            status = "active",
+            reported = false,
+            created_at = Manifest.iso_now(),
+            last_active_at = Manifest.iso_now(),
+            agent_spawned = true,
+        })
+
+        assert.is_false(Batch.on_child_settled("child-legacy", { ok = true, output = "x" }))
+    end)
+
     it("poll reports partial when one item fails", function()
         Subsessions.spawn = function(_parent, opts, callback)
             local id = "child-" .. opts.name
