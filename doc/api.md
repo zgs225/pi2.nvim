@@ -35,7 +35,9 @@ pi.worktree_open(opts?, cb?)  -- start a fresh session in an EXISTING directory 
                               -- linked checkout; `repo_cwd` scopes it to an explicit repository;
                               -- `create = true` makes it first when it does not exist (the :Pi* commands
                               -- pass it); `tab_after` is the tabpage the new tab is inserted after
-                              -- (default: the end of the tabline); `cwd` may be any existing directory — a linked
+                              -- (default: its checkout's block via pi.sessions.tab_order — right after that
+                              -- block's last tab, or the end of the tabline while the list is flat);
+                              -- `cwd` may be any existing directory — a linked
                               -- worktree (attached as worktree metadata) or the main checkout / plain dir
 pi.worktree_branch(branch)    -- put the current worktree session on `branch`, creating it
                               -- when it does not exist

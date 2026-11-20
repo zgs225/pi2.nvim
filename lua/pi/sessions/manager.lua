@@ -1695,12 +1695,15 @@ function M.list()
     ---@type pi.Session[]
     local result = {}
     for _, session in pairs(registry) do
-        if session.attached_tab then
+        -- A session whose tabpage is already gone is not shown: `cleanup()` runs
+        -- on `vim.schedule`, so a just-closed tab would otherwise render a
+        -- phantom row at the end (an unranked handle) until the next tick.
+        if session.attached_tab and rank[session.attached_tab] then
             result[#result + 1] = session
         end
     end
     table.sort(result, function(a, b)
-        return (rank[a.attached_tab] or math.huge) < (rank[b.attached_tab] or math.huge)
+        return rank[a.attached_tab] < rank[b.attached_tab]
     end)
     return result
 end
@@ -1851,6 +1854,9 @@ function M.new_tab()
     local session = M.get_or_create()
     if session then
         session.chat:ensure_shown_and_focus_prompt()
+        -- Join the checkout's block instead of landing behind every other
+        -- checkout's tabs — the same ordering model :PiSessions groups rows by.
+        require("pi.sessions.tab_order").place_for(session)
     end
 end
 
@@ -2637,6 +2643,11 @@ local function open_resume_target(session_path, opts, new_tab, resume)
             -- Adopt the checkout metadata before the switch, so release/Ship
             -- see it immediately after the resume.
             session.worktree = target_worktree
+        end
+        if new_tab then
+            -- A resume opened in a new tab joins its checkout's block in the
+            -- tabline; an in-place resume keeps the current tab where it is.
+            require("pi.sessions.tab_order").place_for(session)
         end
         session.chat:show({ loading = true })
         load_session(session, session_path)
