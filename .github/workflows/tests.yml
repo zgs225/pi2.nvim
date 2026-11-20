@@ -50,10 +50,11 @@
 name: tests
 
 on:
-  # `dev` is the integration branch: without it a red suite would surface only
-  # when dev is merged into main, i.e. after the damage was already merged.
+  # `main` is the only long-lived branch since the `dev` integration branch was
+  # merged into it for v1.8.0 and retired, so a push to `main` and every PR are
+  # the authoritative runs.
   push:
-    branches: [main, dev]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
