@@ -21,10 +21,16 @@
 -- `tests/resume_layout_spec.lua: keeps the recency order when the current
 -- directory is outside every checkout` — neither layer may lose that half.
 --
--- Requires: git, and telescope.nvim on disk. The open assertion additionally
--- needs the pi binary; without it the script skips that part and still verifies
--- the picker. Missing prerequisites skip cleanly (exit 0), keeping CI on the
--- plenary suite.
+-- Requires: git, and telescope.nvim on disk (`TELESCOPE_PATH` overrides the
+-- lazy.nvim default). The open assertion additionally needs the pi binary; without
+-- it the script skips that part and still verifies the picker.
+--
+-- A missing prerequisite is **not** a pass: `tests/e2e_deps.lua` exits 3 (skipped)
+-- locally and 2 (failure) when `PI_E2E_REQUIRE_DEPS=1`, which is what CI sets —
+-- this script is the only layer that renders the picker with the real telescope,
+-- so a silent skip here was a false green in the `e2e` gate (Gitea #125).
+
+local deps = require("e2e_deps")
 
 local failures = {}
 
@@ -57,7 +63,7 @@ local function git(repo, ...)
     return vim.trim(out)
 end
 
-local telescope_root = vim.fn.expand("~/.local/share/nvim/lazy/telescope.nvim")
+local telescope_root = vim.env.TELESCOPE_PATH or vim.fn.expand("~/.local/share/nvim/lazy/telescope.nvim")
 local plenary_root = vim.env.PLENARY_PATH or vim.fn.expand("~/.local/share/nvim/lazy/plenary.nvim")
 
 local tmp = vim.fn.tempname()
@@ -77,18 +83,9 @@ local function cleanup()
 end
 
 local ok, err = pcall(function()
-    if vim.fn.isdirectory(telescope_root) == 0 then
-        print("[SKIP] telescope.nvim is not installed")
-        return
-    end
-    if vim.fn.isdirectory(plenary_root) == 0 then
-        print("[SKIP] plenary.nvim is not installed (telescope needs it)")
-        return
-    end
-    if vim.fn.executable("git") ~= 1 then
-        print("[SKIP] git is not installed")
-        return
-    end
+    deps.require_dir(telescope_root, "telescope.nvim is not installed (set TELESCOPE_PATH)")
+    deps.require_dir(plenary_root, "plenary.nvim is not installed (telescope needs it)")
+    deps.require_executable("git", "git is not installed")
     vim.opt.runtimepath:prepend(telescope_root)
 
     local Sessions = require("pi.sessions.manager")
@@ -330,7 +327,9 @@ local ok, err = pcall(function()
     check("narrowed to the fix-auth partition", narrowed)
 
     if vim.fn.executable("pi") ~= 1 then
-        print("[SKIP] pi is not installed: opening a row was not exercised")
+        if not deps.skip_part("pi is not installed: opening a row was not exercised") then
+            check("pi is installed, so the open assertion can run", false, "pi not in PATH")
+        end
         return
     end
 
@@ -364,8 +363,8 @@ local ok, err = pcall(function()
                 return proc_cwd ~= nil
             end, 50)
             check("the OS process really runs in that checkout", proc_cwd == realpath(wt_auth), tostring(proc_cwd))
-        else
-            print("[SKIP] /proc process-cwd check (not Linux, or no pid)")
+        elseif not deps.skip_part("/proc process-cwd check (not Linux, or no pid)") then
+            check("the OS process really runs in that checkout", false, "not Linux, or no pid")
         end
         local loaded = vim.wait(20000, function()
             return realpath(opened.session_file) == realpath(auth_session)

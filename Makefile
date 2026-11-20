@@ -53,6 +53,12 @@ PLENARY_PATH ?= $(HOME)/.local/share/nvim/lazy/plenary.nvim
 # OPTIONAL: render-markdown.nvim, used only by tests/render_contract_spec.lua.
 # When the checkout is absent, minimal_init skips it and that spec skips itself.
 RENDER_MARKDOWN_PATH ?= $(HOME)/.local/share/nvim/lazy/render-markdown.nvim
+# OPTIONAL locally, REQUIRED in CI: telescope.nvim, used only by
+# tests/resume_partitions_e2e.lua — the one layer that renders the resume picker
+# with the REAL picker. A missing checkout makes that script exit 3 (skipped); the
+# `e2e` CI job installs the pinned checkout and sets PI_E2E_REQUIRE_DEPS=1, which
+# turns the same absence into exit 2 (failure) instead of a false green (#125).
+TELESCOPE_PATH ?= $(HOME)/.local/share/nvim/lazy/telescope.nvim
 MIN_INIT := tests/minimal_init.lua
 # Concurrent child editors for `make test` (see scripts/run_tests.lua). Raise it
 # locally for speed; CI keeps it low so timing-sensitive specs are not raced.
@@ -72,19 +78,31 @@ test:
 		NVIM_BIN=$(NVIM_BIN) MIN_INIT=$(MIN_INIT) TEST_JOBS=$(TEST_JOBS) TEST_TIMEOUT=$(TEST_TIMEOUT) \
 		$(NVIM_BIN) --headless -u NONE -l scripts/run_tests.lua
 
+# Every script runs; the summary — never a single script's line — is the verdict.
+# Exit codes are the protocol (`tests/e2e_deps.lua`): 0 pass, 1 assertion failure,
+# 2 a prerequisite is missing in gate mode (`PI_E2E_REQUIRE_DEPS=1`), 3 skipped
+# locally. A skip is counted and named, never folded into "passed": the `e2e` CI
+# job sets the gate mode, so a script that goes dark there fails the job (#125).
 e2e:
-	@failed=0; total=0; \
+	@failed=0; skipped=0; total=0; \
 	for f in tests/*_e2e.lua; do \
 		total=$$((total + 1)); \
 		printf '%s\n' "e2e: $$f"; \
-		$(NVIM_BIN) --headless -u $(MIN_INIT) -l $$f; \
+		TELESCOPE_PATH=$(TELESCOPE_PATH) PLENARY_PATH=$(PLENARY_PATH) \
+			$(NVIM_BIN) --headless -u $(MIN_INIT) -l $$f; \
 		code=$$?; \
 		printf '%s\n' "e2e: $$f exit=$$code"; \
-		if [ $$code -ne 0 ]; then failed=$$((failed + 1)); fi; \
+		if [ $$code -eq 3 ]; then skipped=$$((skipped + 1)); \
+		elif [ $$code -ne 0 ]; then failed=$$((failed + 1)); fi; \
 	done; \
 	if [ $$failed -ne 0 ]; then \
-		printf 'e2e: %d of %d script(s) FAILED\n' "$$failed" "$$total"; \
+		printf 'e2e: %d of %d script(s) FAILED, %d SKIPPED\n' "$$failed" "$$total" "$$skipped"; \
 		exit 1; \
+	fi; \
+	if [ $$skipped -ne 0 ]; then \
+		printf 'e2e: %d of %d script(s) passed, %d SKIPPED — a skip is not a pass (CI sets PI_E2E_REQUIRE_DEPS=1)\n' \
+			"$$((total - skipped))" "$$total" "$$skipped"; \
+		exit 0; \
 	fi; \
 	printf 'e2e: all %d script(s) passed\n' "$$total"
 
