@@ -235,11 +235,6 @@ require("pi").setup({
         -- included) before pi.worktree_remove / Worktree.remove deletes it.
         -- When false, the confirmation warns that the work is lost.
         snapshot_before_remove = true,
-        -- Prefix the chat-title worktree badge with ⚠ when the session's cwd
-        -- differs from Neovim's cwd (the usual case for a worktree session:
-        -- starting one does not :cd the editor). Set false for the plain
-        -- `󰙅 <name>` badge — the path anchors then differ silently.
-        warn_on_cwd_mismatch = true,
         -- Take a `git worktree lock` on every checkout we create and unlock it
         -- again when the checkout is removed (default true), so an external
         -- `git worktree prune` / `remove` cannot delete a checkout an agent is
