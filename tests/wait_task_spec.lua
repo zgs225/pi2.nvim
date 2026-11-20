@@ -298,6 +298,9 @@ describe("stop_task / list_tasks renderer", function()
     end)
 
     it("renders the task list as the body, not as one collapsed line", function()
+        -- An older session replays a `list_tasks` result from a transcript
+        -- written before the extension sent `details.tasks`: the rows still
+        -- have to reach the chat.
         local h = History.new(TAB)
         h:on_tool_start("list_tasks", "lt1", {})
         pump(50)
@@ -315,6 +318,115 @@ describe("stop_task / list_tasks renderer", function()
         assert.is_truthy(text:find("npm run dev", 1, true), "expected the task row")
         assert.is_truthy(text:find("pi-bash-b3f2a1.log", 1, true), "expected the log path")
         delete(h)
+    end)
+
+    it("names each listed task command-first, the way wait_task names one", function()
+        local h = History.new(TAB)
+        h:on_tool_start("list_tasks", "lt2", { include_finished = true })
+        pump(50)
+        h:on_tool_end("list_tasks", "lt2", {
+            -- The model-facing text leads with the id on purpose (recovering an
+            -- id is the model's job); the block must not echo it.
+            content = {
+                {
+                    type = "text",
+                    text = '2 of 2 background tasks, 1 running:\n- b3f2a1 [running, stdin open] 1m04s "npm run dev" (output: /tmp/pi-bash-b3f2a1.log)\n- c0ffee1 [exited with code 0] 3.0s "make test" (output: /tmp/pi-bash-c0ffee1.log)',
+                },
+            },
+            details = {
+                total = 2,
+                running = 1,
+                listed = 2,
+                tasks = {
+                    { id = "b3f2a1", command = "npm run dev", state = "running, stdin open", elapsed = "1m04s" },
+                    { id = "c0ffee1", command = "make test", state = "done", elapsed = "3.0s" },
+                },
+            },
+        }, false)
+        pump(60)
+        local buf = h:buf()
+        local lines = table.concat(lines_of(buf), "\n")
+        assert.is_true(#rows_with(buf, "npm run dev · b3f2a1 · running, stdin open · 1m04s") == 1, lines)
+        assert.is_true(#rows_with(buf, "make test · c0ffee1 · done · 3.0s") == 1, lines)
+        -- The id leads the extension's own text; the row must not.
+        assert.is_false(lines:find("[running, stdin open]", 1, true) ~= nil, lines)
+        -- The input line is still the flag, not the rows.
+        assert.is_true(#rows_with(buf, "including finished tasks") == 1, lines)
+        delete(h)
+    end)
+
+    it("flattens and truncates an over-long row command, keeping the id", function()
+        local h = History.new(TAB)
+        h:on_tool_start("list_tasks", "lt3", {})
+        pump(50)
+        h:on_tool_end("list_tasks", "lt3", {
+            content = { { type = "text", text = "(model text)" } },
+            details = {
+                total = 1,
+                running = 1,
+                listed = 1,
+                tasks = {
+                    {
+                        id = "b3f2a1",
+                        command = "echo one\necho " .. string.rep("x", 200),
+                        state = "running",
+                        elapsed = "1.2s",
+                    },
+                },
+            },
+        }, false)
+        pump(60)
+        local buf = h:buf()
+        local lines = table.concat(lines_of(buf), "\n")
+        local row = nil
+        for _, line in ipairs(lines_of(buf)) do
+            if line:find("b3f2a1", 1, true) then
+                row = line
+            end
+        end
+        assert.is_not_nil(row, lines)
+        -- One row, one line: the command's newline is flattened, and the elided
+        -- command still ends with the ellipsis the block uses elsewhere.
+        assert.is_truthy(row:find("^echo one echo ", 1), row)
+        assert.is_truthy(row:find("… · b3f2a1 · running · 1.2s", 1, true), row)
+        delete(h)
+    end)
+
+    it("keeps the text for an errored list and for a row without a command", function()
+        local h = History.new(TAB)
+        h:on_tool_start("list_tasks", "lt4", {})
+        pump(50)
+        h:on_tool_end("list_tasks", "lt4", {
+            content = { { type = "text", text = "list_tasks failed: no task table" } },
+            details = {
+                total = 1,
+                running = 1,
+                listed = 1,
+                tasks = { { id = "b3f2a1", command = "npm run dev", state = "running", elapsed = "1.2s" } },
+            },
+        }, true)
+        pump(60)
+        local lines = table.concat(lines_of(h:buf()), "\n")
+        assert.is_truthy(lines:find("list_tasks failed: no task table", 1, true), lines)
+        assert.is_nil(lines:find("npm run dev · b3f2a1", 1, true), lines)
+        delete(h)
+
+        -- A row with no command degrades to its id rather than to an empty line.
+        local h2 = History.new(TAB)
+        h2:on_tool_start("list_tasks", "lt5", {})
+        pump(50)
+        h2:on_tool_end("list_tasks", "lt5", {
+            content = { { type = "text", text = "(model text)" } },
+            details = {
+                total = 1,
+                running = 1,
+                listed = 1,
+                tasks = { { id = "b3f2a1", command = "", state = "running", elapsed = "1.2s" } },
+            },
+        }, false)
+        pump(60)
+        assert.is_true(#rows_with(h2:buf(), "b3f2a1 · running · 1.2s") == 1, table.concat(lines_of(h2:buf()), "\n"))
+        delete(h2)
     end)
 end)
 
@@ -421,6 +533,9 @@ describe("bg-tasks extension contract", function()
         local src = read_extension()
         assert.is_truthy(src:find('name: "stop_task"', 1, true), "stop_task must be registered")
         assert.is_truthy(src:find('name: "list_tasks"', 1, true), "list_tasks must be registered")
+        -- The chat renders `list_tasks` command-first, which needs the rows
+        -- pre-split: the model-facing text leads with the id on purpose.
+        assert.is_truthy(src:find("tasks: shown.map(taskRow)", 1, true), "list_tasks must send its rows")
         -- The model has to be told the affordance exists in the bash tool too.
         assert.is_truthy(src:find("is stopped with stop_task", 1, true))
         assert.is_truthy(src:find("list_tasks shows what is still running", 1, true))
