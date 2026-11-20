@@ -81,9 +81,9 @@ scripts/checks/
 
 | Code | Meaning | When |
 |------|---------|------|
-| `0` | clean | every rule ran and reported nothing |
-| `1` | findings | the code is wrong — **whether or not a rule also failed to run** |
-| `2` | broken gate | no findings, but at least one rule could not run (missing tool, unreadable or absent subject tree, unknown rule name) |
+| `0` | clean | every rule ran and reported nothing blocking |
+| `1` | findings | at least one **blocking** (`error`/`warn`) finding — **whether or not a rule also failed to run** |
+| `2` | broken gate | no blocking findings, but at least one rule could not run (missing tool, unreadable or absent subject tree, unknown rule name) |
 
 Findings deliberately outrank a broken gate: a run that found real violations must
 not be reported as "the gate is broken", or the violations get ignored while
@@ -91,6 +91,26 @@ someone debugs the harness. Errors always go to **stderr** and `--json` always
 carries both `findings` and `errors`, so nothing is hidden when both happen at
 once. CI needs no special handling — any non-zero fails the job. A `warn` finding
 is a finding: it exits 1 (see contract 3).
+
+### Severities
+
+| Severity | Blocks? | For |
+|----------|---------|-----|
+| `error` | yes | the code is wrong, at a location the rule can name |
+| `warn` | yes | a fact about the tree ("nothing here for this rule") or a real defect the rule cannot localize |
+| `info` | **no** | an advisory heuristic whose premise static analysis cannot prove |
+
+`info` is the only non-blocking severity, and it exists because one backlog rule
+could not be written honestly without it: `uv-fast-event` (G26) asks whether a
+`vim.uv`/`vim.system` callback touches the editor without `vim.schedule`, and no
+static reachability proof of "this callback runs on a fast event" is possible — a
+heuristic that fires on compliant code must not be able to fail a merge, and
+turning it into a `warn` (which exits 1) would make the gate red on a clean tree.
+So an `info` finding is printed, counted and carried in `--json`, and the runner
+still prints `ok: … 0 blocking findings (N advisory)` and exits 0. The consequences
+are deliberate: a rule that *can* prove its finding must use `error`; `info` is
+never a place to park a real defect, and a rule made only of `info` findings is not
+a gate — it is a report, and the rule's docstring has to say so.
 
 ### The four contracts
 
@@ -264,8 +284,10 @@ tracks the coverage gaps the audit found.
   impossible for the rules we write.
 - **A `warn` that means "never mind".** `severity="warn"` is neither a pass nor
   a mute: it still exits 1. Use it for a fact about the tree (nothing here for the
-  rule to check, contract 3) or for a heuristic whose docstring says so — never to
-  keep a run green by softening a real defect.
+  rule to check, contract 3) or for a real defect the rule cannot localize — never
+  to keep a run green by softening a real defect. The non-blocking channel is
+  `info`, and it is reserved for heuristics whose premise static analysis cannot
+  prove (see § Severities).
 - **Adopting a linter because it exists.** No luacheck/selene/ast-grep: the
   *checks* stay stdlib-only Python (no third-party packages at runtime) plus
   binaries the gates already need. `ruff` is the one added linter, and it exists
