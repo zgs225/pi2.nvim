@@ -13,11 +13,13 @@
 # stay manual (`make e2e-bg-delivery`). See
 # .agents/skills/develop/references/testing.md.
 #
-# Lives under .github/workflows/ so it runs on GitHub Actions and is also picked
-# up by Gitea Actions (which reads .github/workflows/ by default) on the canonical
-# Gitea mirror. Both toolchains are installed by direct download, so the job is
-# self-contained and needs no Node, no package manager and no third-party action
-# beyond checkout.
+# Lives under .github/workflows/ and is executed by GitHub Actions ONLY. The
+# canonical Gitea instance (git.yuez.me) is this repo's issue tracker — see
+# .agents/skills/develop/references/gitea.md — not a second CI host: Actions are
+# disabled for this repo there (`has_actions: false`) and not one workflow run has
+# ever happened, so a commit that only reaches Gitea runs nothing at all. Both
+# toolchains are installed by direct download, so the job is self-contained and
+# needs no Node, no package manager and no third-party action beyond checkout.
 
 name: e2e
 

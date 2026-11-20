@@ -1,8 +1,12 @@
-# Unit-test gate: runs the plenary suite (`make test`) so a broken spec can no
-# longer merge just because CI never looked at it. Until this file existed the
-# header of lint.yml said so in as many words ("`make test` ... is NOT run here
-# yet"), which made a green check mean "the code compiles and parses", not "the
-# tests pass".
+# Behaviour gates, two jobs:
+#   unit — the plenary suite (`make test`), so a broken spec can no longer merge
+#          just because CI never looked at it. Until this file existed the header
+#          of lint.yml said so in as many words ("`make test` ... is NOT run here
+#          yet"), which made a green check mean "the code compiles and parses",
+#          not "the tests pass".
+#   e2e  — the nine hermetic `tests/*_e2e.lua` scripts (`make e2e`). The target
+#          existed but no workflow called it, so those headless render / focus /
+#          subsession checks ran nowhere at all.
 #
 # The assertion is the EXIT CODE of `make test`, nothing else. Two gotchas
 # earned that rule:
@@ -26,24 +30,40 @@
 # is red at random is worse than none.
 #
 # The toolchain is pinned in `env:` for the same reason e2e.yml pins it: the
-# suite asserts behaviour of a specific Neovim (and of specific plugin APIs), so
+# suites assert behaviour of a specific Neovim (and of specific plugin APIs), so
 # an upstream release must not silently change what this gate means. Versions are
 # plain release tags / commits and every tool is installed by direct download —
 # no third-party action beyond `actions/checkout`, no package manager, no Node.
+# Both jobs read the Neovim / plenary pins from the single workflow-level `env:`
+# block, so the two jobs cannot drift onto different editors.
 #
-# Lives under .github/workflows/ so it runs on GitHub Actions and is also picked
-# up by Gitea Actions (which reads .github/workflows/ by default) on the
-# canonical Gitea mirror. That is why the log is kept as a file in the runner
-# rather than uploaded as an artifact: `actions/upload-artifact` support on Gitea
-# Actions is unverified, and this repo's convention is "nothing but checkout".
+# Lives under .github/workflows/ and is executed by GitHub Actions ONLY. The
+# canonical Gitea instance (git.yuez.me) is this repo's issue tracker — see
+# .agents/skills/develop/references/gitea.md — not a second CI host: Actions are
+# disabled for this repo there (`has_actions: false`) and not one workflow run has
+# ever happened, so a commit that only reaches Gitea runs nothing at all.
+#
+# That is also why the log is kept as a file in the runner rather than uploaded as
+# an artifact: `actions/upload-artifact` is a third-party action, and this repo's
+# convention is "nothing but checkout".
 
 name: tests
 
 on:
+  # `dev` is the integration branch: without it a red suite would surface only
+  # when dev is merged into main, i.e. after the damage was already merged.
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
   workflow_dispatch:
+
+# Pinned on purpose: the specs assert Neovim-version-specific behaviour, so an
+# upstream release must not silently change what these gates mean. Bump with a
+# local `make test` + `make e2e` run on the new versions. Declared once here (not
+# per job) so the unit and e2e jobs cannot end up on different toolchains.
+env:
+  NVIM_VERSION: "v0.12.6"
+  PLENARY_COMMIT: "74b06c6c75e4eeb3108ec01852001636d85a932b"
 
 jobs:
   unit:
@@ -51,12 +71,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
-      # Pinned on purpose: the specs assert Neovim-version-specific behaviour and
-      # a render-contract spec that tracks render-markdown.nvim's internals, so a
-      # bump upstream must not silently change what this gate means. Bump all
-      # three together, with a local `make test` run on the new versions.
-      NVIM_VERSION: "v0.12.6"
-      PLENARY_COMMIT: "74b06c6c75e4eeb3108ec01852001636d85a932b"
+      # Unit suite only: tests/render_contract_spec.lua tracks
+      # render-markdown.nvim's internals, so the checkout is pinned too.
       # Resolved from the local lazy.nvim checkout's HEAD and confirmed to be on
       # upstream `main` (`git branch -r --contains` reported `origin/main`), so
       # `git checkout` finds it in a fresh clone.
@@ -123,3 +139,89 @@ jobs:
           echo "=== failing spec files"
           grep -E '^\[FAILED\]' "$plain" || echo "(none)"
           echo "=== spec files in the tree : $(find tests -maxdepth 1 -name '*_spec.lua' | wc -l)"
+
+  # `make e2e` runs every `tests/*_e2e.lua` (currently nine: ANSI rendering,
+  # prompt <Up>, side-layout focus, resume partitions, the subsession panels and
+  # the subagent dispatch renderer) under `nvim --headless -u tests/minimal_init.lua
+  # -l <file>`, so they never load the user's config.
+  #
+  # No provider, no account and no secret is needed: each script points
+  # PI_CODING_AGENT_DIR (and the prompt-history / draft paths) at a temp dir and
+  # stubs the backend send, so no request is ever made. The `pi` BINARY is still
+  # required: creating a session spawns the real backend (`jobstart("pi")`), and
+  # the first CI run of this job proved it — without the binary every session
+  # creation died with `Vim:E475: … 'pi' is not executable`. It is installed from
+  # a pinned GitHub release exactly as e2e.yml does, so no Node/npm is involved;
+  # Neovim and plenary.nvim are installed as in the `unit` job.
+  #
+  # Same rule as above: the exit code of `make e2e` is the gate. The loop inside it
+  # runs EVERY script and fails at the end with `e2e: N of M script(s) FAILED`, so
+  # the summary — never a single script's line — is what the job believes.
+  e2e:
+    name: headless e2e (make e2e)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      # Job-specific: the scripts spawn the real backend, so its version is part
+      # of what this gate means (same pin as e2e.yml).
+      PI_VERSION: "1.5.2"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Neovim
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/nvim.tar.gz \
+            "https://github.com/neovim/neovim/releases/download/${NVIM_VERSION}/nvim-linux-x86_64.tar.gz"
+          sudo tar -xzf /tmp/nvim.tar.gz -C /opt
+          sudo ln -sf /opt/nvim-linux-x86_64/bin/nvim /usr/local/bin/nvim
+          nvim --version | head -1
+
+      - name: Install plenary.nvim
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.local/share/nvim/lazy
+          git clone --quiet https://github.com/nvim-lua/plenary.nvim \
+            ~/.local/share/nvim/lazy/plenary.nvim
+          git -C ~/.local/share/nvim/lazy/plenary.nvim checkout --quiet "${PLENARY_COMMIT}"
+          git -C ~/.local/share/nvim/lazy/plenary.nvim rev-parse HEAD
+
+      # Creating a session spawns `pi --mode rpc`; with the send stubbed nothing
+      # is ever asked of a model, but the binary must exist (see the note above).
+      - name: Install pi
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/pi.tar.gz \
+            "https://github.com/earendil-works/pi/releases/download/v${PI_VERSION}/pi-linux-x64.tar.gz"
+          sudo tar -xzf /tmp/pi.tar.gz -C /opt
+          sudo ln -sf /opt/pi/pi /usr/local/bin/pi
+          pi --version
+
+      # No render-markdown.nvim: none of the e2e scripts load the render
+      # integration (tests/minimal_init.lua adds it to 'runtimepath' only when the
+      # checkout exists). `tee` + `pipefail` for the same reason as the unit job —
+      # the diagnostics step needs a log, `make e2e` stays authoritative.
+      - name: Run headless e2e scripts
+        run: |
+          set -euo pipefail
+          set -o pipefail
+          make e2e 2>&1 | tee /tmp/make-e2e.log
+
+      # Diagnostics only — never the gate. The Makefile prints one `exit=<code>`
+      # line per script and one summary line at the very end, so a missing summary
+      # means the loop itself died; the assertion lines are what triage needs.
+      - name: Diagnostics on failure
+        if: failure()
+        run: |
+          set -uo pipefail
+          echo "=== tail of /tmp/make-e2e.log"
+          tail -100 /tmp/make-e2e.log || true
+          plain=/tmp/make-e2e.plain.log
+          sed -e 's/\x1b\[[0-9;]*m//g' /tmp/make-e2e.log > "$plain" || true
+          echo "=== scripts that exited non-zero"
+          grep -E '^e2e: .* exit=[1-9][0-9]*$' "$plain" || echo "(none)"
+          echo "=== failing assertions"
+          grep -E '^\[FAIL\]|^FAIL:|^[a-z_0-9]+_e2e: FAIL' "$plain" || echo "(none)"
+          echo "=== make e2e summary (a missing line means the loop never finished)"
+          grep -E '^e2e: (all )?[0-9]+ (of [0-9]+ )?script\(s\)' "$plain" | tail -2 || echo "(none)"
+          echo "=== e2e scripts in the tree : $(find tests -maxdepth 1 -name '*_e2e.lua' | wc -l)"
