@@ -94,6 +94,9 @@ jobs:
       - name: deadline check-in + lifetime note (ONE notify-only message each, no kill)
         run: make e2e-bg-deadline
 
+      - name: conditional wait on a printed line (wait_task until; match does not consume the exit report)
+        run: make e2e-bg-until
+
       - name: transcript fold + adoption (survive a SIGKILL)
         run: make e2e-bg-reconcile
 

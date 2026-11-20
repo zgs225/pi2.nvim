@@ -1180,6 +1180,11 @@ end
 --- an arbitrary shell string and the row has to stay scannable.
 local WAIT_TASK_COMMAND_WIDTH = 80
 
+--- Display width the `until` needle in a `wait_task` body row may take. The
+--- needle is what the wait is *for*, so it has to be visible — but it is a
+--- model-chosen literal that can be arbitrarily long.
+local WAIT_TASK_UNTIL_WIDTH = 40
+
 --- Human-readable label for a `wait_task` call: the command the task runs, then
 --- the id.
 ---
@@ -1214,6 +1219,12 @@ end
 --- clean exit stays silent — the result body already reports `exited with code
 --- 0` — while a signal or a non-zero exit is what the reader scans the header
 --- for.
+---
+--- A wait that passed `until` gets its own two badges: `matched` says the text
+--- appeared (and the process is still running), `pattern not seen` says the
+--- wait window closed without it. The second one matters because "still
+--- running" alone does not tell the reader that what was being waited for
+--- never happened.
 ---@param result table?
 ---@return string?
 local function wait_task_status(result)
@@ -1221,7 +1232,16 @@ local function wait_task_status(result)
     if type(details) ~= "table" then
         return nil
     end
+    if details.status == "matched" then
+        return "matched"
+    end
     if details.status == "still_running" then
+        -- A deadline hit while watching for text: what did not happen is the
+        -- point, and "still running" alone does not say the pattern never
+        -- appeared.
+        if type(details["until"]) == "string" and details["until"] ~= "" then
+            return "pattern not seen"
+        end
         return "still running"
     end
     if details.status == "cancelled" then
@@ -1384,6 +1404,17 @@ local renderers = {
             local line = wait_task_label(args.task_id)
             if type(args.timeout_ms) == "number" and args.timeout_ms > 0 then
                 line = string.format("%s (timeout %ds)", line, math.floor(args.timeout_ms / 1000))
+            end
+            -- What the wait is looking for belongs in the body: a bare
+            -- `wait_task · id` reads the same whether it waits for an exit or
+            -- for a readiness line, and the needle is the only thing that says
+            -- which.
+            if type(args["until"]) == "string" and args["until"] ~= "" then
+                local needle = M.flatten_line(args["until"])
+                if vim.fn.strdisplaywidth(needle) > WAIT_TASK_UNTIL_WIDTH then
+                    needle = vim.fn.strcharpart(needle, 0, WAIT_TASK_UNTIL_WIDTH - 1) .. "…"
+                end
+                line = string.format('%s · until "%s"', line, needle)
             end
             render_body_line(history, line)
         end,

@@ -31,6 +31,7 @@
 #   make e2e-bg-wake — real-pi e2e: two same-tick completions send ONE coalesced wake naming both tasks (needs pi; fake provider)
 #   make e2e-bg-wake-gate — real-pi e2e: a held completion starts no turn, says why, and rides the next prompt exactly once (needs pi; fake provider)
 #   make e2e-bg-deadline — real-pi e2e: deadline_ms and the lifetime cap send ONE notify-only check-in each, no kill (needs pi; fake provider)
+#   make e2e-bg-until — real-pi e2e: wait_task(until) returns on a printed line, the exit report still arrives once (needs pi; fake provider)
 #   make e2e-bg-ownership — real-pi e2e: a fork does not adopt the parent's tasks, a clean quit records its kills
 #   make e2e-subagent-failure — real-pi e2e: a failed child run reaches the parent as a failed item (needs pi; not CI)
 #   make e2e-subagent-worktree — real-pi e2e: a spawn item's assigned worktree is the child's real cwd (needs pi; not CI)
@@ -63,7 +64,7 @@ RUFF_BIN ?= ruff
 
 export LUAJIT_BIN
 
-.PHONY: test smoke format style lint docs-links check check-selftest check-list parse e2e e2e-reaper e2e-worktrees e2e-bg-delivery e2e-bg-stop e2e-bg-reconcile e2e-bg-stdin e2e-bg-report e2e-bg-ownership e2e-subagent-failure e2e-subagent-worktree e2e-bg-fallback e2e-bg-wake e2e-bg-wake-gate e2e-bg-deadline
+.PHONY: test smoke format style lint docs-links check check-selftest check-list parse e2e e2e-reaper e2e-worktrees e2e-bg-delivery e2e-bg-stop e2e-bg-reconcile e2e-bg-stdin e2e-bg-report e2e-bg-ownership e2e-subagent-failure e2e-subagent-worktree e2e-bg-fallback e2e-bg-wake e2e-bg-wake-gate e2e-bg-deadline e2e-bg-until
 
 test:
 	PLENARY_PATH=$(PLENARY_PATH) RENDER_MARKDOWN_PATH=$(RENDER_MARKDOWN_PATH) \
@@ -152,6 +153,13 @@ e2e-bg-wake-gate:
 # kills anything. Needs the pi binary only — runs in CI.
 e2e-bg-deadline:
 	$(NVIM_BIN) --headless -u $(MIN_INIT) -l scripts/e2e/bg_tasks_deadline.lua
+
+# Real-pi e2e for the conditional wait: `wait_task({ until = … })` returns on a
+# literal line with the process still running, that match does NOT consume the
+# task's exit report (it still arrives, exactly once), and a needle that never
+# appears times out without a kill. Needs the pi binary only — runs in CI.
+e2e-bg-until:
+	$(NVIM_BIN) --headless -u $(MIN_INIT) -l scripts/e2e/bg_tasks_until.lua
 
 # Real-pi e2e for ownership: fork inheritance and the clean-quit shutdown record.
 # Needs the pi binary only — runs in CI.
