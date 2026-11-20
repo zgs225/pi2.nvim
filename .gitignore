@@ -1,2 +1,8 @@
 /.agents/gigs/
 /.agents/notes/
+
+# Python bytecode from scripts/ (checks, docs-links).
+__pycache__/
+
+# Stray per-session checkouts; real worktrees live outside the repo.
+/.worktrees/
