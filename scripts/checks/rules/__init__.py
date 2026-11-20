@@ -10,6 +10,7 @@ from .docs_config import DocsConfig
 from .docs_highlights import DocsHighlights
 from .docs_keymaps import DocsKeymaps
 from .parse_luajit import ParseLuajit
+from .skill_inline_pkill import SkillInlinePkill
 
 ALL: list[Check] = [
     ParseLuajit(),
@@ -19,4 +20,5 @@ ALL: list[Check] = [
     DocsHighlights(),
     DocsKeymaps(),
     DocsApi(),
+    SkillInlinePkill(),
 ]
