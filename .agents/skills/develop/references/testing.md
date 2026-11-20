@@ -51,6 +51,17 @@ The repo ships `tests/minimal_init.lua` and a `Makefile` with `test` (hermetic p
 
 **Template:** `scripts/headless_e2e_template.lua`.
 
+**Prerequisites are not a pass (Gitea #125).** `make e2e` is a CI gate, so a script that prints `[SKIP] …` and exits 0 reports coverage that never ran — `tests/resume_partitions_e2e.lua`, the only layer that renders the resume picker with the **real** telescope picker, did exactly that on every CI run while the job printed `all 9 script(s) passed`. The protocol lives in `tests/e2e_deps.lua` (loaded as `require("e2e_deps")`; `minimal_init.lua` puts `tests/` on `package.path`) and is expressed as **exit codes**, never as output grepping:
+
+| code | meaning |
+|------|---------|
+| 0 | every assertion ran and passed |
+| 1 | at least one assertion failed |
+| 2 | a prerequisite is missing and `PI_E2E_REQUIRE_DEPS=1` (gate mode) |
+| 3 | a prerequisite is missing, gate mode off (a local run may skip) |
+
+Use `deps.skip(reason)` when the whole script cannot run, `deps.skip_part(reason)` for a prerequisite of one later assertion (it returns `false` in gate mode so the caller records a failure), and `deps.require_dir` / `deps.require_executable` for the common “is this checkout / binary there” case. `make e2e` counts exit 3 separately and reports `e2e: N of M script(s) passed, K SKIPPED — a skip is not a pass`, and the `e2e` CI job sets `PI_E2E_REQUIRE_DEPS=1`, so the same absence is a red job there. The optional checkouts are `PLENARY_PATH` (also `make test`), `RENDER_MARKDOWN_PATH` (unit layer) and `TELESCOPE_PATH` (this layer); CI installs all three at pinned commits. Do **not** add telescope to `'runtimepath'` in `minimal_init.lua` — the unit specs inject a fake telescope module tree into `package.loaded`, and a real checkout on `'runtimepath'` loads the real `telescope/pickers.lua` alongside it (`attempt to call field 'on_close_prompt' (a nil value)`), so the script that needs the real picker must prepend it itself. Verify the gate itself with a mutation, not by reading it: `PI_E2E_REQUIRE_DEPS=1 TELESCOPE_PATH=/nonexistent make e2e` must fail.
+
 ## Layer 3 — GUI automation (xdotool + wmctrl + maim + RPC)
 
 **What it's for:** the only layer that exercises real keybindings through the terminal emulator, real insert mode, and **visual rendering**. This is where G1, G2, G3, G11, G12 were actually caught. Like `make smoke`, it boots the user config and loads pi from the **main checkout**, so a GUI run does not see a feature worktree's code (G23) — verify worktree changes via unit / headless-`minimal_init`, or point lazy at the worktree first.

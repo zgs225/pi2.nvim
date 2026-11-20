@@ -64,6 +64,12 @@ on:
 env:
   NVIM_VERSION: "v0.12.6"
   PLENARY_COMMIT: "74b06c6c75e4eeb3108ec01852001636d85a932b"
+  # Resolved from the local lazy.nvim checkout's HEAD and confirmed to be on
+  # upstream `master` (`git branch -r --contains` reported `origin/master`).
+  # tests/resume_partitions_e2e.lua renders the resume picker with the REAL
+  # telescope picker — the plenary specs stub it — so this checkout is a
+  # prerequisite of the `e2e` gate, not an optional nicety (Gitea #125).
+  TELESCOPE_COMMIT: "1e1bab730218eaf97fce743be3f56e51075928ac"
 
 jobs:
   unit:
@@ -165,6 +171,9 @@ jobs:
       # Job-specific: the scripts spawn the real backend, so its version is part
       # of what this gate means (same pin as e2e.yml).
       PI_VERSION: "1.5.2"
+      # A missing prerequisite fails this job instead of silently skipping a
+      # script into a false green (`tests/e2e_deps.lua`; Gitea #125).
+      PI_E2E_REQUIRE_DEPS: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -185,6 +194,19 @@ jobs:
             ~/.local/share/nvim/lazy/plenary.nvim
           git -C ~/.local/share/nvim/lazy/plenary.nvim checkout --quiet "${PLENARY_COMMIT}"
           git -C ~/.local/share/nvim/lazy/plenary.nvim rev-parse HEAD
+
+      # `tests/resume_partitions_e2e.lua` renders the resume picker with the REAL
+      # telescope picker, so this checkout is a prerequisite of the gate: without
+      # it the script printed `[SKIP]` and the job stayed green on a script that
+      # asserted nothing (Gitea #125). telescope's only hard dependency is
+      # plenary, installed above.
+      - name: Install telescope.nvim
+        run: |
+          set -euo pipefail
+          git clone --quiet https://github.com/nvim-telescope/telescope.nvim \
+            ~/.local/share/nvim/lazy/telescope.nvim
+          git -C ~/.local/share/nvim/lazy/telescope.nvim checkout --quiet "${TELESCOPE_COMMIT}"
+          git -C ~/.local/share/nvim/lazy/telescope.nvim rev-parse HEAD
 
       # Creating a session spawns `pi --mode rpc`; with the send stubbed nothing
       # is ever asked of a model, but the binary must exist (see the note above).
