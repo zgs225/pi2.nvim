@@ -177,6 +177,37 @@ local function worktree_names(repo)
     return names
 end
 
+--- The `locked` reason git recorded for `<repo>/.worktrees/<name>` (nil when unlocked).
+--- The lock is read where git keeps it, `<git_dir>/locked`.
+---@param repo string
+---@param name string
+---@return string?
+local function lock_reason(repo, name)
+    local text = read(repo .. "/.git/worktrees/" .. name .. "/locked")
+    if not text or vim.trim(text) == "" then
+        return nil
+    end
+    return vim.trim(text)
+end
+
+--- The `locked` reason `git worktree list --porcelain` reports for `<name>`.
+---@param repo string
+---@param name string
+---@return string?
+local function listed_lock(repo, name)
+    local target = repo .. "/.worktrees/" .. name
+    local in_block = false
+    for _, raw in ipairs(vim.split(git({ "worktree", "list", "--porcelain" }, repo), "\n", { plain = true })) do
+        local line = vim.trim(raw)
+        if line:match("^worktree ") then
+            in_block = line:sub(10) == target
+        elseif in_block and line:match("^locked") then
+            return vim.trim(line:sub(7))
+        end
+    end
+    return nil
+end
+
 --- Create a throwaway git repository with one commit and neutral identity.
 ---@param name string
 ---@return string path
@@ -436,6 +467,21 @@ local function scenario_s1(repo_dir)
     check(session.rpc:is_running(), "worktree session process is live")
     check(vim.tbl_contains(worktree_names(repo_dir), "w1"), "git worktree list contains w1")
 
+    -- A1: the checkout we own is locked, so an external prune/remove cannot
+    -- delete it while the session is still working in it.
+    local reason = lock_reason(repo_dir, "w1")
+    check(reason ~= nil, "the created checkout is locked", { reason = reason })
+    check(reason ~= nil and reason:match("^pi2 name=w1 ") ~= nil, "the lock reason is ours and names the checkout", {
+        reason = reason,
+    })
+    check(reason ~= nil and reason:find("nvim=", 1, true) ~= nil, "the lock reason records the nvim pid", {
+        reason = reason,
+    })
+    local listed = listed_lock(repo_dir, "w1")
+    check(listed ~= nil and listed:match("^pi2 ") ~= nil, "git worktree list reports the checkout as locked", {
+        listed = listed,
+    })
+
     local meta_path = repo_dir .. "/.git/worktrees/w1/pi2-worktree.json"
     local meta_text = read(meta_path)
     local meta = meta_text and vim.json.decode(meta_text) or {}
@@ -660,7 +706,15 @@ local function scenario_s11(repo_dir)
     step("S11 A: N -> name input -> fresh session in a new worktree")
     local before_a = session_set()
     local wt_session
-    with_worktree_dialogs({ input = "e2e-n" }, function()
+    -- The picker now lists the main checkout first, so the default (`options[1]`)
+    -- would pick it and never reach the name input: choose the last entry,
+    -- which is `New worktree…`.
+    with_worktree_dialogs({
+        select = function(options)
+            return options[#options]
+        end,
+        input = "e2e-n",
+    }, function()
         press_on_row(main_tab, repo_dir, "N")
         wait(function()
             return #DialogLog.inputs == 1
@@ -676,6 +730,9 @@ local function scenario_s11(repo_dir)
     )
     track(wt_session)
     wait_live(wt_session)
+    check(lock_reason(repo_dir, "e2e-n") ~= nil, "A: the created checkout is locked", {
+        reason = lock_reason(repo_dir, "e2e-n"),
+    })
 
     local wt = repo_dir .. "/.worktrees/e2e-n"
     check(realpath(wt_session.cwd) == realpath(wt), "A: session cwd is <repo>/.worktrees/e2e-n", {
@@ -857,6 +914,8 @@ local function scenario_s9(repo_dir)
         return not exists(clean_wt)
     end, 30000, "clean worktree removal")
     check(not vim.tbl_contains(worktree_names(repo_dir), "w-clean"), "clean close removed the worktree from git")
+    check(lock_reason(repo_dir, "w-clean") == nil, "clean close left no lock entry behind")
+    check(listed_lock(repo_dir, "w-clean") == nil, "no lock is left in the git worktree list")
     local patches = vim.fn.glob(repo_dir .. "/.git/pi2-worktree-snapshots/w-clean/*.patch", false, true)
     check(#patches == 1, "clean close wrote one (empty) snapshot patch", { patches = patches })
     check(read(patches[1]) == "", "clean snapshot patch is empty", { content = read(patches[1]) })
@@ -930,12 +989,15 @@ local function scenario_s6(repo_dir)
 
     step("S6 confirm snapshots then removes the checkout")
     create_checkout(repo_dir, "w-confirm")
+    check(lock_reason(repo_dir, "w-confirm") ~= nil, "the checkout to remove is locked first")
     local confirm_pack = call(function(cb)
         require("pi.worktree_session").remove({ name = "w-confirm" }, cb)
     end, 30000)
     check(confirm_pack[1] == true, "confirm reported the removal", { result = confirm_pack[1] })
     check(not exists(repo_dir .. "/.worktrees/w-confirm"), "confirm removed the checkout directory")
     check(not vim.tbl_contains(worktree_names(repo_dir), "w-confirm"), "confirm removed it from git worktree list")
+    check(lock_reason(repo_dir, "w-confirm") == nil, "confirm left no lock entry behind")
+    check(listed_lock(repo_dir, "w-confirm") == nil, "no lock is left in the git worktree list")
     local patches = vim.fn.glob(repo_dir .. "/.git/pi2-worktree-snapshots/w-confirm/*.patch", false, true)
     check(#patches == 1, "confirm wrote one snapshot patch under R/.git/pi2-worktree-snapshots/<name>/", {
         patches = patches,

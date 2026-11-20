@@ -524,6 +524,43 @@ function M.worktree_remove(opts)
     require("pi.worktree_session").remove(opts)
 end
 
+--- Run the worktree retention sweep now (`pi.worktree_gc`): the same prune that
+--- runs automatically after a create, exposed for manual and scripted use.
+--- Only checkouts carrying pi2 metadata are ever pruned — a hand-made
+--- `git worktree add` is never touched — and a dirty or ahead checkout is kept.
+--- API only: no command, no keymap.
+---@param opts? pi.WorktreeRetentionOpts
+---@param callback? fun(report: pi.WorktreeRetentionReport?, err: string?)
+function M.worktree_gc(opts, callback)
+    opts = opts or {}
+    local loaded, Retention = pcall(require, "pi.worktree_retention")
+    if not loaded or type(Retention) ~= "table" or type(Retention.run) ~= "function" then
+        if callback then
+            callback(nil, "worktree_gc: pi.worktree_retention unavailable")
+        end
+        return
+    end
+    Retention.run(opts, callback)
+end
+
+--- Release `git worktree lock`s this plugin set whose owning processes are gone
+--- (`pi.worktree_sweep_locks`). A lock set by someone else, recorded on another
+--- host, or bearing no pid at all is never released. API only: no command, no
+--- keymap.
+---@param opts? { cwd?: string } Repository scope (default: process cwd).
+---@param callback? fun(report: pi.WorktreeSweepReport?, err: string?)
+function M.worktree_sweep_locks(opts, callback)
+    opts = opts or {}
+    local loaded, Worktree = pcall(require, "pi.worktree")
+    if not loaded or type(Worktree) ~= "table" or type(Worktree.sweep_locks) ~= "function" then
+        if callback then
+            callback(nil, "worktree_sweep_locks: pi.worktree unavailable")
+        end
+        return
+    end
+    Worktree.sweep_locks(opts.cwd, callback)
+end
+
 --- Toggle the sessions overview list (:PiSessions): a live list of all
 --- active sessions with their display name and status (busy/idle/attention).
 --- One shared buffer; each tab opens its own window on it.

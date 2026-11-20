@@ -233,6 +233,24 @@ require("pi").setup({
         -- starting one does not :cd the editor). Set false for the plain
         -- `󰙅 <name>` badge — the path anchors then differ silently.
         warn_on_cwd_mismatch = true,
+        -- Take a `git worktree lock` on every checkout we create and unlock it
+        -- again when the checkout is removed (default true), so an external
+        -- `git worktree prune` / `remove` cannot delete a checkout an agent is
+        -- still working in. A reason that is not ours is never touched, and a
+        -- foreign lock keeps the checkout on release ("Worktree kept: …").
+        lock = true,
+        -- Deferred cleanup, scheduled after a checkout is created (never at
+        -- startup, never on the create path). ONLY checkouts carrying π's own
+        -- <git dir>/pi2-worktree.json metadata are ever pruned: a hand-made
+        -- `git worktree add` checkout is never touched. See
+        -- doc/worktrees.md#locking-and-retention.
+        retention = {
+            enabled = true,     -- run the sweep after a create
+            max_count = 25,     -- keep the newest N π-managed checkouts per repository
+            max_age_days = 14,  -- … prune ones whose checkout directory (top-level mtime, so a deep edit may not count) has not changed for this many days
+            snapshot_days = 30, -- keep the snapshots of a removed checkout this many days
+            sweep_locks = true, -- release stale π locks before pruning
+        },
     },
 
     -- Sub-sessions (子会话). When enabled (default), injects extensions/subagent.ts
