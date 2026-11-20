@@ -8,14 +8,22 @@
 # earned that rule:
 #   G25 — never grep the (ANSI-coloured) output for "Success"/"Failed": a driver
 #         that stops early, a target that never ran, and a suite that silently
-#         skipped can all leave a green grep behind. plenary's harness exits
-#         non-zero if ANY child spec failed (test_harness.lua collects every
-#         job's code in parallel mode), so the code is the whole answer.
-#   G33 — a child nvim that dies before busted runs prints no `Testing:` line at
-#         all, i.e. one fewer `Testing:` than there are spec files. A count that
-#         matches is the only cheap proof the suite was actually entered; that is
-#         what the failure diagnostics below compare. They are diagnostics only,
-#         never the gate.
+#         skipped can all leave a green grep behind. `make test` runs
+#         `scripts/run_tests.lua`, which spawns each spec as its own child and
+#         exits non-zero if ANY child failed, was killed, or if no spec matched,
+#         so the code is the whole answer.
+#   G33 — a child that dies before busted runs used to print no `Testing:` line,
+#         i.e. one fewer than there are spec files, and the run looked green. The
+#         runner closes that hole by construction: every child it starts prints
+#         either `ok` or `[FAILED] <file> (<reason>)`, and a killed child reports
+#         `signal 9` rather than the `code = 0` a signal kill actually carries.
+#         The diagnostics below print those lines and the runner's own summary;
+#         they are diagnostics only, never the gate.
+#
+# Concurrency is capped (`TEST_JOBS`, default 8) because the suite is ~170 spec
+# files: plenary's own `test_directory` joined them all at once, which on this
+# machine killed children and made every wall-clock assertion flaky — a gate that
+# is red at random is worse than none.
 #
 # The toolchain is pinned in `env:` for the same reason e2e.yml pins it: the
 # suite asserts behaviour of a specific Neovim (and of specific plugin APIs), so
@@ -110,8 +118,8 @@ jobs:
           tail -100 /tmp/make-test.log || true
           plain=/tmp/make-test.plain.log
           sed -e 's/\x1b\[[0-9;]*m//g' /tmp/make-test.log > "$plain" || true
-          echo "=== spec coverage"
-          echo "Testing: lines : $(grep -c 'Testing:' "$plain" || true)"
-          echo "spec files     : $(find tests -maxdepth 1 -name '*_spec.lua' | wc -l)"
-          echo "=== non-zero summary lines (Failed / Errors)"
-          grep -E '^(Failed|Errors)[[:space:]]*:[[:space:]]*[1-9]' "$plain" || echo "(none)"
+          echo "=== runner summary (a missing line means the runner never finished)"
+          grep -E '^run_tests: ' "$plain" | tail -2 || echo "(none)"
+          echo "=== failing spec files"
+          grep -E '^\[FAILED\]' "$plain" || echo "(none)"
+          echo "=== spec files in the tree : $(find tests -maxdepth 1 -name '*_spec.lua' | wc -l)"

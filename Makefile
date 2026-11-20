@@ -1,11 +1,16 @@
 # pi.nvim development helpers.
 #
-#   make test    — run the plenary unit test suite (hermetic, -u tests/minimal_init.lua).
+#   make test    — run the plenary spec suite via `scripts/run_tests.lua` (hermetic,
+#                  -u tests/minimal_init.lua for every child).
 #                  This is the CI unit gate (`.github/workflows/tests.yml`, pushed to
 #                  main + every PR, judged by exit code only).
-#                  Files run in parallel, 120 s per file: tests/worktree_git_spec.lua
-#                  alone spends ~50 s on real git commits at APFS fsync speed, which
-#                  plenary's 50 s default would kill under parallel load.
+#                  Concurrency is CAPPED (`TEST_JOBS`, default 8): plenary's
+#                  `test_directory` spawns one child nvim per spec file and joins
+#                  them all at once, which at ~170 files kills children and makes
+#                  every wall-clock assertion flaky. tests/worktree_git_spec.lua
+#                  alone spends ~50 s on real git commits, so the per-child budget
+#                  is `TEST_TIMEOUT` (default 300 s), not plenary's 50 s default.
+#                  `TEST_FILTER=tests/prompt_*_spec.lua` runs a subset.
 #                  render-markdown.nvim is OPTIONAL (RENDER_MARKDOWN_PATH): the
 #                  render-contract spec skips itself when the checkout is missing.
 #   make check   — static gates: LuaJIT parse (G24) + docs sync; `check-selftest`
@@ -46,6 +51,11 @@ PLENARY_PATH ?= $(HOME)/.local/share/nvim/lazy/plenary.nvim
 # When the checkout is absent, minimal_init skips it and that spec skips itself.
 RENDER_MARKDOWN_PATH ?= $(HOME)/.local/share/nvim/lazy/render-markdown.nvim
 MIN_INIT := tests/minimal_init.lua
+# Concurrent child editors for `make test` (see scripts/run_tests.lua). Raise it
+# locally for speed; CI keeps it low so timing-sensitive specs are not raced.
+TEST_JOBS ?= 8
+# Per-child budget in seconds; a child that hangs is killed and reported red.
+TEST_TIMEOUT ?= 300
 STYLUA_BIN ?= stylua
 LUA_LS_BIN ?= lua-language-server
 RUFF_BIN ?= ruff
@@ -55,8 +65,9 @@ export LUAJIT_BIN
 .PHONY: test smoke format style lint docs-links check check-selftest check-list parse e2e e2e-reaper e2e-worktrees e2e-bg-delivery e2e-bg-stop e2e-bg-reconcile e2e-bg-stdin e2e-bg-report e2e-bg-ownership e2e-subagent-failure e2e-subagent-worktree e2e-bg-fallback e2e-bg-wake e2e-bg-wake-gate e2e-bg-deadline
 
 test:
-	PLENARY_PATH=$(PLENARY_PATH) RENDER_MARKDOWN_PATH=$(RENDER_MARKDOWN_PATH) $(NVIM_BIN) --headless -u $(MIN_INIT) \
-		-c "lua require('plenary.test_harness').test_directory('tests', { minimal_init = '$(MIN_INIT)', timeout = 120000 })"
+	PLENARY_PATH=$(PLENARY_PATH) RENDER_MARKDOWN_PATH=$(RENDER_MARKDOWN_PATH) \
+		NVIM_BIN=$(NVIM_BIN) MIN_INIT=$(MIN_INIT) TEST_JOBS=$(TEST_JOBS) TEST_TIMEOUT=$(TEST_TIMEOUT) \
+		$(NVIM_BIN) --headless -u NONE -l scripts/run_tests.lua
 
 e2e:
 	@for f in tests/*_e2e.lua; do \
