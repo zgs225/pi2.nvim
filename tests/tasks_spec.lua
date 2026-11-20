@@ -861,3 +861,85 @@ describe("pi.tasks held report events", function()
         assert.is_nil(Tasks.get("nope"))
     end)
 end)
+
+describe("pi.tasks delete_log", function()
+    before_each(function()
+        Tasks._reset()
+    end)
+
+    --- Create a real temp file standing in for a task's log.
+    ---@return string
+    local function log_file()
+        local path = vim.fn.tempname()
+        vim.fn.writefile({ "hello" }, path)
+        return path
+    end
+
+    it("deletes a finished task's log and flags the record", function()
+        local path = log_file()
+        Tasks.upsert({
+            id = "done1",
+            command = "make",
+            status = "completed",
+            start_time = 1,
+            end_time = 2,
+            output_file = path,
+        })
+        local refreshes = 0
+        Tasks.on_refresh(function()
+            refreshes = refreshes + 1
+        end)
+
+        assert.is_true(Tasks.delete_log("done1"))
+        assert.are.equal(0, vim.fn.filereadable(path), "the log file must be gone from disk")
+        assert.is_true(Tasks.get("done1").log_removed)
+        pump(50)
+        assert.are.equal(1, refreshes, "the row must redraw to show `log removed`")
+    end)
+
+    it("refuses a running task and leaves its log alone", function()
+        local path = log_file()
+        Tasks.upsert({ id = "run1", command = "make", status = "running", start_time = 1, output_file = path })
+
+        local ok, err = Tasks.delete_log("run1")
+
+        assert.is_false(ok)
+        assert.are.equal("still running", err)
+        assert.are.equal(1, vim.fn.filereadable(path), "a running task's writer still owns the file")
+        assert.is_nil(Tasks.get("run1").log_removed)
+        vim.fn.delete(path)
+    end)
+
+    it("reports an unknown task", function()
+        local ok, err = Tasks.delete_log("ghost")
+        assert.is_false(ok)
+        assert.are.equal("unknown task", err)
+    end)
+
+    it("reports a task without an output file", function()
+        Tasks.upsert({ id = "nofile", command = "", status = "completed", start_time = 1, end_time = 2 })
+
+        local ok, err = Tasks.delete_log("nofile")
+
+        assert.is_false(ok)
+        assert.are.equal("no output file", err)
+        assert.is_nil(Tasks.get("nofile").log_removed)
+    end)
+
+    it("treats an already-missing log as deleted (idempotent)", function()
+        -- Never created: the TTL sweep or a manual rm may have beaten the panel
+        -- to it, which is exactly the state the caller asked for.
+        local path = vim.fn.tempname()
+        Tasks.upsert({
+            id = "gone",
+            command = "",
+            status = "completed",
+            start_time = 1,
+            end_time = 2,
+            output_file = path,
+        })
+
+        assert.is_true(Tasks.delete_log("gone"))
+        assert.is_true(Tasks.get("gone").log_removed)
+    end)
+end)
