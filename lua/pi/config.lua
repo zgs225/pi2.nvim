@@ -703,7 +703,14 @@ function M.setup(opts)
         opts.verbs = nil
     end
 
-    M.options = vim.tbl_deep_extend("force", defaults, opts or {})
+    -- Deepcopy `defaults` into the merge: tbl_deep_extend keeps a *reference*
+    -- to the first source's nested tables, so `options.subagent` used to BE
+    -- `defaults.subagent`. Any in-place write to a nested option (the natural
+    -- thing a test or a user plugin does) then landed in the module-local
+    -- defaults and survived every later setup() (G31). Copying here makes
+    -- "setup() restores the defaults" true again, at the cost of one deepcopy
+    -- of a small table per setup() call (setup is a once-per-session call).
+    M.options = vim.tbl_deep_extend("force", vim.deepcopy(defaults), opts or {})
 
     -- Resolve verbs: merge or replace based on use_defaults.
     if user_verbs then

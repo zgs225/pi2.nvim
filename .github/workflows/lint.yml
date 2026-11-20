@@ -19,9 +19,12 @@
 # the same file developers get their pinned toolchain from, so a version bump
 # happens in exactly one place.
 #
-# `make test` (the plenary suite) is NOT run here yet — it needs Neovim plus
-# plenary.nvim. Tracked separately; until then a local `make test` is still
-# mandatory before merge (see .agents/skills/develop/SKILL.md).
+# `make test` (the plenary suite) is deliberately not one of the three jobs: it
+# needs Neovim plus plenary.nvim, so it lives in its own workflow,
+# `.github/workflows/tests.yml`, which gates push to main and every PR the same
+# way — judged by exit code only, never by grepping the coloured output (G25) —
+# with a pinned Neovim / plenary / render-markdown.nvim toolchain. Both runs are
+# required before merge; see .agents/skills/develop/SKILL.md § CI verification.
 
 name: lint
 
