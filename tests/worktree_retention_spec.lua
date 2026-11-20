@@ -9,6 +9,7 @@
 -- driven by real directory mtimes (`uv.fs_utime`), not by the fake.
 
 local Config = require("pi.config")
+local RepoConfig = require("pi.worktree_config")
 local W = require("pi.worktree")
 local Retention = require("pi.worktree_retention")
 
@@ -146,6 +147,7 @@ describe("worktree retention", function()
     before_each(function()
         W._reset()
         Retention._reset()
+        RepoConfig._reset()
         Config.setup({})
         root = tempdir()
         repo = root .. "/repo"
@@ -156,6 +158,7 @@ describe("worktree retention", function()
     after_each(function()
         Retention._reset()
         W._reset()
+        RepoConfig._reset()
         Config.setup({})
         if root then
             vim.fn.delete(root, "rf")
@@ -220,6 +223,25 @@ describe("worktree retention", function()
         local removes = all_calls(calls, "worktree remove")
         assert.are.equal(1, #removes)
         assert.are.same({ "git", "-C", repo, "worktree", "remove", paths["wt-1"] }, removes[1].argv)
+    end)
+
+    it("takes the caps from the repository's .pi-worktrees.toml", function()
+        local paths, listing = build({
+            { name = "wt-1", age_seconds = 3000 },
+            { name = "wt-2", age_seconds = 2000 },
+        })
+        install_git({ repo = repo, listing = listing })
+        vim.fn.writefile({ "[retention]", "max_count = 0" }, repo .. "/.pi-worktrees.toml")
+
+        -- Both are well inside the global `max_count = 25` / `max_age_days = 14`:
+        -- only the repository's own cap selects them.
+        local res = call(Retention.run, { cwd = repo, quiet = true })
+        local report, err = res[1], res[2]
+        assert.is_nil(err, tostring(err))
+        assert.are.same({ "wt-2", "wt-1" }, report.removed)
+        assert.are.equal(0, #report.kept)
+        local removes = all_calls(calls, "worktree remove")
+        assert.are.same({ "git", "-C", repo, "worktree", "remove", paths["wt-2"] }, removes[1].argv)
     end)
 
     it("releases a checkout older than max_age_days and keeps a fresh one", function()

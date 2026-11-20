@@ -7,6 +7,7 @@
 -- a user-level excludes file cannot change the .gitignore assertions.
 
 local Config = require("pi.config")
+local RepoConfig = require("pi.worktree_config")
 local W = require("pi.worktree")
 
 ---@param argv string[]
@@ -155,6 +156,7 @@ local function teardown_repo(ctx)
     if loaded and type(Retention) == "table" and type(Retention._reset) == "function" then
         pcall(Retention._reset)
     end
+    RepoConfig._reset()
     W._reset()
     Config.setup({})
 end
@@ -285,6 +287,108 @@ describe("worktree create (real git)", function()
         assert.is_truthy(res[2]:find("nope", 1, true))
         assert.is_not_nil(vim.uv.fs_stat(repo .. "/.worktrees/wt-setup-fail"))
         assert.is_not_nil(vim.uv.fs_stat(repo .. "/.git/worktrees/wt-setup-fail/pi2-worktree.json"))
+    end)
+
+    it("starts the checkout at the repository's .pi-worktrees.toml base_ref", function()
+        local first = head_of(repo)
+        vim.fn.writefile({ "second" }, repo .. "/second.txt")
+        git_ok({ "git", "add", "-A" }, repo)
+        git_ok({ "git", "commit", "-qm", "second" }, repo)
+        assert.are_not.equal(first, head_of(repo))
+        vim.fn.writefile({ 'base_ref = "' .. first .. '"' }, repo .. "/.pi-worktrees.toml")
+
+        -- An explicit `base` still wins; with none, the repository decides.
+        local info = create_wt(repo, "wt-base-cfg")
+        assert.are.equal(first, info.base_sha)
+
+        local explicit = call(W.create, { cwd = repo, name = "wt-base-explicit", base = "HEAD" })
+        assert.is_nil(explicit[2], tostring(explicit[2]))
+        assert.are_not.equal(first, explicit[1].base_sha)
+    end)
+
+    it("merges .pi-worktrees.toml include patterns with .worktreeinclude", function()
+        teardown_repo(ctx)
+        ctx = setup_repo({
+            gitignore = "dist/\n.cache/\n",
+            worktreeinclude = ".cache/\n",
+            files = {
+                ["dist/o.js"] = "dist",
+                [".cache/x"] = "cache",
+            },
+        })
+        repo = ctx.repo
+        vim.fn.writefile({ 'include = ["dist/"]' }, repo .. "/.pi-worktrees.toml")
+
+        local info = create_wt(repo, "wt-inc-cfg")
+        assert.is_not_nil(vim.uv.fs_stat(info.path .. "/.cache/x"), ".worktreeinclude pattern lost")
+        assert.is_not_nil(vim.uv.fs_stat(info.path .. "/dist/o.js"), "config include pattern not applied")
+    end)
+
+    it("does not run a repository's setup commands without worktree.repo_setup", function()
+        vim.fn.writefile({ "[setup]", 'all = [["sh", "-c", "echo ran > .repo-setup"]]' }, repo .. "/.pi-worktrees.toml")
+
+        local Notify = require("pi.notify")
+        local notices = {}
+        local original = Notify.info
+        Notify.info = function(msg)
+            notices[#notices + 1] = msg
+        end
+        local info
+        local ok, err = pcall(function()
+            info = create_wt(repo, "wt-no-trust")
+        end)
+        Notify.info = original
+        assert.is_true(ok, tostring(err))
+
+        assert.is_nil(vim.uv.fs_stat(info.path .. "/.repo-setup"), "an untrusted repository must not run code")
+        -- Declaring them while off is reported once, not silently dropped.
+        local found = false
+        for _, msg in ipairs(notices) do
+            if msg:find("declares 1 setup command(s); not run", 1, true) then
+                found = true
+            end
+        end
+        assert.is_true(found, "no notice about the skipped setup commands: " .. vim.inspect(notices))
+    end)
+
+    it("runs the repository's setup commands after setup_cmd, with both path variables", function()
+        vim.fn.writefile({
+            "[setup]",
+            'all = [["sh", "-c", "printenv PI_ROOT_WORKTREE_PATH > .root-path; printenv PI_WORKTREE_PATH > .wt-path"]]',
+        }, repo .. "/.pi-worktrees.toml")
+        Config.setup({
+            worktree = {
+                repo_setup = true,
+                -- Runs first: the repository's command must not have run yet.
+                setup_cmd = { "sh", "-c", "test -e .root-path && exit 1; echo user > .user-setup" },
+            },
+        })
+
+        local info = create_wt(repo, "wt-trusted")
+        assert.is_not_nil(vim.uv.fs_stat(info.path .. "/.user-setup"), "setup_cmd did not run")
+        assert.is_not_nil(vim.uv.fs_stat(info.path .. "/.root-path"), "repository setup did not run")
+        local root_path = vim.trim(table.concat(vim.fn.readfile(info.path .. "/.root-path"), ""))
+        local wt_path = vim.trim(table.concat(vim.fn.readfile(info.path .. "/.wt-path"), ""))
+        assert.are.equal(info.repo_root, root_path)
+        assert.are.equal(info.path, wt_path)
+    end)
+
+    it("fails the creation when a trusted repository setup command fails", function()
+        vim.fn.writefile({ "[setup]", 'all = [["sh", "-c", "echo boom >&2; exit 9"]]' }, repo .. "/.pi-worktrees.toml")
+        Config.setup({ worktree = { repo_setup = true } })
+
+        local res = call(W.create, { cwd = repo, name = "wt-repo-setup-fail" })
+        assert.is_nil(res[1])
+        assert.is_truthy(res[2]:find(".pi-worktrees.toml setup failed (exit 9)", 1, true), tostring(res[2]))
+        assert.is_truthy(res[2]:find("boom", 1, true), tostring(res[2]))
+        -- The checkout stays on disk, like a failing `setup_cmd`.
+        assert.is_not_nil(vim.uv.fs_stat(repo .. "/.worktrees/wt-repo-setup-fail"))
+    end)
+
+    it("ignores a broken .pi-worktrees.toml and still creates the checkout", function()
+        vim.fn.writefile({ 'base_reff = "fresh"' }, repo .. "/.pi-worktrees.toml")
+        local info = create_wt(repo, "wt-bad-cfg")
+        assert.are.equal(head_of(repo), info.base_sha)
     end)
 
     it("reports a clear error outside a repository, without commits, and nested", function()

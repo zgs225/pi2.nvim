@@ -218,11 +218,18 @@ require("pi").setup({
         -- worktree root as cwd; nil = no setup step. A non-zero exit keeps
         -- the checkout on disk but fails the creation (no session starts).
         setup_cmd = nil, -- e.g. { "mise", "install" }
+        -- Run the `[setup]` commands a repository declares in its own
+        -- .pi-worktrees.toml (default false). A cloned repository is untrusted
+        -- input, so its commands only run when you say so; a repository that
+        -- declares them is reported once while this is off. See
+        -- doc/worktrees.md#repository-configuration.
+        repo_setup = false,
         -- Base commit new checkouts start from: "head" (default; the commit the
         -- creating session's checkout is on), "fresh" (the repository's remote
         -- default branch, origin/HEAD — re-fetched at most once per 24h, capped
         -- at 5s, falling back to the cached ref then local HEAD), or nothing
-        -- else (a per-item revision overrides it, see subagent.worktree).
+        -- else (a per-item revision overrides it, see subagent.worktree). A
+        -- repository's .pi-worktrees.toml base_ref overrides both.
         base_ref = "head",
         -- Snapshot a worktree's patch (base commit → now, untracked files
         -- included) before pi.worktree_remove / Worktree.remove deletes it.

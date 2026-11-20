@@ -267,8 +267,9 @@
 ---@field sweep_locks? boolean Release stale pi locks before pruning (default true)
 
 ---@class pi.WorktreeConfig
----@field setup_cmd? string[] Command run inside a freshly created worktree before the creation callback fires. Executed directly (no shell) with the worktree root as cwd; a non-zero exit keeps the worktree in place and fails the creation.
----@field base_ref? "head"|"fresh" Base commit new worktrees start from: `"head"` (default) detaches at the checkout the creating session runs in, `"fresh"` at the repository's remote default branch (`origin/HEAD`, re-fetched at most once per 24h with a 5s cap, falling back to the cached ref then local `HEAD`). A `create.base` on a sub-agent dispatch item overrides it per item.
+---@field setup_cmd? string[] Command run inside a freshly created worktree before the creation callback fires. Executed directly (no shell) with the worktree root as cwd; a non-zero exit keeps the worktree in place and fails the creation. The command sees `PI_ROOT_WORKTREE_PATH` (the repository's main checkout) and `PI_WORKTREE_PATH` (the new checkout).
+---@field repo_setup? boolean Run the `setup` commands a repository declares in its `.pi-worktrees.toml` (default false). Off by default because a cloned repository is untrusted input: its commands would otherwise run on checkout. See `doc/worktrees.md#repository-configuration`.
+---@field base_ref? "head"|"fresh" Base commit new worktrees start from *unless* the repository's `.pi-worktrees.toml` declares one: `"head"` (default) detaches at the checkout the creating session runs in, `"fresh"` at the repository's remote default branch (`origin/HEAD`, re-fetched at most once per 24h with a 5s cap, falling back to the cached ref then local `HEAD`). A `create.base` on a sub-agent dispatch item overrides it per item.
 ---@field snapshot_before_remove? boolean Write a patch snapshot before removing a worktree (`Worktree.remove`, `pi.worktree_remove`) (default true)
 ---@field warn_on_cwd_mismatch? boolean Prefix the chat-title worktree badge with `⚠` when the session's cwd differs from Neovim's cwd (default true). false keeps the plain `󰙅 <name>` badge instead
 ---@field lock? boolean Take a `git worktree lock` on every checkout we create and release it when the checkout is removed (default true). Prevents an external `git worktree prune` / `remove` from deleting a checkout an agent is still working in.
@@ -535,6 +536,7 @@ local defaults = {
     },
     worktree = {
         setup_cmd = nil,
+        repo_setup = false,
         base_ref = "head",
         snapshot_before_remove = true,
         warn_on_cwd_mismatch = true,

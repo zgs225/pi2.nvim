@@ -12,6 +12,7 @@ Worktree support is opt-in per session, not a mode: you start a session in a new
   - [`.gitignore`](#gitignore)
   - [`.worktreeinclude`](#worktreeinclude)
   - [`worktree.setup_cmd`](#worktreesetupcmd)
+- [Repository configuration](#repository-configuration)
 - [Detached HEAD and attaching a branch](#detached-head-and-attaching-a-branch)
 - [Applying a patch](#applying-a-patch)
 - [Shipping the work](#shipping-the-work)
@@ -121,6 +122,8 @@ A fresh checkout only contains tracked files, so per-repository local files — 
 
 Only files git **ignores** are copied: the copy is the intersection of `.gitignore` and `.worktreeinclude`. Tracked files are already in the checkout, and copying them would only risk clobbering the base commit. The `.worktrees/` directory itself is never copied (so the copy cannot recurse), and a pattern matching more than 20 000 files is refused loudly instead of hanging the editor. The same cap bounds how many untracked files a patch capture will include (see [Removing a worktree](#removing-a-worktree)).
 
+A committed [`include` list in `.pi-worktrees.toml`](#repository-configuration) is **added** to these patterns, so a shared config never has to repeat what `.worktreeinclude` already says.
+
 ```
 # <repo>/.worktreeinclude
 .env
@@ -144,9 +147,43 @@ require("pi").setup({
 
 The command's exit status decides what happens: `0` → the session starts in the worktree; non-zero → creation **fails**, the session is not started, and the error notification carries the tail of the command's output. The worktree itself stays on disk (it is already registered with git), so nothing is lost — fix the problem and create the session there again, or remove the checkout with `pi.worktree_remove()`.
 
+The command runs with the worktree root as cwd and two extra variables, so a project script never has to guess where it is: **`PI_ROOT_WORKTREE_PATH`** (the repository's main checkout — the usual source of a local `.env`) and **`PI_WORKTREE_PATH`** (the checkout being set up).
+
+`setup_cmd` is *your machine's* bootstrap. Commands that belong to the repository itself (install its dependencies, generate its config) go in the repository's [`[setup]` block](#repository-configuration), which is opt-in via `worktree.repo_setup` and runs after this command.
+
+## Repository configuration
+
+Per-repository settings that should travel with the repository — extra include globs, the base ref its checkouts start from, its setup commands, and how many checkouts to keep — live in a **`.pi-worktrees.toml`** at the repository root. Commit it and every checkout of that repository behaves the same for every developer and every agent; nothing about it comes from your own `setup()`.
+
+```toml
+# <repo>/.pi-worktrees.toml
+base_ref = "fresh"                    # "head" | "fresh" | any revision
+include = [".env", "config/local/*"]  # added to .worktreeinclude
+
+[setup]
+unix = [["npm", "ci"], ["./scripts/setup.sh"]]
+windows = [["npm.cmd", "ci"]]
+
+[retention]
+max_count = 10
+```
+
+| Key | What it does | Precedence |
+| --- | --- | --- |
+| `base_ref` | Commit a new checkout starts from (`head`, `fresh`, or any revision git accepts) | a per-create `base` (a sub-agent dispatch item) > this file > `worktree.base_ref` > `head` |
+| `include` | Globs copied into a fresh checkout, **in addition to** `.worktreeinclude` — same rules: only git-ignored files, same 20 000-file cap | merged with `.worktreeinclude` |
+| `[setup]` | Commands run inside a fresh checkout, after `worktree.setup_cmd` | opt-in, see below |
+| `[retention]` | `max_count`, `max_age_days`, `snapshot_days` for this repository's checkouts | per-call `worktree_gc` opts > this file > `worktree.retention` |
+
+`[setup]` commands are **argv lists run directly** (no shell, no string splitting): `unix` and `windows` choose by platform, `all` is the shared fallback, and a bare `setup = [["npm", "ci"]]` applies everywhere. They run in order, with the checkout as cwd, and see `PI_ROOT_WORKTREE_PATH` (the repository's main checkout) and `PI_WORKTREE_PATH` (the new checkout). A non-zero exit fails the creation exactly like [`worktree.setup_cmd`](#worktreesetupcmd). `retention.enabled` and `retention.sweep_locks` are deliberately *not* accepted here: they are user-level switches, read before the sweep knows which repository it is in.
+
+**Repository setup commands are trusted, not inferred.** A cloned repository is untrusted input — running its commands on checkout would execute code from someone else's commit. They therefore run only with `worktree.repo_setup = true`; while it is off, a repository that declares them is reported once (`… declares 2 setup command(s); not run`) instead of silently looking set up when it is not. Everything else in the file is data and needs no switch.
+
+The file is read **when it is used** (a create, a retention sweep) and cached against its size and mtime — never on `pi.setup()`, on `:PiSessions`, or on any rendering path. It is strict on purpose: an unknown key, a wrong type, a negative number or a TOML syntax error is reported once (naming the line) and the file is then ignored, so a typo in a committed config cannot break worktree creation for everybody — but it also cannot pass unnoticed.
+
 ## Detached HEAD and attaching a branch
 
-Worktrees are created detached on purpose: a branch can only be checked out in one worktree at a time, and the point is not to take the branch away from the main checkout (or from another agent). Your work therefore starts on the base commit, and `git status` / `git diff <base>` are the natural views of it.
+Worktrees are created detached on purpose: a branch can only be checked out in one worktree at a time, and the point is not to take the branch away from the main checkout (or from another agent). Your work therefore starts on the base commit, and `git status` / `git diff <base>` are the natural views of it. The base commit itself comes from an explicit `base`, else the repository's [`base_ref`](#repository-configuration), else `worktree.base_ref`, else the checkout you create from.
 
 When the work needs a branch name — to push it, or because you prefer to commit on a branch — attach one explicitly:
 
@@ -247,6 +284,8 @@ Creation stays cheap and nothing is deleted while you work: cleanup is **schedul
 | `max_age_days` | `14` | Also candidate: a π-managed checkout whose top-level directory mtime has not changed for this many days (an edit deep inside does not count). |
 | `snapshot_days` | `30` | Keep the snapshots of a removed checkout this many days (see [Snapshot GC](#snapshot-gc)). |
 | `sweep_locks` | `true` | Release stale π locks before pruning (see [Stale locks](#stale-locks)). |
+
+A repository can tighten these for itself: `max_count`, `max_age_days` and `snapshot_days` are also read from its [`[retention]` block](#repository-configuration), which overrides the values above for that repository's checkouts (`enabled` and `sweep_locks` stay user-level).
 
 What the sweep will and will not touch:
 
@@ -378,10 +417,16 @@ require("pi").setup({
         -- a non-zero exit keeps the checkout but fails the creation.
         setup_cmd = nil, -- e.g. { "mise", "install" }
 
+        -- Run the `[setup]` commands a repository declares in its own
+        -- .pi-worktrees.toml (default false). Off because a cloned repository
+        -- is untrusted input: its commands would otherwise run code on checkout.
+        repo_setup = false,
+
         -- Base commit new checkouts start from: "head" (default; the checkout
         -- the creating session runs in), "fresh" (the repository's remote
         -- default branch, origin/HEAD, re-fetched at most once per 24h with a
-        -- 5s cap), or a per-dispatch-item `create.base` revision.
+        -- 5s cap), or a per-dispatch-item `create.base` revision. A repository's
+        -- .pi-worktrees.toml base_ref overrides this for its own checkouts.
         base_ref = "head",
 
         -- Snapshot a worktree's patch before pi.worktree_remove / Worktree.remove
@@ -424,4 +469,5 @@ Full annotated reference: [Configuration](configuration.md). The `pi.worktree*` 
 - **No lifecycle on a borrowed checkout.** A `worktree = { path = … }` assignment and a `create` that adopted an existing name never create, reset, merge, apply or remove that checkout; the path is only attached to the child's process. Only a checkout the spawn itself created is released (and only when clean).
 - **No automatic merge for a child checkout.** A finished child leaves its work in its checkout; review and apply it with `pi.worktree_apply` / `pi.worktree_ship` like any other worktree.
 - **No automatic commit.** `pi.worktree_apply` writes to a **working tree** only (never the index, never a commit), and `pi.worktree_ship` only prefills a prompt — commits and pushes stay yours (or the agent's, once you send that prompt).
+- **No trusted-by-clone setup.** A repository's `.pi-worktrees.toml` is data except its `[setup]` commands, which only run with `worktree.repo_setup = true` — see [Repository configuration](#repository-configuration).
 - **`:PiContinue` is still cwd-scoped.** It means "the most recent session *here*"; the cross-worktree enumeration lives in `:PiResume`.

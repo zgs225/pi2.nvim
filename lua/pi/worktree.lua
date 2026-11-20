@@ -24,6 +24,7 @@
 local M = {}
 
 local Config = require("pi.config")
+local RepoConfig = require("pi.worktree_config")
 
 local uv = vim.uv
 
@@ -405,7 +406,7 @@ local sidecar_writer_override = nil
 
 --- Run `argv` asynchronously. The callback always fires on the main loop.
 ---@param argv string[]
----@param opts { cwd?: string, stdin?: string, timeout?: integer } `timeout` (ms) kills the process
+---@param opts { cwd?: string, stdin?: string, timeout?: integer, env?: table<string, string> } `timeout` (ms) kills the process; `env` is the **full** environment (see `vim.system`'s `clear_env` default)
 ---@param cb fun(code: integer, stdout: string, stderr: string)
 local function run(argv, opts, cb)
     if runner_override then
@@ -419,6 +420,13 @@ local function run(argv, opts, cb)
     local sys = { text = true }
     if opts and opts.cwd then
         sys.cwd = opts.cwd
+    end
+    if opts and opts.env then
+        -- `vim.system` replaces the whole environment unless `clear_env = false`
+        -- is passed, so a caller that needs extra variables hands over the full
+        -- merged table (see `run_setup_command`).
+        ---@diagnostic disable-next-line: undefined-field -- `env` is runtime-valid but missing from the bundled `vim.system` types
+        sys.env = opts.env
     end
     if opts and opts.stdin then
         sys.stdin = opts.stdin
@@ -1179,9 +1187,8 @@ function M.resolve_base(opts, cb)
         return cb(nil, "base: not a directory: " .. tostring(opts.cwd))
     end
     local kind = type(opts.kind) == "string" and vim.trim(opts.kind) or ""
-    if kind == "" then
-        kind = "head"
-    end
+    -- `kind == ""` is meaningful: the repository's `.pi-worktrees.toml` (then
+    -- `worktree.base_ref`, then HEAD) decides, further down.
     local repo = type(opts.repo) == "string" and vim.trim(opts.repo) or ""
 
     ---@param fn fun(repo_root: string)
@@ -1218,6 +1225,46 @@ function M.resolve_base(opts, cb)
         end)
     end
 
+    if kind == "" then
+        -- No strategy given: the repository's `.pi-worktrees.toml` decides, then
+        -- the user's `worktree.base_ref`, then the checkout's own HEAD. The root is
+        -- resolved only to find that config; a directory that is not a repository
+        -- still ends up in `head()`, which reports the real failure itself.
+        ---@param root string?
+        local function decide(root)
+            ---@type string
+            local ref = ""
+            if type(root) == "string" and root ~= "" then
+                local repo_ref = RepoConfig.base_ref(root)
+                if type(repo_ref) == "string" then
+                    ref = repo_ref
+                end
+            end
+            if ref == "" then
+                local cfg = Config.options.worktree or {}
+                ref = type(cfg.base_ref) == "string" and vim.trim(cfg.base_ref) or ""
+            end
+            if ref == "" or ref == "head" then
+                return head()
+            end
+            -- The configured strategy ("fresh" or a revision) resolves through the
+            -- same paths as an explicit `kind`, so there is one implementation.
+            return M.resolve_base(vim.tbl_extend("force", opts, { kind = ref, repo = root }), cb)
+        end
+        if repo ~= "" then
+            return decide(repo)
+        end
+        -- Best effort: the root is resolved only to find its config, so a directory
+        -- that is not a repository (or a failing git) falls through to `head()`,
+        -- which reports the real error itself.
+        return run({ "git", "-C", cwd, "rev-parse", "--show-toplevel" }, {}, function(code, stdout)
+            local root = vim.trim(stdout or "")
+            if code ~= 0 or root == "" then
+                return head()
+            end
+            decide(realpath(root) or root)
+        end)
+    end
     if kind == "head" then
         return head()
     end
@@ -1438,14 +1485,18 @@ end
 --- Copy the files matched by `.worktreeinclude` into a fresh worktree. Only
 --- files git *ignores* are copied (the intersection of `.gitignore` and
 --- `.worktreeinclude`), and the `.worktrees/` directory itself is never copied.
+---
+--- A repository's `include` list in `.pi-worktrees.toml` is **additive**: the two
+--- sources are merged, so a config file never has to repeat what
+--- `.worktreeinclude` already says (and vice versa).
 ---@param info pi.WorktreeInfo
 ---@param cb fun(err: string?)
 local function copy_includes(info, cb)
-    local text = read_text(info.repo_root .. "/" .. INCLUDE_FILE)
-    if type(text) ~= "string" then
-        return cb(nil)
+    local patterns = M._parse_include(read_text(info.repo_root .. "/" .. INCLUDE_FILE))
+    for _, pattern in ipairs(RepoConfig.include_patterns(info.repo_root)) do
+        patterns[#patterns + 1] = pattern
     end
-    local pathspecs = M._include_pathspecs(M._parse_include(text))
+    local pathspecs = M._include_pathspecs(patterns)
     if #pathspecs == 0 then
         return cb(nil)
     end
@@ -1497,42 +1548,107 @@ end
 
 -- setup_cmd ------------------------------------------------------------------
 
---- Run the configured `worktree.setup_cmd` inside the new worktree.
+--- Run one argv command inside a fresh checkout.
+---
+--- Both `worktree.setup_cmd` and a repository's `[setup]` lists get the same two
+--- variables, so a project script does not have to guess where it is:
+--- `PI_ROOT_WORKTREE_PATH` is the repository's main checkout (Cursor's
+--- `$ROOT_WORKTREE_PATH` — the usual source of a local `.env`), and
+--- `PI_WORKTREE_PATH` is the checkout being set up (also the cwd).
 ---@param info pi.WorktreeInfo
+---@param argv string[]
+---@param label string Prefix of the error message ("setup_cmd", ".pi-worktrees.toml setup")
 ---@param cb fun(err: string?)
-local function run_setup(info, cb)
-    local cfg = Config.options.worktree or {}
-    local cmd = cfg.setup_cmd
-    if cmd == nil then
-        return cb(nil)
-    end
-    if type(cmd) == "string" then
-        cmd = { cmd }
-    end
-    if type(cmd) ~= "table" then
-        return cb("setup_cmd: expected a string[]")
-    end
-    local argv = {}
-    for _, part in ipairs(cmd) do
-        if type(part) ~= "string" then
-            return cb("setup_cmd: every element must be a string")
-        end
-        argv[#argv + 1] = part
-    end
-    if #argv == 0 then
-        return cb(nil)
-    end
-
-    run(argv, { cwd = info.path }, function(code, stdout, stderr)
+local function run_setup_command(info, argv, label, cb)
+    local env = vim.fn.environ()
+    env.PI_ROOT_WORKTREE_PATH = info.repo_root
+    env.PI_WORKTREE_PATH = info.path
+    run(argv, { cwd = info.path, env = env }, function(code, stdout, stderr)
         if code == 0 then
             return cb(nil)
         end
         local detail = tail(stderr ~= "" and stderr or stdout, 10)
         if detail == "" then
-            return cb("setup_cmd failed (exit " .. code .. ")")
+            return cb(label .. " failed (exit " .. code .. ")")
         end
-        return cb("setup_cmd failed (exit " .. code .. "): " .. detail)
+        return cb(label .. " failed (exit " .. code .. "): " .. detail)
     end)
+end
+
+--- Normalize `worktree.setup_cmd` (a string or a string[]) into an argv list.
+---@param cmd any
+---@return string[]? argv
+---@return string? err
+local function user_setup_argv(cmd)
+    if cmd == nil then
+        return nil
+    end
+    if type(cmd) == "string" then
+        cmd = { cmd }
+    end
+    if type(cmd) ~= "table" then
+        return nil, "setup_cmd: expected a string[]"
+    end
+    local argv = {}
+    for _, part in ipairs(cmd) do
+        if type(part) ~= "string" then
+            return nil, "setup_cmd: every element must be a string"
+        end
+        argv[#argv + 1] = part
+    end
+    if #argv == 0 then
+        return nil
+    end
+    return argv
+end
+
+--- Run the setup hooks of a fresh checkout, in order: `worktree.setup_cmd`
+--- (the user's machine-level commands) and then the repository's
+--- `.pi-worktrees.toml` `[setup]` lists.
+---
+--- The repository's commands are **opt-in** (`worktree.repo_setup`): a cloned
+--- repository is untrusted input, and running its commands on checkout would be
+--- remote code execution. Declaring them while the switch is off is reported
+--- once, never silently ignored.
+---@param info pi.WorktreeInfo
+---@param cb fun(err: string?)
+local function run_setup(info, cb)
+    local cfg = Config.options.worktree or {}
+    local argv, argv_err = user_setup_argv(cfg.setup_cmd)
+    if argv_err then
+        return cb(argv_err)
+    end
+
+    ---@type { argv: string[], label: string }[]
+    local commands = {}
+    if argv then
+        commands[#commands + 1] = { argv = argv, label = "setup_cmd" }
+    end
+    local repo_commands = RepoConfig.setup_commands(info.repo_root)
+    if #repo_commands > 0 then
+        if cfg.repo_setup == true then
+            for _, repo_argv in ipairs(repo_commands) do
+                commands[#commands + 1] = { argv = repo_argv, label = RepoConfig.FILE .. " setup" }
+            end
+        else
+            RepoConfig.note_setup_skipped(info.repo_root)
+        end
+    end
+
+    ---@param index integer
+    local function step(index)
+        local command = commands[index]
+        if not command then
+            return cb(nil)
+        end
+        run_setup_command(info, command.argv, command.label, function(err)
+            if err then
+                return cb(err)
+            end
+            step(index + 1)
+        end)
+    end
+    step(1)
 end
 
 -- Creation -------------------------------------------------------------------
@@ -1643,14 +1759,12 @@ function M.create(opts, cb)
         end
 
         local requested = type(opts.base) == "string" and vim.trim(opts.base) or ""
-        local rev = requested ~= "" and (requested .. "^{commit}") or "HEAD"
-        run({ "git", "-C", repo_root, "rev-parse", "--verify", "-q", rev }, {}, function(base_code, base_out)
-            local base_sha = vim.trim(base_out or "")
-            if base_code ~= 0 or base_sha == "" then
-                if requested ~= "" then
-                    return cb(nil, "create: invalid base commit: " .. requested)
-                end
-                return cb(nil, "create: repository has no commits yet: " .. repo_root)
+        -- An explicit `base` wins; an empty one hands the choice to
+        -- `resolve_base`, which consults the repository's `.pi-worktrees.toml`
+        -- `base_ref`, then `worktree.base_ref`, then the checkout's HEAD.
+        M.resolve_base({ kind = requested, cwd = cwd, repo = repo_root }, function(base_sha, base_err)
+            if type(base_sha) ~= "string" or base_sha == "" then
+                return cb(nil, base_err or ("create: cannot resolve a base commit for " .. repo_root))
             end
 
             ensure_gitignore(repo_root, function(ignore_err)
