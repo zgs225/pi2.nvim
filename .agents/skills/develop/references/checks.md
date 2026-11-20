@@ -14,7 +14,7 @@ it is "everything is green while the defect ships" (G25).
 |------|---------|-------|----|
 | Formatting | `make style` | `stylua`, `ruff` | `style` job |
 | Types / undefined symbols / Python smells | `make lint` | `lua-language-server` over `lua/` (strict, `.luarc.json`), `tests/` + `scripts/e2e/` (`.luarc-tests.json`), and `ruff` over `scripts/` | `lint` job |
-| 7 rules: LuaJIT parse (G24), docs sync, config three-spots (G19) | `make check` | `luajit`, `python3` | `checks` job |
+| 12 rules: LuaJIT parse (G24), docs sync ×5, config three-spots (G19), spec scoping (G14), config capture (G20), expr mappings (G1/G2), test isolation (G17/G18), uv fast events (G26, advisory) | `make check` | `luajit`, `python3` | `checks` job |
 | Prove the gates can fail | `make check-selftest` | same as above | `checks` job (runs first) |
 | Doc links + anchors | `make docs-links` | `python3` | `checks` job |
 | Behaviour | `make test` / `make smoke` / GUI | nvim (+ plenary, optional render-markdown) | `tests` job (`make test` only; `make smoke` and the GUI layer stay local — they load the user's own config) |
@@ -81,9 +81,9 @@ scripts/checks/
 
 | Code | Meaning | When |
 |------|---------|------|
-| `0` | clean | every rule ran and reported nothing |
-| `1` | findings | the code is wrong — **whether or not a rule also failed to run** |
-| `2` | broken gate | no findings, but at least one rule could not run (missing tool, unreadable or absent subject tree, unknown rule name) |
+| `0` | clean | every rule ran and reported nothing blocking |
+| `1` | findings | at least one **blocking** (`error`/`warn`) finding — **whether or not a rule also failed to run** |
+| `2` | broken gate | no blocking findings, but at least one rule could not run (missing tool, unreadable or absent subject tree, unknown rule name) |
 
 Findings deliberately outrank a broken gate: a run that found real violations must
 not be reported as "the gate is broken", or the violations get ignored while
@@ -91,6 +91,26 @@ someone debugs the harness. Errors always go to **stderr** and `--json` always
 carries both `findings` and `errors`, so nothing is hidden when both happen at
 once. CI needs no special handling — any non-zero fails the job. A `warn` finding
 is a finding: it exits 1 (see contract 3).
+
+### Severities
+
+| Severity | Blocks? | For |
+|----------|---------|-----|
+| `error` | yes | the code is wrong, at a location the rule can name |
+| `warn` | yes | a fact about the tree ("nothing here for this rule") or a real defect the rule cannot localize |
+| `info` | **no** | an advisory heuristic whose premise static analysis cannot prove |
+
+`info` is the only non-blocking severity, and it exists because one backlog rule
+could not be written honestly without it: `uv-fast-event` (G26) asks whether a
+`vim.uv`/`vim.system` callback touches the editor without `vim.schedule`, and no
+static reachability proof of "this callback runs on a fast event" is possible — a
+heuristic that fires on compliant code must not be able to fail a merge, and
+turning it into a `warn` (which exits 1) would make the gate red on a clean tree.
+So an `info` finding is printed, counted and carried in `--json`, and the runner
+still prints `ok: … 0 blocking findings (N advisory)` and exits 0. The consequences
+are deliberate: a rule that *can* prove its finding must use `error`; `info` is
+never a place to park a real defect, and a rule made only of `info` findings is not
+a gate — it is a report, and the rule's docstring has to say so.
 
 ### The four contracts
 
@@ -148,7 +168,7 @@ Each is a scar from a run that reported green while checking nothing (G25).
    `fixtures/parse-luajit/always-accept.sh` — a `#!/bin/sh` that exits 0 for any
    input — is the point: the probe must refuse it rather than trust it. The same
    two knobs prove a rule refuses a wrong tree (`no-lua/`). `--self-test` is now
-   32 fixtures across 7 rules.
+   64 fixtures across 12 rules.
 
 ## Linting the developer trees: `.luarc-tests.json`
 
@@ -228,18 +248,28 @@ is what that gate answers; the developer trees are not it).
 | `parse-luajit` | G24 — a Lua 5.3-only operator merges green and the plugin fails to *load* on Neovim stable | Compiles every file under `lua/` with the LuaJIT that Neovim embeds, after probing that this binary actually rejects Lua 5.3 syntax (contract 2). `tests/` and `scripts/` stay out of this gate — they are developer-run, not the plugin's runtime constraint — but they are type-checked by `make lint` with `.luarc-tests.json`, which is what caught the digit separators that made them unparseable. |
 | `docs-commands` | The docs sync gate for `:Pi*` — a new command must be documented in the same change, and a stale doc mention must die with the command | Both directions. A doc mention that is a strict prefix of real commands (`:PiSub` for `:PiSubFirst`/… family) is accepted shorthand. |
 | `config-three-spots` | G19 — a `---@class pi.*` field and the `defaults` entry it is merged with can disagree, and the option silently does nothing | Both directions, code against code: the `---@class pi.Options` + `---@field` tree vs the `local defaults = { … }` table, both in `lua/pi/config.lua` (`vim.tbl_deep_extend("force", defaults, opts)` can only merge keys `defaults` has). Optional fields (`---@field name?`) may be absent from `defaults` — `nil` is the meaning, 13 measured deliberate cases (`subagent.tools`, `layout.side.height`, …) — and descent follows a field's declared type only when its first `|` alternative is a plain `pi.<Class>`. |
+| `config-read-at-call-time` | G20 — a module-level `local x = require("pi.config").options…` freezes the pre-`setup()` snapshot, so the option silently never updates | Token-level, chunk depth 0 only: a binding whose initializer reaches `.options` / `["options"]` on `require("pi.config")` or on a chunk-level alias of it. 0 hits today — 34 modules bind `local Config = require("pi.config")` and read `Config.options` inside functions, which is the pattern; 207 such call-time reads. Documented non-catches: a capture through a helper function, `require("pi").options`, an alias re-bound after use, and a capture inside a chunk-level `if`/`do` body. |
+| `spec-scope` | G14 — a `before_each`/`after_each` outside a `describe` silently no-ops, and the run exits 1 with no assertion message | A frame-stack walk over `tests/*_spec.lua`: a hook call is a finding when the innermost enclosing `function` is missing (chunk level, or a top-level `if`/`do`) or is not an argument of a `describe(...)`. 0 hits across 174 specs / 472 hook calls today, and six comment-or-string mentions never reach the matcher — prepending one top-level hook to a copy of the corpus reports exactly that hit, so the green is the tree, not a blind matcher. Non-catches: aliasing (`local be = before_each`) and a receiver-qualified hook (`_G.before_each(...)`). The opposite direction is the deliberate cost: an aliased `describe` (`local d = describe; d("x", fn)`) or a hook behind a `wrap(fn)` fires as a false positive, because the rule models the literal `describe(...)` argument — the finding names the enclosing closure, so the reader sees which shape was matched. |
+| `expr-mapping` | G2 (**error**) — returning `vim.keycode("<Up>")` from an `<expr>` mapping types the raw `\x80ku` bytes as text; G1 (**warn**) — a buffer write inside an `<expr>` mapping is silently dropped | Both halves read the same tokenized `vim.keymap.set(...)`: the option table must carry `expr = true` (bare or as the string key `["expr"] = true`), and the callback is resolved inline or by same-file name. 3 real expr mappings today, all returning a literal `"<Esc>"`/`"<Up>"`/`"<Down>"`; the writes those keys trigger live in `Chat:history_prev`/`history_next` and are `vim.schedule`d, so same-function-only is what keeps the gate green. The returned expression is matched through a leading `(`, so `return (vim.keycode(…))` fires too. Non-catches: `vim.api.nvim_set_keymap`, a callback passed as a table field or reached as `self:method()`, a write behind `pcall`/`xpcall`, a keymap call through a module alias (`local keymap = vim.keymap`, which also degrades the rule to its tree-level "nothing to verify" warn), and mutators other than `nvim_buf_set_lines`/`set_lines` (`nvim_buf_set_text`, `nvim_put`, `vim.fn.setline`). |
+| `test-isolation` | G17/G18 — a test that reads the real pi data dir corrupts the user's history/draft, and a "clean up by grepping the session dir" step can delete a real session | Two error bans over `tests/*.lua` + `scripts/e2e/*.lua`: a token-level `stdpath("data")` call (a comment spelling it stays quiet — that is `tests/minimal_init.lua:34`), and an enclosing function that both runs a command naming `grep` and deletes a file. 0 hits today over 203 subject files (184 specs, 19 e2e scripts, 29 command calls, 151 delete calls); the closest near-misses pair a `git` command with a delete and carry no `grep`, which is why they stay quiet. The pairing is frame-based, and an audit caught it leaking on `for`/`while` (a loop's `end` popped the enclosing function, so a delete in one function was blamed on a sibling's grep) — fixed, with `sibling-functions` (expect 0) and `inside-loop` (expect 1) locking both directions. Non-catches: an un-restored `prompt.history.path`/`draft._set_path` (the softer follow-up in #117), a non-literal `stdpath` argument, `vim.fn["stdpath"](…)`, `vim.cmd("!rm …")` as the delete, and a command built from a variable. |
+| `uv-fast-event` | G26 — a `vim.uv` timer or a `vim.system` callback that calls the editor without `vim.schedule` | **Advisory**: every finding *about the code* is `severity="info"`, because static reachability cannot prove that a callback really runs on a fast event, so this rule must not be able to block a merge on its own (§ Severities); its two non-code outcomes are the framework's own blocking channels — one `warn` when there is nothing to inspect, `CheckError` when `lua/` is absent. Two signals: a one-shot timer (`repeat = 0`) whose callback calls `vim.api`/`vim.fn`/`nvim_*`, and a `vim.system` callback doing the same outside a `vim.schedule` span; the finding is reported at the unguarded call. 0 hits today: all 7 inline `vim.system` callbacks in `ui/diff_review.lua` schedule, 5 of the 6 one-shot timers pass `vim.schedule_wrap`, and the sixth only stops/kills its own process group. The zero is the guards, not a blind matcher — unwrapping them in a diagnostic run reports one site (`ui/chat/decorators.lua:101`), and only dropping the `repeat = 0` requirement as well adds the three `history.lua` spinner call sites, which are a repeating timer. Non-catches: a timer handle built by a factory, a named callback helper, `pcall(vim.system, …)`, and editor work through `vim.cmd`/`vim.o`/`vim.notify` (the signals name `vim.api`/`vim.fn`/`nvim_*` only). |
 | `docs-config` | Docs sync, config keys — an option ships documented-but-dead, or exists only in source | Both directions between the `defaults` table in `lua/pi/config.lua` (code) and the fenced `require("pi").setup({ … })` example that opens `doc/configuration.md` (docs). Both sides are tokenized and parsed as table literals, so a positional array value (`left = { "context", "attention" }`) is never a key — and a commented-out option is not documentation, so commenting a key out is exactly the drift it reports. Found real drift on its first run: `title.lang` / `title.model` were in `defaults` but missing from the example, now documented as `nil`. |
 | `docs-keymaps` | Docs sync, default keymaps — a binding ships undocumented, or a documented one no longer exists | Both directions read the same anchored slice: the bullet list introduced by the `"bind on its own"` sentence in `doc/keymaps.md`, ending at the next heading, fenced blocks excluded. Forward: every literal lhs of a `vim.keymap.set(` inside `Chat:_set_keymaps` (`lua/pi/ui/chat/init.lua`) must be mentioned in that list. Reverse: every backticked `<Key>` name in it must be a literal lhs somewhere under `lua/`. Both are anchored because a key mentioned in `## Example setup` is the user's own example, not a claim about plugin bindings — counting it as one flagged correct docs *and* credited a plugin binding with documentation it did not have. Bare-word keys (`q`, `gf`) are trusted in the forward direction only, and a non-literal lhs (`for _, key in ipairs(…)`, `entry.lhs`, `Keys.bind`) in neither. |
 | `docs-highlights` | Docs sync, highlight groups — a `Pi*` group ships undocumented, or a documented row names a dead group | Both directions between `nvim_set_hl(0, "Pi…", …)` under `lua/` and the rows of `doc/highlight-groups.md`. Token-level rather than line-oriented, because 9 definitions in `lua/pi/ui/highlights.lua` put the group name two lines below the call. The dynamically built `PiAnsi*` family is excluded in both directions (names made by string concatenation, prose-only in the docs). |
 | `docs-api` | Docs sync, public API — a public function ships undocumented, or `doc/api.md` promises one that no longer exists | Both directions between `function M.<name>` (or `M.<name> = function`) in `lua/pi/init.lua`, tokenized so a commented-out definition does not count, and `pi.<name>` mentions in `doc/api.md`, plain text there because a mention is only ever a regex. |
 
-What is still missing from that class — spec hook scoping (G14),
-config-read-at-call-time (G20), uv fast events (G26), expr mappings (G1/G2), test
-isolation (G17/G18), and the CI-only changelog rule — is specified item by item
-in Gitea issue **#117** (`harness: remaining machine-checkable gates`). Gone
-from that backlog are the docs-sync classes: commands, config keys, keymaps,
-highlight groups and the public API are all gated now, and closing them paid for
-itself on arrival, since `docs-config` found real drift on its first run.
+What is still missing from that class is the CI-only `changelog` rule, and it is
+the last open item in Gitea issue **#117** (`harness: remaining machine-checkable
+gates`) — it needs a base ref (`git diff --name-only origin/main...HEAD`), so it
+belongs in a workflow rather than in `make check`. `toolchain-sync` needed no work
+at all (CI parses `.mise.toml`, so local/CI drift is structurally impossible).
+Everything else in that backlog landed: the docs-sync classes (commands, config
+keys, keymaps, highlight groups, public API) came first and paid for themselves on
+arrival, since `docs-config` found real drift on its first run; the four source
+rules and the advisory one followed, and each shipped green because the tree
+really was compliant — with the audit numbers recorded in the rule table above
+(174 specs / 472 hook calls, 203 subject files, 3 expr mappings, 0 module-level
+captures, 0 unguarded uv callbacks) rather than assumed.
 
 ## What is not a static check
 
@@ -264,8 +294,10 @@ tracks the coverage gaps the audit found.
   impossible for the rules we write.
 - **A `warn` that means "never mind".** `severity="warn"` is neither a pass nor
   a mute: it still exits 1. Use it for a fact about the tree (nothing here for the
-  rule to check, contract 3) or for a heuristic whose docstring says so — never to
-  keep a run green by softening a real defect.
+  rule to check, contract 3) or for a real defect the rule cannot localize — never
+  to keep a run green by softening a real defect. The non-blocking channel is
+  `info`, and it is reserved for heuristics whose premise static analysis cannot
+  prove (see § Severities).
 - **Adopting a linter because it exists.** No luacheck/selene/ast-grep: the
   *checks* stay stdlib-only Python (no third-party packages at runtime) plus
   binaries the gates already need. `ruff` is the one added linter, and it exists

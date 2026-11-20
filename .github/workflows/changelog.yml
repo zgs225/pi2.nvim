@@ -1,0 +1,133 @@
+# Changelog gate: a change that touches `lua/` must carry a CHANGELOG.md section
+# for its date; a change that touches no `lua/` path is not asked for one.
+#
+# The convention (.agents/skills/commit/SKILL.md § Changelog) was prose only, and
+# the release skill draws a release's notes from CHANGELOG.md *first* (with `git
+# log` as the documented fallback), so a user-facing change that merged with no
+# entry shipped as a missing line in the notes. No local gate can decide it: the
+# rule is "this change has an entry", and "this change" is a range against a base
+# ref only the workflow knows — hence CI-only, not a rule under scripts/checks/.
+#
+# Base ref: a PR compares against `origin/${{ github.base_ref }}` — actions/checkout
+# with `fetch-depth: 0` already has every branch, and the job still fetches that one
+# branch if the ref is somehow missing (a PR's merge base is not in a depth-1
+# clone). A push compares against `${{ github.event.before }}`, the sha the branch
+# pointed at before it. A branch's FIRST push reports an all-zero `before`, i.e.
+# there is no range to look at: that case SKIPs with a message and exits 0, rather
+# than demanding an entry for the entire history.
+#
+# Two dates are accepted, because the convention is the author's LOCAL date while
+# this job's clock is UTC: the runner's UTC date (`date -u +%F`) or the author date
+# of the newest commit (`%ad --date=format:%Y-%m-%d`, rendered in the commit's own
+# timezone). That two-way check closes the midnight edge both ways — 23:xx local
+# read after midnight UTC, and after-midnight local read before it — and only
+# section headers count: a date inside a bullet is not a section.
+#
+# Judged by EXIT CODE only, never by grepping output (G25): `lua/` changed and no
+# matching header → exit 1, everything else → exit 0. The failure diagnostics
+# (changed `lua/` paths, both dates, the remedy) are diagnostics, not the gate.
+# No third-party action beyond `actions/checkout`, no package manager, no Node.
+
+name: changelog
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  entry:
+    name: CHANGELOG entry for lua/ changes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history on purpose: the gate diffs the merge base against HEAD,
+          # and a depth-1 clone has neither the base branch nor the merge base.
+          fetch-depth: 0
+
+      - name: Require a CHANGELOG entry when lua/ changed
+        env:
+          # Passed through `env:` so the shell below never interpolates an event
+          # payload (a ref name is data, not code) and so the step is runnable
+          # locally by setting the same three variables.
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+
+          CHANGELOG=CHANGELOG.md
+          event="${EVENT_NAME:-}"
+
+          # 1. Which ref do we compare against?
+          case "$event" in
+            pull_request|pull_request_target) base="origin/${BASE_REF:-}" ;;
+            push)                             base="${BEFORE:-}" ;;
+            *)                                base="" ;;
+          esac
+
+          # 2. An absent base, or an all-zero one (a branch's first push, and any
+          #    dispatch that carries no range) means there is nothing to compare:
+          #    skip loudly and pass.
+          case "$base" in
+            ""|*[!0]*) ;;
+            *)
+              echo "changelog: base ref is empty or all zeroes (event=${event}, base=${base}) — a first push / no range to compare, so there is nothing to check. Passing."
+              exit 0
+              ;;
+          esac
+
+          # 3. Resolve it. fetch-depth: 0 should already carry every branch; ask
+          #    for exactly this one ref if it does not (never guess a refspec).
+          if [ -n "${BASE_REF:-}" ] && ! git rev-parse --verify --quiet "${base}^{commit}" >/dev/null; then
+            git fetch --no-tags --quiet origin \
+              "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}" || true
+          fi
+          if ! git rev-parse --verify --quiet "${base}^{commit}" >/dev/null; then
+            echo "changelog: cannot resolve base ref '${base}' (event=${event}) — the gate cannot run, and a gate that cannot run must not be green." >&2
+            exit 1
+          fi
+
+          # 4. Did this change touch lua/? Three dots: the merge base, so a PR is
+          #    measured against where it branched, not against the base tip.
+          changed=$(git diff --name-only "${base}...HEAD")
+          lua_paths=$(printf '%s\n' "$changed" | grep '^lua/' || true)
+          if [ -z "$lua_paths" ]; then
+            echo "changelog: no lua/ path changed in ${base}...HEAD, so this change owes no CHANGELOG entry. Passing."
+            exit 0
+          fi
+
+          # 5. Accept either date, against section headers only.
+          utc_today=$(date -u +%Y-%m-%d)
+          # `format:` (not `format-local:`) renders the author time in the COMMIT's
+          # own timezone — verified: the same sha prints 2026-11-20 under both
+          # TZ=UTC and TZ=America/New_York, while format-local: flips to 11-19.
+          author_date=$(git log -1 --format=%ad --date=format:%Y-%m-%d)
+
+          has_section() {
+            grep -qE "^##[[:space:]]+$1([[:space:]]|\$)" "$CHANGELOG"
+          }
+
+          if has_section "$utc_today" || has_section "$author_date"; then
+            echo "changelog: lua/ changed and ${CHANGELOG} has a section for ${utc_today} (UTC) or ${author_date} (author date). Passing."
+            exit 0
+          fi
+
+          # 6. Fail: exit 1 is the gate. Everything below is diagnostics.
+          {
+            echo "changelog: this change touches lua/ but ${CHANGELOG} has no '## <date>' section for it."
+            echo
+            echo "changed lua/ paths (${base}...HEAD):"
+            while IFS= read -r path; do
+              printf '  %s\n' "$path"
+            done <<< "$lua_paths"
+            echo
+            echo "looked for a top-level header matching either:"
+            echo "  ## ${utc_today}    (UTC date of this run)"
+            echo "  ## ${author_date}    (author date of $(git rev-parse --short HEAD))"
+            echo
+            echo "remedy: add a \`## ${author_date}\` bullet to ${CHANGELOG} (tag it ADDED/CHANGED/FIXED/…, see .agents/skills/commit/SKILL.md § Changelog)."
+          } >&2
+          exit 1

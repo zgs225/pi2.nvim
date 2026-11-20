@@ -14,11 +14,22 @@ Three design rules, all of them consequences of past fake-green incidents
 * **Findings are `path:line: severity: [rule] message`.** Grep-able, clickable
   in an editor, and stable enough to diff in CI logs.
 
+Severities
+----------
+    error  the code is wrong; blocks (the default)
+    warn   a fact about the tree (nothing to verify) or a real defect that the
+           rule cannot localize; blocks too — a warn is not a mute
+    info   ADVISORY: printed, counted, and included in `--json`, but it never
+           changes the exit code. Reserved for a heuristic whose premise static
+           analysis cannot prove (e.g. "this callback may run on a fast event"),
+           where a false positive must not be able to block a merge on its own.
+           A rule that can prove its finding uses `error`.
+
 Exit codes
 ----------
-    0   clean: every rule ran and reported nothing
-    1   findings: the code is wrong (whether or not a gate also broke)
-    2   broken gate: no findings, but at least one rule could not run
+    0   clean: every rule ran and reported nothing blocking
+    1   findings: at least one blocking (error/warn) finding exists
+    2   broken gate: no blocking findings, but at least one rule could not run
 
 Findings deliberately outrank a broken gate: a run that found real violations
 must not be reported as "the gate is broken", or the violations get ignored
@@ -54,7 +65,11 @@ class CheckError(RuntimeError):
 
 @dataclass
 class Finding:
-    """One violated rule, at one location."""
+    """One violated rule, at one location.
+
+    `severity` is one of `error` / `warn` (both blocking) or `info` (advisory: it
+    is printed and counted by `--self-test` but never affects the exit code).
+    """
 
     check: str
     message: str
@@ -252,8 +267,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python3 -m scripts.checks",
         description=(
-            "Static gates for pi.nvim. Exit 0 = clean, 1 = findings, 2 = broken gate (no findings). "
-            "Findings outrank a broken gate."
+            "Static gates for pi.nvim. Exit 0 = clean, 1 = blocking findings, "
+            "2 = broken gate (no blocking findings). Findings outrank a broken gate."
         ),
     )
     parser.add_argument("--root", default=str(REPO_ROOT), help="tree to check (default: repo root)")
@@ -274,6 +289,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     root = Path(args.root).resolve()
     findings, errors, count = run_checks(root, args.only)
+    blocking = [f for f in findings if f.severity != "info"]
+    advisory = len(findings) - len(blocking)
 
     for err in errors:
         print(f"error: {err}", file=sys.stderr)
@@ -283,13 +300,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         for finding in sorted(findings, key=lambda f: (f.path, f.line, f.check)):
             print(finding.render())
-        if findings:
-            print(f"\n{len(findings)} finding(s) from {count} check(s)", file=sys.stderr)
-        elif not errors:
+        if blocking:
+            print(f"\n{len(blocking)} finding(s) from {count} check(s)", file=sys.stderr)
+        elif errors:
+            pass  # the errors above are the whole story
+        elif advisory:
+            print(f"ok: {count} check(s), 0 blocking findings ({advisory} advisory)", file=sys.stderr)
+        else:
             print(f"ok: {count} check(s), 0 findings", file=sys.stderr)
 
     # Findings win: real violations must never be reported as "the gate broke".
-    if findings:
+    # Only an `info` finding is advisory, and an advisory note is not a finding.
+    if blocking:
         return 1
     if errors:
         return 2
