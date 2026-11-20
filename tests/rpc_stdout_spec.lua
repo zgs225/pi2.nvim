@@ -26,6 +26,31 @@ local function jsonl(t)
     return vim.json.encode(t)
 end
 
+--- Reassemble one single-line response whose payload is `bytes` bytes long,
+--- delivered in 64KB chunks like a real job stdout (no newline until the end).
+---@param bytes integer payload size in bytes
+---@return number ms wall-clock time of the reassembly loop, in milliseconds
+---@return table out dispatched messages
+local function reassemble_big_line(bytes)
+    local out = {}
+    local rpc = make_rpc(out)
+    local line = jsonl({ type = "response", id = "big", blob = string.rep("z", bytes) })
+    local chunk = 64 * 1024
+    local t0 = vim.uv.hrtime()
+    local i = 1
+    while i <= #line do
+        local piece = line:sub(i, i + chunk - 1)
+        if i + chunk - 1 >= #line then
+            rpc:_on_stdout({ piece, "" })
+        else
+            rpc:_on_stdout({ piece })
+        end
+        i = i + chunk
+    end
+    local ms = (vim.uv.hrtime() - t0) / 1e6
+    return ms, out
+end
+
 describe("rpc stdout reassembly", function()
     it("decodes a complete line delivered in one chunk", function()
         local out = {}
@@ -82,27 +107,54 @@ describe("rpc stdout reassembly", function()
     end)
 
     it("reassembles a large single-line response in linear time (perf guard)", function()
-        local out = {}
-        local rpc = make_rpc(out)
-        local line = jsonl({ type = "response", id = "big", blob = string.rep("z", 20 * 1024 * 1024) })
-        -- Deliver in 64KB chunks like a real job stdout, no newline until the end.
-        local chunk = 64 * 1024
-        local t0 = vim.uv.hrtime()
-        local i = 1
-        while i <= #line do
-            local piece = line:sub(i, i + chunk - 1)
-            if i + chunk - 1 >= #line then
-                rpc:_on_stdout({ piece, "" })
-            else
-                rpc:_on_stdout({ piece })
-            end
-            i = i + chunk
-        end
-        local ms = (vim.uv.hrtime() - t0) / 1e6
-        assert.equals(1, #out)
-        assert.equals("big", out[1].id)
-        -- The O(n^2) version took ~3s for 20MB at 64KB chunks; linear is well under.
-        assert.is_true(ms < 800, string.format("large-line reassembly took %.1f ms (O(n^2) regression?)", ms))
+        local bytes = 20 * 1024 * 1024
+        -- Warm up the allocator so the timed run does not pay one-off costs.
+        reassemble_big_line(1024 * 1024)
+
+        -- Correctness first: the line must decode exactly once.
+        local t20, out20 = reassemble_big_line(bytes)
+        assert.equals(1, #out20)
+        assert.equals("big", out20[1].id)
+
+        -- This used to assert `t20 < 800` ms. An absolute wall-clock bound is an
+        -- assertion about the machine, not about the code: on a loaded runner a
+        -- *correct* linear implementation measured 913 ms and the gate went red at
+        -- random (the same flake class as G33 — parallel spec children are a full
+        -- machine load). Calibrate against this machine instead, in this process,
+        -- immediately before the assertion: decode the very same 20 MB line in ONE
+        -- call, which is the irreducible cost the reassembly also has to pay. Every
+        -- term the chunked path adds (64 KB copies, the final concat, the decode)
+        -- is linear in the payload, so a correct implementation stays within a
+        -- small multiple of the baseline — measured 1.2x-1.7x — while the O(n^2)
+        -- version measured ~43x. A slow or loaded runner moves both numbers
+        -- together, which is exactly what a fixed millisecond budget could not do.
+        local line = jsonl({ type = "response", id = "big", blob = string.rep("z", bytes) })
+        local b0 = vim.uv.hrtime()
+        local decoded = vim.json.decode(line)
+        local baseline = (vim.uv.hrtime() - b0) / 1e6
+        assert.equals(bytes, #decoded.blob)
+
+        local ratio = t20 / math.max(baseline, 1)
+        print(
+            string.format(
+                "large-line reassembly: t20=%.1f ms, one-shot decode=%.1f ms, ratio=%.2fx (linear ~1.5x)",
+                t20,
+                baseline,
+                ratio
+            )
+        )
+        -- 5x leaves >3x headroom for a correct implementation and is still an
+        -- order of magnitude below the quadratic version. The 250 ms floor covers
+        -- a machine so fast (or a baseline so small) that timer noise dominates.
+        assert.is_true(
+            t20 <= math.max(5 * baseline, 250),
+            string.format(
+                "20MB reassembly took %.1f ms vs a %.1f ms one-shot decode of the same line (%.1fx) — O(n^2) regression?",
+                t20,
+                baseline,
+                ratio
+            )
+        )
     end)
 end)
 

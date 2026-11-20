@@ -14,10 +14,10 @@ it is "everything is green while the defect ships" (G25).
 |------|---------|-------|----|
 | Formatting | `make style` | `stylua`, `ruff` | `style` job |
 | Types / undefined symbols / Python smells | `make lint` | `lua-language-server` over `lua/` (strict, `.luarc.json`), `tests/` + `scripts/e2e/` (`.luarc-tests.json`), and `ruff` over `scripts/` | `lint` job |
-| 12 rules: LuaJIT parse (G24), docs sync ×5, config three-spots (G19), spec scoping (G14), config capture (G20), expr mappings (G1/G2), test isolation (G17/G18), uv fast events (G26, advisory) | `make check` | `luajit`, `python3` | `checks` job |
+| 13 rules: LuaJIT parse (G24), docs sync ×5, config three-spots (G19), spec scoping (G14), config capture (G20), expr mappings (G1/G2), test isolation (G17/G18), uv fast events (G26, advisory), skill-fence safety (G16) | `make check` | `luajit`, `python3` | `checks` job |
 | Prove the gates can fail | `make check-selftest` | same as above | `checks` job (runs first) |
 | Doc links + anchors | `make docs-links` | `python3` | `checks` job |
-| Behaviour | `make test` / `make smoke` / GUI | nvim (+ plenary, optional render-markdown) | `tests` job (`make test` only; `make smoke` and the GUI layer stay local — they load the user's own config) |
+| Behaviour | `make test` / `make e2e` / `make smoke` / GUI | nvim (+ plenary, optional render-markdown; the e2e scripts also spawn the `pi` backend) | `tests` workflow: `unit` = `make test`, `e2e` = `make e2e` (the nine hermetic `tests/*_e2e.lua` scripts); `make smoke` and the GUI layer stay local — they load the user's own config |
 
 `make check` is the fast, hermetic half: no nvim, no plugin loading, no fixture
 data — it reads the tree and answers questions about it in about a second.
@@ -139,7 +139,7 @@ Each is a scar from a run that reported green while checking nothing (G25).
    first, because the G24 "banned syntax" greps that shipped for a year matched
    `-- Buffer & windows ---` and the string `"&Yes\n&No"` in this very repo — five
    hits, zero real. A rule that cries wolf gets deleted.
-3. **A tree is never silently clean: warn vs error.** One contract, all seven
+3. **A tree is never silently clean: warn vs error.** One contract, all eight
    rules — the two original ones illustrate it here.
    The *subject tree is absent or unreadable* → `CheckError`, exit 2: a root with
    no `lua/` directory is refused by both `docs-commands` and `parse-luajit`,
@@ -168,7 +168,7 @@ Each is a scar from a run that reported green while checking nothing (G25).
    `fixtures/parse-luajit/always-accept.sh` — a `#!/bin/sh` that exits 0 for any
    input — is the point: the probe must refuse it rather than trust it. The same
    two knobs prove a rule refuses a wrong tree (`no-lua/`). `--self-test` is now
-   64 fixtures across 12 rules.
+   68 fixtures across 13 rules.
 
 ## Linting the developer trees: `.luarc-tests.json`
 
@@ -257,6 +257,7 @@ is what that gate answers; the developer trees are not it).
 | `docs-keymaps` | Docs sync, default keymaps — a binding ships undocumented, or a documented one no longer exists | Both directions read the same anchored slice: the bullet list introduced by the `"bind on its own"` sentence in `doc/keymaps.md`, ending at the next heading, fenced blocks excluded. Forward: every literal lhs of a `vim.keymap.set(` inside `Chat:_set_keymaps` (`lua/pi/ui/chat/init.lua`) must be mentioned in that list. Reverse: every backticked `<Key>` name in it must be a literal lhs somewhere under `lua/`. Both are anchored because a key mentioned in `## Example setup` is the user's own example, not a claim about plugin bindings — counting it as one flagged correct docs *and* credited a plugin binding with documentation it did not have. Bare-word keys (`q`, `gf`) are trusted in the forward direction only, and a non-literal lhs (`for _, key in ipairs(…)`, `entry.lhs`, `Keys.bind`) in neither. |
 | `docs-highlights` | Docs sync, highlight groups — a `Pi*` group ships undocumented, or a documented row names a dead group | Both directions between `nvim_set_hl(0, "Pi…", …)` under `lua/` and the rows of `doc/highlight-groups.md`. Token-level rather than line-oriented, because 9 definitions in `lua/pi/ui/highlights.lua` put the group name two lines below the call. The dynamically built `PiAnsi*` family is excluded in both directions (names made by string concatenation, prose-only in the docs). |
 | `docs-api` | Docs sync, public API — a public function ships undocumented, or `doc/api.md` promises one that no longer exists | Both directions between `function M.<name>` (or `M.<name> = function`) in `lua/pi/init.lua`, tokenized so a commented-out definition does not count, and `pi.<name>` mentions in `doc/api.md`, plain text there because a mention is only ever a regex. |
+| `skill-inline-pkill` | G16 — a cleanup one-liner pasted out of a skill's code fence kills its own shell, so every later step (rm, restore, summary) silently never runs | Scans only what a reader would paste: shell-fence lines (`bash` / `sh` / `shell` / `console` / `zsh`, or an untagged fence, which is a shell block by convention here) in `.agents/skills/**/*.md`, reporting a `pkill` / `pgrep` whose *options* (before the pattern) carry a short flag cluster with `f` (`-f`, `-af`, `-lf`) or `--full`, i.e. a full-cmdline match. Deliberately quiet on the documentation of the hazard: prose, comment lines inside a fence, non-shell fences (a `python` `subprocess.run(["pkill", "-f", …])` is a snippet about the tool), `pgrep -l` (process-name matching), and the script files under `.agents/skills/develop/scripts/` — a script is the fix, not the defect, because its own cmdline carries no feature string and it can capture pids then kill in a second step. A skills tree with no shell fence yields one `warn` (nothing to scan), a tree with no `.agents/skills/` directory a `CheckError`. |
 
 What is still missing from that class is the CI-only `changelog` rule, and it is
 the last open item in Gitea issue **#117** (`harness: remaining machine-checkable
