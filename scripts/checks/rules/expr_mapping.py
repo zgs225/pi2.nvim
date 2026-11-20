@@ -34,10 +34,14 @@ callback is the third argument, resolved in exactly two shapes:
 
 The body of that function is then the only place a detector looks. A callback
 that is anything else (`opts.callback`, a module function, `require(…)`) is not
-resolved and produces no finding.
+resolved and produces no finding. Two spellings of the same intent are accepted:
+the `expr` key counts both bare (`expr = true`) and bracket-string
+(`{ ["expr"] = true }`), and a returned call may be parenthesised
+(`return (vim.keycode(…))`) — the `(` between `return` and the call is skipped
+when matching the returned expression.
 
-What this rule cannot catch (deliberately, all four are out of static reach)
----------------------------------------------------------------------------
+What this rule cannot catch (deliberately, all seven are out of static reach)
+-----------------------------------------------------------------------------
   * a callback passed as a table field — `vim.keymap.set(m, l, { … })` and
     `vim.keymap.set(m, l, opts.cb, …)` — because the function is not lexically
     at the call site;
@@ -48,16 +52,26 @@ What this rule cannot catch (deliberately, all four are out of static reach)
     take a Lua callback and so cannot carry either defect;
   * a write reached through a helper call: a wrapper that itself writes the
     buffer (`Prompt:_replace_lines(…)`, `History:_append_lines(…)`) carries the
-    mutation one call away, where this detector does not follow it; and a
-    mutation other than the two callee names below (`nvim_buf_set_text`,
-    `nvim_put`, `setline`, …) is not a buffer-write detector subject at all. What
-    *is* matched: the callee name `nvim_buf_set_lines` (bare or `vim.api.`-qualified)
+    mutation one call away, where this detector does not follow it. What *is*
+    matched: the callee name `nvim_buf_set_lines` (bare or `vim.api.`-qualified)
     and an aliased `set_lines`, never a `:set_lines` method call — and the write
     is quiet only when an enclosing `vim.schedule` / `vim.schedule_wrap` call in
-    the same body lexically contains it.
+    the same body lexically contains it;
+  * a helper behind `pcall` / `xpcall` inside an `<expr>` callback:
+    `pcall(vim.api.nvim_buf_set_lines, buf, 0, -1, false, { "" })` passes the
+    callee as a *value*, so there is no `name(` for the detector to see and the
+    dropped write goes unreported;
+  * a keymap registered through an alias of the module — `local keymap =
+    vim.keymap; keymap.set(…)` — which is the same call under a different
+    receiver. On a tree that did this *exclusively* the rule would also emit its
+    single "no `vim.keymap.set(` … nothing to verify" warn: the run is not green,
+    but it is the tree-level warning, not a per-mapping finding;
+  * any buffer mutator other than `nvim_buf_set_lines` / an aliased `set_lines`
+    (`vim.api.nvim_buf_set_text`, `nvim_put`, `vim.fn.setline`, …): the write
+    detector is a name list, not a model of Neovim's buffer API.
 
 Measured on this tree (no allowlist, `make check` is green with it)
-------------------------------------------------------------------
+-------------------------------------------------------------------
   * `lua/` holds exactly 3 `expr = true` mappings, all in
     `lua/pi/ui/chat/init.lua`: the calls start on 418 (`<Esc>`), 447 (`<Up>`) and
     454 (`<Down>`), their `expr = true` option sits on 421, 452 and 467. Each
@@ -158,15 +172,22 @@ class ExprMapping(Check):
             self.fixture(
                 "good",
                 0,
-                "four negative controls in one tree: an <expr> mapping returning the literal `<Esc>`, an "
+                "six negative controls in one tree: an <expr> mapping returning the literal `<Esc>`, an "
                 "<expr> callback whose `nvim_buf_set_lines` sits inside `vim.schedule(...)`, a NON-expr "
-                "mapping writing the buffer directly, and an <expr> mapping whose same-file named callback "
-                "returns the literal `<Up>`",
+                "mapping writing the buffer directly, an <expr> mapping whose same-file named callback "
+                "returns the literal `<Up>`, a bracket-string option table with no `expr` key writing the "
+                "buffer, and an <expr> mapping returning a parenthesised literal `<Down>`",
             ),
             self.fixture(
                 "bad-keycode",
                 1,
                 'G2: an <expr> callback returning `vim.keycode("<Up>")` instead of the literal `"<Up>"`',
+            ),
+            self.fixture(
+                "bad-bracketed",
+                1,
+                'the two spelling bypasses: `{ ["expr"] = true }` plus `return (vim.keycode("<Up>"))` — one '
+                "G2 error, so both the bracket-string option key and the parenthesised return really fire",
             ),
             self.fixture(
                 "bad-write",
@@ -340,24 +361,44 @@ def _arguments(tokens: list[lua.Token], open_index: int, close_index: int) -> li
 
 
 def _has_expr_true(tokens: list[lua.Token], start: int, end: int) -> bool:
-    """Does the option-table span hold `expr = true` at its own level?"""
+    """Does the option-table span set `expr = true`, bare or `["expr"] = true`?
+
+    Both spellings are the same Lua field. The bracket-string form puts its key
+    one bracket deeper (`{` -> 1, `[` -> 2), which is why the key is looked for
+    at depth 1 when bare and at depth 2 when bracketed: a nested table such as
+    `{ cb = { ["expr"] = true } }` is a field of a *different* table and must not
+    turn this mapping into an `<expr>` one.
+    """
     if start >= end or not tokens[start].is_punct("{"):
         return False
     depth = 0
-    for index in range(start, end - 2):
+    for index in range(start, end):
         token = tokens[index]
         if token.kind == "punct" and token.text in "([{":
             depth += 1
-        elif token.kind == "punct" and token.text in ")]}":
+            continue
+        if token.kind == "punct" and token.text in ")]}":
             depth -= 1
-        elif (
-            depth == 1
-            and token.is_name("expr")
-            and tokens[index + 1].is_punct("=")
-            and tokens[index + 2].is_name("true")
-        ):
+            continue
+        if depth == 1 and token.is_name("expr") and _assigns_true(tokens, index + 1, end):
+            return True
+        bracketed = (
+            depth == 2
+            and token.kind == "string"
+            and token.value == "expr"
+            and index > start
+            and tokens[index - 1].is_punct("[")
+            and index + 1 < end
+            and tokens[index + 1].is_punct("]")
+        )
+        if bracketed and _assigns_true(tokens, index + 2, end):
             return True
     return False
+
+
+def _assigns_true(tokens: list[lua.Token], index: int, end: int) -> bool:
+    """Do the tokens at `index` (within `end`) read `= true`?"""
+    return index + 1 < end and tokens[index].is_punct("=") and tokens[index + 1].is_name("true")
 
 
 def _callback_body(tokens: list[lua.Token], span: tuple[int, int]) -> tuple[int, int] | None:
@@ -431,12 +472,21 @@ def _literal(tokens: list[lua.Token], span: tuple[int, int]) -> str | None:
 
 
 def _keycode_return(tokens: list[lua.Token], start: int, end: int) -> tuple[str, int] | None:
-    """First `return <keycode helper>(` inside the body, as (helper, line)."""
+    """First `return [(]…<keycode helper>(` inside the body, as (helper, line).
+
+    A `(` right after `return` is skipped (repeatedly), because
+    `return (vim.keycode("<Up>"))` is the same expression as
+    `return vim.keycode("<Up>")` — the parenthesis is cosmetic and must not hide
+    the G2 defect.
+    """
     for index in range(start, end):
         if not tokens[index].is_name("return"):
             continue
+        probe = index + 1
+        while probe < end and tokens[probe].is_punct("("):
+            probe += 1
         for chain in KEYCODE_CHAINS:
-            if _call_open(tokens, index + 1, chain) is not None:
+            if _call_open(tokens, probe, chain) is not None:
                 return ".".join(chain), tokens[index].line
     return None
 

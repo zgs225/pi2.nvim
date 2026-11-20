@@ -33,9 +33,17 @@ a capture split across lines is still one binding.
 
 What this rule cannot catch — and deliberately does not pretend to
 -------------------------------------------------------------------
-  * a capture through a helper: `local o = cfg()`, `local o = M.options()`, or a
-    local function whose *body* reads `Config.options` and is immediately called
-    at module level;
+  * a capture through a helper — **deliberate narrowing**, because deciding it
+    needs the helper's body evaluated: `local o = cfg()`, `local o =
+    M.options()`, or a chunk-level `local function cfg() return
+    require("pi.config").options end` that a chunk-level binding then calls;
+  * **a miss, not a narrowing:** a non-`local` chunk-level binding freezes
+    exactly the same way and is invisible to this detector, which only looks at
+    `local` declarations — `M.opts = require("pi.config").options` and a table
+    field `local M = { opts = Config.options }` both go unreported;
+  * **a miss:** a parenthesized base, `local o =
+    (require("pi.config")).options` — the base token is then an opaque `)` and
+    `_config_base` only recognises the bare call;
   * `Table.options` reached through an unrelated table (`local o =
     SomeOtherTable.options`, or a re-export such as `local options =
     require("pi").options`), because only a `pi.config` base is provable;
@@ -55,7 +63,11 @@ Measured on this tree (2026-02, `feat/remaining-gates`): 77 `*.lua` files under
 level and 4 only inside a function — and **0** module-level captures. The idiom
 in use is the safe one: `local Config = require("pi.config")` at the top, and
 207 `options` reads inside function bodies (call time), so the real tree reports
-nothing and this rule ships **without an allowlist**. That number is also why the
+nothing and this rule ships **without an allowlist**. Re-measured after the
+`for` / `while` depth fix: still 0 captures, and `lua/` has 0 chunk-level
+`for` / `while` at all — so the leak that was hiding later captures never masked
+a real one here, which is precisely why it needed a fixture rather than a green
+run. That number is also why the
 detector is narrowed rather than allowed: any widening that starts reporting the
 34 compliant aliases would make the gate red on a clean tree, so the alias itself
 is never a finding — only a `.options` read at chunk depth is.
@@ -83,7 +95,12 @@ OPTION_KEY = "options"
 REQUIRE = "require"
 
 # Block structure, by keyword. `elseif` / `else` / `then` neither open nor close.
-BLOCK_OPENERS = frozenset({"function", "do", "if", "for", "while", "repeat"})
+# `for` / `while` are separate because their header is closed by its own `do`,
+# which opens nothing: counting both leaked one level per loop and made every
+# later chunk-level capture invisible (`for i = 1, 2 do end` then a capture
+# reported 0 findings).
+HEADER_OPENERS = frozenset({"for", "while"})
+BLOCK_OPENERS = HEADER_OPENERS | frozenset({"function", "do", "if", "repeat"})
 BLOCK_CLOSERS = frozenset({"end", "until"})
 
 # Tokens that start a new statement: the initializer of a `local` ends here.
@@ -112,6 +129,40 @@ BRACKET_CLOSE = frozenset(")]}")
 # expression continuation (`local x = Config.options.a` then `M.foo()`).
 VALUE_KINDS = frozenset({"name", "string", "number"})
 VALUE_PUNCT = frozenset({")", "]", "}"})
+
+
+class _Blocks:
+    """Block depth over a token stream, with `for` / `while` headers counted once.
+
+    `for` / `while` open their block at the keyword and then spell a `do` that
+    opens nothing; every other opener (`function`, `do`, `if`, `repeat`) opens,
+    and `end` / `until` close. The header `do` is remembered per depth, so a `do`
+    statement in a nested body (`for i = 1, f(function() do end) do`) cannot be
+    mistaken for a header. Leaking a level was a real false negative: one
+    chunk-level loop hid every chunk-level capture below it.
+    """
+
+    def __init__(self) -> None:
+        self.depth = 0
+        self._header_do: set[int] = set()
+
+    def advance(self, token: lua.Token) -> None:
+        """Update the depth for `token`; non-name tokens change nothing."""
+        if token.kind != "name":
+            return
+        if token.text in HEADER_OPENERS:
+            self.depth += 1
+            self._header_do.add(self.depth)
+            return
+        if token.text in BLOCK_OPENERS:
+            if token.text == "do" and self.depth in self._header_do:
+                self._header_do.discard(self.depth)  # the header's own `do`: already counted
+            else:
+                self.depth += 1
+            return
+        if token.text in BLOCK_CLOSERS:
+            self.depth = max(self.depth - 1, 0)
+            self._header_do = {depth for depth in self._header_do if depth <= self.depth}
 
 
 class ConfigReadAtCallTime(Check):
@@ -173,10 +224,23 @@ class ConfigReadAtCallTime(Check):
                 '`Config.options.subagent.tools`, and `require("pi.config")["options"]`',
             ),
             self.fixture(
+                "after-loop",
+                1,
+                "a chunk-level `for … do … end` and `while … do … end` followed by a chunk-level capture: the "
+                "header `do` opens nothing, so the loop must not leak a level and hide the capture below it",
+            ),
+            self.fixture(
                 "empty-lua",
                 1,
                 "lua/ present but no *.lua file at all: a tree with nothing to check warns exactly once instead "
                 "of reporting a clean gate",
+            ),
+            self.fixture(
+                "no-lua",
+                0,
+                "no lua/ directory at all: the subject tree is missing, so the rule refuses the input with a "
+                "CheckError (exit 2) instead of reporting a clean or a warned tree",
+                expect_error=True,
             ),
         ]
 
@@ -190,17 +254,13 @@ def _captures(tokens: list[lua.Token]) -> list[tuple[str, str, int]]:
     """
     found: list[tuple[str, str, int]] = []
     aliases: set[str] = set()
-    depth = 0
+    blocks = _Blocks()
     index = 0
     while index < len(tokens):
         token = tokens[index]
-        if token.kind == "name":
-            if token.text in BLOCK_OPENERS:
-                depth += 1
-            elif token.text in BLOCK_CLOSERS:
-                depth = max(depth - 1, 0)
+        blocks.advance(token)
 
-        if depth == 0 and token.is_name("local"):
+        if blocks.depth == 0 and token.is_name("local"):
             names, span = _binding(tokens, index)
             if span is not None:
                 start, end = span
@@ -253,7 +313,7 @@ def _expression_end(tokens: list[lua.Token], start: int) -> int:
     that followed it and lose the alias declared before it.
     """
     brackets = 0
-    blocks = 0
+    blocks = _Blocks()
     index = start
     while index < len(tokens):
         token = tokens[index]
@@ -264,25 +324,20 @@ def _expression_end(tokens: list[lua.Token], start: int) -> int:
                 if brackets == 0:
                     return index
                 brackets -= 1
-            elif token.text == ";" and brackets == 0 and blocks == 0:
+            elif token.text == ";" and brackets == 0 and blocks.depth == 0:
                 return index
             index += 1
             continue
         if token.kind == "name" and brackets == 0:
-            if token.text in BLOCK_OPENERS:
-                if blocks > 0 or token.text == "function":
-                    blocks += 1
-                else:
+            if blocks.depth == 0:
+                if token.text in BLOCK_OPENERS:
+                    if token.text != "function":
+                        return index  # `if`/`do`/`for`/`while`/`repeat` is never inside an expression
+                elif token.text in STATEMENT_KEYWORDS:
                     return index
-            elif token.text in BLOCK_CLOSERS:
-                if blocks == 0:
+                elif index > start and _ends_value(tokens[index - 1]):
                     return index
-                blocks -= 1
-            elif blocks == 0:
-                if token.text in STATEMENT_KEYWORDS:
-                    return index
-                if index > start and _ends_value(tokens[index - 1]):
-                    return index
+            blocks.advance(token)
         index += 1
     return len(tokens)
 
@@ -316,16 +371,13 @@ def _option_base(tokens: list[lua.Token], start: int, end: int, aliases: set[str
     callback stored in a table (`local M = { get = function() … end }`) is a
     call-time read and is not reported.
     """
-    blocks = 0
+    blocks = _Blocks()
     for index in range(start, end):
         token = tokens[index]
         if token.kind == "name":
-            if token.text in BLOCK_OPENERS:
-                blocks += 1
-            elif token.text in BLOCK_CLOSERS:
-                blocks = max(blocks - 1, 0)
+            blocks.advance(token)
             continue
-        if blocks or index <= start:
+        if blocks.depth or index <= start:
             continue
         if not (token.is_punct(".") or token.is_punct("[")):
             continue

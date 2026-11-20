@@ -28,12 +28,18 @@ backend stubbed no test transcript exists, so the cleanup has nothing to delete
 and its grep can only ever match real sessions. "Same enclosing function" means
 one site's `function` chain is a prefix of the other's, so a grep in an outer
 function and the delete in its callback are one defect — and two *sibling*
-functions that grep and delete independently are not (measured: verified by a
-one-off, not a fixture). That narrowing is deliberate: a file that greps for one
+functions that grep and delete independently are not (fixture
+`sibling-functions`). That narrowing is deliberate: a file that greps for one
 thing in one function and removes its own temp files in another is ordinary
 correct code, and a rule that fires on it would be the false positive that gets
 the gate deleted. Code at chunk level counts as its own scope, so a script that
-does both at top level still fires.
+does both at top level still fires. The narrowing only holds while every block
+keyword pushes its own frame: the first version of this rule pushed nothing for
+`for`/`while`, so a loop's `end` popped the enclosing *function*, everything
+after the loop looked chunk-level, and two independent helpers were paired
+(fixture `sibling-functions` fired at its `os.remove` line before that fix;
+fixture `inside-loop` keeps the opposite direction — a loop between the two
+halves of one function is still reported).
 
 Subject
 -------
@@ -86,6 +92,11 @@ What this rule cannot catch (deliberate non-catches)
 * A command assembled from a variable — `local cmd = "grep -rl " .. text;
   vim.fn.system(cmd)` — is not read as grep, and `os.execute("rm -rf …")` is not
   one of the three command calls. Both are stated limits, not guesses.
+* `vim.cmd("!rm -rf …")` beside a `grep` command is not a delete this rule sees:
+  only `os.remove`, `vim.fn.delete` and an `rm` inside a *system* command string
+  (the three forms above) count.
+* `vim.fn["stdpath"](…)` — bracket-form member access — is not a call the chain
+  matcher follows; it reads `.`-chains only.
 
 Measured on this tree (the reason the rule ships with no allowlists — a rule that
 needs one on its own repo gets switched off): 203 subject files (184
@@ -218,6 +229,19 @@ class TestIsolation(Check):
                 "bad-grep-delete",
                 1,
                 "one function that greps sessions and then `os.remove`s every match — the G18 cleanup pattern",
+            ),
+            self.fixture(
+                "sibling-functions",
+                0,
+                "a `for`-loop grep function and a `while`-loop delete function in the same file: the loops must "
+                "not pop the enclosing function frame, so the two helpers are never paired (the false positive "
+                "this fixture locks)",
+            ),
+            self.fixture(
+                "inside-loop",
+                1,
+                "one function whose loop sits between the grep and the delete: tracking the loop must not switch "
+                "the pairing off, so the G18 defect is still reported at the delete",
             ),
             self.fixture(
                 "empty",
@@ -385,7 +409,13 @@ def _scopes(tokens: list[lua.Token]) -> list[tuple[int, ...]]:
         elif word in _BLOCK_OPENERS:
             blocks.append("block")
         elif word in _FOR_WHILE:
-            # `for … do` / `while … do` is one block, opened by its own `do`.
+            # `for … do` / `while … do` is ONE block: the frame is opened by the
+            # keyword itself and the header's own `do` is not a second frame.
+            # Without this push the loop's `end` pops the *enclosing function*
+            # (`blocks.pop() == "function"`), so every site after the loop looks
+            # chunk-level — and `()`, a prefix of every chain, then pairs a
+            # delete in one function with a grep in an unrelated one.
+            blocks.append("block")
             pending_do = True
         elif word == "do":
             if pending_do:

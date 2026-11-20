@@ -10,11 +10,15 @@ This rule reports the first two where they meet at one call site, and says
 nothing about handle lifetime — that is not a source predicate.
 
 **Static reachability cannot prove that a given callback runs on a libuv fast
-event, so every finding here is `severity="info"`: the framework prints it,
-counts it and carries it in `--json`, but it never changes the exit code. That
-makes this rule a report and never a merge blocker — `make check` stays exit 0
-however many hits it prints, and a false positive cannot block a merge. A rule
-that can prove its finding uses `error` instead** (checks.md, § Severities).
+event, so every finding this rule makes about the *code* is `severity="info"`:
+the framework prints it, counts it and carries it in `--json`, but it never
+changes the exit code. That makes the rule a report and never a merge blocker —
+`make check` stays exit 0 however many code findings it prints, and a false
+positive cannot block a merge. The two non-code outcomes are the framework's own
+channels and both still block, by contract 3 (see § Warn vs error): the single
+"nothing to verify" finding is a `warn` (exit 1) and a missing `lua/` tree is a
+`CheckError` (exit 2). A rule that can prove a finding uses `error` instead**
+(checks.md, § Severities).
 
 Two signals, both same-function
 ------------------------------
@@ -55,11 +59,17 @@ Every one of these is a non-catch by construction, not a suppressed finding:
 * The guard is judged lexically, per call: an unguarded call in a body that
   also contains one `vim.schedule` is still reported, but a call into a helper
   that schedules internally reads as unguarded — a false positive.
+* Editor entry points other than `vim.api.…`, `vim.fn.…` and a bare `nvim_…`
+  name are not matched at all: `vim.cmd("echo 1")` (and whatever command that
+  runs), `vim.o.…` / `vim.b.…`, `vim.notify(…)` and an aliased `vim.fn`
+  (`local fn = vim.fn` then `fn.fnamemodify(…)`) never fire, even unguarded in a
+  fast-event callback. An aliased `vim.api` *is* caught, but as the bare
+  `nvim_…` name, because every `vim.api` function is one.
 * `vim.uv.*` / luv calls (`vim.uv.kill`, `fs_stat`, `now`) are legal in a fast
   event and are never matched, nor is anything outside `lua/**/*.lua`.
 
-Measured numbers (this tree: 77 `*.lua` files, 1.94 MB under `lua/`)
---------------------------------------------------------------------
+Measured numbers (this tree: 77 `*.lua` files, 1 946 805 bytes under `lua/`)
+----------------------------------------------------------------------------
 There are 14 `new_timer()` sites and 8 direct `vim.system(` calls, and the rule
 reports **0 findings** on all of them:
 
@@ -79,20 +89,24 @@ reports **0 findings** on all of them:
   `vim.schedule_wrap`'d anyway, e.g. `lua/pi/image_compress.lua`'s `done`).
 
 So the real tree is clean because of its guards, not because the matcher is
-blind: unwrapping `vim.schedule_wrap` in the matcher (a diagnostic run, not
-shipped) makes the same traversal report
-`lua/pi/ui/chat/history.lua:1578/1597/1599` and
-`lua/pi/ui/chat/decorators.lua:101`. The fixtures below are still what proves
-the rule can fire, which is why it ships as an advisory report and not as a
-gate.
+blind. Measured on a `/tmp` copy with the matcher monkeypatched (diagnostics,
+nothing here is shipped): treating `vim.schedule_wrap(function() … end)` as
+unguarded reports **1** finding — `lua/pi/ui/chat/decorators.lua:101`
+(`vim.api.nvim_buf_is_valid` in a one-shot debounce). Treating it as unguarded
+*and* dropping the `repeat == 0` requirement reports **4** — that one plus
+`lua/pi/ui/chat/history.lua:1578/1597/1599`, whose spinner timer is repeating
+(`self._spinner_rate` in both slots, so signal 1 never applies to it). The
+fixtures below are still what proves the rule can fire, which is why it ships
+as an advisory report and not as a gate.
 
 Cost, since `make check` is the fast gate: a file whose raw bytes contain
 neither `new_timer` nor `system` is skipped before the lexer (a token's text is
 a raw substring, so a skipped file provably holds no signal) — that keeps 30 of
-the 77 files, 1.27 of 1.94 MB. Tokenizing and matching the kept files is
-338 ms (best of 3, vs 681 ms unfiltered); the matching itself is ~40 ms and the
-rest is `lua.tokenize`, dominated by `lua/pi/ui/chat/history.lua`. Nothing here
-runs at Neovim startup — the rule only runs under `python3 -m scripts.checks`.
+the 77 files, 1 269 841 of the 1 946 805 bytes. Tokenizing and matching the kept
+files is 338 ms (best of 3, vs 681 ms unfiltered); the matching itself is
+~40 ms and the rest is `lua.tokenize`, dominated by
+`lua/pi/ui/chat/history.lua`. Nothing here runs at Neovim startup — the rule
+only runs under `python3 -m scripts.checks`.
 
 Warn vs error
 -------------
