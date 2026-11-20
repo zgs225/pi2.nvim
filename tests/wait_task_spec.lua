@@ -121,6 +121,47 @@ describe("wait_task renderer", function()
         assert.is_true(#rows_with(buf, "(timeout 60s)") == 1, "expected the attach window in seconds")
     end)
 
+    it("shows the until needle in the block body", function()
+        local h = History.new(TAB)
+        h:on_tool_start("wait_task", "wtu1", { task_id = "b3f2a1", timeout_ms = 60000, ["until"] = "listening on" })
+        pump(50)
+        -- A wait for a readiness line and a wait for the exit read identically
+        -- without the needle, so the body has to say what is being waited for.
+        assert.is_true(
+            #rows_with(h:buf(), 'b3f2a1 (timeout 60s) · until "listening on"') == 1,
+            table.concat(lines_of(h:buf()), "\n")
+        )
+        delete(h)
+
+        -- Without an attach window the needle still follows the task label.
+        local h2 = History.new(TAB)
+        h2:on_tool_start("wait_task", "wtu2", { task_id = "b3f2a1", ["until"] = "READY" })
+        pump(50)
+        assert.is_true(#rows_with(h2:buf(), 'b3f2a1 · until "READY"') == 1, text_of(h2:buf()))
+        delete(h2)
+    end)
+
+    it("elides an over-long until needle", function()
+        local h = History.new(TAB)
+        h:on_tool_start("wait_task", "wtu3", {
+            task_id = "b3f2a1",
+            timeout_ms = 60000,
+            ["until"] = string.rep("x", 120),
+        })
+        pump(50)
+        local buf = h:buf()
+        local row = rows_with(buf, "b3f2a1")[1]
+        assert.is_not_nil(row, "expected the body row")
+        local line = lines_of(buf)[row + 1]
+        assert.is_truthy(line:find("…", 1, true), "expected the needle to be elided")
+        assert.is_nil(line:find(string.rep("x", 41), 1, true), "the needle must be cut to the display width")
+        -- `b3f2a1 (timeout 60s) · until "` is 30 cells; the needle is clamped to
+        -- 40 and the closing quote adds one. An untruncated 120-cell needle
+        -- would make the row 151 cells wide.
+        assert.is_true(vim.fn.strdisplaywidth(line) <= 30 + 40 + 1, line)
+        delete(h)
+    end)
+
     it("omits the window when the call did not pass one", function()
         local h = History.new(TAB)
         h:on_tool_start("wait_task", "wt2", { task_id = "b3f2a1" })
@@ -170,6 +211,49 @@ describe("wait_task renderer", function()
         }, false)
         pump(60)
         assert.is_true(has_badge(h, "still running"), table.concat(header_virt(h), "|"))
+        delete(h)
+    end)
+
+    it("badges a match as matched", function()
+        local h = History.new(TAB)
+        h:on_tool_start("wait_task", "wtu4", { task_id = "b3f2a1", timeout_ms = 8000, ["until"] = "READY" })
+        pump(50)
+        h:on_tool_end("wait_task", "wtu4", {
+            content = { { type = "text", text = '[matched] Task b3f2a1 printed "READY" after 1.2s.' } },
+            details = {
+                taskId = "b3f2a1",
+                status = "matched",
+                ["until"] = "READY",
+                matchedLine = "READY",
+                wallTimeSeconds = 1.2,
+            },
+        }, false)
+        pump(60)
+        local virt = table.concat(header_virt(h), "|")
+        assert.is_true(has_badge(h, "matched"), virt)
+        -- A match is not the task's result, so it must never read as an error.
+        assert.is_false(has_badge(h, "exit 0"), virt)
+        delete(h)
+    end)
+
+    it("badges a deadline hit while watching for text as pattern not seen", function()
+        local h = History.new(TAB)
+        h:on_tool_start("wait_task", "wtu5", { task_id = "b3f2a1", timeout_ms = 3000, ["until"] = "NEVER" })
+        pump(50)
+        h:on_tool_end("wait_task", "wtu5", {
+            content = {
+                {
+                    type = "text",
+                    text = '[still running] Task b3f2a1 has not exited after 3.0s. The output never contained "NEVER".',
+                },
+            },
+            details = { taskId = "b3f2a1", status = "still_running", ["until"] = "NEVER", wallTimeSeconds = 3.0 },
+        }, false)
+        pump(60)
+        local virt = table.concat(header_virt(h), "|")
+        -- `still running` would hide the interesting half: the text never appeared.
+        assert.is_true(has_badge(h, "pattern not seen"), virt)
+        assert.is_false(has_badge(h, "still running"), virt)
         delete(h)
     end)
 
@@ -1004,6 +1088,124 @@ describe("bg-tasks extension contract", function()
             count_occurrences(src, "armCheckIns(task)") >= 2,
             "the lifetime note arms on the detach and the '&' paths"
         )
+    end)
+
+    it("offers until as an optional literal needle, with a bounded length", function()
+        local src = read_extension()
+        assert.is_truthy(src:find("until: Type.Optional(", 1, true), "`until` must be an optional parameter")
+        -- Both ends of the needle are bounded: a whitespace-only one would match
+        -- everything, and a huge one makes a byte scan pointless.
+        assert.is_truthy(src:find('until.trim() === ""', 1, true), "an empty needle must be rejected")
+        assert.is_truthy(src:find("const MAX_UNTIL_LENGTH = 512", 1, true), "the needle length must be capped")
+        -- The watch polls on a named interval, and the constant is actually used.
+        assert.is_truthy(src:find("const UNTIL_POLL_MS = 250", 1, true), "the text watch must poll")
+        assert.is_true(
+            count_occurrences(src, "UNTIL_POLL_MS") >= 2,
+            "UNTIL_POLL_MS must be defined AND armed, not just declared"
+        )
+    end)
+
+    it("reports a text watch with a fourth outcome: matched", function()
+        local src = read_extension()
+        assert.is_truthy(src:find('type WaitOutcome = "exited" | "deadline" | "aborted" | "matched";', 1, true))
+        assert.is_truthy(
+            src:find('status: "exited" | "still_running" | "cancelled" | "matched";', 1, true),
+            "the details status the renderer badges from must allow a match"
+        )
+        -- The scanner is a real function that resumes from an offset, not an
+        -- inline read of the tail: a line printed an hour ago still has to match.
+        assert.is_truthy(src:find("function scanForNeedle(", 1, true), "scanForNeedle must exist")
+        assert.is_truthy(src:find("offset: number", 1, true), "the scan must resume from an offset")
+    end)
+
+    it("does not consume the exit report when the text matches", function()
+        local src = read_extension()
+        -- The process is still running, so its exit report still has to arrive
+        -- exactly once: `markConfirmed` in this branch would retire it forever.
+        local matched_at = assert(src:find('outcome === "matched"', 1, true), "matched must have its own branch")
+        local exited_at = assert(src:find('if (outcome === "exited")', matched_at, true), "exited follows it")
+        -- Strip `//` comments first: the branch explains in prose that
+        -- `markConfirmed` must NOT be called here, and that explanation is the
+        -- point, not a violation.
+        local matched = src:sub(matched_at, exited_at):gsub("//[^\n]*", "")
+        assert.is_nil(matched:find("markConfirmed", 1, true), "a match must not consume the exit report")
+        assert.is_truthy(matched:find("still running", 1, true), "the result must say the process keeps running")
+        assert.is_truthy(matched:find("exit report still arrives exactly once", 1, true), "and promise the exit report")
+        -- The exit branch still confirms, so the assertion above is a real
+        -- difference and not just `markConfirmed` missing from the file.
+        local aborted_at = assert(src:find('if (outcome === "aborted")', exited_at, true), "aborted follows exited")
+        assert.is_truthy(src:sub(exited_at, aborted_at):find("markConfirmed", 1, true), "an exit still confirms")
+    end)
+
+    it("says whether the needle ever appeared, and carries it in the details", function()
+        local src = read_extension()
+        assert.is_truthy(src:find("never contained", 1, true), "a deadline result must state the negative")
+        assert.is_truthy(src:find("was printed", 1, true), "an exit result must state the positive")
+        -- The renderer badges from `details`, so a replayed block can only say
+        -- `pattern not seen` if the needle it watched is in the payload.
+        assert.is_truthy(src:find("until?: string;", 1, true), "WaitTaskDetails must carry the needle")
+        assert.is_truthy(src:find("matchedLine?: string;", 1, true), "and the line it sat on")
+        local matched_at = assert(src:find('outcome === "matched"', 1, true))
+        local matched = src:sub(matched_at, assert(src:find('if (outcome === "exited")', matched_at, true)))
+        assert.is_truthy(matched:find("matchedLine,", 1, true), "a matched result must report the matched line")
+        -- The streaming update carries it too, so a live block knows what it waits for.
+        local schema_at = assert(src:find("until: Type.Optional(", 1, true))
+        local stream_at = assert(src:find("onUpdate%({\n", schema_at), "the wait must stream its progress")
+        local stream = src:sub(stream_at, matched_at)
+        assert.is_truthy(stream:find('status: "still_running"', 1, true), "the stream announces the wait")
+        assert.is_truthy(stream:find("until,", 1, true), "and carries the needle")
+    end)
+
+    it("documents until in the tool description and the prompt guidelines", function()
+        local src = read_extension()
+        local decl_at = assert(src:find('name: "wait_task"', 1, true), "wait_task must be registered")
+        local decl_end = assert(src:find("executionMode", decl_at, true), "the declaration ends at the mode")
+        local decl = src:sub(decl_at, decl_end)
+        assert.is_truthy(decl:find("`until`", 1, true), "the description must document `until`")
+        assert.is_truthy(
+            decl:find("still reported exactly once", 1, true),
+            "and say the exit is still reported once after a match"
+        )
+        local guides_at = assert(decl:find("promptGuidelines", 1, true), "the guidelines are part of the declaration")
+        assert.is_truthy(decl:sub(guides_at):find("`until`", 1, true), "a guideline must point at `until`")
+    end)
+
+    it("sweeps only its own stale logs, and only files it may touch", function()
+        local src = read_extension()
+        -- The import line is where `readdirSync` has to come from; a bare global
+        -- would fail at runtime instead of at review.
+        local import_at = assert(src:find('from "node:fs"', 1, true), "node:fs must be imported")
+        local line_start = src:sub(1, import_at):match(".*()\n") or 1
+        assert.is_truthy(src:sub(line_start, import_at):find("readdirSync", 1, true), "the sweep needs readdirSync")
+        assert.is_truthy(src:find('const LOG_TTL_ENV = "PI_BG_TASK_LOG_TTL_MS"', 1, true), "the TTL env must exist")
+        assert.is_truthy(
+            src:find("const DEFAULT_LOG_TTL_MS = 7 * 24 * 60 * 60 * 1000", 1, true),
+            "the default TTL is 7 days"
+        )
+        assert.is_truthy(
+            src:find("const LOG_FILE_PATTERN = /^pi-bash-(b[0-9a-f]{6})\\.log$/", 1, true),
+            "only this extension's log names may be touched"
+        )
+        local sweep_at = assert(src:find("function sweepLogFiles(", 1, true), "sweepLogFiles must exist")
+        -- The sweep is bounded by the next top-level declaration; the body is
+        -- where the two guards live.
+        local body = src:sub(sweep_at, sweep_at + 2500)
+        assert.is_truthy(body:find("if (tasks.has(", 1, true), "a task this process knows keeps its log")
+        assert.is_truthy(body:find("unlinkSync(file)", 1, true), "an old unknown log is removed")
+        assert.is_truthy(body:find("catch", 1, true), "a filesystem error must never throw out of the sweep")
+    end)
+
+    it("runs the log sweep once per process, after the transcript fold", function()
+        local src = read_extension()
+        local start = assert(src:find('pi.on("session_start"', 1, true), "session_start must be handled")
+        local stop = assert(src:find('pi.on("session_shutdown"', start, true), "session_shutdown follows it")
+        local handler = src:sub(start, stop)
+        local fold_at = assert(handler:find("reconcileSession(ctx)", 1, true), "the handler folds the transcript")
+        local sweep_at = assert(handler:find("sweepLogFiles()", 1, true), "and sweeps stale logs")
+        -- Order matters: an adopted task is in the table only after the fold, so
+        -- sweeping first would delete the log of a task that is still running.
+        assert.is_true(fold_at < sweep_at, "the sweep must run AFTER the fold")
+        assert.is_truthy(handler:find("if (!sweptLogs)", 1, true), "the sweep is once per process")
     end)
 end)
 

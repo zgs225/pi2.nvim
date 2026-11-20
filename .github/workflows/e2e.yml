@@ -7,7 +7,7 @@
 # (`PI_CODING_AGENT_DIR` + `PI_OFFLINE=1`). The assertions are behavioural, and
 # the session transcript JSONL is the ground truth.
 #
-# That is exactly why these eight suites run here while the provider-backed ones
+# That is exactly why these eleven suites run here while the provider-backed ones
 # do not: `bg_tasks_delivery` (a real model answer has to be long enough for a
 # task to exit mid-run) and `bg_tasks_notify` need a configured provider, so they
 # stay manual (`make e2e-bg-delivery`). See
@@ -94,11 +94,17 @@ jobs:
       - name: deadline check-in + lifetime note (ONE notify-only message each, no kill)
         run: make e2e-bg-deadline
 
+      - name: conditional wait on a printed line (wait_task until; match does not consume the exit report)
+        run: make e2e-bg-until
+
       - name: transcript fold + adoption (survive a SIGKILL)
         run: make e2e-bg-reconcile
 
       - name: ownership (fork does not adopt, clean quit records kills)
         run: make e2e-bg-ownership
+
+      - name: log sweep (stale unknown logs go, fresh and live ones stay)
+        run: make e2e-bg-logs
 
       # A headless failure is hard to read from the script's own output alone:
       # the scripts check against the transcript, so show what it saw.

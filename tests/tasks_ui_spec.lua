@@ -937,11 +937,120 @@ describe("tasks panel UI", function()
             assert.are.equal(1, map.buffer)
             assert.are.equal("Stop the task under the cursor", map.desc)
         end)
+    end)
 
-        it("does not bind a delete key", function()
+    describe("delete log key (D)", function()
+        --- Stub pi.notify and return the messages it received.
+        ---@return string[] messages, fun() restore
+        local function capture_info()
+            local Notify = require("pi.notify")
+            local original = Notify.info
+            local messages = {}
+            Notify.info = function(msg)
+                messages[#messages + 1] = msg
+            end
+            return messages, function()
+                Notify.info = original
+            end
+        end
+
+        --- Put the cursor on the first row of the open panel.
+        local function focus_first_row()
+            local win = Panel.win(vim.api.nvim_get_current_tabpage())
+            vim.api.nvim_set_current_win(win)
+            vim.api.nvim_win_set_cursor(win, { 4, 0 })
+        end
+
+        it("binds D to the delete action with a description", function()
             Panel.open()
-            local map = vim.fn.maparg("d", "n", false, true)
-            assert.are_not.equal(1, map.buffer)
+            local map = vim.fn.maparg("D", "n", false, true)
+            assert.are.equal(1, map.buffer)
+            assert.are.equal("Delete the task's log file", map.desc)
+        end)
+
+        it("refuses a running task and leaves its log in place", function()
+            local path = vim.fn.tempname()
+            vim.fn.writefile({ "still writing" }, path)
+            seed({ id = "run1", output_file = path })
+            Panel.open()
+            focus_first_row()
+            local messages, restore = capture_info()
+
+            press("D")
+            restore()
+
+            assert.are.equal(1, vim.fn.filereadable(path), "a running task's log must survive")
+            assert.are.equal(1, #messages, "the panel must explain the refusal")
+            assert.is_truthy(messages[1]:find("stop it first", 1, true))
+            assert.are.equal("running", Tasks.get("run1").status)
+            assert.is_nil(Tasks.get("run1").log_removed)
+            vim.fn.delete(path)
+        end)
+
+        it("confirms, deletes the log, and renders `log removed` on the row", function()
+            local path = vim.fn.tempname()
+            vim.fn.writefile({ "done output" }, path)
+            seed({ id = "done1", status = "completed", end_time = now_ms() - 1000, output_file = path })
+            Panel.open()
+            focus_first_row()
+
+            local orig_confirm = vim.fn.confirm
+            vim.fn.confirm = function()
+                return 1 -- &Yes
+            end
+            press("D")
+            vim.fn.confirm = orig_confirm
+
+            assert.are.equal(0, vim.fn.filereadable(path), "the log file must be gone")
+            assert.is_true(Tasks.get("done1").log_removed)
+            assert.is_true(
+                vim.wait(1000, function()
+                    return panel_text():find("log removed", 1, true) ~= nil
+                end),
+                "the row must say the log was removed"
+            )
+        end)
+
+        it("keeps the log when the confirmation is declined", function()
+            local path = vim.fn.tempname()
+            vim.fn.writefile({ "done output" }, path)
+            seed({ id = "done1", status = "completed", end_time = now_ms() - 1000, output_file = path })
+            Panel.open()
+            focus_first_row()
+
+            local orig_confirm = vim.fn.confirm
+            vim.fn.confirm = function()
+                return 2 -- &No
+            end
+            press("D")
+            vim.fn.confirm = orig_confirm
+
+            assert.are.equal(1, vim.fn.filereadable(path), "a declined delete must not touch the file")
+            assert.is_nil(Tasks.get("done1").log_removed)
+            vim.fn.delete(path)
+        end)
+
+        it("lists D in the help overlay", function()
+            Panel.open()
+            press("?")
+            local win, buf = find_help_win()
+            assert.is_not_nil(win)
+            local text = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+            assert.is_truthy(text:find("Delete the task's log file", 1, true))
+        end)
+
+        it("explains a removed log instead of opening an empty output window", function()
+            seed({ id = "gone1", status = "completed", end_time = now_ms() - 1000, log_removed = true })
+            Panel.open()
+            focus_first_row()
+            local messages, restore = capture_info()
+
+            press("o")
+            restore()
+
+            assert.are.equal(1, #messages, "`o` must explain the missing log")
+            assert.is_truthy(messages[1]:find("was deleted", 1, true))
+            assert.is_nil(find_win_by_name("pi://task-output/gone1"))
         end)
     end)
 
@@ -1237,10 +1346,10 @@ describe("tasks panel UI", function()
             local win, buf = find_help_win()
             assert.is_not_nil(win)
             local text = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
-            for _, key in ipairs({ "<CR>, o", "a, i", "p", "x", "A", "R", "q", "?" }) do
+            for _, key in ipairs({ "<CR>, o", "a, i", "p", "x", "D", "A", "R", "q", "?" }) do
                 assert.is_truthy(text:find(key, 1, true), "help should list " .. key)
             end
-            assert.are.equal(8, #Panel._help_entries())
+            assert.are.equal(9, #Panel._help_entries())
         end)
 
         it("toggles on a second ?", function()

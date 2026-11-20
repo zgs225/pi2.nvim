@@ -92,6 +92,12 @@
  * the process exits or its own deadline hits. Both are advertised in the bash
  * tool description and in every result that starts or hands off a task.
  *
+ * `wait_task` can also wait for a LINE instead of an exit (`until`). A match
+ * settles the call but does NOT consume the completion: the lease is released
+ * and the process keeps running, so its exit report still arrives exactly once.
+ * The watch is a literal, case-sensitive substring (no regex) scanned from
+ * offset 0 in 250 ms increments, so a line printed earlier still counts.
+ *
  * `stop_task` / `list_tasks` make the task table usable by the model, not only by
  * the panel: a task nobody wants any more (a stale dev server holding its port, a
  * watcher for a file that is already fixed) is stopped through the same
@@ -109,6 +115,18 @@
  * behaviour is byte-for-byte stock, and a foreground command that outlives its
  * window and detaches has no stdin (`task_input` says so instead of silently
  * dropping what it was given).
+ *
+ * Every task owns ONE log file, `tmpdir()/pi-bash-<taskId>.log`, because the log
+ * is what `wait_task`, the panel and the wake tail all read. A foreground command
+ * that exits cleanly and untruncated deletes its own file on the spot; a
+ * background one is kept, since that task outlives the call that started it.
+ * Those files are the one thing here that accumulates, so their lifetime is
+ * explicit: a log nobody references any more dies of old age after
+ * `DEFAULT_LOG_TTL_MS` (7 days, `LOG_TTL_ENV` overrides) and is removed by ONE
+ * sweep at `session_start`, after the transcript fold. The sweep only ever
+ * considers our own file-name shape, and never a task THIS process has a record
+ * for — a live writer, an adopted task, or a row the user can still open.
+ * Immediate deletion is the panel's `D`, not the sweep's job.
  *
  * Two NOTIFY-ONLY timers cover the other half of that hole — a task that runs
  * far longer than anyone expected while the agent simply never hears about it.
@@ -209,7 +227,7 @@ import { createBashToolDefinition, getShellConfig } from "@earendil-works/pi-cod
 import type { BashToolDetails, BashToolInput, SessionEntry, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { closeSync, createWriteStream, openSync, readFileSync, readSync, statSync, unlinkSync } from "node:fs";
+import { closeSync, createWriteStream, openSync, readFileSync, readSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { Writable } from "node:stream";
@@ -264,6 +282,17 @@ const LIVE_TAIL_LINES = 200;
 const LIVE_TAIL_BYTES = 8 * 1024;
 /** Minimum interval between live updates. */
 const UPDATE_INTERVAL_MS = 500;
+/**
+ * Poll interval for a `wait_task({ until })` text watch: slower than the live
+ * ticker because a readiness line is not a live view, and far below any attach
+ * window it runs inside.
+ */
+const UNTIL_POLL_MS = 250;
+/**
+ * Longest accepted `until` needle. There is no regex syntax, so a short literal
+ * is always enough — a longer one would only buy scan cost.
+ */
+const MAX_UNTIL_LENGTH = 512;
 /** Line count is only computed when the log is small enough to read whole. */
 const COUNT_LINES_UP_TO_BYTES = 8 * 1024 * 1024;
 /** Bound on the output tail inlined in a wake report. */
@@ -286,6 +315,12 @@ const MAX_DEADLINE_MS = 24 * 60 * 60 * 1000;
  */
 const DEFAULT_MAX_LIFETIME_MS = 24 * 60 * 60 * 1000;
 const LIFETIME_ENV = "PI_BG_TASK_MAX_LIFETIME_MS";
+/** Default lifetime of a finished task's log; the sweep deletes anything older. */
+const DEFAULT_LOG_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+/** Overrides `DEFAULT_LOG_TTL_MS` (milliseconds), read when the sweep runs. */
+const LOG_TTL_ENV = "PI_BG_TASK_LOG_TTL_MS";
+/** The only files the sweep may touch: the logs THIS extension writes. */
+const LOG_FILE_PATTERN = /^pi-bash-(b[0-9a-f]{6})\.log$/;
 /**
  * Where the frontend publishes its idle-wake policy (JSON:
  * `{wake_on_idle, wake_budget, wake_cache_window_ms, present}`), re-read at every
@@ -495,6 +530,12 @@ let exitHookInstalled = false;
  * never queue two.
  */
 let wakeTimer: ReturnType<typeof setTimeout> | undefined;
+/**
+ * Whether this process already swept stale log files. Once per process is the
+ * whole policy: a `/reload` re-evaluates the module, and the next process sweeps
+ * again, so nothing has to remember a sweep across restarts.
+ */
+let sweptLogs = false;
 /**
  * Session whose transcript this process folds, and the owner id its own records
  * carry. Set on `session_start`.
@@ -1149,6 +1190,123 @@ function readOutputTail(file: string, maxBytes: number, maxLines: number): Outpu
 	return { text: `${text}${footer}`, totalLines, truncated: true };
 }
 
+interface NeedleScan {
+	/** The needle was found in the bytes scanned by THIS call. */
+	matched: boolean;
+	/** The line the needle sat on, flattened and bounded (empty when no match). */
+	line: string;
+	/** Offset to resume the next scan from (never rewinds). */
+	offset: number;
+}
+
+/** Bytes read per `scanForNeedle` iteration (a log can be hundreds of KB). */
+const NEEDLE_SCAN_CHUNK = 64 * 1024;
+/** Bounded slice used on a side whose line boundary is outside the window. */
+const NEEDLE_LINE_FALLBACK = 200;
+/**
+ * How far right of a match a line is followed when no newline is in sight. Wide
+ * enough that the elision below always ends on a character, never on a byte
+ * count: 4 KiB is at least 1024 characters in any UTF-8 text.
+ */
+const NEEDLE_LINE_TAIL = 4 * 1024;
+/** Display width of a matched line before it is elided. */
+const NEEDLE_LINE_WIDTH = 200;
+
+/**
+ * Flatten one log line: trim it, squeeze internal whitespace (a progress or
+ * table line is mostly whitespace) and elide it past the display width.
+ * `\uFFFD` is what a slice through a multi-byte character decodes to, so it is
+ * trimmed away at both ends.
+ */
+function flattenMatchedLine(raw: string): string {
+	const flat = raw.replace(/^\uFFFD+|\uFFFD+$/g, "").replace(/\s+/g, " ").trim();
+	return flat.length > NEEDLE_LINE_WIDTH ? `${flat.slice(0, NEEDLE_LINE_WIDTH - 1)}…` : flat;
+}
+
+/**
+ * Extract the line around the match at `at` (ending at byte `end`) from
+ * `window`, whose first byte sits at file offset `base`.
+ *
+ * A boundary that is not visible in the window degrades instead of being
+ * guessed: a window that began mid-line (`base > 0`, no newline before the
+ * match) shows a bounded slice left of the match, so the needle itself stays
+ * visible; a line that runs past the window end is followed far enough for the
+ * elision below to apply.
+ */
+function lineAroundMatch(window: Buffer, base: number, at: number, end: number): string {
+	let start = at > 0 ? window.lastIndexOf(0x0a, at - 1) + 1 : 0;
+	if (start === 0 && base > 0 && at > NEEDLE_LINE_FALLBACK) {
+		start = Math.max(0, at - NEEDLE_LINE_FALLBACK);
+	}
+	let stop = window.indexOf(0x0a, end);
+	if (stop < 0) {
+		stop = Math.min(window.length, end + NEEDLE_LINE_TAIL);
+	}
+	return flattenMatchedLine(window.toString("utf8", start, stop));
+}
+
+/**
+ * Scan `file` from byte `offset` for the literal `needle`.
+ *
+ * Pure, synchronous and read-only: this runs on a timer for the whole time a
+ * `wait_task({ until })` call is attached, so it must never load the log whole,
+ * never throw (the panel may have deleted the file under us) and never rewind.
+ * Matching is BYTE-level (`Buffer#indexOf`) — decoding first would misplace
+ * every offset past a multi-byte character — and a needle straddling a chunk
+ * boundary is caught by carrying the last `needle.length - 1` bytes into the
+ * next window. One call reads until it matches or hits EOF; the returned
+ * `offset` keeps that same carry tail, so a needle split by a line written later
+ * still matches on the next tick.
+ */
+function scanForNeedle(file: string, needle: string, offset: number): NeedleScan {
+	if (needle === "") {
+		// Defensive: an empty needle would "match" at every position.
+		return { matched: false, line: "", offset };
+	}
+	const needleBytes = Buffer.byteLength(needle, "utf8");
+	// A needle can straddle a chunk boundary, so the tail that the next window
+	// re-checks is one byte shorter than the needle itself.
+	const keep = Math.max(0, needleBytes - 1);
+	let pos = offset;
+	let carry = Buffer.alloc(0);
+	let fd: number | undefined;
+	try {
+		fd = openSync(file, "r");
+		for (;;) {
+			const buffer = Buffer.allocUnsafe(NEEDLE_SCAN_CHUNK);
+			let read: number;
+			try {
+				read = readSync(fd, buffer, 0, NEEDLE_SCAN_CHUNK, pos);
+			} catch {
+				return { matched: false, line: "", offset: pos };
+			}
+			if (read > 0) {
+				const chunk = read === NEEDLE_SCAN_CHUNK ? buffer : buffer.subarray(0, read);
+				const window = carry.length > 0 ? Buffer.concat([carry, chunk]) : chunk;
+				const at = window.indexOf(needle, 0, "utf8");
+				if (at >= 0) {
+					const base = pos - carry.length;
+					return { matched: true, line: lineAroundMatch(window, base, at, at + needleBytes), offset: pos + read };
+				}
+				pos += read;
+				carry = keep > 0 ? Buffer.from(window.subarray(window.length - keep)) : Buffer.alloc(0);
+			}
+			if (read < NEEDLE_SCAN_CHUNK) {
+				// EOF: hand back a resume point that still covers the last `keep` bytes,
+				// so a needle split by whatever is appended next is still caught.
+				return { matched: false, line: "", offset: Math.max(offset, pos - keep) };
+			}
+		}
+	} catch {
+		// Missing or unreadable log (scratch space; a task may already be gone).
+		return { matched: false, line: "", offset };
+	} finally {
+		if (fd !== undefined) {
+			closeSync(fd);
+		}
+	}
+}
+
 function formatBytes(bytes: number): string {
 	return bytes >= 1024 * 1024 ? `${(bytes / (1024 * 1024)).toFixed(1)}MB` : `${(bytes / 1024).toFixed(1)}KB`;
 }
@@ -1203,25 +1361,94 @@ function lifetimeCapMs(): number {
 	return DEFAULT_MAX_LIFETIME_MS;
 }
 
-type WaitOutcome = "exited" | "deadline" | "aborted";
+/**
+ * How long a finished task's log may sit in `tmpdir()` before the startup sweep
+ * removes it. Read LAZILY for the same reason as `lifetimeCapMs`: the sweep runs
+ * after the environment of this process is what it is, and a test needs to point
+ * it at a tiny TTL to prove the decision is really made on `mtime`. Any positive
+ * finite number is accepted — even 1 ms.
+ */
+function logTtlMs(): number {
+	const raw = process.env[LOG_TTL_ENV];
+	if (raw !== undefined && raw.trim() !== "") {
+		const value = Number(raw);
+		if (Number.isFinite(value) && value > 0) {
+			return Math.floor(value);
+		}
+	}
+	return DEFAULT_LOG_TTL_MS;
+}
+
+/**
+ * Remove log files this extension wrote in an earlier process that are older
+ * than the TTL. Returns how many were removed.
+ *
+ * Best-effort by construction: every filesystem call is guarded, because a sweep
+ * that throws on `session_start` would break the extension for a mere cleanup.
+ * Only our OWN file name shape is touched (a log this extension would write), and
+ * a task this process still has a record for is never swept — `list_tasks` and
+ * the panel may still point at that path.
+ */
+function sweepLogFiles(): number {
+	const ttl = logTtlMs();
+	let names: string[];
+	try {
+		names = readdirSync(tmpdir());
+	} catch {
+		return 0; // an unreadable tmpdir is not an error worth surfacing
+	}
+	const now = Date.now();
+	let removed = 0;
+	for (const name of names) {
+		const match = LOG_FILE_PATTERN.exec(name);
+		if (!match) {
+			continue; // not ours: another tool's spill file, a directory, …
+		}
+		if (tasks.has(match[1])) {
+			// The process still has a record for it (running, adopted, or finished
+			// this session) — a `list_tasks`/panel row and a `wait_task` may still
+			// point at this path, so age alone is not enough.
+			continue;
+		}
+		const file = join(tmpdir(), name);
+		try {
+			const stats = statSync(file);
+			if (now - stats.mtimeMs < ttl) {
+				continue;
+			}
+			unlinkSync(file);
+			removed += 1;
+		} catch {
+			// Gone between the readdir and the stat, or not ours to remove.
+		}
+	}
+	return removed;
+}
+
+type WaitOutcome = "exited" | "deadline" | "aborted" | "matched";
 
 interface AttachOptions {
 	deadlineMs: number;
 	signal?: AbortSignal;
 	/** When set, the live tail is pushed through it (throttled). */
 	onUpdate?: (tail: string) => void;
+	/** Wait for this literal text to appear in the log instead of only for the exit. */
+	until?: string;
 }
 
 /**
  * Attach a tool call to a task and settle on the first of: process exit, the
- * call's own deadline, or abort.
+ * call's own deadline, abort, or — when `until` was given — the needle showing
+ * up in the log.
  *
  * The observer lease is what keeps completion delivery exactly-once: the
  * counter is incremented for the whole time this call is attached, and the
  * exit handler suppresses the wake report while it is > 0, because THIS call is
- * about to hand the terminal state back to the model. Releasing on a deadline
- * or abort re-arms the wake for a later exit. There is no polling: the promise
- * races the task's `exited` promise against a timer and the abort signal.
+ * about to hand the terminal state back to the model. Releasing on a deadline,
+ * abort or a text match re-arms the wake for a later exit. Without a needle
+ * there is no polling: the promise races the task's `exited` promise against a
+ * timer and the abort signal. A text match DOES poll, because the log is the
+ * only place the needle can appear.
  */
 function attachWait(task: BgTaskState, options: AttachOptions): Promise<WaitOutcome> {
 	task.observers += 1;
@@ -1238,6 +1465,10 @@ function attachWait(task: BgTaskState, options: AttachOptions): Promise<WaitOutc
 		let lastSent = "";
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		let ticker: ReturnType<typeof setInterval> | undefined;
+		// The text watch is its own timer: the live tail may be off (no `onUpdate`)
+		// while a needle is still being watched, and they run at different rates.
+		let scanTimer: ReturnType<typeof setInterval> | undefined;
+		let scanOffset = 0;
 		const onAbort = (): void => finish("aborted");
 
 		function finish(outcome: WaitOutcome): void {
@@ -1250,6 +1481,9 @@ function attachWait(task: BgTaskState, options: AttachOptions): Promise<WaitOutc
 			}
 			if (ticker) {
 				clearInterval(ticker);
+			}
+			if (scanTimer) {
+				clearInterval(scanTimer);
 			}
 			options.signal?.removeEventListener("abort", onAbort);
 			release();
@@ -1282,6 +1516,23 @@ function attachWait(task: BgTaskState, options: AttachOptions): Promise<WaitOutc
 		if (options.onUpdate) {
 			ticker = setInterval(pushLive, UPDATE_INTERVAL_MS);
 			pushLive();
+		}
+		const needle = options.until;
+		if (needle !== undefined && needle !== "") {
+			const scan = (): void => {
+				const result = scanForNeedle(task.outputFile, needle, scanOffset);
+				scanOffset = result.offset;
+				if (result.matched) {
+					finish("matched");
+				}
+			};
+			// Scan immediately: a line printed before this call is still a hit, and
+			// the first tick would otherwise wait a full `UNTIL_POLL_MS`.
+			scan();
+			if (!settled) {
+				scanTimer = setInterval(scan, UNTIL_POLL_MS);
+				scanTimer.unref?.();
+			}
 		}
 		void task.exited.then(() => finish("exited"));
 	});
@@ -1538,6 +1789,14 @@ export default function bgTasks(pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => {
 		reconcileSession(ctx);
+		// AFTER the fold, never before: an adopted task is in `tasks` now, so a
+		// running task's log survives even when it is older than the TTL. Once per
+		// process — a `/reload` re-evaluates this module, and the next process
+		// sweeps again.
+		if (!sweptLogs) {
+			sweptLogs = true;
+			sweepLogFiles();
+		}
 		return undefined;
 	});
 
@@ -2609,29 +2868,41 @@ export default function bgTasks(pi: ExtensionAPI) {
 					"How long to stay attached, in milliseconds (default 120000, max 1800000). Reaching it does NOT kill the task and is NOT a failure: call again, or end your turn and let the wake report deliver the result.",
 			}),
 		),
+		until: Type.Optional(
+			Type.String({
+				description:
+					'Wait until this literal text appears in the task\'s output, instead of only waiting for the process to exit (no regex, case-sensitive). The task keeps running: use it for a readiness line ("listening on"), a build stage, or a prompt. Returns as soon as the line appears, when the process exits, or when the timeout hits — whichever comes first.',
+			}),
+		),
 	});
 
 	type WaitTaskParams = Static<typeof waitTaskParameters>;
 
 	interface WaitTaskDetails {
 		taskId: string;
-		status: "exited" | "still_running" | "cancelled";
+		status: "exited" | "still_running" | "cancelled" | "matched";
 		command: string;
 		exitCode?: number | null;
 		signal?: string | null;
 		outputFile?: string;
 		wallTimeSeconds: number;
+		/** The `until` needle this call was watching, when it passed one. */
+		until?: string;
+		/** The line the needle sat on (matched results only). */
+		matchedLine?: string;
 	}
 
 	pi.registerTool({
 		name: "wait_task",
 		label: "Wait for background task",
 		description:
-			"Stay attached to a background bash task until it exits or the timeout hits, then return its output. Use this instead of `sleep` whenever you need a task's result before you can continue. Reaching the timeout is not a failure: the process keeps running and you can wait again (or end your turn and be woken when it exits).",
-		promptSnippet: "Block until a background task exits (or the timeout hits) and return its output",
+			"Stay attached to a background bash task until it exits or the timeout hits, then return its output. Use this instead of `sleep` whenever you need a task's result before you can continue. Reaching the timeout is not a failure: the process keeps running and you can wait again (or end your turn and be woken when it exits). Pass `until` to wait for a LINE instead (a server's ready line, a port binding, a build stage): the call returns as soon as the text appears, the process keeps running, and its exit is still reported exactly once.",
+		promptSnippet:
+			"Block until a background task exits, prints a line you pass as `until`, or the timeout hits, and return its output",
 		promptGuidelines: [
 			"Use wait_task (not `sleep`) when you need a background task's result before continuing: it returns as soon as the process exits, and a \"still running\" result is not a failure.",
 			"If a task's result is all that is left and you have nothing else to do, ending your turn is correct — wait_task's sibling wake report will deliver the result and start a new turn.",
+			"To wait for a task to reach a state (a server's ready line, a port binding line, a build stage), pass `until` with the literal text to look for instead of `sleep`-polling its output file; a match does NOT stop the task, and its exit is still reported once.",
 		],
 		parameters: waitTaskParameters,
 		// Shared mutable task table + a long-lived wait: serialize with itself.
@@ -2648,11 +2919,23 @@ export default function bgTasks(pi: ExtensionAPI) {
 			}
 			assertOwned(task, "wait_task");
 
+			// A literal needle, never a pattern: the watch is a substring search, so
+			// there is no regex to compile and no ReDoS to risk. An empty or blank one
+			// would "match" everywhere, and an unbounded one would only buy scan cost.
+			const until = typeof params.until === "string" ? params.until : undefined;
+			if (until !== undefined && until.trim() === "") {
+				throw new Error("wait_task: `until` must be a non-empty literal string (there is no regex syntax).");
+			}
+			if (until !== undefined && until.length > MAX_UNTIL_LENGTH) {
+				throw new Error(`wait_task: \`until\` is limited to ${MAX_UNTIL_LENGTH} characters.`);
+			}
+
 			const window = clampWaitWindow(params.timeout_ms);
 			const started = Date.now();
 			const outcome = await attachWait(task, {
 				deadlineMs: window,
 				signal,
+				until,
 				onUpdate: onUpdate
 					? (tail) => {
 							onUpdate({
@@ -2668,6 +2951,7 @@ export default function bgTasks(pi: ExtensionAPI) {
 									command: task.command,
 									outputFile: task.outputFile,
 									wallTimeSeconds: (Date.now() - started) / 1000,
+									until,
 								} satisfies WaitTaskDetails,
 							});
 						}
@@ -2677,11 +2961,48 @@ export default function bgTasks(pi: ExtensionAPI) {
 			const wallTimeSeconds = (Date.now() - started) / 1000;
 			const tail = readOutputTail(task.outputFile, MAX_OUTPUT_BYTES, MAX_OUTPUT_LINES);
 			const elapsed = formatSeconds((task.endedAt ?? Date.now()) - task.startedAt);
+			const waited = formatSeconds(Date.now() - started);
+
+			if (outcome === "matched" && until !== undefined) {
+				// A text match is NOT the task's result: the process is still running, so
+				// its exit report must still arrive exactly once. `markConfirmed` would
+				// retire that report forever — never call it on this path. The observer
+				// lease was already released by `attachWait`'s `finish`.
+				const matchedLine = scanForNeedle(task.outputFile, until, 0).line;
+				const matchTail = readOutputTail(task.outputFile, CHECK_IN_TAIL_BYTES, CHECK_IN_TAIL_LINES).text;
+				let text = `[matched] Task ${task.taskId} printed "${until}" after ${waited} (running for ${elapsed}).\nThe process is still running — this is not its result; its exit report still arrives exactly once.`;
+				if (matchedLine) {
+					text += `\n\nMatched line: ${matchedLine}`;
+				}
+				if (matchTail) {
+					text += `\n\nRecent output:\n\n${matchTail}`;
+				}
+				return {
+					content: [{ type: "text" as const, text }],
+					details: {
+						taskId: task.taskId,
+						status: "matched",
+						command: task.command,
+						outputFile: task.outputFile,
+						wallTimeSeconds,
+						until,
+						matchedLine,
+					} satisfies WaitTaskDetails,
+				};
+			}
 
 			if (outcome === "exited") {
 				// This result carries the terminal state: the report is delivered.
 				markConfirmed(task);
-				const head = `Task ${task.taskId} ${describeExit(task)} after ${elapsed}.`;
+				let head = `Task ${task.taskId} ${describeExit(task)} after ${elapsed}.`;
+				if (until !== undefined) {
+					// The log is final, so this is the authoritative answer to "was it
+					// ever printed?" even though the exit won the race.
+					head =
+						scanForNeedle(task.outputFile, until, 0).matched === true
+							? `${head} Pattern "${until}" was printed.`
+							: `${head} The output never contained "${until}".`;
+				}
 				return {
 					content: [{ type: "text" as const, text: tail.text ? `${head}\n\n${tail.text}` : head }],
 					details: {
@@ -2692,6 +3013,7 @@ export default function bgTasks(pi: ExtensionAPI) {
 						signal: task.signal,
 						outputFile: tail.truncated ? task.outputFile : undefined,
 						wallTimeSeconds,
+						until,
 					} satisfies WaitTaskDetails,
 					isError: task.spawnError !== undefined || (task.exitCode !== null && task.exitCode !== 0),
 				};
@@ -2713,17 +3035,21 @@ export default function bgTasks(pi: ExtensionAPI) {
 						signal: task.signal,
 						outputFile: task.outputFile,
 						wallTimeSeconds,
+						until,
 					} satisfies WaitTaskDetails,
 					isError: true,
 				};
 			}
 
 			const soFar = tail.text.trim() ? `\n\nOutput so far:\n${tail.text}` : "";
+			// A deadline never matched, so state the negative explicitly: otherwise a
+			// model reads "still running" and cannot tell whether the line ever appeared.
+			const neverPrinted = until === undefined ? "" : ` The output never contained "${until}".`;
 			return {
 				content: [
 					{
 						type: "text" as const,
-						text: `[still running] Task ${task.taskId} has not exited after ${formatSeconds(window)} attached (running for ${elapsed}). This is not a failure — the process is still alive and was not killed.${soFar}\nCall wait_task again with a larger timeout_ms, or end your turn and you will be woken with the result. Do not \`sleep\`.`,
+						text: `[still running] Task ${task.taskId} has not exited after ${formatSeconds(window)} attached (running for ${elapsed}). This is not a failure — the process is still alive and was not killed.${neverPrinted}${soFar}\nCall wait_task again with a larger timeout_ms, or end your turn and you will be woken with the result. Do not \`sleep\`.`,
 					},
 				],
 				details: {
@@ -2734,6 +3060,7 @@ export default function bgTasks(pi: ExtensionAPI) {
 					signal: task.signal,
 					outputFile: task.outputFile,
 					wallTimeSeconds,
+					until,
 				} satisfies WaitTaskDetails,
 			};
 		},
