@@ -1288,6 +1288,56 @@ local function stop_task_status(result)
     return nil
 end
 
+--- Body rows for a `list_tasks` result: one line per task, named the way
+--- `wait_task` names one — the command first, then the id — followed by the
+--- state and the elapsed time.
+---
+--- The extension's model-facing text leads with the id on purpose (recovering an
+--- id is the model's job), which is why a block used to read as a column of
+--- `b3f2a1`-style ids with the commands trailing behind. The extension therefore
+--- sends the same rows pre-split in `details.tasks`; a result that has no such
+--- payload — an older session replayed from its transcript, or a blocked call —
+--- keeps the text.
+---@param result table?
+---@return string[]?
+local function list_tasks_rows(result)
+    if type(result) ~= "table" then
+        return nil
+    end
+    -- Replay keeps toolResult details on the message itself; live results
+    -- nest them under `details`.
+    local details = type(result.details) == "table" and result.details or result
+    local tasks = details.tasks
+    if type(tasks) ~= "table" or #tasks == 0 then
+        return nil
+    end
+    ---@type string[]
+    local rows = {}
+    for _, task in ipairs(tasks) do
+        if type(task) == "table" and type(task.id) == "string" and task.id ~= "" then
+            ---@type string[]
+            local parts = {}
+            if type(task.command) == "string" then
+                local command = M.flatten_line(task.command)
+                if vim.fn.strdisplaywidth(command) > WAIT_TASK_COMMAND_WIDTH then
+                    command = vim.fn.strcharpart(command, 0, WAIT_TASK_COMMAND_WIDTH - 1) .. "…"
+                end
+                if command ~= "" then
+                    parts[#parts + 1] = command
+                end
+            end
+            parts[#parts + 1] = task.id
+            for _, field in ipairs({ task.state, task.elapsed }) do
+                if type(field) == "string" and field ~= "" then
+                    parts[#parts + 1] = M.flatten_line(field)
+                end
+            end
+            rows[#rows + 1] = table.concat(parts, " · ")
+        end
+    end
+    return #rows > 0 and rows or nil
+end
+
 ---@type table<string, pi.ToolRenderer>
 local renderers = {
     -- Synthetic block rendered by pi.nvim (not a real tool call): the
@@ -1411,6 +1461,9 @@ local renderers = {
     },
     -- list_tasks has no meaningful input: the list in the result is the whole
     -- point, so the output keeps its room instead of collapsing to one line.
+    -- Its body is rendered from the pre-split rows (command · id · state ·
+    -- elapsed, like wait_task names a task) rather than from the extension's
+    -- id-first model text; a result without that payload falls back to the text.
     list_tasks = {
         input_visible = 1,
         output_visible = 12,
@@ -1419,12 +1472,15 @@ local renderers = {
                 render_body_line(history, "including finished tasks")
             end
         end,
-        on_end = function(history, _, result, _, insert_at)
-            local text = extract_result_text(result)
-            if text and text ~= "" then
-                insert_at = render_output(history, text, insert_at)
+        on_end = function(history, _, result, is_error, insert_at)
+            local rows = not is_error and list_tasks_rows(result)
+            if rows then
+                for _, row in ipairs(rows) do
+                    insert_at = render_body_line(history, row, nil, insert_at)
+                end
+                return insert_at
             end
-            return insert_at
+            return render_result_output(history, nil, result, is_error, insert_at)
         end,
     },
     -- codemode: the input is raw JavaScript, so the block body is the script

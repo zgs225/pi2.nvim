@@ -3026,13 +3026,11 @@ export default function bgTasks(pi: ExtensionAPI) {
 		),
 	});
 
-	/** One `list_tasks` row: id, state, elapsed, command, log file. */
-	function describeTaskLine(task: BgTaskState): string {
-		const elapsed = formatSeconds((task.endedAt ?? Date.now()) - task.startedAt);
-		let command = task.command.replace(/\s+/g, " ").trim();
-		if (command.length > LISTED_COMMAND_WIDTH - 3) {
-			command = `${command.substring(0, LISTED_COMMAND_WIDTH - 3)}...`;
-		}
+	/**
+	 * Display state of a task — the descriptor `describeTaskLine` puts in the
+	 * brackets, flags included.
+	 */
+	function describeTaskState(task: BgTaskState): string {
 		const state = task.completed
 			? describeExit(task)
 			: task.foreign
@@ -3045,7 +3043,52 @@ export default function bgTasks(pi: ExtensionAPI) {
 		// A held report is still pending delivery: say why, so the model can decide
 		// to `wait_task` instead of assuming the completion was swallowed.
 		const held = task.held !== undefined ? `, report held (${task.held})` : "";
-		return `- ${task.taskId} [${state}${stdin}${held}] ${elapsed} "${command}" (output: ${task.outputFile})`;
+		return `${state}${stdin}${held}`;
+	}
+
+	/** One `list_tasks` row: id, state, elapsed, command, log file. */
+	function describeTaskLine(task: BgTaskState): string {
+		const elapsed = formatSeconds((task.endedAt ?? Date.now()) - task.startedAt);
+		let command = task.command.replace(/\s+/g, " ").trim();
+		if (command.length > LISTED_COMMAND_WIDTH - 3) {
+			command = `${command.substring(0, LISTED_COMMAND_WIDTH - 3)}...`;
+		}
+		return `- ${task.taskId} [${describeTaskState(task)}] ${elapsed} "${command}" (output: ${task.outputFile})`;
+	}
+
+	/**
+	 * The same row in the shape the chat renders it.
+	 *
+	 * The model-facing line above leads with the task id, because recovering an
+	 * id is the model's job. A reader wants the command first — the way a
+	 * `wait_task` block names the task it waits on (`command · id`) — so the
+	 * frontend is handed the pieces (command, id, a short state, the elapsed
+	 * time) rather than having to take that line apart again. Same ordering as
+	 * `describeExit`, so the two views cannot disagree about an exit.
+	 */
+	function taskRow(task: BgTaskState): { id: string; command: string; state: string; elapsed: string } {
+		let state: string;
+		if (!task.completed) {
+			state = task.foreign ? "running elsewhere" : task.adopted ? "running (adopted)" : "running";
+		} else if (task.spawnError) {
+			state = "failed to start";
+		} else if (task.exitUnknown) {
+			state = "exit unknown";
+		} else if (task.signal !== null) {
+			state = `stopped (${task.signal})`;
+		} else {
+			state = task.exitCode === 0 ? "done" : `failed (exit ${task.exitCode})`;
+		}
+		const flags = [
+			!task.completed && task.stdinOpen ? "stdin open" : "",
+			task.held !== undefined ? `held (${task.held})` : "",
+		].filter((f) => f !== "");
+		return {
+			id: task.taskId,
+			command: task.command.replace(/\s+/g, " ").trim(),
+			state: flags.length > 0 ? `${state}, ${flags.join(", ")}` : state,
+			elapsed: formatSeconds((task.endedAt ?? Date.now()) - task.startedAt),
+		};
 	}
 
 	pi.registerTool({
@@ -3109,7 +3152,7 @@ export default function bgTasks(pi: ExtensionAPI) {
 						text: `${header}\n${shown.map(describeTaskLine).join("\n")}${hidden}${footer}`,
 					},
 				],
-				details: { total: all.length, running: runningCount, listed: shown.length },
+				details: { total: all.length, running: runningCount, listed: shown.length, tasks: shown.map(taskRow) },
 			};
 		},
 	});

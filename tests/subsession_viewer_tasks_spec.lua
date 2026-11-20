@@ -304,4 +304,58 @@ describe("sub-session viewer background tasks", function()
         assert.equals(0, #Tasks.list("p-1"))
         assert.equals(2, #Tasks.list(child_id))
     end)
+
+    it("renders a child's list_tasks rows command-first, like the parent's chat", function()
+        -- `get_messages` serves a replayed toolResult with its `details` at the
+        -- top level (not nested), which is the shape the viewer meets.
+        local messages = {
+            { role = "user", content = { { type = "text", text = "what is running?" } }, timestamp = 1 },
+            {
+                role = "assistant",
+                content = {
+                    {
+                        type = "toolCall",
+                        toolCallId = "call_list_1",
+                        toolName = "list_tasks",
+                        arguments = { include_finished = true },
+                    },
+                },
+                timestamp = 2,
+            },
+            {
+                role = "toolResult",
+                toolCallId = "call_list_1",
+                toolName = "list_tasks",
+                content = {
+                    {
+                        type = "text",
+                        text = '1 of 1 background task, 1 running:\n- b3f2a1 [running, stdin open] 1m04s "npm run dev" (output: /tmp/pi-bash-b3f2a1.log)',
+                    },
+                },
+                details = {
+                    total = 1,
+                    running = 1,
+                    listed = 1,
+                    tasks = {
+                        { id = "b3f2a1", command = "npm run dev", state = "running, stdin open", elapsed = "1m04s" },
+                    },
+                },
+                timestamp = 3,
+            },
+        }
+
+        local h = History.new(-998)
+        Viewer._replay(h, messages, "child-live-2")
+        pump(100)
+
+        local text = text_of(h:buf())
+        assert_labelled(text, "npm run dev", "b3f2a1")
+        assert.is_truthy(text:find("npm run dev · b3f2a1 · running, stdin open · 1m04s", 1, true), text)
+        -- The extension's id-first line is the model's copy, not the viewer's.
+        assert.is_falsy(text:find("- b3f2a1 [running", 1, true), text)
+
+        local buf = h:buf()
+        h:clear()
+        pcall(vim.api.nvim_buf_delete, buf, { force = true })
+    end)
 end)
