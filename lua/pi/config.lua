@@ -254,11 +254,20 @@
 ---@field border? string|string[] Float border style (default "rounded")
 ---@field list pi.DiffReviewListConfig Side file-list window
 
+---@class pi.WorktreeRetentionConfig
+---@field enabled? boolean Run the deferred retention sweep after a checkout is created (default true)
+---@field max_count? integer Keep this many most recent pi-managed checkouts per repository (default 25)
+---@field max_age_days? number Remove pi-managed checkouts whose checkout directory (its top-level mtime, so an edit deep inside may not count) has not changed for this many days (default 14)
+---@field snapshot_days? number Keep snapshots of removed checkouts this many days (default 30)
+---@field sweep_locks? boolean Release stale pi locks before pruning (default true)
+
 ---@class pi.WorktreeConfig
 ---@field setup_cmd? string[] Command run inside a freshly created worktree before the creation callback fires. Executed directly (no shell) with the worktree root as cwd; a non-zero exit keeps the worktree in place and fails the creation.
 ---@field base_ref? "head"|"fresh" Base commit new worktrees start from: `"head"` (default) detaches at the checkout the creating session runs in, `"fresh"` at the repository's remote default branch (`origin/HEAD`, re-fetched at most once per 24h with a 5s cap, falling back to the cached ref then local `HEAD`). A `create.base` on a sub-agent dispatch item overrides it per item.
 ---@field snapshot_before_remove? boolean Write a patch snapshot before removing a worktree (`Worktree.remove`, `pi.worktree_remove`) (default true)
 ---@field warn_on_cwd_mismatch? boolean Prefix the chat-title worktree badge with `⚠` when the session's cwd differs from Neovim's cwd (default true). false keeps the plain `󰙅 <name>` badge instead
+---@field lock? boolean Take a `git worktree lock` on every checkout we create and release it when the checkout is removed (default true). Prevents an external `git worktree prune` / `remove` from deleting a checkout an agent is still working in.
+---@field retention? pi.WorktreeRetentionConfig
 
 ---@class pi.DialogKeys
 ---@field confirm? pi.KeySpecs
@@ -523,6 +532,14 @@ local defaults = {
         base_ref = "head",
         snapshot_before_remove = true,
         warn_on_cwd_mismatch = true,
+        lock = true,
+        retention = {
+            enabled = true,
+            max_count = 25,
+            max_age_days = 14,
+            snapshot_days = 30,
+            sweep_locks = true,
+        },
     },
     subagent = {
         enabled = true,

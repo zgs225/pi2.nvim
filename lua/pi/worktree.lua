@@ -38,9 +38,13 @@ local uv = vim.uv
 ---@field mode? string Creation mode recorded in the metadata (`"isolated"` by default)
 ---@field session_id? string pi session bound to this worktree
 ---@field session_file? string pi session transcript file bound to this worktree
+---@field managed? boolean Metadata (`pi2-worktree.json`) present in its git dir
+---@field locked? boolean A `git worktree lock` is in effect (read from `<git_dir>/locked`)
+---@field lock_reason? string Raw lock reason text (nil when unlocked)
 
 ---@class pi.WorktreeCreateOpts
 ---@field cwd string Directory that selects the repository (usually the session cwd)
+---@field session_id? string pi session id recorded in the checkout's lock reason (`-` while unknown)
 ---@field name? string Worktree name (directory under `<repo>/.worktrees/`); generated when omitted
 ---@field mode? string Free-form mode recorded in the metadata (default `"isolated"`)
 ---@field base? string Commit the checkout is detached at (default: the repository's current `HEAD`); any revision `git rev-parse` accepts
@@ -55,6 +59,18 @@ local uv = vim.uv
 ---@field dirty boolean Uncommitted changes (tracked, staged, or untracked)
 ---@field ahead integer Commits on the worktree's HEAD that are not in `base_sha`
 ---@field head string Current HEAD commit sha
+
+--- State of the `git worktree lock` of one checkout.
+---@class pi.WorktreeLockState
+---@field locked boolean
+---@field ours boolean Reason starts with `"pi2 "`
+---@field reason? string Raw reason text (nil when unlocked, or when locked without a reason)
+
+--- Outcome of `M.sweep_locks`.
+---@class pi.WorktreeSweepReport
+---@field released string[] Paths whose stale pi2 lock was released
+---@field kept string[] Paths considered but left alone (pids alive, foreign reason, other host)
+---@field foreign integer Foreign-locked checkouts seen (never touched)
 
 ---@class pi.WorktreeBindFields
 ---@field session_id? string
@@ -78,6 +94,11 @@ local uv = vim.uv
 ---@field path string Absolute path of the `.patch` file
 ---@field meta? pi.WorktreeSnapshotMeta Sidecar metadata (nil when missing or unreadable)
 
+---@class pi.WorktreeSnapshotGcOpts
+---@field keep_days? number Snapshots of a gone checkout younger than this are kept (default 30)
+---@field live_names? table<string, true> Names whose checkout still exists: keep every patch
+---@field now? integer Clock override in Unix seconds (tests)
+
 --- A linked worktree as reported by `git worktree list --porcelain`, enriched
 --- with the `detect()` metadata. Used by cross-worktree resume.
 ---@class pi.WorktreeListEntry: pi.WorktreeInfo
@@ -87,6 +108,9 @@ local uv = vim.uv
 ---@field prunable boolean git reports a prunable gitdir (directory gone)
 ---@field missing? boolean True when the registered directory is gone (prunable/missing); `path` no longer exists, the session binding may
 ---@field snapshot? string Snapshot patch backing a `missing` entry (only set by `snapshot_worktrees`)
+---@field managed boolean Metadata (`pi2-worktree.json`) present in its git dir
+---@field locked boolean A `git worktree lock` is in effect
+---@field locked_reason? string Lock reason text reported by `git worktree list`
 
 local META_FILE = "pi2-worktree.json"
 --- Bumped when the metadata layout changes; readers reject newer versions.
@@ -103,6 +127,8 @@ local INCLUDE_FILE = ".worktreeinclude"
 local SNAPSHOT_DIR = "pi2-worktree-snapshots"
 --- Suffix of the snapshot metadata sidecar (`<patch>.json`).
 local SIDECAR_SUFFIX = ".json"
+--- Default snapshot retention window for `M.snapshot_gc`, in days.
+local SNAPSHOT_KEEP_DAYS = 30
 --- Hard stop for pathological `.worktreeinclude` matches (e.g. a whole
 --- `node_modules/` tree). Refusing loudly beats hanging the editor.
 local MAX_INCLUDE_FILES = 20000
@@ -346,8 +372,11 @@ end
 --- but missing* (the directory was deleted by hand, or a crash left
 --- `.git/worktrees/<name>` behind).
 ---
---- Only that situation may be retried with `--force`; "already exists" (a real
---- directory is in the way) must never be forced.
+--- A missing registration reports "already registered", a missing *and locked*
+--- one reports "missing but locked worktree" (`use 'add -f -f' to override, or
+--- 'unlock' and 'prune' …`). Both may be recovered, but only after the lock — if
+--- any — is dealt with; "already exists" (a real directory is in the way) must
+--- never be forced.
 ---@param text string?
 ---@return boolean
 local function is_stale_registration(text)
@@ -355,7 +384,10 @@ local function is_stale_registration(text)
         return false
     end
     local lower = text:lower()
-    return lower:find("already registered", 1, true) ~= nil and lower:find("already exists", 1, true) == nil
+    if lower:find("already exists", 1, true) then
+        return false
+    end
+    return lower:find("already registered", 1, true) ~= nil or lower:find("missing but locked", 1, true) ~= nil
 end
 
 -- Process runner -------------------------------------------------------------
@@ -482,7 +514,17 @@ end
 
 -- Detection ------------------------------------------------------------------
 
----@type table<string, { marker: string?, marker_stamp: string, meta_path: string?, meta_stamp: string, info: pi.WorktreeInfo }>
+--- One cached `M.detect` result, revalidated by cheap `stat` stamps.
+---@class pi.WorktreeDetectCacheEntry
+---@field marker string? Absolute `.git` marker the info was built from
+---@field marker_stamp string Stamp of that marker when the info was built
+---@field meta_path string? Metadata file of the per-worktree git dir
+---@field meta_stamp string Stamp of that metadata file
+---@field lock_path string `<git_dir>/locked` (the lock state `locked`/`lock_reason` came from)
+---@field lock_stamp string Stamp of that lock file
+---@field info pi.WorktreeInfo
+
+---@type table<string, pi.WorktreeDetectCacheEntry>
 local detect_cache = {}
 
 --- Cheap identity stamp for a file: changes whenever git/we rewrites it.
@@ -633,7 +675,13 @@ local function build_info(cwd)
         mode = type(meta.mode) == "string" and meta.mode or nil,
         session_id = type(meta.session_id) == "string" and meta.session_id or nil,
         session_file = type(meta.session_file) == "string" and meta.session_file or nil,
+        managed = next(meta) ~= nil,
     }
+    -- One `stat` + read of `<git_dir>/locked`, no subprocess: that file *is* the
+    -- lock state (`git worktree list` is not asked).
+    local lock = M.lock_state(info)
+    info.locked = lock.locked
+    info.lock_reason = lock.reason
     return info, marker
 end
 
@@ -672,9 +720,10 @@ end
 
 --- Resolve the worktree a directory belongs to.
 ---
---- Pure filesystem work (reads `.git`, the metadata file, and `commondir`), no
---- git subprocess, so it is safe to call on rendering paths. Results are cached
---- per directory and revalidated with cheap `stat` stamps.
+--- Pure filesystem work (reads `.git`, the metadata file, `commondir` and the
+--- per-worktree `locked` file), no git subprocess, so it is safe to call on
+--- rendering paths. Results are cached per directory and revalidated with cheap
+--- `stat` stamps (marker, metadata, lock file).
 ---@param cwd string? Directory to inspect (default: the process cwd)
 ---@return pi.WorktreeInfo?
 function M.detect(cwd)
@@ -685,7 +734,10 @@ function M.detect(cwd)
 
     local cached = detect_cache[dir]
     if cached then
-        if file_stamp(cached.marker) == cached.marker_stamp and file_stamp(cached.meta_path) == cached.meta_stamp then
+        local marker_same = file_stamp(cached.marker) == cached.marker_stamp
+        local meta_same = file_stamp(cached.meta_path) == cached.meta_stamp
+        local lock_same = file_stamp(cached.lock_path) == cached.lock_stamp
+        if marker_same and meta_same and lock_same then
             return cached.info
         end
         detect_cache[dir] = nil
@@ -696,14 +748,360 @@ function M.detect(cwd)
         return nil
     end
     local entry_meta = meta_path(info.git_dir)
+    local entry_lock = info.git_dir .. "/locked"
     detect_cache[dir] = {
         marker = marker,
         marker_stamp = file_stamp(marker),
         meta_path = entry_meta,
         meta_stamp = file_stamp(entry_meta),
+        lock_path = entry_lock,
+        lock_stamp = file_stamp(entry_lock),
         info = info,
     }
     return info
+end
+
+-- Locking --------------------------------------------------------------------
+
+-- `git worktree lock` is the only thing that stops `git worktree prune` /
+-- `git worktree remove` from deleting a checkout out from under a running agent,
+-- so every checkout we create gets one and loses it when the checkout goes away.
+-- Git stores the reason as plain text in `<git_dir>/locked`; reading that file is
+-- the whole lock-state query (no subprocess), which keeps the hot paths cheap.
+
+--- Read `<git_dir>/locked`, git's physical storage for a worktree lock.
+---@param git_dir string?
+---@return string? reason Trimmed reason text; nil when unlocked, `""` when locked without a reason
+local function read_lock_reason(git_dir)
+    if type(git_dir) ~= "string" or git_dir == "" then
+        return nil
+    end
+    local text = read_text(git_dir .. "/locked")
+    if type(text) ~= "string" then
+        return nil
+    end
+    return vim.trim((text:gsub("\r", "")))
+end
+
+---@param reason string?
+---@return boolean True when the reason was written by this plugin (`^pi2%s`)
+local function is_our_lock(reason)
+    return type(reason) == "string" and reason:find("^pi2%s") ~= nil
+end
+
+--- Parse a lock reason into its `key=value` fields.
+---
+--- Tolerant on purpose: unknown fields are ignored and a malformed reason simply
+--- yields no fields, so a caller must treat "ours but unparseable" as "no pids
+--- recorded" (i.e. leave the lock alone).
+---@param reason string?
+---@return table<string, string>
+local function parse_lock_fields(reason)
+    local fields = {}
+    if type(reason) ~= "string" then
+        return fields
+    end
+    for key, value in reason:gmatch("([%w_]+)=(%S+)") do
+        fields[key] = value
+    end
+    return fields
+end
+
+---@return string hostname Hostname, or `"-"` when it cannot be read.
+local function local_hostname()
+    local ok, name = pcall(uv.os_gethostname)
+    if ok and type(name) == "string" and name ~= "" then
+        return name
+    end
+    return "-"
+end
+
+--- The reason recorded in `<git_dir>/locked` (stable format — the sweep and the
+--- tests parse it):
+--- `pi2 name=<name> session=<id|-> pid=<agentpid|0> nvim=<nvimpid> host=<host>`.
+---@param name string Checkout name (`validate_name` forbids spaces)
+---@param opts { session_id?: string, pid?: integer }?
+---@return string
+local function lock_reason(name, opts)
+    local session = "-"
+    local pid = 0
+    if type(opts) == "table" then
+        if type(opts.session_id) == "string" and opts.session_id ~= "" then
+            session = opts.session_id
+        end
+        if type(opts.pid) == "number" and opts.pid > 0 then
+            pid = math.floor(opts.pid)
+        end
+    end
+    return string.format(
+        "pi2 name=%s session=%s pid=%d nvim=%d host=%s",
+        name,
+        session,
+        pid,
+        uv.os_getpid(),
+        local_hostname()
+    )
+end
+
+--- Lock bookkeeping only reads the per-worktree git dir, so a `missing` checkout
+--- (directory already gone, registration still there) is a valid argument too.
+---@param info pi.WorktreeInfo
+---@return boolean ok
+---@return string? err
+local function check_lock_info(info)
+    if type(info) ~= "table" then
+        return false, "worktree: info table required"
+    end
+    if type(info.path) ~= "string" or info.path == "" then
+        return false, "worktree: path missing"
+    end
+    if type(info.repo_root) ~= "string" or info.repo_root == "" then
+        return false, "worktree: repo_root missing"
+    end
+    if type(info.git_dir) ~= "string" or info.git_dir == "" then
+        return false, "worktree: git_dir missing"
+    end
+    return true, nil
+end
+
+--- Lock state of a checkout. Synchronous and filesystem only — never errors.
+---@param info pi.WorktreeInfo
+---@return pi.WorktreeLockState
+function M.lock_state(info)
+    if type(info) ~= "table" then
+        return { locked = false, ours = false }
+    end
+    local reason = read_lock_reason(info.git_dir)
+    if reason == nil then
+        return { locked = false, ours = false }
+    end
+    ---@type pi.WorktreeLockState
+    return {
+        locked = true,
+        ours = is_our_lock(reason),
+        reason = reason ~= "" and reason or nil,
+    }
+end
+
+--- Release our lock. Unlocked → `cb(true)`. A foreign lock is never touched:
+--- `cb(nil, "unlock: …")` and nothing runs. `git worktree unlock` failing with
+--- "is not locked" (git exits 128 for that) counts as success.
+---@param info pi.WorktreeInfo
+---@param cb fun(ok: boolean?, err: string?)
+function M.unlock(info, cb)
+    if type(cb) ~= "function" then
+        return
+    end
+    local info_ok, info_err = check_lock_info(info)
+    if not info_ok then
+        return cb(nil, "unlock: " .. tostring(info_err))
+    end
+    local state = M.lock_state(info)
+    if not state.locked then
+        return cb(true)
+    end
+    if not state.ours then
+        return cb(nil, string.format("unlock: %s is locked (%s)", info.path, tostring(state.reason)))
+    end
+    run({ "git", "-C", info.repo_root, "worktree", "unlock", info.path }, {}, function(code, stdout, stderr)
+        invalidate()
+        if code == 0 then
+            return cb(true)
+        end
+        local detail = stderr ~= "" and stderr or stdout
+        -- The checkout is unlocked either way, which is all the caller asked for.
+        if (detail or ""):find("is not locked", 1, true) then
+            return cb(true)
+        end
+        cb(false, "unlock: " .. git_err("git worktree unlock", code, detail))
+    end)
+end
+
+--- Take (or refresh) our lock.
+---
+--- Refreshing means "ours → unlock, then lock with the new reason", which is how
+--- the reason learns the agent pid once a session is bound. A foreign lock is
+--- never touched: `cb(nil, "lock: <path> is locked (<reason>)")`.
+---
+--- `worktree.lock = false` is honoured here (not only in `create`), so every
+--- caller inherits the knob; a disabled lock reports success without spawning git.
+---@param info pi.WorktreeInfo
+---@param opts? { session_id?: string, pid?: integer } Recorded in the lock reason
+---@param cb fun(ok: boolean?, err: string?)
+function M.lock(info, opts, cb)
+    if type(opts) == "function" then
+        cb, opts = opts, nil
+    end
+    if type(cb) ~= "function" then
+        return
+    end
+    local info_ok, info_err = check_lock_info(info)
+    if not info_ok then
+        return cb(nil, "lock: " .. tostring(info_err))
+    end
+    -- Single gate for the knob: `create` asks earlier too, but only to skip the
+    -- whole step cheaply (and to avoid a pointless re-read of the lock file).
+    if (Config.options.worktree or {}).lock == false then
+        return cb(true)
+    end
+    local state = M.lock_state(info)
+    if state.locked and not state.ours then
+        return cb(nil, string.format("lock: %s is locked (%s)", info.path, tostring(state.reason)))
+    end
+
+    local reason = lock_reason(info.name or basename(info.path), opts)
+
+    local function take()
+        local argv = { "git", "-C", info.repo_root, "worktree", "lock", "--reason", reason, info.path }
+        run(argv, {}, function(code, stdout, stderr)
+            invalidate()
+            if code ~= 0 then
+                return cb(nil, "lock: " .. git_err("git worktree lock", code, stderr ~= "" and stderr or stdout))
+            end
+            cb(true)
+        end)
+    end
+
+    if not state.locked then
+        return take()
+    end
+    M.unlock(info, function(unlocked, unlock_err)
+        if not unlocked then
+            return cb(nil, unlock_err)
+        end
+        take()
+    end)
+end
+
+---@param pid integer
+---@return boolean True when the process exists (EPERM counts: it exists, it is just not ours)
+local function pid_alive(pid)
+    if type(pid) ~= "number" or pid <= 0 then
+        return false
+    end
+    local ok, rc, err, errname = pcall(uv.kill, pid, 0)
+    if not ok then
+        return false
+    end
+    if rc == 0 then
+        return true
+    end
+    local detail = tostring(err) .. " " .. tostring(errname)
+    return detail:find("EPERM", 1, true) ~= nil or detail:find("permission denied", 1, true) ~= nil
+end
+
+--- Every owner pid recorded in a reason: agent `pid` and creating `nvim`
+--- (`0`/absent means "unknown" and is skipped).
+---@param reason string?
+---@return integer[]
+local function lock_pids(reason)
+    local fields = parse_lock_fields(reason)
+    local pids = {}
+    for _, key in ipairs({ "pid", "nvim" }) do
+        local value = tonumber(fields[key])
+        if value and value > 0 then
+            pids[#pids + 1] = math.floor(value)
+        end
+    end
+    return pids
+end
+
+--- Can this `pi2 ` lock be released by *this* process?
+---
+--- The lock is a cross-process guard, so removal and the sweep must obey the same
+--- rule: our own process may always release its own lock and a dead owner makes
+--- the lock stale, while a lock taken on another host, a lock with no recorded pid
+--- (nothing proves the owner is gone) and a lock whose owner is still alive block.
+---@param reason string Ours (`pi2 `-prefixed)
+---@return boolean ok
+---@return string? err Why it must be kept
+local function lock_releasable(reason)
+    local fields = parse_lock_fields(reason)
+    local host = fields.host
+    if type(host) == "string" and host ~= "" and host ~= local_hostname() then
+        return false, "it was taken on another host (" .. host .. ")"
+    end
+    local pids = lock_pids(reason)
+    if #pids == 0 then
+        return false, "it records no owner pid"
+    end
+    local self = uv.os_getpid()
+    for _, pid in ipairs(pids) do
+        if pid ~= self and pid_alive(pid) then
+            return false, "its owner (pid " .. pid .. ") is still running"
+        end
+    end
+    return true, nil
+end
+
+--- Release locks WE set whose owning processes are all gone.
+---
+--- Never touches a reason that is not ours, a lock recorded on another host, or a
+--- lock with no recorded pid at all (nothing proves its owner is dead). Runs off
+--- the worktree listing, so a stale lock on an already-missing checkout is found
+--- too — such a lock keeps `git worktree prune` from cleaning the registration up.
+---@param cwd string? Any directory inside the repository (default: the process cwd)
+---@param cb fun(report: pi.WorktreeSweepReport?, err: string?)
+function M.sweep_locks(cwd, cb)
+    if type(cb) ~= "function" then
+        return
+    end
+    M.list(cwd, function(entries, list_err)
+        if type(entries) ~= "table" then
+            return cb(nil, list_err or "sweep: cannot list worktrees")
+        end
+        ---@type pi.WorktreeSweepReport
+        local report = { released = {}, kept = {}, foreign = 0 }
+        local host = local_hostname()
+        local index = 0
+
+        ---@param done fun()
+        local function step(done)
+            index = index + 1
+            local entry = entries[index]
+            if not entry then
+                return done()
+            end
+            local state = M.lock_state(entry)
+            if not state.locked then
+                return step(done)
+            end
+            if not state.ours then
+                report.foreign = report.foreign + 1
+                report.kept[#report.kept + 1] = entry.path
+                return step(done)
+            end
+            -- Deliberately *not* `lock_releasable`: the sweep treats every live pid
+            -- as alive, including this process's own (a checkout we are still using
+            -- must survive the sweep), while removal may release its own lock.
+            local fields = parse_lock_fields(state.reason)
+            local pids = lock_pids(state.reason)
+            local alive = false
+            for _, pid in ipairs(pids) do
+                if pid_alive(pid) then
+                    alive = true
+                    break
+                end
+            end
+            local other_host = type(fields.host) == "string" and fields.host ~= host
+            if other_host or #pids == 0 or alive then
+                report.kept[#report.kept + 1] = entry.path
+                return step(done)
+            end
+            M.unlock(entry, function(unlocked)
+                if unlocked then
+                    report.released[#report.released + 1] = entry.path
+                else
+                    report.kept[#report.kept + 1] = entry.path
+                end
+                step(done)
+            end)
+        end
+
+        step(function()
+            cb(report, nil)
+        end)
+    end)
 end
 
 -- Name validation ------------------------------------------------------------
@@ -1153,6 +1551,26 @@ local function info_meta(info)
     }
 end
 
+--- Hand the repository to the retention module, which debounces and defers the
+--- actual sweep, so this costs nothing on the creation path.
+---
+--- The `require` is lazy on purpose: `pi.worktree_retention` calls back into this
+--- module, so a module-level require would create a load-order cycle. A missing or
+--- broken module is not fatal — retention is best-effort housekeeping.
+---@param repo_root string
+local function schedule_retention(repo_root)
+    local worktree_cfg = Config.options.worktree or {}
+    local retention = type(worktree_cfg.retention) == "table" and worktree_cfg.retention or {}
+    if retention.enabled == false then
+        return
+    end
+    local ok, Retention = pcall(require, "pi.worktree_retention")
+    if not ok or type(Retention) ~= "table" or type(Retention.schedule) ~= "function" then
+        return
+    end
+    pcall(Retention.schedule, repo_root)
+end
+
 --- Create a linked worktree under `<repo>/.worktrees/<name>` on a detached HEAD.
 ---
 --- Steps (in order, each one leaving the repository consistent):
@@ -1160,12 +1578,16 @@ end
 ---      commit yet, and creation from *inside* a linked worktree,
 ---   2. ensure `/.worktrees/` is in the repository `.gitignore`,
 ---   3. `git worktree add --detach <target> <base>` (`opts.base`, default `HEAD`),
----   4. write the metadata into the new per-worktree git dir,
+---   4. write the metadata into the new per-worktree git dir and lock the checkout
+---      (`worktree.lock`, skipped when it is `false`),
 ---   5. copy `.worktreeinclude` ∩ gitignored files,
----   6. run `worktree.setup_cmd` (async, cwd = worktree) unless `opts.setup` is `false`.
+---   6. run `worktree.setup_cmd` (async, cwd = worktree) unless `opts.setup` is `false`,
+---   7. hand the repository to the deferred retention sweep.
 ---
---- Any failure after step 3 keeps the worktree on disk (so nothing is lost) and
---- reports the error; the worktree is already registered with git at that point.
+--- A failing lock removes the checkout again: a worktree nobody can lock is a
+--- worktree an external `git worktree prune` / `remove` may delete under a live
+--- agent. Any other failure after step 3 keeps the worktree on disk (so nothing is
+--- lost) and reports the error; the worktree is already registered with git then.
 ---@param opts pi.WorktreeCreateOpts
 ---@param cb fun(info: pi.WorktreeInfo?, err: string?)
 function M.create(opts, cb)
@@ -1272,20 +1694,57 @@ function M.create(opts, cb)
                     end
                     invalidate()
 
-                    copy_includes(info, function(include_err)
-                        if include_err then
-                            return cb(nil, include_err)
+                    --- Locked, filled and set up: hand over to the retention timer
+                    --- (deferred there, so this adds no latency) and report.
+                    local function succeed()
+                        schedule_retention(info.repo_root)
+                        cb(info, nil)
+                    end
+
+                    --- Take the lock (skipped when `worktree.lock` is `false`).
+                    ---@param cont fun(err: string?)
+                    local function with_lock(cont)
+                        if (Config.options.worktree or {}).lock == false then
+                            return cont(nil)
                         end
-                        if opts.setup == false then
-                            return cb(info, nil)
-                        end
-                        run_setup(info, function(setup_err)
-                            if setup_err then
-                                return cb(nil, setup_err)
+                        M.lock(info, { session_id = opts.session_id }, function(locked, lock_err)
+                            if not locked then
+                                return cont(lock_err or "lock failed")
                             end
-                            cb(info, nil)
+                            local state = M.lock_state(info)
+                            info.locked = state.locked
+                            info.lock_reason = state.reason
+                            cont(nil)
                         end)
-                    end)
+                    end
+
+                    ---@param lock_err string?
+                    local function on_lock(lock_err)
+                        if lock_err then
+                            -- An unguardable checkout is worse than none: drop it again.
+                            run({ "git", "-C", repo_root, "worktree", "remove", "--force", target }, {}, function()
+                                invalidate()
+                                cb(nil, "create: " .. tostring(lock_err))
+                            end)
+                            return
+                        end
+                        copy_includes(info, function(include_err)
+                            if include_err then
+                                return cb(nil, include_err)
+                            end
+                            if opts.setup == false then
+                                return succeed()
+                            end
+                            run_setup(info, function(setup_err)
+                                if setup_err then
+                                    return cb(nil, setup_err)
+                                end
+                                succeed()
+                            end)
+                        end)
+                    end
+
+                    with_lock(on_lock)
                 end
 
                 ---@param code integer
@@ -1294,6 +1753,83 @@ function M.create(opts, cb)
                 ---@param op string
                 local function on_add_error(code, stdout, stderr, op)
                     cb(nil, "create: " .. git_err(op, code, stderr ~= "" and stderr or stdout))
+                end
+
+                local function retry_force()
+                    run(add_argv(true), {}, function(retry_code, retry_out, retry_err)
+                        if retry_code ~= 0 then
+                            return on_add_error(retry_code, retry_out, retry_err, "git worktree add --force")
+                        end
+                        on_added()
+                    end)
+                end
+
+                --- Recover a registered-but-missing target. A lock that is not ours,
+                --- or that a live process still holds, is never released: the add
+                --- fails instead (`-f -f` would override locks we must respect).
+                ---@param retry fun()
+                ---@param fail fun(err: string)
+                local function recover_stale(retry, fail)
+                    -- `<repo>/.git` (a directory, or a gitdir file) → the common dir;
+                    -- the stale registration's git dir sits under its `worktrees/`.
+                    -- Resolved by hand: `repo_common_dir` is a local defined further
+                    -- down the file and is out of scope here.
+                    local dot_git = repo_root .. "/.git"
+                    local marker = stat(dot_git)
+                    local git_dir = realpath(dot_git) or dot_git
+                    if marker and marker.type ~= "directory" then
+                        local parsed = parse_gitdir_file(read_text(dot_git))
+                        if parsed then
+                            git_dir = is_abs(parsed) and parsed or (repo_root .. "/" .. parsed)
+                        end
+                    end
+                    local common = resolve_common_dir(git_dir) or git_dir
+                    local reason = read_lock_reason(common .. "/worktrees/" .. name)
+                    if reason == nil then
+                        return retry()
+                    end
+                    ---@return string
+                    local function locked_error()
+                        return string.format(
+                            "create: %s is locked (%s); run `git worktree unlock %s` first",
+                            target,
+                            reason,
+                            target
+                        )
+                    end
+
+                    if not is_our_lock(reason) then
+                        return fail(locked_error())
+                    end
+                    -- Same guards as `lock_releasable`: another host's pid says nothing
+                    -- about this machine, and a lock without a pid proves nothing.
+                    local host = parse_lock_fields(reason).host
+                    if type(host) == "string" and host ~= "" and host ~= local_hostname() then
+                        return fail(locked_error())
+                    end
+                    local pids = lock_pids(reason)
+                    if #pids == 0 then
+                        return fail(locked_error())
+                    end
+                    local self_pid = uv.os_getpid()
+                    for _, pid in ipairs(pids) do
+                        -- Our own (possibly reused) pid never blocks: we are the
+                        -- creator re-creating our own missing checkout.
+                        if pid ~= self_pid and pid_alive(pid) then
+                            return fail(
+                                string.format("create: %s is still locked by a live process (%s)", target, reason)
+                            )
+                        end
+                    end
+                    run({ "git", "-C", repo_root, "worktree", "unlock", target }, {}, function(code, stdout, stderr)
+                        local text = stderr ~= "" and stderr or stdout
+                        -- The registration is unlocked either way, which is all we need.
+                        if code ~= 0 and not (text or ""):find("is not locked", 1, true) then
+                            return fail("create: " .. git_err("git worktree unlock", code, text))
+                        end
+                        invalidate()
+                        retry()
+                    end)
                 end
 
                 run(add_argv(false), {}, function(add_code, add_out, add_err)
@@ -1309,11 +1845,8 @@ function M.create(opts, cb)
                     if not is_stale_registration(detail) then
                         return on_add_error(add_code, add_out, add_err, "git worktree add")
                     end
-                    run(add_argv(true), {}, function(retry_code, retry_out, retry_err)
-                        if retry_code ~= 0 then
-                            return on_add_error(retry_code, retry_out, retry_err, "git worktree add --force")
-                        end
-                        on_added()
+                    recover_stale(retry_force, function(err)
+                        cb(nil, err)
                     end)
                 end)
             end)
@@ -1729,6 +2262,7 @@ function M.snapshot_worktrees(cwd)
                 -- already gone (pruned): read it only for the session binding.
                 local git_dir = common .. "/worktrees/" .. name
                 local bound = read_meta(git_dir) or {}
+                local reason = read_lock_reason(git_dir)
                 ---@type pi.WorktreeListEntry
                 local entry = {
                     kind = "linked",
@@ -1746,6 +2280,10 @@ function M.snapshot_worktrees(cwd)
                     prunable = true,
                     missing = true,
                     snapshot = patch,
+                    managed = next(bound) ~= nil,
+                    locked = reason ~= nil,
+                    lock_reason = reason ~= "" and reason or nil,
+                    locked_reason = reason ~= "" and reason or nil,
                 }
                 entries[#entries + 1] = entry
             end
@@ -1755,6 +2293,100 @@ function M.snapshot_worktrees(cwd)
         return a.name < b.name
     end)
     return entries
+end
+
+--- Delete old snapshot patches (with their sidecars) of checkouts that are gone.
+---
+--- Per `<name>/` directory under `<common dir>/pi2-worktree-snapshots`: the newest
+--- patch and its sidecar are kept while they are younger than `keep_days`, every
+--- older patch is deleted with its sidecar, and the directory itself goes away
+--- when nothing survives. A name whose checkout is still registered
+--- (`opts.live_names`) keeps every patch. Pure filesystem work: names that fail
+--- `validate_name` are skipped and nothing outside the snapshot directory is ever
+--- touched.
+---@param repo_root string
+---@param opts? pi.WorktreeSnapshotGcOpts
+---@param cb fun(removed: integer?, err: string?)
+function M.snapshot_gc(repo_root, opts, cb)
+    if type(cb) ~= "function" then
+        return
+    end
+    if type(repo_root) ~= "string" or repo_root == "" then
+        return vim.schedule(function()
+            cb(nil, "snapshot_gc: repo_root required")
+        end)
+    end
+    local gc_opts = type(opts) == "table" and opts or {}
+    local keep_days = tonumber(gc_opts.keep_days) or SNAPSHOT_KEEP_DAYS
+    local live = type(gc_opts.live_names) == "table" and gc_opts.live_names or {}
+    local now = tonumber(gc_opts.now) or os.time()
+
+    vim.schedule(function()
+        local common = repo_common_dir(norm(repo_root))
+        if not common then
+            return cb(nil, "snapshot_gc: not a git repository: " .. repo_root)
+        end
+        local root = common .. "/" .. SNAPSHOT_DIR
+        local scan = uv.fs_scandir(root)
+        if not scan then
+            return cb(0, nil)
+        end
+
+        local removed = 0
+        while true do
+            local name, kind = uv.fs_scandir_next(scan)
+            if not name then
+                break
+            end
+            if kind == "directory" and (M.validate_name(name)) and not live[name] then
+                local dir = root .. "/" .. name
+                local patches = {}
+                local patch_scan = uv.fs_scandir(dir)
+                if patch_scan then
+                    while true do
+                        local entry, entry_kind = uv.fs_scandir_next(patch_scan)
+                        if not entry then
+                            break
+                        end
+                        if entry_kind ~= "directory" and entry:sub(-6) == ".patch" then
+                            patches[#patches + 1] = entry
+                        end
+                    end
+                end
+                -- `<YYYYmmdd-HHMMSS>.patch`, but same-second collisions add
+                -- `<stamp>-2.patch` and there `'.' > '-'` makes the *older* name sort
+                -- last: only mtime identifies the newest patch (a filename tie-break
+                -- covers an equal mtime).
+                local keep = nil
+                local keep_stamp = nil
+                for _, patch in ipairs(patches) do
+                    local st = stat(dir .. "/" .. patch)
+                    local mtime = st and st.mtime and st.mtime.sec or 0
+                    if now - mtime < keep_days * 86400 then
+                        local nsec = (st and st.mtime and st.mtime.nsec) or 0
+                        local stamp = mtime * 1000 + math.floor(nsec / 1000000)
+                        if not keep or stamp > keep_stamp or (stamp == keep_stamp and patch > keep) then
+                            keep, keep_stamp = patch, stamp
+                        end
+                    end
+                end
+                for _, patch in ipairs(patches) do
+                    if patch ~= keep then
+                        local path = dir .. "/" .. patch
+                        uv.fs_unlink(path .. SIDECAR_SUFFIX)
+                        if uv.fs_unlink(path) then
+                            removed = removed + 1
+                        end
+                    end
+                end
+                if not keep then
+                    -- Only succeeds when the directory is empty (rmdir semantics).
+                    pcall(uv.fs_rmdir, dir)
+                end
+            end
+        end
+        cb(removed, nil)
+    end)
 end
 
 --- Unified patch of the worktree against `opts.from` (default: its base commit;
@@ -1893,6 +2525,7 @@ end
 ---@field prunable boolean
 ---@field bare boolean
 ---@field locked boolean
+---@field locked_reason? string
 
 --- Parse `git worktree list --porcelain` output into records (pure).
 ---@param text string?
@@ -1924,6 +2557,8 @@ function M._parse_worktree_list(text)
                 current.prunable = true
             elseif line:match("^locked") then
                 current.locked = true
+                local reason = vim.trim(line:sub(#"locked" + 1))
+                current.locked_reason = reason ~= "" and reason or nil
             elseif line == "bare" then
                 current.bare = true
             end
@@ -1968,6 +2603,10 @@ local function missing_list_entry(main_root, record)
         detached = record.detached,
         prunable = true,
         missing = true,
+        managed = next(meta) ~= nil,
+        locked = record.locked == true,
+        locked_reason = type(record.locked_reason) == "string" and record.locked_reason or nil,
+        lock_reason = type(record.locked_reason) == "string" and record.locked_reason or nil,
     }
 end
 
@@ -2033,6 +2672,10 @@ function M.list(cwd, cb)
                                 detached = record.detached,
                                 prunable = record.prunable,
                                 missing = false,
+                                managed = info.managed == true,
+                                locked = info.locked == true or record.locked == true,
+                                lock_reason = info.lock_reason or record.locked_reason,
+                                locked_reason = record.locked_reason or info.lock_reason,
                             }
                             entries[#entries + 1] = entry
                         end
@@ -2062,23 +2705,71 @@ end
 ---@param opts { force?: boolean }
 ---@param cb fun(removed: boolean, err: string?)
 local function worktree_remove(info, opts, cb)
-    local argv = { "git", "-C", info.repo_root, "worktree", "remove" }
-    if opts and opts.force then
-        argv[#argv + 1] = "--force"
-    end
-    argv[#argv + 1] = info.path
-
-    run(argv, {}, function(code, stdout, stderr)
-        if code ~= 0 then
-            return cb(false, git_err("git worktree remove", code, stderr ~= "" and stderr or stdout))
+    ---@param force boolean
+    local function remove(force)
+        local argv = { "git", "-C", info.repo_root, "worktree", "remove" }
+        if force then
+            argv[#argv + 1] = "--force"
         end
-        run({ "git", "-C", info.repo_root, "worktree", "prune" }, {}, function(prune_code, prune_out, prune_err)
-            invalidate()
-            if prune_code ~= 0 then
-                return cb(true, git_err("git worktree prune", prune_code, prune_err ~= "" and prune_err or prune_out))
+        argv[#argv + 1] = info.path
+
+        run(argv, {}, function(code, stdout, stderr)
+            if code ~= 0 then
+                return cb(false, git_err("git worktree remove", code, stderr ~= "" and stderr or stdout))
             end
-            cb(true, nil)
+            run({ "git", "-C", info.repo_root, "worktree", "prune" }, {}, function(prune_code, prune_out, prune_err)
+                invalidate()
+                if prune_code ~= 0 then
+                    return cb(
+                        true,
+                        git_err("git worktree prune", prune_code, prune_err ~= "" and prune_err or prune_out)
+                    )
+                end
+                cb(true, nil)
+            end)
         end)
+    end
+
+    local force = opts ~= nil and opts.force == true
+    local state = M.lock_state(info)
+    if not state.locked then
+        return remove(force)
+    end
+    if not state.ours then
+        -- The lock exists exactly to keep external cleanups out (and `--force`
+        -- cannot override it), so report it and touch nothing.
+        return cb(
+            false,
+            string.format(
+                "worktree %s is locked (%s); run `git worktree unlock %s` first",
+                info.path,
+                tostring(state.reason),
+                info.path
+            )
+        )
+    end
+    -- Our own lock, but only if this process may release it: another live owner,
+    -- another host or a lock without a pid still guards the checkout.
+    local releasable, why = lock_releasable(state.reason or "")
+    if not releasable then
+        return cb(
+            false,
+            string.format(
+                "worktree %s is locked (%s); %s — run `git worktree unlock %s` first",
+                info.path,
+                tostring(state.reason),
+                tostring(why),
+                info.path
+            )
+        )
+    end
+    -- Releasable: unlock first, so the checkout goes away without leaving a lock
+    -- record (and without git refusing the removal).
+    M.unlock(info, function(unlocked, unlock_err)
+        if not unlocked then
+            return cb(false, unlock_err)
+        end
+        remove(force)
     end)
 end
 
@@ -2091,6 +2782,9 @@ end
 --- later. A failing snapshot keeps the checkout instead of silently losing that
 --- link (`cb(false, err)`); the removal itself goes through the internal
 --- `worktree_remove`, never `M.remove`, so nothing snapshots twice or recurses.
+---
+--- A foreign `git worktree lock` keeps the checkout as well (`cb(false, err)`);
+--- our own lock is released right before the removal.
 ---@param info pi.WorktreeInfo
 ---@param cb fun(removed: boolean, err: string?)
 function M.release(info, cb)
@@ -2135,6 +2829,9 @@ end
 
 --- Remove a worktree. Snapshots first by default (`worktree.snapshot_before_remove`,
 --- overridable per call) so a forced removal stays recoverable.
+---
+--- Our own `git worktree lock` is released first; a foreign lock refuses the
+--- removal (`--force` cannot override it either) and keeps the checkout.
 ---@param info pi.WorktreeInfo
 ---@param opts? { force?: boolean, snapshot?: boolean }
 ---@param cb fun(removed: boolean, err: string?, snapshot_path: string?)

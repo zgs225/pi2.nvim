@@ -16,6 +16,13 @@ Worktree support is opt-in per session, not a mode: you start a session in a new
 - [Applying a patch](#applying-a-patch)
 - [Shipping the work](#shipping-the-work)
 - [Removing a worktree](#removing-a-worktree)
+- [Locking and retention](#locking-and-retention)
+  - [Locks](#locks)
+  - [What a lock blocks](#what-a-lock-blocks)
+  - [Stale locks](#stale-locks)
+  - [Retention](#retention)
+  - [Snapshot GC](#snapshot-gc)
+  - [Running the sweep yourself](#running-the-sweep-yourself)
 - [Cleanup when a session closes](#cleanup-when-a-session-closes)
 - [Sub-sessions](#sub-sessions)
   - [Creating a checkout for a child](#creating-a-checkout-for-a-child)
@@ -179,12 +186,99 @@ Once the patch is applied elsewhere, the worktree's own commits (and the branch 
 `git worktree remove` refuses a dirty checkout, which is the right default but not a workflow: `pi.worktree_remove({ name? })` removes the checkout **explicitly**, with the guards that make that safe.
 
 - **A live session refuses the removal.** If any π process still runs with the worktree as its cwd (a tab session, a sub-session child, or a detached process you cannot see), the call errors out and names the session to close first (`:PiStop`, `:PiSubClose`, or `x` in `:PiSessions`). Deleting a live cwd breaks the agent's next tool call. The guard matches three things: the session's worktree metadata, the session's **process cwd**, and the session id recorded on the worktree — so a child that merely *inherited* the checkout (a sub-session of a session that already ran in a worktree, which owns no worktree metadata of its own) is caught by its cwd and still blocks the removal.
+- **A foreign lock refuses it too.** A checkout locked by something other than π is left alone and the call tells you to `git worktree unlock` it first; π's own lock is released as part of the removal (see [Locking and retention](#locking-and-retention)).
 - **You confirm first**, and the dialog tells you what is at risk: uncommitted changes, commits ahead of the base commit, or both.
 - **A snapshot is written before anything is deleted** (`worktree.snapshot_before_remove`, default on): the same patch `pi.worktree_apply` would review — base commit → current state, untracked files included — is saved to `<git common dir>/pi2-worktree-snapshots/<worktree>/<YYYYmmdd-HHMMSS>.patch` (i.e. under `.git/`, which survives the checkout). **If the snapshot fails, nothing is removed** and the error is reported. With `snapshot_before_remove = false` the confirmation warns that the work will be lost instead.
 - **Capture fails closed.** A snapshot that silently dropped files would be worse than none, so the patch is only written when it is complete: untracked content beyond the 20 000-file cap, or an untracked path a patch cannot represent (an untracked directory holding its own git repository — a nested clone, a vendored repo, a submodule checkout — produces no diff), aborts the snapshot and therefore the removal, with a message naming the offending path. Commit, ignore or delete that path, then retry. `pi.worktree_apply` shares the same capture rules.
 - Only then does it run `git worktree remove --force` followed by `git worktree prune`, so the metadata and the checkout are both gone. The notification includes the snapshot path.
 
-Snapshots are written, never pruned: they are ordinary patch files you can `git apply` later, and pi2.nvim does not garbage-collect them.
+Snapshots are ordinary patch files you can `git apply` later. They are not kept forever: the retention sweep prunes the snapshots of checkouts that are gone once they are older than `worktree.retention.snapshot_days` (default 30), keeping the newest one per checkout (see [Snapshot GC](#snapshot-gc)). While a checkout still exists, all of its snapshots are kept.
+
+## Locking and retention
+
+A checkout that nobody can clean up is a leak; a checkout deleted under a running agent is a broken session. Two mechanisms handle both sides: git **locks** on every checkout π creates, and a deferred **retention sweep** that prunes only what π itself created.
+
+### Locks
+
+Every checkout π creates is locked with `git worktree lock` as soon as git registers it, and unlocked again right before it is removed (`worktree.lock`, default `true`). The lock is what stops an external cleanup — a `git worktree prune` run by a `git gc`, by another tool, or by you — from deleting a directory an agent is still working in: git skips a locked worktree when it prunes, and `git worktree remove` refuses one (only a doubled `--force` overrides that). Foreign tools therefore see the checkout as in use, and π gets its chance to snapshot it first. No lock is taken for new checkouts with `worktree.lock = false`; the sweep still runs and would only find locks left behind by an earlier configuration, and `worktree.retention` still prunes either way.
+
+The lock reason records who holds it:
+
+```
+pi2 name=<name> session=<id|-> pid=<agent pid|0> nvim=<nvim pid> host=<hostname>
+```
+
+| Field | Meaning |
+| --- | --- |
+| `name` | The checkout name under `<repo>/.worktrees/`. |
+| `session` | The π session id bound to the checkout, or `-` while it is still unknown. |
+| `pid` | The **agent** process id; `0` means "not known". |
+| `nvim` | The Neovim process that took (or last refreshed) the lock. |
+| `host` | The machine the lock was taken on. |
+
+A checkout is locked at creation with the Neovim pid (the agent process does not exist yet), and **relocked once per session** as soon as that session's agent is running — which is what fills in `session` and `pid` for a checkout that was created before a session was bound to it. A reason that does not start with `pi2 ` is **foreign** and is never touched — not by a removal, not by the sweep. The lock lives in git's own per-worktree bookkeeping (`<git dir>/locked`), so `git worktree list` shows it and every git tool sees it.
+
+### What a lock blocks
+
+- `pi.worktree_remove` (and `Worktree.remove`) on a **foreign-locked** checkout refuses, naming the reason and the fix: ``worktree <path> is locked (<reason>); run `git worktree unlock <path>` first``. Unlock it yourself when you are sure, then retry.
+- A **`pi2` lock is not a free pass either**. The lock is a cross-process guard, so a removal — like every release — also refuses a lock this plugin set when the recorded owner is still alive in another process on this machine, when it was taken on another host, or when it records no pid at all: two Neovims cannot steal each other's checkout. Owner alive, other host and no pid are exactly the cases [Stale locks](#stale-locks) keeps.
+- Only a lock that is ours **and provably dead** is released as part of the removal — this process's own lock, or one whose recorded pids are all gone; a failing unlock aborts the removal with its error. The rule sits in the removal path shared by `Worktree.release` and `Worktree.remove`, so it covers `pi.worktree_remove`, closing the session, a settled sub-session child and the reaper, not only the explicit removal.
+- A release therefore treats a checkout it may not unlock exactly like a dirty or ahead one: it is **kept**, and the `Worktree kept: <path> …` notification says why.
+
+### Stale locks
+
+A Neovim that crashed or was killed leaves its lock behind. That is the safe direction, but such a lock also blocks `git worktree prune` for a directory that may already be gone. `pi.worktree_sweep_locks()` (also `Worktree.sweep_locks(cwd, cb)`) releases the locks **this plugin** set whose owning processes are all gone:
+
+- the pids recorded in the reason are probed with `kill(pid, 0)`; `pid=0` means "unknown" and is skipped;
+- a lock is released only when it recorded **at least one** pid and **none** of them is alive;
+- a lock recorded on **another host** is kept — its pids say nothing about this machine — and so is a lock with **no** pid field at all, where nothing proves the owner is dead;
+- a reason that is not `pi2 `-prefixed is counted as foreign and never touched. Pid reuse can keep a dead lock alive; it can never release a live one.
+
+The sweep runs before every retention prune, and you can run it on its own at any time ([Running the sweep yourself](#running-the-sweep-yourself)).
+
+### Retention
+
+Creation stays cheap and nothing is deleted while you work: cleanup is **scheduled after** a checkout is created and runs in the background, deferred by a few seconds and coalesced per repository, so the create path and `pi.setup()` pay nothing for it. A run sweeps stale locks first, then prunes pi-managed checkouts, then prunes snapshots. The knobs are `worktree.retention` (below) or `pi.worktree_gc(opts)` per call:
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `enabled` | `true` | Run the sweep after a create. `false` disables the scheduled run **and** `pi.worktree_gc()`; pass `enabled = true` per call to override. |
+| `max_count` | `25` | Keep the **newest** N π-managed checkouts per repository; every older one is a candidate. |
+| `max_age_days` | `14` | Also candidate: a π-managed checkout whose top-level directory mtime has not changed for this many days (an edit deep inside does not count). |
+| `snapshot_days` | `30` | Keep the snapshots of a removed checkout this many days (see [Snapshot GC](#snapshot-gc)). |
+| `sweep_locks` | `true` | Release stale π locks before pruning (see [Stale locks](#stale-locks)). |
+
+What the sweep will and will not touch:
+
+- **Only a checkout carrying π's own metadata is ever pruned.** A candidate must have `<git dir>/pi2-worktree.json`, the file every `Worktree.create` writes. A checkout you made by hand — `git worktree add .worktrees/x`, or a worktree root anywhere else — is **never** touched by retention: it is only counted in the report's `foreign` field and left exactly as it is. That is the guarantee that lets the sweep run without a confirmation prompt.
+- **A live session vetoes.** A selected checkout whose path is a running session's cwd, a session's worktree, an assigned sub-session checkout, or a cwd a spawn is about to register is skipped and reported as live, never released.
+- **Candidates are ordered by the checkout directory's mtime**, newest first (ties by name), and selected when they fall past `max_count` **or** are older than `max_age_days`. Age alone therefore trims an idle repository, and the count cap bounds a busy one.
+- **Release keeps its usual decision**: only a clean checkout with no commits beyond its base commit is removed. A dirty, ahead, foreign-locked or unsnapshottable one is kept (and named in the report) — the sweep never forces, never retries and never applies anything.
+- **Missing checkouts are not prune candidates.** A directory that is already gone is left to the snapshot GC: it is never "released" a second time.
+- **Nothing is reported unless something happened**: a run that removed, unlocked or dropped nothing is silent. Else a single notification reads `Worktree retention: removed N, released M stale lock(s), dropped K snapshot(s)`.
+
+Retention does not distinguish ownership: every π-managed checkout of the repository is a candidate, including one a sub-session spawn created. A checkout a live session runs in — a parent's, a child's, an assigned one — is vetoed for that run; once nothing uses it, the same clean-only rule decides.
+
+### Snapshot GC
+
+Snapshots live under `<git common dir>/pi2-worktree-snapshots/<name>/` and survive the checkout, so they need their own expiry. Every retention run prunes them (`Worktree.snapshot_gc(repo_root, { keep_days, live_names })`):
+
+- a `name` whose checkout **still exists** keeps **all** of its snapshots — nothing is deleted while the working tree it describes is on disk;
+- for a checkout that is gone, the newest patch and its `.json` sidecar are kept while they are younger than `snapshot_days`; every older patch and sidecar is deleted, and the `<name>/` directory goes with the last one;
+- only `*.patch` files inside that directory are ever deleted, only for names that pass the normal name validation, and nothing outside it is touched. A snapshot you copied elsewhere is yours.
+
+Once a gone checkout's snapshot is pruned, the last record of its work is gone too, so a resume of a session whose checkout *and* snapshot are both missing cannot recover it — the [`:PiResume`](#resuming-across-worktrees) picker says so instead of opening the transcript in the main checkout. Raise `snapshot_days` (or keep the sweep off with `retention.enabled = false`) if you want the window longer.
+
+### Running the sweep yourself
+
+```lua
+require("pi").worktree_gc({ dry_run = true }, function(report, err) ... end)
+require("pi").worktree_sweep_locks({ cwd = "/repo" }, function(report, err) ... end)
+```
+
+`pi.worktree_gc(opts, cb)` accepts `cwd` (repository scope, default the process cwd), `enabled`, `max_count`, `max_age_days`, `snapshot_days`, `dry_run` (select and report, release nothing), `quiet` (no notification) and `skip = function(entry) return true end` (an extra veto on top of the live-session check). Its report carries `disabled`, `repo_root`, `removed`, `kept`, `foreign`, `live`, `stale_locks`, `snapshots_removed` and `errors`.
+
+Both functions are **API only** — no `:Pi*` command, no keymap, no entry in `:PiSessions`. See the [Lua API](api.md#worktrees).
 
 ## Cleanup when a session closes
 
@@ -298,6 +392,24 @@ require("pi").setup({
         -- from Neovim's cwd (default true). false keeps the plain 󰙅 <name>
         -- badge; the editor and the agent may then anchor paths differently.
         warn_on_cwd_mismatch = true,
+
+        -- Lock every checkout π creates with `git worktree lock` and unlock it
+        -- again when the checkout is removed (default true), so an external
+        -- `git worktree prune` / `remove` cannot delete a checkout an agent is
+        -- still working in. A lock π did not take is never touched.
+        lock = true,
+
+        -- Deferred cleanup, run after a checkout is created (never at
+        -- startup, never mid-create). ONLY checkouts carrying π's own
+        -- <git dir>/pi2-worktree.json metadata are ever pruned — a hand-made
+        -- `git worktree add` checkout is never touched.
+        retention = {
+            enabled = true,     -- run the sweep after a create
+            max_count = 25,     -- keep the newest N π-managed checkouts per repo
+            max_age_days = 14,  -- … and drop ones whose top-level dir is untouched for this long
+            snapshot_days = 30, -- keep removed checkouts' snapshots this long
+            sweep_locks = true, -- release stale π locks before pruning
+        },
     },
 })
 ```

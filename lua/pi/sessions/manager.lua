@@ -48,6 +48,7 @@
 ---@field assigned_worktree? { kind: "linked", path: string, name?: string, repo_root?: string, git_dir?: string, common_dir?: string, base_sha?: string } Pre-existing linked worktree explicitly assigned to this child by its parent. Never owned by this session: no release, no bind, no resume rebind.
 ---@field forked_from? { session_id?: string, session_file?: string, worktree?: string } Source conversation for a worktree fork; surfaced by the sessions UI.
 ---@field _worktree_released? boolean True once release was dispatched for this session's worktree (guards close_session + process-exit double release).
+---@field _worktree_lock_refreshed? boolean True once the worktree lock was relocked with the agent pid (guards the once-per-session relock in bind_session_worktree).
 ---@field changed_files table<string, true> Set of file paths modified by edit/write tools during the current session.
 ---@field _pending_file_change_args? table<string, table> Pending tool args by tool call id for file-changing tools.
 ---@field _compaction_rebuilding? boolean True while compacted messages are being fetched/replayed.
@@ -261,6 +262,45 @@ local function rebind_resumed_worktree(session, cwd)
     return detected
 end
 
+--- Best-effort relock so the lock reason learns the *agent* pid.
+---
+--- The create-time lock can only record the Neovim pid; the agent process pid
+--- exists only once the RPC child is running. `bind` runs on every
+--- `refresh_state`, so `_worktree_lock_refreshed` keeps this to one relock per
+--- session. A failure is a warning only — the create-time lock still protects
+--- the checkout, so it must never break the session.
+--- Contract: `Worktree.lock(info, { session_id, pid }, cb)` with `cb(ok, err)`.
+---@param session pi.Session
+---@param worktree pi.WorktreeInfo
+---@param id string
+local function relock_session_worktree(session, worktree, id)
+    if session._worktree_lock_refreshed then
+        return
+    end
+    -- A borrowed checkout is never relocked: its lock is not ours.
+    if type(session.assigned_worktree) == "table" then
+        return
+    end
+    local job_id = type(session.rpc) == "table" and session.rpc._job_id or nil
+    if type(job_id) ~= "number" then
+        return
+    end
+    local ok_pid, pid = pcall(vim.fn.jobpid, job_id)
+    if not ok_pid or type(pid) ~= "number" or pid <= 0 then
+        return
+    end
+    local ok, Worktree = pcall(require, "pi.worktree")
+    if not ok or type(Worktree) ~= "table" or type(Worktree.lock) ~= "function" then
+        return
+    end
+    session._worktree_lock_refreshed = true
+    pcall(Worktree.lock, worktree, { session_id = id, pid = pid }, function(locked, err)
+        if locked == nil and err then
+            Notify.warn("worktree lock failed: " .. tostring(err))
+        end
+    end)
+end
+
 --- Publish the backend-assigned session id/file onto the session's worktree
 --- metadata, so the worktree index can map worktree <-> session (for
 --- `pi.worktree_*`, revive and the sessions list).
@@ -299,6 +339,8 @@ local function bind_session_worktree(session)
         Notify.warn("worktree bind failed: " .. tostring(bound))
     elseif bound == false and bind_err then
         Notify.warn("worktree bind failed: " .. tostring(bind_err))
+    else
+        relock_session_worktree(session, worktree, id)
     end
 end
 

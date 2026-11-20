@@ -149,6 +149,12 @@ local function teardown_repo(ctx)
     end
     vim.env.GIT_CONFIG_GLOBAL = SAVED_GIT_CONFIG_GLOBAL
     vim.env.GIT_CONFIG_SYSTEM = SAVED_GIT_CONFIG_SYSTEM
+    -- `W.create` schedules the deferred retention sweep (8 s). Cancel it so no
+    -- timer fires against the repository this teardown just deleted.
+    local loaded, Retention = pcall(require, "pi.worktree_retention")
+    if loaded and type(Retention) == "table" and type(Retention._reset) == "function" then
+        pcall(Retention._reset)
+    end
     W._reset()
     Config.setup({})
 end
@@ -786,9 +792,49 @@ describe("worktree detect and bind (real git)", function()
         assert.are.equal("/tmp/sess-real.jsonl", rebound.session_file)
 
         -- Removing the worktree makes detection fall back to nil for its path.
+        -- Our own lock blocks a plain `git worktree remove`, so release it first
+        -- (`W.remove`/`W.release` do exactly this).
+        git_ok({ "git", "-C", repo, "worktree", "unlock", info.path }, repo)
         git_ok({ "git", "-C", repo, "worktree", "remove", "--force", info.path }, repo)
         W._reset()
         assert.is_nil(W.detect(info.path))
+    end)
+end)
+
+describe("worktree lock (real git)", function()
+    local ctx
+    local repo
+
+    before_each(function()
+        W._reset()
+        Config.setup({})
+        ctx = setup_repo()
+        repo = ctx.repo
+    end)
+
+    after_each(function()
+        teardown_repo(ctx)
+    end)
+
+    it("locks the created checkout and release drops the lock with it", function()
+        local info = create_wt(repo, "wt-lock")
+        assert.is_true(info.locked)
+        assert.is_truthy(info.lock_reason:match("^pi2 name=wt%-lock "), info.lock_reason)
+        assert.is_truthy(info.lock_reason:find("nvim=" .. vim.fn.getpid(), 1, true), info.lock_reason)
+
+        -- git's own view: the lock file exists and the porcelain listing says so.
+        assert.is_not_nil(vim.uv.fs_stat(info.git_dir .. "/locked"))
+        local listing = git_ok({ "git", "-C", repo, "worktree", "list", "--porcelain" }, repo)
+        assert.is_truthy(listing:find("locked pi2 name=wt-lock ", 1, true), listing)
+        assert.is_true(W.detect(info.path).locked)
+
+        -- release() unlocks the checkout itself: no manual `git worktree unlock`.
+        local res = call(W.release, info)
+        assert.is_true(res[1], tostring(res[2]))
+        assert.is_nil(vim.uv.fs_stat(info.path))
+        local after_release = git_ok({ "git", "-C", repo, "worktree", "list", "--porcelain" }, repo)
+        assert.is_nil(after_release:find("locked", 1, true), after_release)
+        assert.is_nil(after_release:find("wt-lock", 1, true), after_release)
     end)
 end)
 
