@@ -160,8 +160,8 @@ local function set_defaults()
     vim.api.nvim_set_hl(0, "PiChatHistoryWinbar", { default = true, bg = normal.bg })
     vim.api.nvim_set_hl(0, "PiChatHistoryWinbarTitle", { default = true, fg = user.fg, bold = true })
     -- Git worktree badge in the history title (`π 󰙅 name`). Only a linked
-    -- worktree is badged; a session whose cwd differs from Neovim's renders
-    -- the badge in PiStatusLineWarning instead (no separate group).
+    -- worktree is badged; the ⚠ case (session cwd elsewhere, no glyph to show
+    -- it) renders plain text in PiStatusLineWarning (no separate group).
     vim.api.nvim_set_hl(0, "PiChatHistoryWorktree", { default = true, fg = title.fg, bold = true, italic = true })
     vim.api.nvim_set_hl(0, "PiChatPromptWinbar", { default = true, bg = normal.bg })
     vim.api.nvim_set_hl(0, "PiChatPromptWinbarTitle", { default = true, fg = comment.fg, bg = normal.bg, bold = true })

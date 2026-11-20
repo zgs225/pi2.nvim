@@ -97,7 +97,7 @@ Inspect what a block actually uses with `:Inspect` over the coloured text, or li
 | `PiFloatBorder` | Border for π float windows |
 | `PiChatHistoryWinbar` | Winbar background for the history panel (side layout) |
 | `PiChatHistoryWinbarTitle` | Winbar title for the history panel (side layout) |
-| `PiChatHistoryWorktree` | Git worktree badge (`󰙅 <name>`, with `*` when dirty/ahead) in the history title — winbar and float title. A session whose cwd differs from Neovim's renders the badge in `PiStatusLineWarning` instead. |
+| `PiChatHistoryWorktree` | Git worktree badge (`󰙅 <name>`, with `*` when dirty/ahead) in the history title — winbar and float title. Only a linked worktree is badged; the `⚠` case (session cwd elsewhere and no glyph to show it — main checkout or a non-worktree directory) renders `PiStatusLineWarning` instead. |
 | `PiChatPromptWinbar` | Winbar background for the prompt panel (side layout) |
 | `PiChatPromptWinbarTitle` | Winbar title for the prompt panel (side layout) |
 | `PiChatPromptWinbarAttentionTitle` | Winbar title for the prompt panel when attention is pending |

@@ -1,9 +1,10 @@
 -- Chat history title: the worktree badge (`π 󰙅 name`) in the side-layout
 -- winbar and the float border title. Covers the display matrix (main
--- worktree + matching cwd = no badge, linked worktree, dirty/ahead `*`, cwd
--- mismatch warning), breadcrumb priority, `%` escaping for the winbar
--- expression, the layout/show re-apply, and the workspace caches
--- (`_prompt_history` / `_prompt_nav`) reset by `set_cwd`.
+-- worktree + matching cwd = no badge, linked worktree, dirty/ahead `*`, and
+-- the `⚠` reserved for a divergence the badge cannot show on its own),
+-- breadcrumb priority, `%` escaping for the winbar expression, the
+-- layout/show re-apply, and the workspace caches (`_prompt_history` /
+-- `_prompt_nav`) reset by `set_cwd`.
 --
 -- `pi.worktree` is stubbed through package.loaded so nothing shells out to
 -- git; its own spec covers detection.
@@ -126,8 +127,14 @@ describe("chat history worktree badge", function()
             assert.is_nil(Chat.worktree_badge(main, true, { dirty = true }))
         end)
 
-        it("names a linked worktree", function()
+        it("names a linked worktree, whether or not its cwd matches", function()
             assert.are.same({ { GLYPH .. " wt", "PiChatHistoryWorktree" } }, Chat.worktree_badge(linked, true, nil))
+            -- A worktree session normally runs outside Neovim's cwd: the glyph
+            -- is the whole signal, with no `⚠` prefix and no warning color.
+            assert.are.same(
+                { { GLYPH .. " wt", "PiChatHistoryWorktree" } },
+                Chat.worktree_badge(linked, false, nil, "/repo-wt")
+            )
         end)
 
         it("marks a dirty or ahead linked worktree with *", function()
@@ -143,33 +150,41 @@ describe("chat history worktree badge", function()
                 { { GLYPH .. " wt", "PiChatHistoryWorktree" } },
                 Chat.worktree_badge(linked, true, { dirty = false, ahead = 0 })
             )
-        end)
-
-        it("warns when the session cwd differs from Neovim's cwd", function()
-            assert.are.same({ { "⚠ repo", "PiStatusLineWarning" } }, Chat.worktree_badge(main, false, nil))
-            assert.are.same(
-                { { "⚠ " .. GLYPH .. " wt", "PiStatusLineWarning" } },
-                Chat.worktree_badge(linked, false, nil)
-            )
-        end)
-
-        it("drops the mismatch warning when worktree.warn_on_cwd_mismatch = false", function()
-            Config.setup({ worktree = { warn_on_cwd_mismatch = false } })
-            -- The plain linked badge (and its dirty marker) stays; the main
-            -- checkout still shows nothing, because it has no glyph of its own.
-            assert.is_nil(Chat.worktree_badge(main, false, nil))
-            assert.are.same({ { GLYPH .. " wt", "PiChatHistoryWorktree" } }, Chat.worktree_badge(linked, false, nil))
+            -- The dirty marker survives the usual cwd mismatch too.
             assert.are.same(
                 { { GLYPH .. " wt*", "PiChatHistoryWorktree" } },
-                Chat.worktree_badge(linked, false, { dirty = true })
+                Chat.worktree_badge(linked, false, { dirty = true }, "/repo-wt")
             )
-            Config.setup({})
+        end)
+
+        it("warns only where the badge cannot show the divergence itself", function()
+            -- Main checkout elsewhere: its repository name, in the warning color.
+            assert.are.same({ { "⚠ repo", "PiStatusLineWarning" } }, Chat.worktree_badge(main, false, nil, "/repo"))
+            -- Not a work tree at all: the directory's own name.
+            assert.are.same(
+                { { "⚠ scratch", "PiStatusLineWarning" } },
+                Chat.worktree_badge(nil, false, nil, "/tmp/scratch")
+            )
+            assert.are.same(
+                { { "⚠ notes", "PiStatusLineWarning" } },
+                Chat.worktree_badge(nil, false, nil, "/home/me/notes/")
+            )
+            -- Matching cwd: nothing to warn about, in any kind of directory.
+            assert.is_nil(Chat.worktree_badge(nil, true, nil, "/tmp/scratch"))
+            -- No usable directory name: no badge rather than a bare `⚠`.
+            assert.is_nil(Chat.worktree_badge(nil, false, nil, nil))
+            assert.is_nil(Chat.worktree_badge(nil, false, nil, "/"))
         end)
 
         it("ignores unknown or anonymous worktrees", function()
             assert.is_nil(Chat.worktree_badge(nil, true, nil))
             assert.is_nil(Chat.worktree_badge({ kind = "other", name = "x" }, true, nil))
             assert.is_nil(Chat.worktree_badge({ kind = "linked", name = "" }, true, nil))
+            -- An unusable worktree label falls back to the directory's own name.
+            assert.are.same(
+                { { "⚠ scratch", "PiStatusLineWarning" } },
+                Chat.worktree_badge({ kind = "other", name = "x" }, false, nil, "/tmp/scratch")
+            )
         end)
     end)
 
@@ -204,29 +219,29 @@ describe("chat history worktree badge", function()
             teardown_chat(chat)
         end)
 
-        it("shows the mismatch warning in the warning color", function()
+        it("does not warn for a linked worktree whose cwd differs", function()
             local chat = setup_chat("side")
             stub_worktree({ kind = "linked", name = "wt", path = "/tmp/wt", repo_root = "/tmp/main" })
 
             chat:set_cwd(vim.fn.getcwd() .. "-somewhere-else")
 
             local winbar = history_winbar(chat)
-            assert.is_truthy(winbar:find("⚠ ", 1, true))
-            assert.is_truthy(winbar:find("PiStatusLineWarning", 1, true))
+            assert.is_truthy(winbar:find(GLYPH .. " wt", 1, true))
+            assert.is_truthy(winbar:find("PiChatHistoryWorktree", 1, true))
+            assert.is_nil(winbar:find("⚠", 1, true))
             teardown_chat(chat)
         end)
 
-        it("honours warn_on_cwd_mismatch = false in the winbar", function()
-            Config.setup({ worktree = { warn_on_cwd_mismatch = false } })
+        it("warns in the warning color when the main checkout's cwd differs", function()
             local chat = setup_chat("side")
-            stub_worktree({ kind = "linked", name = "wt", path = "/tmp/wt", repo_root = "/tmp/main" })
+            stub_worktree({ kind = "main", name = "repo", path = "/tmp/main", repo_root = "/tmp/main" })
 
             chat:set_cwd(vim.fn.getcwd() .. "-somewhere-else")
 
             local winbar = history_winbar(chat)
-            assert.is_nil(winbar:find("⚠", 1, true))
-            assert.is_truthy(winbar:find(GLYPH .. " wt", 1, true))
-            assert.is_truthy(winbar:find("PiChatHistoryWorktree", 1, true))
+            assert.is_truthy(winbar:find("⚠ repo", 1, true))
+            assert.is_truthy(winbar:find("PiStatusLineWarning", 1, true))
+            assert.is_nil(winbar:find(GLYPH, 1, true))
             teardown_chat(chat)
         end)
 
@@ -286,6 +301,19 @@ describe("chat history worktree badge", function()
             teardown_chat(chat)
         end)
 
+        it("warns in the float border title when the session cwd is elsewhere", function()
+            local chat = setup_chat("float")
+            stub_worktree(nil)
+            local elsewhere = vim.fn.getcwd() .. "-elsewhere"
+
+            chat:set_cwd(elsewhere)
+
+            local title = history_float_title(chat)
+            assert.is_truthy(title:find("π", 1, true))
+            assert.is_truthy(title:find("⚠ " .. vim.fn.fnamemodify(elsewhere, ":t"), 1, true))
+            teardown_chat(chat)
+        end)
+
         it("keeps the plain title in the main worktree with a matching cwd", function()
             local chat = setup_chat("float")
             local cwd = vim.fn.getcwd()
@@ -320,7 +348,7 @@ describe("chat history worktree badge", function()
     end)
 
     describe("refresh triggers", function()
-        it("never runs git status for the main worktree with a matching cwd", function()
+        it("never runs git status for the main worktree", function()
             local chat = setup_chat("side")
             local cwd = vim.fn.getcwd()
             local stub = stub_worktree({ kind = "main", name = "repo", path = cwd, repo_root = cwd })
@@ -328,7 +356,12 @@ describe("chat history worktree badge", function()
             chat:set_cwd(cwd)
             chat:refresh_worktree()
 
-            -- The badge is nil there, so status can never change the title.
+            -- Only a linked worktree's badge carries `*`, so a main checkout's
+            -- status can never change the title.
+            assert.are.equal(0, #stub.calls)
+
+            chat:set_cwd(cwd .. "-elsewhere")
+            chat:refresh_worktree()
             assert.are.equal(0, #stub.calls)
             teardown_chat(chat)
         end)
@@ -374,16 +407,22 @@ describe("chat history worktree badge", function()
 
         it("treats a symlinked or trailing-slash session cwd as matching", function()
             local chat = setup_chat("side")
-            stub_worktree({ kind = "linked", name = "wt", path = "/tmp/wt", repo_root = "/tmp/main" })
+            -- No work tree: the `⚠` falls back to the cwd comparison itself, so
+            -- this is where symlink / trailing-slash normalization is visible.
+            stub_worktree(nil)
             local link = vim.fn.tempname() .. "-link"
             assert.is_truthy(vim.uv.fs_symlink(vim.fn.getcwd(), link, { dir = true }))
 
             chat:set_cwd(link)
             assert.is_nil(history_winbar(chat):find("⚠", 1, true))
-            assert.is_truthy(history_winbar(chat):find(GLYPH .. " wt", 1, true))
 
             chat:set_cwd(vim.fn.getcwd() .. "/")
             assert.is_nil(history_winbar(chat):find("⚠", 1, true))
+
+            local elsewhere = vim.fn.getcwd() .. "-elsewhere"
+            chat:set_cwd(elsewhere)
+            local winbar = history_winbar(chat)
+            assert.is_truthy(winbar:find("⚠ " .. vim.fn.fnamemodify(elsewhere, ":t"), 1, true))
 
             vim.uv.fs_unlink(link)
             teardown_chat(chat)

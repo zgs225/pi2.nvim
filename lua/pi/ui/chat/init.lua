@@ -152,37 +152,62 @@ local function worktree_module()
     return nil
 end
 
---- Title chunks for the worktree badge — pure apart from a config lookup, so
---- the display matrix is unit testable without a repository:
+--- Last path component of `dir`, without trailing separators — the label the
+--- badge uses for a directory that is not a work tree at all.
+---@param dir string?
+---@return string?
+local function dir_basename(dir)
+    if type(dir) ~= "string" then
+        return nil
+    end
+    local trimmed = dir:gsub("[\\/]+$", "")
+    if trimmed == "" then
+        return nil
+    end
+    local base = vim.fn.fnamemodify(trimmed, ":t")
+    if type(base) ~= "string" or base == "" or base == "." or base == ".." then
+        return nil
+    end
+    return base
+end
+
+--- Title chunks for the worktree badge, so the display matrix is unit testable
+--- without a repository:
+---   linked worktree, any cwd                  → `󰙅 name`, `*` when dirty/ahead
 ---   main worktree, session cwd == Neovim cwd  → nil (the title stays `π`)
----   linked worktree, cwd matches              → `󰙅 name`, `*` when dirty/ahead
----   session cwd ≠ Neovim cwd                  → `⚠ 󰙅 name` in the warning color
----                                              (`worktree.warn_on_cwd_mismatch = false`
----                                              keeps the plain `󰙅 name` badge; the
----                                              main checkout shows nothing)
+---   main worktree, cwd differs                → `⚠ repo` in the warning color
+---   not a work tree, cwd differs              → `⚠ <dir>` in the warning color
+---
+--- `⚠` never prefixes a linked worktree's badge. The glyph already says the
+--- agent edits another checkout, and starting a worktree session does not
+--- `:cd` the editor, so that mismatch is the *normal* state — a warning that is
+--- always on is not a warning, and it took the worktree color (and the dirty
+--- `*`) with it. It stays for the two rows where the badge could not otherwise
+--- show the divergence and the roots therefore silently differ for `gf`,
+--- quickfix, `@` mentions, `:PiDiff` and prompt history.
 ---@param info pi.WorktreeInfo?
 ---@param same_cwd boolean
 ---@param status? { dirty?: boolean, ahead?: integer }
+---@param cwd? string session cwd, the label for a non-worktree directory
 ---@return pi.ChatHistoryTitleChunk[]?
-function Chat.worktree_badge(info, same_cwd, status)
-    if type(info) ~= "table" or (info.kind ~= "main" and info.kind ~= "linked") then
+function Chat.worktree_badge(info, same_cwd, status, cwd)
+    local kind = type(info) == "table" and info.kind or nil
+    local name = type(info) == "table" and type(info.name) == "string" and info.name or ""
+    if kind == "linked" and name ~= "" then
+        local marked = status ~= nil and (status.dirty == true or (type(status.ahead) == "number" and status.ahead > 0))
+        return { { "󰙅 " .. name .. (marked and "*" or ""), "PiChatHistoryWorktree" } }
+    end
+    if same_cwd then
         return nil
     end
-    local name = type(info.name) == "string" and info.name or ""
-    if name == "" then
+    local label = dir_basename(cwd)
+    if kind == "main" and name ~= "" then
+        label = name
+    end
+    if not label then
         return nil
     end
-    local glyph = info.kind == "linked" and "󰙅 " or ""
-    local options = Config.options.worktree or {}
-    local warn_on_mismatch = options.warn_on_cwd_mismatch ~= false
-    if not same_cwd and warn_on_mismatch then
-        return { { "⚠ " .. glyph .. name, "PiStatusLineWarning" } }
-    end
-    if info.kind == "main" then
-        return nil
-    end
-    local marked = status ~= nil and (status.dirty == true or (type(status.ahead) == "number" and status.ahead > 0))
-    return { { glyph .. name .. (marked and "*" or ""), "PiChatHistoryWorktree" } }
+    return { { "⚠ " .. label, "PiStatusLineWarning" } }
 end
 
 --- Show a breadcrumb when viewing a sub-session (`◂ 父：…`).
@@ -209,7 +234,8 @@ function Chat:_update_history_title()
         chunks = { { self._subsession_breadcrumb, "PiSessionsListBusy" } }
     else
         chunks = { { Config.options.panels.history.title, "PiChatHistoryWinbar" } }
-        local badge = Chat.worktree_badge(self._worktree, self._worktree_same_cwd, self._worktree_status)
+        local badge =
+            Chat.worktree_badge(self._worktree, self._worktree_same_cwd, self._worktree_status, self:_session_cwd())
         if badge then
             for _, chunk in ipairs(badge) do
                 chunks[#chunks + 1] = chunk
@@ -257,11 +283,19 @@ end
 --- both steps. Nothing here blocks on git, so it is safe on the show path, in
 --- completion/event handlers, and (in a later change) on a manager call after
 --- a cwd switch.
-function Chat:refresh_worktree()
+--- The directory this chat runs in: the session cwd, or Neovim's own while the
+--- session has none yet (the constructor's state before `set_cwd`).
+---@return string
+function Chat:_session_cwd()
     local cwd = self._cwd
     if type(cwd) ~= "string" or cwd == "" then
-        cwd = vim.fn.getcwd()
+        return vim.fn.getcwd()
     end
+    return cwd
+end
+
+function Chat:refresh_worktree()
+    local cwd = self:_session_cwd()
     local session_dir = normalize_cwd(cwd)
     self._worktree_same_cwd = session_dir ~= nil and session_dir == normalize_cwd(vim.fn.getcwd())
     local mod = worktree_module()
@@ -272,9 +306,10 @@ function Chat:refresh_worktree()
     if not info or not mod or type(mod.status) ~= "function" then
         return
     end
-    -- The main worktree with a matching cwd renders no badge at all, so its
-    -- status can never change the title: don't spend a `git status` on it.
-    if info.kind == "main" and self._worktree_same_cwd then
+    -- Only a linked worktree's badge carries the `*` marker, so a main
+    -- checkout's status can never change the title: don't spend a `git
+    -- status` on it.
+    if info.kind == "main" then
         return
     end
     -- A failed spawn must only cost the `*` marker, never the title.
