@@ -18,6 +18,7 @@ local M = {}
 
 local Notify = require("pi.notify")
 local Sessions = require("pi.sessions.manager")
+local TabOrder = require("pi.sessions.tab_order")
 local Config = require("pi.config")
 local Dialog = require("pi.ui.dialog")
 local DiffReview = require("pi.ui.diff_review")
@@ -25,6 +26,8 @@ local DiffReview = require("pi.ui.diff_review")
 ---@class pi.WorktreeOpts
 ---@field name? string Worktree name (default: generated).
 ---@field layout? pi.LayoutMode Chat layout for the new tab.
+---@field tab_after? pi.TabId Place the new tabpage right after this one instead of joining its
+--- checkout's block (the default placement, `pi.sessions.tab_order`).
 
 --- Target of the worktree operations that act on an existing checkout
 --- (`pi.worktree_apply/ship/remove`).
@@ -48,10 +51,11 @@ local DiffReview = require("pi.ui.diff_review")
 ---@field new_tab? boolean Default true; false = current tabpage (refuses when it already runs a session).
 ---@field create? boolean Create the checkout when `name` does not exist yet (default false = an existing
 --- checkout only). Never applies to `cwd`, and always starts a **fresh** conversation in the new checkout.
----@field tab_after? pi.TabId Place the new tabpage right after this one instead of at the end of the
---- tabline. `:PiSessions` passes the last tab of the row's worktree group, whose rows the list keeps
---- contiguous (`n` / `N`), so the new tab does not land behind every other checkout's tabs. Ignored with
---- `new_tab = false`, and when the handle is no longer a valid tabpage.
+---@field tab_after? pi.TabId Place the new tabpage right after this one. Without it the tab joins
+--- its checkout's block in the shared ordering model (`pi.sessions.tab_order`) — right after the block's
+--- last tab, or at the end of the tabline while the list is flat. `:PiSessions` passes the last tab of the
+--- row's worktree group explicitly (`n` / `N`), so the new tab does not land behind every other checkout's
+--- tabs. Ignored with `new_tab = false`, and when the handle is no longer a valid tabpage.
 
 --- Startup flags in `cli.args` that select/own a session. Combining them with
 --- the `--fork` we append makes pi exit before RPC starts, so the fork command
@@ -596,6 +600,15 @@ local function open_worktree_session(Worktree, info, opts, source)
         -- same chat and is the same behavior `:PiFork` already has.
         session.chat:ensure_shown_and_focus_prompt()
     end
+    -- After the chat (and its layout windows) exist: `:tabmove` only reorders
+    -- tabpages, so it cannot disturb them. `tab_after` is an explicit anchor
+    -- (already resolved by the caller); otherwise the tab joins its checkout's
+    -- block in the shared ordering model instead of landing at the end.
+    if opts.tab_after then
+        TabOrder.move_after(tab, opts.tab_after)
+    else
+        TabOrder.place_for(session)
+    end
     Notify.info((source and "Forked into worktree: " or "Worktree session: ") .. info.path)
     return session
 end
@@ -702,38 +715,6 @@ local function bind_opened_session(Worktree, info, session)
     end
 end
 
---- Move the tabpage `tabnew` just opened to its place in the tabline: right
---- after `anchor`, which a caller resolved from the `:PiSessions` list (that
---- list keeps a worktree's rows contiguous, so a session opened in a worktree
---- group must not land behind every other group's tabs).
----
---- A no-op without an anchor, for a handle that is no longer a valid tabpage,
---- and when the tab already sits directly after the anchor. `:tabmove N` moves
---- the *current* tabpage to right after tabpage N, and the new tab is the last
---- one, so moving it earlier never shifts the anchor's index.
----@param tab pi.TabId tabpage created by `tabnew` (last in the tabline)
----@param anchor pi.TabId? tabpage the new one belongs after
-local function move_tab_after(tab, anchor)
-    if type(anchor) ~= "number" or anchor == tab or not vim.api.nvim_tabpage_is_valid(tab) then
-        return
-    end
-    local anchor_index
-    for index, candidate in ipairs(vim.api.nvim_list_tabpages()) do
-        if candidate == anchor then
-            anchor_index = index
-            break
-        end
-    end
-    if not anchor_index then
-        return
-    end
-    local focused = pcall(vim.api.nvim_set_current_tabpage, tab)
-    if not focused then
-        return
-    end
-    pcall(vim.cmd, "tabmove " .. anchor_index)
-end
-
 --- Start a session process in an existing directory, in a fresh tabpage unless
 --- `opts.new_tab == false`.
 ---
@@ -787,8 +768,15 @@ local function open_existing_session(target, opts)
     end
     if scratch then
         -- After the chat (and its layout windows) exist: `:tabmove` only
-        -- reorders tabpages, so it cannot disturb them.
-        move_tab_after(scratch.tab, opts.tab_after)
+        -- reorders tabpages, so it cannot disturb them. An explicit
+        -- `tab_after` wins; otherwise the tab joins its checkout's block in the
+        -- shared ordering model (`pi.sessions.tab_order`) rather than landing
+        -- behind every other checkout's tabs.
+        if opts.tab_after then
+            TabOrder.move_after(scratch.tab, opts.tab_after)
+        else
+            TabOrder.place_for(session)
+        end
     end
     return session
 end

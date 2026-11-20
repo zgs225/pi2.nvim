@@ -262,6 +262,7 @@ require("pi").setup({
 | `:PiFork` | Start a new session from a past user message (rewind and re-ask) |
 | `:PiClone` | Duplicate the current session branch into a new session file |
 | `:PiSessions` | Toggle the live sessions overview (all active sessions: name + busy/idle/attention) |
+| `:PiSessionsSync` | Reorder the π tabs into `:PiSessions` list order (same as `S` in the list) |
 | `:PiTasks` | Toggle the background tasks panel: background bash tasks (dev servers, long builds) with status, output viewer, and stop — requires the `bg-tasks` extension loaded (see [doc/usage.md](doc/usage.md#background-tasks)) |
 | `:PiSessionStats` | Show the session stats dashboard: messages, tokens (with cache split), per-model cost breakdown, cache re-billed waste, context usage — plus the vision extension's own usage (`Extensions` section) |
 | `:PiSubNew` | Spawn a background sub-session with a task prompt (inherits model/thinking by default) |
