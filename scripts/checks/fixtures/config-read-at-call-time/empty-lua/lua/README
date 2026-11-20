@@ -1,0 +1,3 @@
+This fixture tree has a lua/ directory but no *.lua file under it, so the rule
+has nothing to check and must warn exactly once instead of reporting a clean
+gate (contract 3: a tree that holds nothing for a rule is never silently green).
