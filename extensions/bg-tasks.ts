@@ -116,6 +116,18 @@
  * window and detaches has no stdin (`task_input` says so instead of silently
  * dropping what it was given).
  *
+ * Every task owns ONE log file, `tmpdir()/pi-bash-<taskId>.log`, because the log
+ * is what `wait_task`, the panel and the wake tail all read. A foreground command
+ * that exits cleanly and untruncated deletes its own file on the spot; a
+ * background one is kept, since that task outlives the call that started it.
+ * Those files are the one thing here that accumulates, so their lifetime is
+ * explicit: a log nobody references any more dies of old age after
+ * `DEFAULT_LOG_TTL_MS` (7 days, `LOG_TTL_ENV` overrides) and is removed by ONE
+ * sweep at `session_start`, after the transcript fold. The sweep only ever
+ * considers our own file-name shape, and never a task THIS process has a record
+ * for — a live writer, an adopted task, or a row the user can still open.
+ * Immediate deletion is the panel's `D`, not the sweep's job.
+ *
  * Two NOTIFY-ONLY timers cover the other half of that hole — a task that runs
  * far longer than anyone expected while the agent simply never hears about it.
  * (1) `deadline_ms`, the model-facing bash parameter next to
@@ -215,7 +227,7 @@ import { createBashToolDefinition, getShellConfig } from "@earendil-works/pi-cod
 import type { BashToolDetails, BashToolInput, SessionEntry, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { execFileSync, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { closeSync, createWriteStream, openSync, readFileSync, readSync, statSync, unlinkSync } from "node:fs";
+import { closeSync, createWriteStream, openSync, readFileSync, readSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { Writable } from "node:stream";
@@ -303,6 +315,12 @@ const MAX_DEADLINE_MS = 24 * 60 * 60 * 1000;
  */
 const DEFAULT_MAX_LIFETIME_MS = 24 * 60 * 60 * 1000;
 const LIFETIME_ENV = "PI_BG_TASK_MAX_LIFETIME_MS";
+/** Default lifetime of a finished task's log; the sweep deletes anything older. */
+const DEFAULT_LOG_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+/** Overrides `DEFAULT_LOG_TTL_MS` (milliseconds), read when the sweep runs. */
+const LOG_TTL_ENV = "PI_BG_TASK_LOG_TTL_MS";
+/** The only files the sweep may touch: the logs THIS extension writes. */
+const LOG_FILE_PATTERN = /^pi-bash-(b[0-9a-f]{6})\.log$/;
 /**
  * Where the frontend publishes its idle-wake policy (JSON:
  * `{wake_on_idle, wake_budget, wake_cache_window_ms, present}`), re-read at every
@@ -512,6 +530,12 @@ let exitHookInstalled = false;
  * never queue two.
  */
 let wakeTimer: ReturnType<typeof setTimeout> | undefined;
+/**
+ * Whether this process already swept stale log files. Once per process is the
+ * whole policy: a `/reload` re-evaluates the module, and the next process sweeps
+ * again, so nothing has to remember a sweep across restarts.
+ */
+let sweptLogs = false;
 /**
  * Session whose transcript this process folds, and the owner id its own records
  * carry. Set on `session_start`.
@@ -1337,6 +1361,70 @@ function lifetimeCapMs(): number {
 	return DEFAULT_MAX_LIFETIME_MS;
 }
 
+/**
+ * How long a finished task's log may sit in `tmpdir()` before the startup sweep
+ * removes it. Read LAZILY for the same reason as `lifetimeCapMs`: the sweep runs
+ * after the environment of this process is what it is, and a test needs to point
+ * it at a tiny TTL to prove the decision is really made on `mtime`. Any positive
+ * finite number is accepted — even 1 ms.
+ */
+function logTtlMs(): number {
+	const raw = process.env[LOG_TTL_ENV];
+	if (raw !== undefined && raw.trim() !== "") {
+		const value = Number(raw);
+		if (Number.isFinite(value) && value > 0) {
+			return Math.floor(value);
+		}
+	}
+	return DEFAULT_LOG_TTL_MS;
+}
+
+/**
+ * Remove log files this extension wrote in an earlier process that are older
+ * than the TTL. Returns how many were removed.
+ *
+ * Best-effort by construction: every filesystem call is guarded, because a sweep
+ * that throws on `session_start` would break the extension for a mere cleanup.
+ * Only our OWN file name shape is touched (a log this extension would write), and
+ * a task this process still has a record for is never swept — `list_tasks` and
+ * the panel may still point at that path.
+ */
+function sweepLogFiles(): number {
+	const ttl = logTtlMs();
+	let names: string[];
+	try {
+		names = readdirSync(tmpdir());
+	} catch {
+		return 0; // an unreadable tmpdir is not an error worth surfacing
+	}
+	const now = Date.now();
+	let removed = 0;
+	for (const name of names) {
+		const match = LOG_FILE_PATTERN.exec(name);
+		if (!match) {
+			continue; // not ours: another tool's spill file, a directory, …
+		}
+		if (tasks.has(match[1])) {
+			// The process still has a record for it (running, adopted, or finished
+			// this session) — a `list_tasks`/panel row and a `wait_task` may still
+			// point at this path, so age alone is not enough.
+			continue;
+		}
+		const file = join(tmpdir(), name);
+		try {
+			const stats = statSync(file);
+			if (now - stats.mtimeMs < ttl) {
+				continue;
+			}
+			unlinkSync(file);
+			removed += 1;
+		} catch {
+			// Gone between the readdir and the stat, or not ours to remove.
+		}
+	}
+	return removed;
+}
+
 type WaitOutcome = "exited" | "deadline" | "aborted" | "matched";
 
 interface AttachOptions {
@@ -1701,6 +1789,14 @@ export default function bgTasks(pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => {
 		reconcileSession(ctx);
+		// AFTER the fold, never before: an adopted task is in `tasks` now, so a
+		// running task's log survives even when it is older than the TTL. Once per
+		// process — a `/reload` re-evaluates this module, and the next process
+		// sweeps again.
+		if (!sweptLogs) {
+			sweptLogs = true;
+			sweepLogFiles();
+		}
 		return undefined;
 	});
 

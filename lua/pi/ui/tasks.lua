@@ -223,6 +223,11 @@ function M.format_line(row, tick, width, now_ms, current_session_id)
     if task.held_reason then
         subtitle = subtitle .. " · held (" .. task.held_reason .. ")"
     end
+    -- The reaper collects logs by age; this flag says the user already did it,
+    -- so `o` / `p` on the row is explained instead of reading as broken output.
+    if task.log_removed then
+        subtitle = subtitle .. " · log removed"
+    end
 
     local prefix = dot .. " " .. (spinner and spinner .. " " or "")
     local sep = " · "
@@ -549,6 +554,7 @@ local HELP_ENTRIES = {
     { "a, i", "Open the output and focus it" },
     { "p", "Preview output live in a float (command + metadata header)" },
     { "x", "Stop the task under the cursor" },
+    { "D", "Delete the task's log file (finished tasks only)" },
     { "A", "Toggle between current-session and all tasks" },
     { "R", "Redraw the list" },
     { "q", "Close the list" },
@@ -684,6 +690,10 @@ local function open_output_under_cursor(focus)
         return
     end
     local Notify = require("pi.notify")
+    if task.log_removed then
+        Notify.info("The log of " .. task.id .. " was deleted")
+        return
+    end
     if not task.output_file or task.output_file == "" then
         Notify.warn("Task " .. task.id .. " has no output file")
         return
@@ -992,6 +1002,10 @@ local function toggle_preview(list_win)
         return
     end
     local Notify = require("pi.notify")
+    if task.log_removed then
+        Notify.info("The log of " .. task.id .. " was deleted")
+        return
+    end
     if not task.output_file or task.output_file == "" then
         Notify.warn("Task " .. task.id .. " has no output file")
         return
@@ -1078,6 +1092,35 @@ local function stop_under_cursor()
     Tasks.stop(task.id)
 end
 
+-- Delete log (D) --------------------------------------------------------------
+
+--- Delete the log of the task under the cursor.
+---
+--- Deliberately refuses a running task instead of stopping it: `x` is the door
+--- for that, and silently killing a job to reclaim a file would be a surprise.
+local function delete_log_under_cursor()
+    local row, task = row_task_under_cursor()
+    if not row or not task then
+        return
+    end
+    local Notify = require("pi.notify")
+    if task.status == "running" then
+        Notify.info("Task " .. task.id .. " is still running (" .. row.status_label .. "); stop it first (x)")
+        return
+    end
+    local path = type(task.output_file) == "string" and task.output_file or ""
+    local prompt = "Delete the log of task " .. task.id .. (path ~= "" and ("\n" .. path) or "") .. "?"
+    if vim.fn.confirm(prompt, "&Yes\n&No", 2) ~= 1 then
+        return
+    end
+    local ok, err = Tasks.delete_log(task.id)
+    if ok then
+        Notify.info("Deleted the log of " .. task.id)
+    else
+        Notify.warn("Could not delete the log of " .. task.id .. ": " .. tostring(err))
+    end
+end
+
 -- Buffer & windows ------------------------------------------------------------
 
 ---@return integer
@@ -1113,6 +1156,9 @@ local function ensure_buf()
     vim.keymap.set("n", "x", function()
         stop_under_cursor()
     end, vim.tbl_extend("force", map_opts, { desc = "Stop the task under the cursor" }))
+    vim.keymap.set("n", "D", function()
+        delete_log_under_cursor()
+    end, vim.tbl_extend("force", map_opts, { desc = "Delete the task's log file" }))
     vim.keymap.set("n", "A", function()
         show_all = not show_all
         M._render()

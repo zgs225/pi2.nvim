@@ -24,6 +24,7 @@ local M = {}
 ---@field held_reason string? why an idle wake for this task's report is being
 ---                          held for the next user turn (see the bg-tasks
 ---                          extension's idle-wake gate); nil once delivered
+---@field log_removed? boolean true once the panel deleted this task's log
 
 ---@class pi.TasksRow
 ---@field task pi.Task
@@ -740,6 +741,42 @@ function M.stop(id, now_ms)
     if signalled and type(task.pid) == "number" and task.pid > 1 then
         schedule_escalation(id, task.pid)
     end
+    return true
+end
+
+--- Delete a finished task's log file from disk.
+---
+--- The extension keeps a finished task's log until its TTL sweep (7 days by
+--- default), because `wait_task` / a panel row may still point at it — but a
+--- 300 MB build log the user is done with should not have to wait for that.
+--- Running tasks are refused: the writer still holds the file, and the row's
+--- preview follows it.
+---@param id string
+---@return boolean ok
+---@return string? err
+function M.delete_log(id)
+    local task = store[id]
+    if not task then
+        return false, "unknown task"
+    end
+    if task.status == "running" then
+        return false, "still running"
+    end
+    local path = task.output_file
+    if type(path) ~= "string" or path == "" then
+        return false, "no output file"
+    end
+    -- Synchronous form: no callback means luv blocks and returns the result.
+    local ok, err = uv.fs_unlink(path)
+    if not ok then
+        -- ENOENT is the caller's desired end state: an already-collected file
+        -- (a TTL sweep, a manual rm, a previous delete) is not a failure.
+        if not tostring(err):find("ENOENT", 1, true) then
+            return false, tostring(err)
+        end
+    end
+    task.log_removed = true
+    M.request_refresh()
     return true
 end
 

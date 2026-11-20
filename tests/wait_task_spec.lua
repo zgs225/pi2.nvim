@@ -1169,6 +1169,44 @@ describe("bg-tasks extension contract", function()
         local guides_at = assert(decl:find("promptGuidelines", 1, true), "the guidelines are part of the declaration")
         assert.is_truthy(decl:sub(guides_at):find("`until`", 1, true), "a guideline must point at `until`")
     end)
+
+    it("sweeps only its own stale logs, and only files it may touch", function()
+        local src = read_extension()
+        -- The import line is where `readdirSync` has to come from; a bare global
+        -- would fail at runtime instead of at review.
+        local import_at = assert(src:find('from "node:fs"', 1, true), "node:fs must be imported")
+        local line_start = src:sub(1, import_at):match(".*()\n") or 1
+        assert.is_truthy(src:sub(line_start, import_at):find("readdirSync", 1, true), "the sweep needs readdirSync")
+        assert.is_truthy(src:find('const LOG_TTL_ENV = "PI_BG_TASK_LOG_TTL_MS"', 1, true), "the TTL env must exist")
+        assert.is_truthy(
+            src:find("const DEFAULT_LOG_TTL_MS = 7 * 24 * 60 * 60 * 1000", 1, true),
+            "the default TTL is 7 days"
+        )
+        assert.is_truthy(
+            src:find("const LOG_FILE_PATTERN = /^pi-bash-(b[0-9a-f]{6})\\.log$/", 1, true),
+            "only this extension's log names may be touched"
+        )
+        local sweep_at = assert(src:find("function sweepLogFiles(", 1, true), "sweepLogFiles must exist")
+        -- The sweep is bounded by the next top-level declaration; the body is
+        -- where the two guards live.
+        local body = src:sub(sweep_at, sweep_at + 2500)
+        assert.is_truthy(body:find("if (tasks.has(", 1, true), "a task this process knows keeps its log")
+        assert.is_truthy(body:find("unlinkSync(file)", 1, true), "an old unknown log is removed")
+        assert.is_truthy(body:find("catch", 1, true), "a filesystem error must never throw out of the sweep")
+    end)
+
+    it("runs the log sweep once per process, after the transcript fold", function()
+        local src = read_extension()
+        local start = assert(src:find('pi.on("session_start"', 1, true), "session_start must be handled")
+        local stop = assert(src:find('pi.on("session_shutdown"', start, true), "session_shutdown follows it")
+        local handler = src:sub(start, stop)
+        local fold_at = assert(handler:find("reconcileSession(ctx)", 1, true), "the handler folds the transcript")
+        local sweep_at = assert(handler:find("sweepLogFiles()", 1, true), "and sweeps stale logs")
+        -- Order matters: an adopted task is in the table only after the fold, so
+        -- sweeping first would delete the log of a task that is still running.
+        assert.is_true(fold_at < sweep_at, "the sweep must run AFTER the fold")
+        assert.is_truthy(handler:find("if (!sweptLogs)", 1, true), "the sweep is once per process")
+    end)
 end)
 
 -- A resumed session replays its transcript (`replay_messages`) instead of

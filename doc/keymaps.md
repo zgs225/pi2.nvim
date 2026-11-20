@@ -27,6 +27,7 @@ What the plugin does bind on its own:
 | `a` / `i` | Open the output and focus it |
 | `p` | Preview the output live in a float (command + metadata header); press `p` again to close |
 | `x` | Stop the task under the cursor (asks for confirmation, then SIGTERMs its process group and SIGKILLs it if it has not exited after 5 s) |
+| `D` | Delete the task's log file from disk (asks for confirmation; finished tasks only — a running task is refused, stop it with `x` first) |
 | `A` | Toggle between the current session's tasks (default) and all sessions' tasks |
 | `R` | Redraw the list |
 | `q` | Close the panel |
