@@ -21,9 +21,13 @@ WT_ROOT=~/.local/share/pi.nvim-worktrees           # MUST be outside .../nvim/la
 name=grep-quickfix                                 # short kebab name
 
 git -C "$MAIN" fetch origin
+cd "$MAIN"
+mise install                                    # pinned gate toolchain (.mise.toml), once per checkout
 git -C "$MAIN" worktree add "$WT_ROOT/$name" -b "feat/$name" origin/main
 cd "$WT_ROOT/$name"
-make test                                          # baseline, must be green
+mise trust && mise install                      # same pins inside the worktree
+make test                                      # baseline: unit suite must be green
+make check                                     # baseline: static gates must be green
 ```
 
 - Keep worktrees **outside** `~/.local/share/nvim/lazy/`. lazy.nvim treats every directory under `lazy/` as a plugin, so a worktree there would be loaded as a *second* pi plugin (duplicate modules, double autocmds).
@@ -35,6 +39,7 @@ Path resolution differs by layer (the trap is G23):
 
 | Layer | In a worktree it exercises… |
 |-------|------------------------------|
+| `make check` / `style` / `lint` (static) | **the worktree** ✓ — they read the tree you are standing in |
 | `make test` (unit) | **the worktree** ✓ — `tests/minimal_init.lua` resolves the repo root from its own file path |
 | Headless e2e with `-u tests/minimal_init.lua` | **the worktree** ✓ — same path-relative resolution |
 | `make smoke` / GUI automation | **the MAIN checkout** ⚠ — these boot `~/.config/nvim/init.lua`, and lazy loads pi from its installed path, not your worktree |

@@ -83,6 +83,9 @@ History._stream_flush_ms = 30
 ---@field tool_name string
 ---@field icon_extmark integer
 ---@field name_extmark? integer marks tool name highlight (inline tools)
+---@field detail_extmark? integer marks the subdued detail span of an inline row
+---@field inline_detail? string flattened detail text written on an inline row (rewritten by `inline_result_text`)
+---@field inline_detail_start? integer byte col where an inline row's "  <detail>" span begins
 ---@field spinner_extmark? integer marks spinner virt_text on header
 ---@field tail_extmark? integer marks last row of block after on_start; used for positional insertion in on_tool_end
 ---@field live_update_extmark? integer marks first row of live partial output
@@ -2613,6 +2616,49 @@ function History:append_custom_block(block)
     end)
 end
 
+--- Append ONE dim system-note line to the history.
+---
+--- `chunks` describes that single line as `{text, hl}` pairs, highlighted
+--- exactly like a custom block's line. Unlike `append_custom_block` this must
+--- not assume the conversation has started: a background-task note can be the
+--- very FIRST content in a fresh history (the extension's startup orphan
+--- summary), so the note finalizes the placeholder itself.
+---@param chunks table[] list of `{text, hl?}` pairs for one line
+function History:append_system_note(chunks)
+    self:_seal_stream_text()
+    vim.schedule(function()
+        if not self._buf or not vim.api.nvim_buf_is_valid(self._buf) then
+            return
+        end
+        self:_pop_text_batch()
+        if not chunks or #chunks == 0 then
+            return
+        end
+        -- No-op once the history has conversation content; on an empty history
+        -- it marks the first content and drops the loading placeholder.
+        self:_begin_conversation_content()
+
+        local parts = {} ---@type string[]
+        for _, chunk in ipairs(chunks) do
+            parts[#parts + 1] = chunk[1] or ""
+        end
+        local row = self:_append_lines({ table.concat(parts) })
+
+        local col = 0
+        for _, chunk in ipairs(chunks) do
+            local chunk_text = chunk[1] or ""
+            local hl = chunk[2]
+            if hl and #chunk_text > 0 then
+                vim.api.nvim_buf_set_extmark(self._buf, ns, row, col, {
+                    end_col = col + #chunk_text,
+                    hl_group = hl,
+                })
+            end
+            col = col + #chunk_text
+        end
+    end)
+end
+
 ---@param tool_name string
 ---@param tool_call_id string
 ---@param tool_input? table
@@ -2655,19 +2701,20 @@ function History:on_tool_start(tool_name, tool_call_id, tool_input)
             local row = lines[1] == "" and start + 1 or start
 
             local icon_start = #indent
+            local detail_start = icon_start + #icon + 1 + #display_name
             local icon_extmark = vim.api.nvim_buf_set_extmark(self._buf, ns, row, icon_start, {
                 end_col = icon_start + #icon,
                 hl_group = "PiToolHeader",
             })
             -- Tool name
             local name_extmark = vim.api.nvim_buf_set_extmark(self._buf, ns, row, icon_start + #icon, {
-                end_col = icon_start + #icon + 1 + #display_name,
+                end_col = detail_start,
                 hl_group = "PiToolHeader",
             })
             -- Detail (path etc.) in subdued color
+            local detail_extmark
             if detail then
-                local detail_start = icon_start + #icon + 1 + #display_name + 2
-                vim.api.nvim_buf_set_extmark(self._buf, ns, row, detail_start, {
+                detail_extmark = vim.api.nvim_buf_set_extmark(self._buf, ns, row, detail_start + 2, {
                     end_col = #line,
                     hl_group = "PiToolCall",
                 })
@@ -2678,6 +2725,11 @@ function History:on_tool_start(tool_name, tool_call_id, tool_input)
                     tool_name = tool_name,
                     icon_extmark = icon_extmark,
                     name_extmark = name_extmark,
+                    detail_extmark = detail_extmark,
+                    -- The row's name is fixed; only the detail span after it can
+                    -- be revised once the result lands (inline_result_text).
+                    inline_detail = detail,
+                    inline_detail_start = detail_start,
                     tool_input = tool_input,
                     inline = true,
                 }
@@ -2844,8 +2896,42 @@ function History:on_tool_end(tool_name, tool_call_id, result, is_error)
                 end
             end
 
-            -- Append status as virtual text at end of line (silent on success)
+            -- A renderer may revise the inline detail once the result is known.
+            -- A dispatch row is written before its batch result exists, so it
+            -- can only name the checkout the item *asked* for then; the result
+            -- item carries the one it actually got. Only a renderer that
+            -- declares `inline_result_text` is touched — a nil return from any
+            -- other tool must never read as "drop the detail". Rewrite just the
+            -- detail span after the tool name, leaving the icon/name extmarks
+            -- alone.
             local renderer = Tools.get_renderer(tool_name)
+            if renderer.inline_result_text then
+                local new_detail = renderer.inline_result_text(block.tool_input, result, is_error)
+                new_detail = new_detail and Tools.flatten_line(new_detail) or nil
+                if new_detail ~= block.inline_detail then
+                    local row = pos[1]
+                    local cur = vim.api.nvim_buf_get_lines(self._buf, row, row + 1, false)[1] or ""
+                    local from = math.min(block.inline_detail_start or #cur, #cur)
+                    local replacement = new_detail and { "  " .. new_detail } or {}
+                    self:_with_modifiable(function()
+                        vim.api.nvim_buf_set_text(self._buf, row, from, row, #cur, replacement)
+                    end)
+                    if new_detail then
+                        local line_now = vim.api.nvim_buf_get_lines(self._buf, row, row + 1, false)[1] or ""
+                        block.detail_extmark = vim.api.nvim_buf_set_extmark(self._buf, ns, row, from + 2, {
+                            id = block.detail_extmark,
+                            end_col = #line_now,
+                            hl_group = "PiToolCall",
+                        })
+                    elseif block.detail_extmark then
+                        pcall(vim.api.nvim_buf_del_extmark, self._buf, ns, block.detail_extmark)
+                        block.detail_extmark = nil
+                    end
+                    block.inline_detail = new_detail
+                end
+            end
+
+            -- Append status as virtual text at end of line (silent on success)
             local extra = renderer.inline_status and renderer.inline_status(result, is_error) or nil
             local row = pos[1]
             local line = vim.api.nvim_buf_get_lines(self._buf, row, row + 1, false)[1] or ""

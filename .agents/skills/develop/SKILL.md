@@ -17,14 +17,14 @@ flowchart TD
     C -- approve --> E["review:approved"]
     E --> F["git worktree add <wt> -b feat/<name>"]
     F --> G["Implement in the worktree\n(config → module → wiring → tests → docs → CHANGELOG)"]
-    G --> H{"make test\nheadless e2e"}
+    G --> H{"make test · make check\nmake style / lint · headless e2e"}
     H -- fail --> G
     H -- green --> I["git commit · push feat/<name>"]
     I --> J["Implementation comment on issue\nlabel: pr:awaiting-review"]
     J --> K{"Human code review"}
     K -- changes requested --> L["pr:changes-requested"] --> G
     K -- approved --> M["pr:approved"]
-    M --> M2{"Docs sync gate\nmake docs-links · 用户可见变更逐项核对\nCHANGELOG 条目"}
+    M --> M2{"Gates: make style / lint / check\ndocs-links · CHANGELOG 条目"}
     M2 -- 不一致 --> G
     M2 -- 通过 --> N["merge --no-ff → push main\ndelete branch · remove worktree"]
     N --> P{"CI run for the merge\ngreen? (GH Actions)"}
@@ -40,12 +40,12 @@ flowchart TD
 | Branch | Create a **git worktree** on `feat/<short-kebab-name>` and develop there — never in the live `lazy/pi2.nvim` checkout. Baseline `make test` green before starting. |
 | Implement | Follow the **standard places** checklist below. Config knobs touch **three** spots in `config.lua` (G19). |
 | Test | Cheapest layer that can observe the behavior. State what was verified and what was not, and end the final report's verification section with a copy-pasteable manual-test nvim command (`PI_DEV_DIR` gate for worktree code — references/testing.md § Verification discipline). |
-| PR | Push branch → implementation comment → `pr:awaiting-review`. CI runs on the push; confirm the run is green before review. |
+| PR | Push branch → implementation comment → `pr:awaiting-review`. CI triggers on a PR and on the merge commit to `main` (a plain feature-branch push does **not** trigger it — `lint.yml` and `e2e.yml` use `on: push: branches: [main]` + `pull_request`; `tests.yml` uses `branches: [main, dev]` + `pull_request` + `workflow_dispatch`), so the authoritative run is the one after merge; open a PR if you want the jobs green before review. |
 | Review | `pr:changes-requested` → fix → re-push → back to `pr:awaiting-review`. `pr:approved` → merge. |
-| Docs gate | Merge 前必须通过 **docs sync gate**：`make docs-links` 绿；逐项核对用户可见变更（commands / keymaps / config / highlight groups / public API / documented behavior）已在**同一变更**里同步到 `README.md` 与 `doc/*.md`；`CHANGELOG.md` 有当日条目。不一致 → 回到 Implement 补齐后重新走 review。详见下方 "Docs sync gate (before merge)"。 |
+| Docs gate | Merge 前必须通过 **docs sync gate**：`make docs-links` + `make check` 绿；逐项核对用户可见变更（commands / keymaps / config / highlight groups / public API / documented behavior）已在**同一变更**里同步到 `README.md` 与 `doc/*.md`（几何上可由 `scripts/checks/` 判定的部分已自动判定，其余靠人）；`CHANGELOG.md` 有当日条目。不一致 → 回到 Implement 补齐后重新走 review。详见下方 "Docs sync gate (before merge)"。 |
 | Merge | In the **main checkout**: `git merge --no-ff`, push main, delete remote+local branch, `git worktree remove`. **Verify the CI run for the merge commit is green** (see CI verification below), then close issue. |
 
-Gitea: 所有 issue 交互统一使用 `tea` CLI（eos-bootstrap 安装，login `yuez`），**不要**手写 curl 调 API，也**不要**在 GitHub 上开 issue —— GitHub 只是公开镜像，issue 只在 Gitea。issue 生命周期命令速查见 `references/gitea.md`。如果误开在 GitHub 上，按 `references/gitea.md` 的 "Migrate from GitHub" 迁回并删除。
+Gitea: 所有 issue 交互统一使用 `gt` CLI（gitea-cli，`/usr/bin/gt`，keyring 认证；`tea` 已被 gitea-cli 取代，不要再用），**不要**手写 curl 调 API，也**不要**在 GitHub 上开 issue —— GitHub 只是公开镜像，issue 只在 Gitea。issue 生命周期命令速查见 `references/gitea.md`。如果误开在 GitHub 上，按 `references/gitea.md` 的 "Migrate from GitHub" 迁回并删除。
 
 ## Worktree workflow
 
@@ -62,25 +62,32 @@ In a worktree, `make test` and headless e2e under `-u tests/minimal_init.lua` ex
 
 | Layer | Command | Sees | Cannot see |
 |-------|---------|------|------------|
-| Unit (plenary) | `make test` | pure-Lua logic, config resolution | buffers, windows, keys, rendering |
-| Headless e2e | `make smoke` / `nvim --headless -l script.lua` | plugin load, RPC, buffer/extmark wiring | visual rendering, real key events |
+| Static gates | `make style` / `make lint` / `make check` / `make docs-links` | formatting (Lua + Python), undefined symbols (`lua/` strictly, `tests/` + `scripts/e2e/` with `.luarc-tests.json`), LuaJIT parse errors (G24, after probing that the parser really rejects Lua 5.3 syntax), docs drift | anything about runtime behaviour |
+| Unit (plenary) | `make test` (the `unit` job of the `tests` workflow) — bounded-concurrency runner, `TEST_JOBS` / `TEST_FILTER` / `TEST_TIMEOUT` | pure-Lua logic, config resolution | buffers, windows, keys, rendering |
+| Headless e2e | `make smoke` / `make e2e` (every `tests/*_e2e.lua`; the `e2e` job of the `tests` workflow) / `nvim --headless -l script.lua` | plugin load, RPC, buffer/extmark wiring; `make e2e` grades each script by **exit code** (`tests/e2e_deps.lua`: 0 pass, 1 failure, 2 missing prerequisite in gate mode, 3 skipped) | visual rendering, real key events |
 | GUI automation | `scripts/gui_launch.sh` + `gui_harness.sh` (macOS: `scripts/macos/`) | real keybindings, insert mode, **pixels** | — (top layer, slow) |
-| CI gate | `.github/workflows/lint.yml` (auto on push/PR) | `make style` + `make lint` reproducibility on a clean runner | plugin runtime; mirrors style/lint only, not `make test` |
+| CI gate | `.github/workflows/lint.yml` + `.github/workflows/tests.yml` (auto on push/PR) | `make style` + `make lint` (three lua-language-server passes) + `make check` (self-test first) + `make docs-links` on a clean runner, **and** the `tests` workflow's two behaviour jobs — `unit` (`make test`) and `e2e` (`make e2e`) — each judged by exit code only | GUI pixels (Layer 3) |
 
-Details, pitfalls, isolation recipe, and script usage: `references/testing.md`.
+Details, pitfalls, isolation recipe, and script usage: `references/testing.md`. The static-gate architecture (how to add a check, what is not checkable): `references/checks.md`.
 
 ## CI verification
 
-A feature is **not complete until the CI run for its merge commit is green** — local green ≠ CI green (the runner is a different, clean environment). `.github/workflows/lint.yml` runs `make style` + `make lint` on every push to `main` and on PRs; it is self-contained (downloads stylua + lua-language-server, no Neovim needed). `make test` is **not** in CI yet — keep running it locally.
+A feature is **not complete until the CI run for its merge commit is green** — local green ≠ CI green (the runner is a different, clean environment). Workflows run on **GitHub Actions only**: the canonical Gitea instance (`git.yuez.me`) is the issue tracker (`has_actions: false`, not one run ever), so a commit that only reaches Gitea runs nothing at all. Two workflows matter here. `.github/workflows/lint.yml` runs `make style` + `make lint` + `make check`; it is self-contained (downloads stylua + lua-language-server + ruff, `apt install luajit`, no Neovim needed) and derives the three release versions from `.mise.toml`. `.github/workflows/tests.yml` has **two behaviour jobs**, both triggered by a push to `main` or `dev`, by every PR and by `workflow_dispatch`, and both judged by **exit code only**, never by grepping the coloured output (G25):
+
+- **`unit`** — `make test`, the plenary suite, with a pinned toolchain (Neovim v0.12.6, plenary and render-markdown.nvim commits — the specs assert version-specific behaviour). `make test` goes through `scripts/run_tests.lua`, which caps concurrency (`TEST_JOBS`, default 8 — the suite is ~170 spec files and unbounded fan-out kills children and flakes every wall-clock assertion) and gives each child its own budget (`TEST_TIMEOUT`, default 300 s). Its output is one `ok <file>` / `[FAILED] <file> (…)` line per spec plus a `run_tests: N files, P passed, F failed` summary, and the failure diagnostics print exactly those lines — so a red run names the spec instead of interleaving 170 streams.
+- **`e2e`** — `make e2e`, all nine hermetic `tests/*_e2e.lua` scripts under `nvim --headless -u tests/minimal_init.lua -l <file>`. No provider, account or secret: each script points `PI_CODING_AGENT_DIR` / prompt-history / draft at temp paths and stubs the backend send, so no request is ever made — but the `pi` **binary** is required, because creating a session spawns the real backend (`jobstart("pi")`), so the job installs a pinned `pi` release (no Node) plus Neovim, plenary and telescope.nvim (render-markdown.nvim is not installed, and nothing there loads it). The first CI run of that job proved the `pi` dependency: without it every session creation died with `Vim:E475`. telescope is there for `tests/resume_partitions_e2e.lua`, the one layer that renders the resume picker with the **real** picker (the plenary specs stub it) — it used to print `[SKIP]` and exit 0, so the job was green on a script that asserted nothing (Gitea #125). **A missing prerequisite is now a failure, never a skip:** `tests/e2e_deps.lua` exits 3 (skipped) locally and 2 under `PI_E2E_REQUIRE_DEPS=1`, which this job sets, and `make e2e` counts exit 3 separately and says `… passed, N SKIPPED — a skip is not a pass` instead of folding it into "passed". The loop runs **every** script, writes `e2e: <file> exit=<code>` per script and fails at the end with `e2e: N of M script(s) FAILED`, so the summary — never a single script's line — is what the job believes; the diagnostics step prints that summary under `if: failure()` only.
+
+A PR gets all of them, so a red spec or a broken e2e script stops the merge instead of being discovered later. `make smoke` and the GUI layer deliberately stay local: they load the user's own config.
 
 - The repo is public, so run status is readable without auth:
   `curl -s "https://api.github.com/repos/zgs225/pi2.nvim/actions/runs?branch=main&per_page=5"` (or `gh run list` when logged in).
 - Inspect a run's jobs/steps: `.../actions/runs/<run_id>/jobs` (or `gh run view <run_id>`).
-- The workflow has no `workflow_dispatch`; it triggers on push/PR. To trigger it, push a commit. Manual dispatch needs auth (`gh auth login` or a PAT with `actions:write`).
+- `.github/workflows/lint.yml` has no `workflow_dispatch`; it triggers on push/PR (`.github/workflows/tests.yml` adds a manual dispatch). Either way, to trigger one, push a commit. Manual dispatch needs auth (`gh auth login` or a PAT with `actions:write`).
 - On failure, fix on a branch, push, and re-check the new run before (re-)merging.
 
 ## Standard places a new feature lands
 
+- **Checkable requirement** → `scripts/checks/rules/<name>.py` + fixtures + an entry in `rules/__init__.py::ALL`; a rule of conduct a machine can decide ships with the check that enforces it (recipe: `references/checks.md`).
 - **Config knob** → `lua/pi/config.lua` — three spots: `---@class` annotation, `pi.Options` field, `defaults` table (G19).
 - **Pure logic** → `lua/pi/<name>.lua`, one table returned, `_` prefix for private, `_reset()` for testability.
 - **Public API** → `lua/pi/init.lua`, nil-guard on `Sessions.get()`.
@@ -90,12 +97,13 @@ A feature is **not complete until the CI run for its merge commit is green** —
 - **Checkable requirements (deps / version floors / config)** → `lua/pi/health.lua` + `lua/pi/compat.lua`: 新特性若引入用户可诊断的依赖、版本下限或配置要求，必须同步给 `:checkhealth pi` 新增检查项（ok/error/warn 三态），并在 `doc/troubleshooting.md` 描述该检查项。版本常量集中放在 `compat.lua`（如 vision fallback 的 `vision_min_supported = "0.81.0"`，与 `min_supported`/`validated` 同处），不要在 health.lua 里硬编码。参考实例：vision fallback 的 pi 0.81.0+ 版本下限检查（`feat(health): check pi version floor for vision fallback`）。
 - **Docs (README + `doc/`) + CHANGELOG** → docs-code consistency is mandatory: user-facing changes update `README.md` / the relevant `doc/*.md` in the same commit; internal changes still verify the docs remain accurate and fix any drift. Run `make docs-links` before committing.
 - **Tests** → `tests/<name>_spec.lua`; e2e per `references/testing.md`.
+- **Startup-sensitive code** (anything `pi.setup()` runs synchronously, session/manifest scans) → `AGENTS.md` § *Startup cost is a hard budget* is the rule; `references/architecture.md` has the *why*. Measure `require("pi.sessions.manager")` plus `require("pi").setup({})` under the real config and put the number in the implementation comment; `tests/subsessions_rebuild_spec.lua` (no per-file parse, mtime short-circuit) and `tests/subsessions_read_spec.lua` (bounded decode count) fail if the fast path regresses.
 
 ## Docs sync gate (before merge)
 
 Merge 前对文档做一次显式核对（流程图 M2，Phase rule `Docs gate`）——不要只依赖实现阶段的自觉，文档与代码必须始终同源（AGENTS.md）：
 
-1. `make docs-links` —— 相对链接与锚点有效（提交前也要跑）。
+1. `make docs-links` —— 相对链接与锚点有效（提交前也要跑）；`make check` —— commands / keymaps / config / highlight groups / public API 与文档的同步由 `docs-*` 规则机器判定（提交前也要跑）。
 2. 逐项核对本次变更的用户可见面，确认已在同一变更里更新文档：
    - `:Pi*` commands → `doc/usage.md`（命令表）
    - keymaps → `doc/keymaps.md`
@@ -109,14 +117,15 @@ Merge 前对文档做一次显式核对（流程图 M2，Phase rule `Docs gate`�
 
 ## Gotchas
 
-G1–G30 are indexed in the quick-reference table at the top of `references/gotchas.md`, with full 现象/根因/修法 and minimal reproductions below it. Read the full entry before relying on a one-liner. Most frequent traps: G1/G2/G3 (expr-mapping keys), G4/G5 (headless e2e), G6 (visual needs a GUI screenshot), G14 (spec scoping), G19 (three config spots), G21 (restart nvim after editing `lua/pi/**`), G23 (worktree test layers), G24 (LuaJIT-parseable syntax).
+G1–G33 are indexed in the quick-reference table at the top of `references/gotchas.md`, with full 现象/根因/修法 and minimal reproductions below it. Read the full entry before relying on a one-liner. Most frequent traps: G1/G2/G3 (expr-mapping keys), G4/G5 (headless e2e), G6 (visual needs a GUI screenshot), G14 (spec scoping), G19 (three config spots), G21 (restart nvim after editing `lua/pi/**`), G23 (worktree test layers), G24 (LuaJIT-parseable syntax — gated by `make parse`). Most of them now name the spec that pins them in a `回归守护` line — start there instead of re-deriving the trap.
 
 ## Cross-references
 
 - `references/worktree.md` — why worktrees, exact setup/verification/cleanup commands, layer caveats.
 - `references/architecture.md` — module map, hard design constraints, rationale for standard places.
 - `references/testing.md` — layer details, pitfalls, isolation recipe, verification discipline, script usage.
-- `references/gotchas.md` — quick-reference table + full 现象/根因/修法 for G1–G30 with minimal reproductions.
-- `references/gitea.md` — tea CLI cheat sheet for the issue lifecycle (create/list/labels/comments/close).
+- `references/gotchas.md` — quick-reference table + full 现象/根因/修法 for G1–G33 with minimal reproductions.
+- `references/checks.md` — the static gates: `scripts/checks/` architecture, the fixture contract, how to add a rule, the pinned toolchain (`.mise.toml`), and what is deliberately not a static check.
+- `references/gitea.md` — issue lifecycle on Gitea via `gt` (gitea-cli): auth/keyring, the `GITEA_TOKEN` pitfall, create / comment / label / close.
 - `AGENTS.md` — architecture charter, style, type-annotation conventions.
 - `.agents/skills/commit/SKILL.md` — Conventional Commit format, CHANGELOG rules, breaking-change policy.

@@ -15,6 +15,7 @@ All highlight groups are defined with `default = true`, so they can be overridde
 | `PiStartupDetail` | Detail lines inside the startup block |
 | `PiStartupError` | Error lines inside the startup block |
 | `PiSystemErrorIcon` | Icon for system-error entries in the history |
+| `PiSystemNote` | One dim line per background-task delivery report in the history (links to `Comment`) |
 | `PiErrorRail` | Vertical rail drawn alongside hard-wrapped error lines |
 | `PiCompactionLabel` | Icon label for compaction summaries |
 | `PiCompactionText` | Body text inside compaction summaries |
@@ -96,6 +97,7 @@ Inspect what a block actually uses with `:Inspect` over the coloured text, or li
 | `PiFloatBorder` | Border for π float windows |
 | `PiChatHistoryWinbar` | Winbar background for the history panel (side layout) |
 | `PiChatHistoryWinbarTitle` | Winbar title for the history panel (side layout) |
+| `PiChatHistoryWorktree` | Git worktree badge (`󰙅 <name>`, with `*` when dirty/ahead) in the history title — winbar and float title. A session whose cwd differs from Neovim's renders the badge in `PiStatusLineWarning` instead. |
 | `PiChatPromptWinbar` | Winbar background for the prompt panel (side layout) |
 | `PiChatPromptWinbarTitle` | Winbar title for the prompt panel (side layout) |
 | `PiChatPromptWinbarAttentionTitle` | Winbar title for the prompt panel when attention is pending |
@@ -175,6 +177,7 @@ The dashboard reuses `PiToolHeader` for its section headers, `Comment` for dimme
 | `PiSessionsListDotDim` | Dim phase of blinking dots |
 | `PiSessionsListCurrent` | Marks the current tab's own session dot in the agent color |
 | `PiSessionsListFloatTitle` | Float title for the sessions list window |
+| `PiSessionsListWorktree` | Worktree group header in `:PiSessions` (`󰙅 name · ~/path`), the partition title in the `:PiResume` picker (`󰙅 name` for a linked worktree, the project name for the main checkout), and the `󰙅 name` badge in the sub-session viewer footer |
 
 ## Background tasks panel
 
@@ -185,6 +188,7 @@ The dashboard reuses `PiToolHeader` for its section headers, `Comment` for dimme
 | `PiTasksListSuccess` | Status dot of a completed task (dim `◌`; links to `DiagnosticOk`) |
 | `PiTasksListFailure` | Status dot of a failed task (steady red `●`; links to `DiagnosticError`) |
 | `PiTasksListStopped` | Status dot of a stopped task (dim `◌`; links to `DiagnosticWarn`) |
+| `PiTasksListUnknown` | Status dot of a task whose exit nobody observed (dim `◌`; links to `DiagnosticWarn`) |
 | `PiTasksListCurrent` | Window-local background marker under the status dot of every running row (cursorline background + bold) |
 | `PiTasksListDotDim` | Dim phase of the running dot's blink, and the `id · status · duration` subtitle (links to `Comment`) |
 | `PiTasksListFloatTitle` | Float title for the tasks panel window |

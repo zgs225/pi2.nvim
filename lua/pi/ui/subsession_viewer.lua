@@ -12,6 +12,7 @@ local Render = require("pi.ui.render")
 local Manifest = require("pi.subsessions.manifest")
 local Sessions = require("pi.sessions.manager")
 local Read = require("pi.subsessions.read")
+local Tasks = require("pi.tasks")
 local Vision = require("pi.vision")
 local Stats = require("pi.stats")
 local TodoToolUi = require("pi.todo.tool_ui")
@@ -19,10 +20,12 @@ local TodoToolUi = require("pi.todo.tool_ui")
 ---@class pi.SubsessionViewerOpts
 ---@field on_close? fun()
 ---@field name? string Display-name override (beats manifest entry and JSONL session_info)
+---@field cwd? string Workspace whose manifest holds the row (default: locate it)
 ---@field width? number Width in columns (>=1) or fraction of editor width (<1)
 ---@field height? number Height in lines (>=1) or fraction of editor height (<1)
 ---@field border? string|string[] Float border style
 ---@field statusline? boolean Whether to show statusline in viewer footer
+---@field worktree? string Display name of the worktree the viewed session ran in (the `:PiSessions` row's own label). nil falls back to detecting the checkout from the session cwd
 
 ---@class pi.SubsessionViewerStatus
 ---@field model_id string?
@@ -31,6 +34,7 @@ local TodoToolUi = require("pi.todo.tool_ui")
 ---@field model_reasoning boolean?
 ---@field thinking_level string?
 ---@field context_tokens integer?
+---@field worktree_name? string Linked worktree the viewed session ran in; renders as the `󰙅 name` footer badge
 
 -- Module state
 ---@type integer?
@@ -278,6 +282,34 @@ local function build_todo_chunk(details)
     return { ("○ %d/%d"):format(completed, total), "PiTodoPending" }
 end
 
+-- Nerd-font worktree glyph, the same one the `:PiSessions` group header, a
+-- sub-session row's subtitle and the chat title badge carry.
+local WORKTREE_GLYPH = "󰙅"
+
+--- Whether the footer carries the worktree badge (`subagent.viewer.worktree`).
+--- Default on: the row already names its checkout, so a viewer that hides it
+--- again would silently drop information the keypress carried in.
+---@return boolean
+local function viewer_worktree_enabled()
+    local viewer_cfg = (Config.options.subagent or {}).viewer or {}
+    return viewer_cfg.worktree ~= false
+end
+
+--- Footer badge naming the checkout the viewed session ran in: `󰙅 <name>`.
+--- The title only carries the display name and the status, so without this the
+--- viewer of a worktree session — or of a child *assigned* another checkout —
+--- says nothing about which working tree the conversation actually visited.
+--- Styled like the `:PiSessions` worktree header so both read as the same fact.
+---@param status pi.SubsessionViewerStatus
+---@return string[]? chunk { text, highlight }
+local function build_worktree_chunk(status)
+    local name = status.worktree_name
+    if type(name) ~= "string" or name == "" then
+        return nil
+    end
+    return { WORKTREE_GLYPH .. " " .. name, "PiSessionsListWorktree" }
+end
+
 --- Build statusline chunks and plain text for subsession viewer footer.
 ---@param status pi.SubsessionViewerStatus
 ---@return string[][]? chunks
@@ -288,6 +320,15 @@ local function format_statusline(status)
     end
 
     local items = {}
+    -- Which checkout comes first: it is the one part of the footer that never
+    -- changes while the session streams, so it stays scannable at a fixed spot
+    -- however the token count and model move.
+    if viewer_worktree_enabled() then
+        local w = build_worktree_chunk(status)
+        if w then
+            items[#items + 1] = w
+        end
+    end
     local c = build_context_chunk(status)
     if c then
         items[#items + 1] = c
@@ -387,11 +428,27 @@ local function set_replaying(history, replaying)
     end
 end
 
+--- Fold one `pi2_bg_task` record into the task registry, containing a failure.
+---
+--- The fold is a side effect of drawing a transcript, so a raise in the
+--- registry must never abort the replay (or the pre-pass) it is part of: it is
+--- downgraded to a warning, exactly as the parent's transcript fold does
+--- (`sessions/manager.lua`, `replay_bg_task_message`).
+---@param record table? transcript entry carrying a pi2_bg_task payload
+---@param session_id string? id of the viewed session (task-record ownership)
+local function fold_task_record(record, session_id)
+    local ok, err = pcall(Tasks.absorb_message, record, session_id, nil)
+    if not ok then
+        Notify.warn("Background task record failed: " .. tostring(err))
+    end
+end
+
 --- Replay structured messages into the viewer's history instance.
 --- Mirrors replay_messages from lua/pi/sessions/manager.lua.
 ---@param history pi.ChatHistory
 ---@param messages table[]
-local function replay(history, messages)
+---@param session_id string? id of the viewed session (task-record ownership)
+local function replay(history, messages, session_id)
     if not history or not history:buf() or not vim.api.nvim_buf_is_valid(history:buf()) then
         return
     end
@@ -521,6 +578,16 @@ local function replay(history, messages)
                 pending_agent_end = false
             end
             history:on_bash_replay(msg)
+        elseif role == "custom" then
+            -- A bg-tasks lifecycle entry renders nothing, but it is where a
+            -- task's command is written down: fold it in transcript order so a
+            -- `wait_task` / `stop_task` / `task_input` block replayed below
+            -- names the command instead of a bare id. `tab` is nil on purpose
+            -- — the viewed session is a child, whose rows must never be
+            -- attributed to the parent's tabpage. The fold is id-keyed, so a
+            -- repeated replay is harmless, and `pending_agent_end` is left
+            -- alone: a custom entry is not a conversation turn.
+            fold_task_record(msg, session_id)
         end
     end
 
@@ -535,6 +602,87 @@ local function replay(history, messages)
             history:scroll_to_bottom()
         end
     end)
+end
+
+--- Whether a path names a readable file (nil-tolerant: manifest rows and
+--- sessions carry optional strings).
+---@param path any
+---@return string?
+local function readable_path(path)
+    if type(path) == "string" and path ~= "" and vim.fn.filereadable(path) == 1 then
+        return path
+    end
+    return nil
+end
+
+--- Path of the checkout a row was *assigned* (sub-agent isolation), when the
+--- row records one.
+---@param entry? pi.SubsessionManifestEntry
+---@return string?
+local function assigned_worktree_path(entry)
+    if type(entry) ~= "table" or type(entry.assigned_worktree) ~= "table" then
+        return nil
+    end
+    local path = entry.assigned_worktree.path
+    if type(path) == "string" and path ~= "" then
+        return path
+    end
+    return nil
+end
+
+--- Workspace a viewed row ran in, when it is recorded but no transcript cwd is
+--- available: the worktree the row was *assigned* (sub-agent isolation), else
+--- the one it owns. Either lives in another checkout's session directory, so the
+--- JSONL cwd is preferred while it exists.
+---@param entry? pi.SubsessionManifestEntry
+---@return string?
+local function recorded_worktree_cwd(entry)
+    local assigned = assigned_worktree_path(entry)
+    if assigned then
+        return assigned
+    end
+    if type(entry) ~= "table" or type(entry.worktree) ~= "table" then
+        return nil
+    end
+    local path = entry.worktree.path
+    if type(path) == "string" and path ~= "" then
+        return path
+    end
+    return nil
+end
+
+--- Worktree the viewer badges in its footer, resolved once when the float
+--- opens (never from the statusline rebuild path, which runs on every streamed
+--- event).
+---
+--- The row's own label wins: `:PiSessions` already resolved it, an assigned
+--- child checkout included. Otherwise the checkout is detected from the cwd the
+--- session actually ran in (`Worktree.detect` is a cached, filesystem-only read
+--- — no git subprocess — so one call per open is free). Only a *linked*
+--- worktree is badged: a session in the repository's main checkout gets no
+--- badge, exactly like the chat title's.
+---@param opts pi.SubsessionViewerOpts
+---@param cwd string? workspace the viewed session ran in
+---@return string?
+local function resolve_worktree_name(opts, cwd)
+    if type(opts.worktree) == "string" and opts.worktree ~= "" then
+        return opts.worktree
+    end
+    if type(cwd) ~= "string" or cwd == "" then
+        return nil
+    end
+    local loaded, Worktree = pcall(require, "pi.worktree")
+    if not loaded or type(Worktree) ~= "table" or type(Worktree.detect) ~= "function" then
+        return nil
+    end
+    local ok, info = pcall(Worktree.detect, cwd)
+    if not ok or type(info) ~= "table" or info.kind ~= "linked" then
+        return nil
+    end
+    if type(info.name) ~= "string" or info.name == "" then
+        return nil
+    end
+    return info.name
 end
 
 ---@param path string
@@ -611,6 +759,29 @@ local function load_messages_from_jsonl(path)
     end
     file:close()
     return messages, session_name, status, entries
+end
+
+--- Fold a dormant session's background-task records into the task registry.
+---
+--- The transcript replayed below holds only `role="message"` conversation
+--- entries, while a task's lifecycle lives in `custom_message` entries (and, in
+--- older files, `type="custom"` ones with the payload under `data`) — both
+--- keyed by the task id. Folding them in a pre-pass, in file order, therefore
+--- cannot mis-order them against the `wait_task` block that names the task,
+--- and folding twice is harmless because the fold is id-keyed (a repeated
+--- `started` is inert, a terminal record is idempotent). Panel side effects are
+--- deliberately absent: opening a viewer must not pop panels.
+---@param entries table[] decoded JSONL entries, in file order
+---@param session_id string? id of the viewed session (task-record ownership)
+local function fold_task_entries(entries, session_id)
+    if type(entries) ~= "table" then
+        return
+    end
+    for _, entry in ipairs(entries) do
+        if type(entry) == "table" and (entry.type == "custom" or entry.type == "custom_message") then
+            fold_task_record(entry, session_id)
+        end
+    end
 end
 
 --- Resolve the current todo snapshot: a live session (RPC running) reads the
@@ -874,6 +1045,7 @@ function M.close()
         model_reasoning = nil,
         thinking_level = nil,
         context_tokens = nil,
+        worktree_name = nil,
     }
 
     if viewer_win == nil and viewer_history == nil then
@@ -1141,9 +1313,13 @@ function M.open(child_id, opts)
     -- 1. Close any existing viewer
     M.close()
 
-    -- 2. Look up manifest entry for name/status
-    local manifest = Manifest.load()
-    local entry = manifest[child_id]
+    -- 2. Look up the child's manifest row. Sub-session rows live in the *parent*
+    -- session's workspace manifest, which is not necessarily Neovim's cwd (a tab
+    -- can run in a worktree checkout): `opts.cwd` is the hint, otherwise the row
+    -- is located across live workspaces and the manifests on disk.
+    local workspace = type(opts.cwd) == "string" and opts.cwd ~= "" and opts.cwd or nil
+    local entry, entry_cwd = Manifest.locate(child_id, workspace)
+    workspace = entry_cwd or workspace
 
     -- Name precedence: opts.name > manifest entry name > JSONL session_info > raw id.
     ---@type string?
@@ -1165,6 +1341,7 @@ function M.open(child_id, opts)
         model_reasoning = nil,
         thinking_level = nil,
         context_tokens = nil,
+        worktree_name = nil,
     }
 
     if entry and entry.config then
@@ -1182,6 +1359,11 @@ function M.open(child_id, opts)
     local session = Sessions.get_by_id(child_id)
     local is_live = session ~= nil and session.rpc ~= nil and session.rpc:is_running()
     local status = (entry and entry.status) or (is_live and "active" or "dormant")
+    -- The viewed session's id, resolved once for both paths: a live session's
+    -- registry id is the id the viewer was opened for, and a dormant session is
+    -- known only by that same id. Background-task records folded by the replay
+    -- below are stamped with it.
+    local viewed_session_id = (session and session.id) or child_id
 
     if session then
         local pin = session.pinned_config
@@ -1203,7 +1385,23 @@ function M.open(child_id, opts)
     -- cwd, or a session file opened by id).
     local session_cwd = (session and session.cwd) or nil
     if not is_live then
-        local path = (session and session.session_file) or Read.find_path(child_id)
+        -- Transcript lookup: the manifest's recorded path first (a child
+        -- running in its own worktree keeps its JSONL in *that* workspace's
+        -- session directory, which the id lookup scoped to the parent's
+        -- workspace cannot see), then the live session's reported file, then
+        -- the id lookup — searched in the assigned checkout before the legacy
+        -- parent/live workspace.
+        local entry_file = type(entry) == "table" and entry.session_file or nil
+        local path = readable_path(entry_file) or readable_path(session and session.session_file)
+        if not path then
+            local assigned_cwd = assigned_worktree_path(entry)
+            if assigned_cwd then
+                path = Read.find_path(child_id, { cwd = assigned_cwd })
+            end
+        end
+        if not path then
+            path = Read.find_path(child_id, { cwd = (session and session.cwd) or workspace })
+        end
         if not path and vim.fn.filereadable(child_id) == 1 then
             path = child_id
         end
@@ -1214,7 +1412,10 @@ function M.open(child_id, opts)
         local msgs, session_name, jsonl_status, entries = load_messages_from_jsonl(path)
         dormant_messages = msgs
         viewer_todo_entries = entries
-        session_cwd = (jsonl_status and jsonl_status.cwd) or session_cwd
+        -- Task records first: the replayed `wait_task` blocks read their
+        -- command from the registry, so the fold has to land before replay.
+        fold_task_entries(entries, viewed_session_id)
+        session_cwd = (jsonl_status and jsonl_status.cwd) or session_cwd or recorded_worktree_cwd(entry)
         -- The JSONL fallback only applies while no name is known yet.
         if session_name and session_name ~= "" and not opts_name and not entry_name then
             name = session_name
@@ -1239,6 +1440,11 @@ function M.open(child_id, opts)
         viewer_status.model_context_window =
             resolve_context_window(viewer_status.model_id, viewer_status.model_provider)
     end
+
+    -- Worktree badge: resolved once, from the row's own label or the checkout
+    -- the session actually ran in (the transcript cwd is the freshest value —
+    -- an owned child checkout can outlive the manifest row's record).
+    viewer_status.worktree_name = resolve_worktree_name(opts, session_cwd)
 
     -- Todo snapshot for the footer chunk and the `T` panel: the per-session
     -- mirror for a live session, the decoded JSONL entries otherwise.
@@ -1300,7 +1506,7 @@ function M.open(child_id, opts)
     viewer_win = win
     viewer_history = history
     viewer_child_id = child_id
-    viewer_is_child = Manifest.is_child_session(child_id)
+    viewer_is_child = type(entry) == "table" and entry.parent_id ~= nil
     viewer_session_name = name
     viewer_loading = false
     viewer_event_queue = nil
@@ -1520,7 +1726,7 @@ function M.open(child_id, opts)
                         resolve_context_window(viewer_status.model_id, viewer_status.model_provider)
                 end
                 M.update_statusline()
-                replay(history, messages)
+                replay(history, messages, viewed_session_id)
                 viewer_loading = false
                 local queue = viewer_event_queue or {}
                 viewer_event_queue = nil
@@ -1538,7 +1744,7 @@ function M.open(child_id, opts)
             Notify.error("Failed to request messages from subsession RPC")
         end
     else
-        replay(history, dormant_messages or {})
+        replay(history, dormant_messages or {}, viewed_session_id)
     end
 end
 
@@ -1555,8 +1761,9 @@ end
 
 ---@param history pi.ChatHistory
 ---@param messages table[]
-function M._replay(history, messages)
-    replay(history, messages)
+---@param session_id? string id of the viewed session (task-record ownership)
+function M._replay(history, messages, session_id)
+    replay(history, messages, session_id)
 end
 
 ---@param path string

@@ -51,7 +51,7 @@ local function seed(fields)
         id = "t1",
         command = "echo hi",
         status = "running",
-        start_time = now_ms() - 60_000,
+        start_time = now_ms() - 60000,
     }, fields)
     Tasks.upsert(task)
     return task
@@ -210,7 +210,7 @@ describe("tasks panel UI", function()
     describe("format_line", function()
         it("formats a running row with dot, spinner, summary and mm:ss subtitle", function()
             local task = seed({ id = "run1", command = "make test" })
-            local row = Tasks.build_rows(task.start_time + 65_000)[1]
+            local row = Tasks.build_rows(task.start_time + 65000)[1]
             local line, chunks = Panel.format_line(row, 0, 80)
 
             assert.is_truthy(line:find("●", 1, true), "running dot")
@@ -238,7 +238,7 @@ describe("tasks panel UI", function()
 
         it("renders terminal rows with a dim glyph and relative end time", function()
             local base = now_ms()
-            seed({ id = "done1", status = "completed", start_time = base - 300_000, end_time = base - 180_000 })
+            seed({ id = "done1", status = "completed", start_time = base - 300000, end_time = base - 180000 })
             local rows = Tasks.build_rows(base)
             local row
             for _, r in ipairs(rows) do
@@ -255,8 +255,8 @@ describe("tasks panel UI", function()
 
         it("maps failed and stopped statuses to their highlight groups", function()
             local base = now_ms()
-            seed({ id = "f1", status = "failed", start_time = base - 10_000, end_time = base - 5000, exit_code = 1 })
-            seed({ id = "s1", status = "stopped", start_time = base - 20_000, end_time = base - 15_000 })
+            seed({ id = "f1", status = "failed", start_time = base - 10000, end_time = base - 5000, exit_code = 1 })
+            seed({ id = "s1", status = "stopped", start_time = base - 20000, end_time = base - 15000 })
             local by_id = {}
             for _, r in ipairs(Tasks.build_rows(base)) do
                 by_id[r.task.id] = r
@@ -265,6 +265,25 @@ describe("tasks panel UI", function()
             local _, stopped_chunks = Panel.format_line(by_id.s1, 0, 80)
             assert.are.equal("PiTasksListFailure", failed_chunks[1][3])
             assert.are.equal("PiTasksListStopped", stopped_chunks[1][3])
+        end)
+
+        it("renders an unknown exit as the dim glyph, not a failure", function()
+            -- `unknown` means nobody watched the exit, not that it failed: a
+            -- filled red dot would contradict the report that produced it.
+            local base = now_ms()
+            seed({ id = "u1", status = "unknown", start_time = base - 20000, end_time = base - 15000 })
+            local row
+            for _, r in ipairs(Tasks.build_rows(base)) do
+                if r.task.id == "u1" then
+                    row = r
+                end
+            end
+            assert.is_not_nil(row)
+            local line, chunks = Panel.format_line(row, 0, 80, base)
+            assert.is_truthy(line:find("◌", 1, true), "unknown uses the hollow glyph")
+            assert.is_nil(line:find("●", 1, true), "unknown must not use the failure glyph")
+            assert.are.equal("PiTasksListUnknown", chunks[1][3])
+            assert.are.equal("unknown", row.status_label)
         end)
 
         it("truncates the command summary to the indent-adjusted budget", function()
@@ -281,10 +300,10 @@ describe("tasks panel UI", function()
     describe("render and lookup", function()
         it("renders running tasks first, then newest terminal tasks", function()
             local base = now_ms()
-            seed({ id = "old_done", status = "completed", start_time = base - 500_000, end_time = base - 400_000 })
-            seed({ id = "new_done", status = "completed", start_time = base - 300_000, end_time = base - 200_000 })
-            seed({ id = "run_a", command = "aaa", start_time = base - 50_000 })
-            seed({ id = "run_b", command = "bbb", start_time = base - 10_000 })
+            seed({ id = "old_done", status = "completed", start_time = base - 500000, end_time = base - 400000 })
+            seed({ id = "new_done", status = "completed", start_time = base - 300000, end_time = base - 200000 })
+            seed({ id = "run_a", command = "aaa", start_time = base - 50000 })
+            seed({ id = "run_b", command = "bbb", start_time = base - 10000 })
 
             Panel.open()
             local rendered = table.concat(
@@ -312,7 +331,7 @@ describe("tasks panel UI", function()
         it("marks row highlights with the contract highlight group names", function()
             local base = now_ms()
             seed({ id = "run1", command = "make" })
-            seed({ id = "f1", status = "failed", start_time = base - 10_000, end_time = base - 5000, exit_code = 1 })
+            seed({ id = "f1", status = "failed", start_time = base - 10000, end_time = base - 5000, exit_code = 1 })
             Panel.open()
 
             local buf = vim.api.nvim_win_get_buf(Panel.win(vim.api.nvim_get_current_tabpage()))
@@ -338,10 +357,10 @@ describe("tasks panel UI", function()
 
         it("renders a blank/title/blank header with running and finished counts", function()
             local base = now_ms()
-            seed({ id = "run1", command = "make test", start_time = base - 50_000 })
-            seed({ id = "run2", command = "make lint", start_time = base - 40_000 })
-            seed({ id = "done1", status = "completed", start_time = base - 300_000, end_time = base - 200_000 })
-            seed({ id = "fail1", status = "failed", start_time = base - 10_000, end_time = base - 5000, exit_code = 1 })
+            seed({ id = "run1", command = "make test", start_time = base - 50000 })
+            seed({ id = "run2", command = "make lint", start_time = base - 40000 })
+            seed({ id = "done1", status = "completed", start_time = base - 300000, end_time = base - 200000 })
+            seed({ id = "fail1", status = "failed", start_time = base - 10000, end_time = base - 5000, exit_code = 1 })
 
             Panel.open()
             local lines = panel_lines()
@@ -356,8 +375,8 @@ describe("tasks panel UI", function()
 
         it("writes zero running counts when every task has finished", function()
             local base = now_ms()
-            seed({ id = "done1", status = "completed", start_time = base - 300_000, end_time = base - 200_000 })
-            seed({ id = "stop1", status = "stopped", start_time = base - 20_000, end_time = base - 15_000 })
+            seed({ id = "done1", status = "completed", start_time = base - 300000, end_time = base - 200000 })
+            seed({ id = "stop1", status = "stopped", start_time = base - 20000, end_time = base - 15000 })
 
             Panel.open()
             assert.are.equal("  Tasks · 0 running · 2 finished", panel_lines()[2])
@@ -365,8 +384,8 @@ describe("tasks panel UI", function()
 
         it("resolves the row under the cursor past the title header", function()
             local base = now_ms()
-            seed({ id = "first", command = "one", start_time = base - 30_000 })
-            seed({ id = "second", command = "two", start_time = base - 20_000 })
+            seed({ id = "first", command = "one", start_time = base - 30000 })
+            seed({ id = "second", command = "two", start_time = base - 20000 })
             Panel.open()
             local win = Panel.win(vim.api.nvim_get_current_tabpage())
             vim.api.nvim_set_current_win(win)
@@ -653,7 +672,7 @@ describe("tasks panel UI", function()
                 message = {
                     role = "custom",
                     customType = "pi2_bg_task",
-                    timestamp = 1_700_000_000_000,
+                    timestamp = 1700000000000,
                     details = details,
                 },
             })
@@ -686,7 +705,7 @@ describe("tasks panel UI", function()
 
         it("still merges a stopped payload after a local mark_stopped", function()
             feed({ kind = "started", taskId = "m3", command = "sleep 1" })
-            local local_end = now_ms() - 1_000
+            local local_end = now_ms() - 1000
             assert.is_true(Tasks.mark_stopped("m3", local_end))
             feed({
                 kind = "stopped",
@@ -852,8 +871,8 @@ describe("tasks panel UI", function()
     end)
 
     describe("stop key (x)", function()
-        it("confirms, marks the task stopped, and signals the pid", function()
-            seed({ id = "run1", pid = 987_654_321 })
+        it("confirms, marks the task stopped, and signals its process group", function()
+            seed({ id = "run1", pid = 987654321 })
             Panel.open()
             vim.api.nvim_set_current_win(Panel.win(vim.api.nvim_get_current_tabpage()))
 
@@ -869,8 +888,36 @@ describe("tasks panel UI", function()
             assert.is_not_nil(stopped.end_time)
         end)
 
+        it("stops through the shared group-kill helper, not a bare-pid kill", function()
+            -- The panel used to call uv.kill(pid) itself, which left the
+            -- children of `npm run dev` running. It now goes through
+            -- pi.tasks.stop -> kill_group, so the group (and its guard against
+            -- pid 0/1) is the one place that decides.
+            seed({ id = "run1", pid = 4242 })
+            Panel.open()
+            vim.api.nvim_set_current_win(Panel.win(vim.api.nvim_get_current_tabpage()))
+
+            local orig_confirm = vim.fn.confirm
+            local orig_kill_group = Tasks.kill_group
+            local seen = nil
+            vim.fn.confirm = function()
+                return 1
+            end
+            Tasks.kill_group = function(pid, signum)
+                seen = { pid = pid, signum = signum }
+                return true
+            end
+            press("x")
+            vim.fn.confirm = orig_confirm
+            Tasks.kill_group = orig_kill_group
+
+            assert.is_not_nil(seen, "the panel must signal through pi.tasks.kill_group")
+            assert.are.equal(4242, seen.pid)
+            assert.are.equal("stopped", Tasks.get("run1").status)
+        end)
+
         it("keeps the task running when the confirmation is declined", function()
-            seed({ id = "run1", pid = 987_654_321 })
+            seed({ id = "run1", pid = 987654321 })
             Panel.open()
             vim.api.nvim_set_current_win(Panel.win(vim.api.nvim_get_current_tabpage()))
 
@@ -890,11 +937,120 @@ describe("tasks panel UI", function()
             assert.are.equal(1, map.buffer)
             assert.are.equal("Stop the task under the cursor", map.desc)
         end)
+    end)
 
-        it("does not bind a delete key", function()
+    describe("delete log key (D)", function()
+        --- Stub pi.notify and return the messages it received.
+        ---@return string[] messages, fun() restore
+        local function capture_info()
+            local Notify = require("pi.notify")
+            local original = Notify.info
+            local messages = {}
+            Notify.info = function(msg)
+                messages[#messages + 1] = msg
+            end
+            return messages, function()
+                Notify.info = original
+            end
+        end
+
+        --- Put the cursor on the first row of the open panel.
+        local function focus_first_row()
+            local win = Panel.win(vim.api.nvim_get_current_tabpage())
+            vim.api.nvim_set_current_win(win)
+            vim.api.nvim_win_set_cursor(win, { 4, 0 })
+        end
+
+        it("binds D to the delete action with a description", function()
             Panel.open()
-            local map = vim.fn.maparg("d", "n", false, true)
-            assert.are_not.equal(1, map.buffer)
+            local map = vim.fn.maparg("D", "n", false, true)
+            assert.are.equal(1, map.buffer)
+            assert.are.equal("Delete the task's log file", map.desc)
+        end)
+
+        it("refuses a running task and leaves its log in place", function()
+            local path = vim.fn.tempname()
+            vim.fn.writefile({ "still writing" }, path)
+            seed({ id = "run1", output_file = path })
+            Panel.open()
+            focus_first_row()
+            local messages, restore = capture_info()
+
+            press("D")
+            restore()
+
+            assert.are.equal(1, vim.fn.filereadable(path), "a running task's log must survive")
+            assert.are.equal(1, #messages, "the panel must explain the refusal")
+            assert.is_truthy(messages[1]:find("stop it first", 1, true))
+            assert.are.equal("running", Tasks.get("run1").status)
+            assert.is_nil(Tasks.get("run1").log_removed)
+            vim.fn.delete(path)
+        end)
+
+        it("confirms, deletes the log, and renders `log removed` on the row", function()
+            local path = vim.fn.tempname()
+            vim.fn.writefile({ "done output" }, path)
+            seed({ id = "done1", status = "completed", end_time = now_ms() - 1000, output_file = path })
+            Panel.open()
+            focus_first_row()
+
+            local orig_confirm = vim.fn.confirm
+            vim.fn.confirm = function()
+                return 1 -- &Yes
+            end
+            press("D")
+            vim.fn.confirm = orig_confirm
+
+            assert.are.equal(0, vim.fn.filereadable(path), "the log file must be gone")
+            assert.is_true(Tasks.get("done1").log_removed)
+            assert.is_true(
+                vim.wait(1000, function()
+                    return panel_text():find("log removed", 1, true) ~= nil
+                end),
+                "the row must say the log was removed"
+            )
+        end)
+
+        it("keeps the log when the confirmation is declined", function()
+            local path = vim.fn.tempname()
+            vim.fn.writefile({ "done output" }, path)
+            seed({ id = "done1", status = "completed", end_time = now_ms() - 1000, output_file = path })
+            Panel.open()
+            focus_first_row()
+
+            local orig_confirm = vim.fn.confirm
+            vim.fn.confirm = function()
+                return 2 -- &No
+            end
+            press("D")
+            vim.fn.confirm = orig_confirm
+
+            assert.are.equal(1, vim.fn.filereadable(path), "a declined delete must not touch the file")
+            assert.is_nil(Tasks.get("done1").log_removed)
+            vim.fn.delete(path)
+        end)
+
+        it("lists D in the help overlay", function()
+            Panel.open()
+            press("?")
+            local win, buf = find_help_win()
+            assert.is_not_nil(win)
+            local text = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
+            assert.is_truthy(text:find("Delete the task's log file", 1, true))
+        end)
+
+        it("explains a removed log instead of opening an empty output window", function()
+            seed({ id = "gone1", status = "completed", end_time = now_ms() - 1000, log_removed = true })
+            Panel.open()
+            focus_first_row()
+            local messages, restore = capture_info()
+
+            press("o")
+            restore()
+
+            assert.are.equal(1, #messages, "`o` must explain the missing log")
+            assert.is_truthy(messages[1]:find("was deleted", 1, true))
+            assert.is_nil(find_win_by_name("pi://task-output/gone1"))
         end)
     end)
 
@@ -968,7 +1124,7 @@ describe("tasks panel UI", function()
         it("p renders a metadata header for a finished task and never polls", function()
             local path = vim.fn.tempname()
             vim.fn.writefile({ "hello", "world" }, path)
-            local start = now_ms() - 12_000
+            local start = now_ms() - 12000
             seed({
                 id = "done1",
                 command = "make build",
@@ -976,7 +1132,7 @@ describe("tasks panel UI", function()
                 exit_code = 0,
                 pid = 4321,
                 start_time = start,
-                end_time = start + 12_000,
+                end_time = start + 12000,
                 output_file = path,
             })
             Panel.open()
@@ -1020,8 +1176,8 @@ describe("tasks panel UI", function()
                 status = "stopped",
                 pid = 9,
                 signal = "SIGTERM",
-                start_time = now_ms() - 3_000,
-                end_time = now_ms() - 1_000,
+                start_time = now_ms() - 3000,
+                end_time = now_ms() - 1000,
                 output_file = path,
             })
             Panel.open()
@@ -1036,10 +1192,37 @@ describe("tasks panel UI", function()
             vim.fn.delete(path)
         end)
 
+        it("renders an unknown exit in the preview header, not as stopped", function()
+            -- An unknown task has no signal and no exit code; without its own
+            -- branch the header would fall through to `stopped`.
+            local path = vim.fn.tempname()
+            vim.fn.writefile({ "gone" }, path)
+            seed({
+                id = "unk1",
+                command = "sleep 100",
+                status = "unknown",
+                pid = 11,
+                start_time = now_ms() - 3000,
+                end_time = now_ms() - 1000,
+                output_file = path,
+            })
+            Panel.open()
+            vim.api.nvim_set_current_win(Panel.win(vim.api.nvim_get_current_tabpage()))
+
+            press("p")
+            local preview = find_win_by_name("pi://task-preview/unk1")
+            assert.is_not_nil(preview)
+            local lines = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(preview), 0, -1, false)
+            assert.is_truthy(lines[3]:find("exit status unknown", 1, true), "header says the exit is unknowable")
+            assert.is_nil(lines[3]:find("stopped", 1, true), "an unknown exit is not a stop")
+
+            vim.fn.delete(path)
+        end)
+
         it("p follows a running task's output live and freezes once it settles", function()
             local path = vim.fn.tempname()
             vim.fn.writefile({ "first" }, path)
-            local start = now_ms() - 5_000
+            local start = now_ms() - 5000
             seed({
                 id = "live1",
                 command = "tail -f log",
@@ -1104,7 +1287,7 @@ describe("tasks panel UI", function()
         it("keeps a scrolled cursor in place on live updates", function()
             local path = vim.fn.tempname()
             vim.fn.writefile({ "first", "second", "third" }, path)
-            local start = now_ms() - 5_000
+            local start = now_ms() - 5000
             seed({
                 id = "scroll1",
                 command = "tail -f log",
@@ -1163,10 +1346,10 @@ describe("tasks panel UI", function()
             local win, buf = find_help_win()
             assert.is_not_nil(win)
             local text = table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n")
-            for _, key in ipairs({ "<CR>, o", "a, i", "p", "x", "A", "R", "q", "?" }) do
+            for _, key in ipairs({ "<CR>, o", "a, i", "p", "x", "D", "A", "R", "q", "?" }) do
                 assert.is_truthy(text:find(key, 1, true), "help should list " .. key)
             end
-            assert.are.equal(8, #Panel._help_entries())
+            assert.are.equal(9, #Panel._help_entries())
         end)
 
         it("toggles on a second ?", function()
@@ -1211,5 +1394,36 @@ describe("tasks panel UI", function()
             Panel._render = orig
             assert.are.equal(1, renders)
         end)
+    end)
+end)
+
+describe("pi.tasks panel row for a held report", function()
+    before_each(function()
+        Tasks._reset()
+    end)
+
+    it("shows the hold reason on a finished row", function()
+        local base = now_ms()
+        seed({
+            id = "held1",
+            command = "make test",
+            status = "completed",
+            start_time = base - 65000,
+            end_time = base - 5000,
+            exit_code = 0,
+            held_reason = "cache",
+        })
+        local row = Tasks.build_rows(base)[1]
+        local line = Panel.format_line(row, 0, 120)
+        assert.is_truthy(line:find("held1", 1, true))
+        assert.is_truthy(line:find("held (cache)", 1, true), "the row must say why the report is waiting: " .. line)
+    end)
+
+    it("keeps a delivered row clean", function()
+        local base = now_ms()
+        seed({ id = "plain1", status = "completed", start_time = base - 65000, end_time = base - 5000 })
+        local row = Tasks.build_rows(base)[1]
+        local line = Panel.format_line(row, 0, 120)
+        assert.is_nil(line:find("held", 1, true))
     end)
 end)

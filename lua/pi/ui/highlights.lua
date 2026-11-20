@@ -85,6 +85,9 @@ local function set_defaults()
     )
     vim.api.nvim_set_hl(0, "PiCompactionText", { default = true, fg = comment.fg, italic = true, nocombine = true })
     vim.api.nvim_set_hl(0, "PiCompactionHint", { default = true, fg = comment.fg, italic = true, nocombine = true })
+    -- One dim line per background-task report the model already received: a
+    -- system remark, not conversation content, so it links to Comment.
+    vim.api.nvim_set_hl(0, "PiSystemNote", { default = true, link = "Comment" })
     vim.api.nvim_set_hl(0, "PiMessageDateTime", { default = true, fg = comment.fg })
     -- Delivered steer/follow-up tag: a subdued mark on the message label that
     -- records how the message entered the conversation. Pending queue entries
@@ -156,6 +159,10 @@ local function set_defaults()
 
     vim.api.nvim_set_hl(0, "PiChatHistoryWinbar", { default = true, bg = normal.bg })
     vim.api.nvim_set_hl(0, "PiChatHistoryWinbarTitle", { default = true, fg = user.fg, bold = true })
+    -- Git worktree badge in the history title (`π 󰙅 name`). Only a linked
+    -- worktree is badged; a session whose cwd differs from Neovim's renders
+    -- the badge in PiStatusLineWarning instead (no separate group).
+    vim.api.nvim_set_hl(0, "PiChatHistoryWorktree", { default = true, fg = title.fg, bold = true, italic = true })
     vim.api.nvim_set_hl(0, "PiChatPromptWinbar", { default = true, bg = normal.bg })
     vim.api.nvim_set_hl(0, "PiChatPromptWinbarTitle", { default = true, fg = comment.fg, bg = normal.bg, bold = true })
     vim.api.nvim_set_hl(
@@ -234,6 +241,9 @@ local function set_defaults()
     vim.api.nvim_set_hl(0, "PiSessionsListPending", { default = true, fg = comment.fg, italic = true })
     vim.api.nvim_set_hl(0, "PiSessionsListSpinner", { default = true, fg = special.fg })
     vim.api.nvim_set_hl(0, "PiSessionsListFloatTitle", { default = true, fg = title.fg, bold = true })
+    -- Worktree group header (`󰙅 name · ~/path`) in :PiSessions; rows under a
+    -- group name their worktree in the row body.
+    vim.api.nvim_set_hl(0, "PiSessionsListWorktree", { default = true, fg = title.fg, bold = true, italic = true })
 
     -- Background tasks panel (:PiTasks): running spins in the info hue,
     -- terminal states map to ok/error/warn, and the current-row marker uses
@@ -243,6 +253,7 @@ local function set_defaults()
     vim.api.nvim_set_hl(0, "PiTasksListSuccess", { default = true, link = "DiagnosticOk" })
     vim.api.nvim_set_hl(0, "PiTasksListFailure", { default = true, link = "DiagnosticError" })
     vim.api.nvim_set_hl(0, "PiTasksListStopped", { default = true, link = "DiagnosticWarn" })
+    vim.api.nvim_set_hl(0, "PiTasksListUnknown", { default = true, link = "DiagnosticWarn" })
     if cursorline.bg then
         vim.api.nvim_set_hl(0, "PiTasksListCurrent", { default = true, bg = cursorline.bg, bold = true })
     else

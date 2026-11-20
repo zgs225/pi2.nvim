@@ -12,7 +12,6 @@
     "diagnostics": {
         "globals": ["vim"],
         "disable": [
-            "duplicate-set-field",
             "inject-field",
             "undefined-doc-name"
         ]

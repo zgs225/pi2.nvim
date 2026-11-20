@@ -13,6 +13,19 @@ local function pump(ms)
     end, 10)
 end
 
+--- Concatenated text of a float's footer chunks ("" when it has none), so a
+--- spec can assert on the badge without caring about chunk boundaries.
+---@param win integer
+---@return string
+local function footer_of(win)
+    local cfg = vim.api.nvim_win_get_config(win)
+    local text = ""
+    for _, chunk in ipairs(cfg.footer or {}) do
+        text = text .. chunk[1]
+    end
+    return text
+end
+
 describe("pi.ui.subsession_viewer", function()
     local tmp_dir = nil
 
@@ -1097,6 +1110,41 @@ describe("pi.ui.subsession_viewer", function()
         assert.is_true(found_err_hl)
     end)
 
+    it("leads the statusline with the viewed session's worktree badge", function()
+        local chunks, plain = Viewer._format_statusline({
+            model_id = "claude-3-5-sonnet",
+            worktree_name = "wt-isolation",
+        })
+        assert.is_table(chunks)
+        -- chunks[1] is the leading pad, so the badge is the first component.
+        assert.are.equal("󰙅 wt-isolation", chunks[2][1])
+        assert.are.equal("PiSessionsListWorktree", chunks[2][2])
+        assert.is_truthy(plain:find("󰙅 wt-isolation", 1, true))
+        -- It leads: which checkout is a constant, tokens/model are not.
+        assert.is_true(plain:find("󰙅", 1, true) < plain:find("claude-3-5-sonnet", 1, true))
+
+        -- A session with no worktree keeps the footer it had: no empty badge.
+        local _, plain_none = Viewer._format_statusline({ model_id = "gpt-4o" })
+        assert.is_nil(plain_none:find("󰙅", 1, true))
+
+        -- subagent.viewer.worktree = false drops the badge, never the footer.
+        local orig_worktree = Config.options.subagent.viewer.worktree
+        Config.options.subagent.viewer.worktree = false
+        local ok, err = pcall(function()
+            local dropped, plain_dropped = Viewer._format_statusline({
+                model_id = "gpt-4o",
+                worktree_name = "wt-isolation",
+            })
+            assert.is_table(dropped)
+            assert.is_nil(plain_dropped:find("󰙅", 1, true))
+            assert.is_truthy(plain_dropped:find("gpt-4o", 1, true))
+        end)
+        Config.options.subagent.viewer.worktree = orig_worktree
+        if not ok then
+            error(err)
+        end
+    end)
+
     it("parses model, thinking, and usage from dormant JSONL file", function()
         local file_path = tmp_dir .. "/status_session.jsonl"
         local lines = {
@@ -1219,6 +1267,93 @@ describe("pi.ui.subsession_viewer", function()
         Viewer.close()
         Manifest.load = orig_load
         Read.find_path = orig_find_path
+    end)
+
+    it("badges the footer with the worktree the list row forwarded", function()
+        local child_id = "dormant-worktree-1"
+        local file_path = tmp_dir .. "/dormant_worktree.jsonl"
+        vim.fn.writefile({
+            vim.json.encode({ type = "session", sessionId = child_id }),
+            vim.json.encode({ type = "session_info", name = "Worktree Worker" }),
+            vim.json.encode({ type = "model_change", modelId = "claude-3-7-sonnet" }),
+        }, file_path)
+
+        local orig_load = Manifest.load
+        local orig_find_path = Read.find_path
+        Manifest.load = function()
+            return { [child_id] = { name = "Worktree Worker", status = "dormant" } }
+        end
+        Read.find_path = function()
+            return file_path
+        end
+
+        Viewer.open(child_id, { worktree = "wt-assigned" })
+        pump(100)
+
+        assert.is_true(Viewer.is_open())
+        assert.are.equal("wt-assigned", Viewer._status().worktree_name)
+        local text = footer_of(Viewer._win())
+        assert.is_truthy(text:find("󰙅 wt-assigned", 1, true))
+        assert.is_truthy(text:find("claude-3-7-sonnet", 1, true))
+
+        Viewer.close()
+        Manifest.load = orig_load
+        Read.find_path = orig_find_path
+    end)
+
+    it("detects the worktree from the transcript cwd when the row forwards none", function()
+        local child_id = "dormant-worktree-detect-1"
+        local file_path = tmp_dir .. "/dormant_worktree_detect.jsonl"
+        local session_cwd = tmp_dir .. "/wt-detected"
+        vim.fn.writefile({
+            vim.json.encode({ type = "session", sessionId = child_id, cwd = session_cwd }),
+            vim.json.encode({ type = "model_change", modelId = "claude-3-7-sonnet" }),
+        }, file_path)
+
+        local orig_load = Manifest.load
+        local orig_find_path = Read.find_path
+        local real_worktree = package.loaded["pi.worktree"]
+        Manifest.load = function()
+            return { [child_id] = { name = "Detected Worker", status = "dormant" } }
+        end
+        Read.find_path = function()
+            return file_path
+        end
+        -- The real detector is a filesystem read; stub it so this spec needs no
+        -- git repository at all (tests/worktree_spec.lua covers the real one).
+        local function stub_detect(info)
+            package.loaded["pi.worktree"] = {
+                detect = function(cwd)
+                    return cwd == session_cwd and info or nil
+                end,
+            }
+        end
+
+        local ok, err = pcall(function()
+            stub_detect({ kind = "linked", name = "wt-detected", path = session_cwd })
+            Viewer.open(child_id)
+            pump(100)
+            assert.are.equal("wt-detected", Viewer._status().worktree_name)
+            assert.is_truthy(footer_of(Viewer._win()):find("󰙅 wt-detected", 1, true))
+            Viewer.close()
+
+            -- A session in the repository's *main* checkout gets no badge: the
+            -- badge means "not the checkout your buffers are in", exactly like
+            -- the chat title's.
+            stub_detect({ kind = "main", name = "repo", path = session_cwd })
+            Viewer.open(child_id)
+            pump(100)
+            assert.is_nil(Viewer._status().worktree_name)
+            assert.is_nil(footer_of(Viewer._win()):find("󰙅", 1, true))
+            Viewer.close()
+        end)
+
+        Manifest.load = orig_load
+        Read.find_path = orig_find_path
+        package.loaded["pi.worktree"] = real_worktree
+        if not ok then
+            error(err)
+        end
     end)
 
     it("updates statusline when live RPC get_state, get_messages, and live events arrive", function()

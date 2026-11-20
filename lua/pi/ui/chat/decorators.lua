@@ -2,10 +2,29 @@
 
 local M = {}
 
-local FilesCache = require("pi.cache.files")
 local CommandsCache = require("pi.cache.commands")
 
 local ns = vim.api.nvim_create_namespace("pi-prompt-decorators")
+
+--- Workspace cwd of the current tab's session (nil = Neovim's cwd).
+---
+--- A mention is workspace-relative, so the existence check must look in the
+--- session's cwd (a worktree session's files are not under Neovim's cwd).
+--- Resolved lazily and defensively so decorating never fails when the session
+--- layer is unavailable.
+---@return string?
+local function session_cwd()
+    local ok, manager = pcall(require, "pi.sessions.manager")
+    if not ok or type(manager) ~= "table" or type(manager.get) ~= "function" then
+        return nil
+    end
+    local ok_get, session = pcall(manager.get)
+    if not ok_get or type(session) ~= "table" then
+        return nil
+    end
+    local cwd = session.cwd
+    return type(cwd) == "string" and cwd ~= "" and cwd or nil
+end
 
 --- Parse mention ref, stripping optional #L range suffix.
 ---@param ref string
@@ -40,6 +59,8 @@ function M.update(buf)
     end
 
     -- @mention highlights
+    local FilesCache = require("pi.cache.files")
+    local cwd = session_cwd()
     for row, line in ipairs(lines) do
         local col = 1
         while col <= #line do
@@ -52,7 +73,7 @@ function M.update(buf)
             finish = start + #clean -- adjust end to exclude punctuation
             local path = parse_path(clean)
             local Providers = require("pi.mention_providers")
-            if Providers.has(path) or FilesCache.exists(path) then
+            if Providers.has(path) or FilesCache.exists(path, cwd) then
                 vim.api.nvim_buf_set_extmark(buf, ns, row - 1, start - 1, {
                     end_col = finish,
                     hl_group = "PiMention",

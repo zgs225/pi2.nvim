@@ -12,11 +12,29 @@ end
 
 local root = repo_root()
 
+-- Shared e2e helper (`tests/e2e_deps.lua`): the hermetic scripts load it as
+-- `require("e2e_deps")`, so `tests/` has to be on package.path.
+package.path = root .. "/tests/?.lua;" .. package.path
+
 -- plenary: prefer a sibling checkout (lazy.nvim layout), fall back to a
 -- user-provided PLENARY_PATH env var.
 local plenary = vim.env.PLENARY_PATH or vim.fn.expand("~/.local/share/nvim/lazy/plenary.nvim")
 
-for _, path in ipairs({ plenary, root }) do
+-- render-markdown: OPTIONAL test dependency for the render contract spec
+-- (G6/G7/G9). Only prepended when present, so the suite still runs on a machine
+-- without it; the spec skips itself instead. Being on 'runtimepath' is not the
+-- same as being loaded — the children run with `--noplugin` (plenary passes it),
+-- so a spec must call setup()/manager.init() itself (G8).
+local render_markdown = vim.env.RENDER_MARKDOWN_PATH or vim.fn.expand("~/.local/share/nvim/lazy/render-markdown.nvim")
+
+-- telescope is deliberately NOT prepended here: the unit specs inject a FAKE
+-- telescope module tree into `package.loaded`, and a real checkout on
+-- 'runtimepath' loads its `plugin/` chunk alongside the fake (observed:
+-- `attempt to call field 'on_close_prompt' (a nil value)` from the real
+-- `telescope/pickers.lua`). The one script that needs the real picker,
+-- `tests/resume_partitions_e2e.lua`, prepends `TELESCOPE_PATH` itself.
+
+for _, path in ipairs({ plenary, root, render_markdown }) do
     if vim.uv.fs_stat(path) then
         vim.opt.runtimepath:prepend(path)
     end

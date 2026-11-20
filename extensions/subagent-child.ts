@@ -4,14 +4,13 @@
  * Loaded into child RPC processes only — parent sessions load
  * extensions/subagent.ts instead, and `subagent.enabled = false` loads
  * neither (see lua/pi/cli.lua). The child has no sub-agent tools and no
- * host bridge; this extension's only job is to append a byte-constant
- * worker note to the system prompt on every turn (before_agent_start).
+ * host bridge; this extension's only job is to append a worker note to the
+ * system prompt on every turn (before_agent_start).
  *
- * Byte-constant on purpose: any dynamic content (task text, parent ids,
- * timestamps) would break pi's prompt-cache prefix across turns (same
- * rationale as extensions/vision.ts CAPABILITY_NOTE). The per-task brief
- * travels in the conversation as the child's first user message, not in
- * the system prompt.
+ * Prompt-cache friendly: the note is byte-constant, so the prompt prefix stays
+ * stable across turns — same rationale as extensions/vision.ts CAPABILITY_NOTE.
+ * The per-task brief travels in the conversation as the child's first user
+ * message, not in the system prompt.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";

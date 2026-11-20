@@ -42,7 +42,13 @@
 ---@field session_file? string Backend-reported session file path (from get_state responses). Lets the resume picker detect "still open in another tab" without extra RPC round-trips.
 ---@field startup_announcements table<string, pi.StartupAnnouncement> Extension startup data (keys ending with `:startup`) shown in the system preamble. Process-level: persists across session switches.
 ---@field system_errors pi.SystemErrorEntry[]
----@field cwd string Working directory the session was started in (anchor for changed_files paths).
+---@field cwd string Working directory the session runs in (anchor for changed_files paths, prompt history and diffs). A worktree session's cwd is its worktree path.
+---@field _process_cwd? string Working directory the process was *deliberately* started in (explicit `opts.cwd`: worktree or sub-session). Distinct from `cwd`, which a resume may adopt from the session file when the process cwd is not fixed.
+---@field worktree? { name: string, path: string, repo_root?: string, base_sha?: string, mode?: string, forked_from?: table, [string]: any } Worktree metadata when this session runs in an isolated git worktree (managed by `pi.worktree`).
+---@field assigned_worktree? { kind: "linked", path: string, name?: string, repo_root?: string, git_dir?: string, common_dir?: string, base_sha?: string } Pre-existing linked worktree explicitly assigned to this child by its parent. Never owned by this session: no release, no bind, no resume rebind.
+---@field forked_from? { session_id?: string, session_file?: string, worktree?: string } Source conversation for a worktree fork; surfaced by the sessions UI.
+---@field _worktree_released? boolean True once release was dispatched for this session's worktree (guards close_session + process-exit double release).
+---@field _worktree_lock_refreshed? boolean True once the worktree lock was relocked with the agent pid (guards the once-per-session relock in bind_session_worktree).
 ---@field changed_files table<string, true> Set of file paths modified by edit/write tools during the current session.
 ---@field _pending_file_change_args? table<string, table> Pending tool args by tool call id for file-changing tools.
 ---@field _compaction_rebuilding? boolean True while compacted messages are being fetched/replayed.
@@ -53,6 +59,12 @@
 
 ---@class pi.SessionCreateOpts
 ---@field layout? pi.LayoutMode
+---@field cwd? string Working directory for the new pi process (default: Neovim's cwd; a worktree path for worktree sessions).
+---@field args? string[] Extra CLI args forwarded to the process (e.g. `{ "--fork", session_file }`).
+---@field worktree? table Worktree metadata this session runs in (stored on `session.worktree`).
+---@field assigned_worktree? table Pre-existing linked worktree assigned by the parent (stored on `session.assigned_worktree`; never released or bound).
+---@field subagent? boolean false marks a child (sub-session) process for `create_detached`.
+---@field tools? string[] Child tool allowlist (see `pi.SubagentConfig.tools`); nil inherits every tool.
 
 local M = {}
 
@@ -66,6 +78,7 @@ local Dialog = require("pi.ui.dialog")
 local Extension = require("pi.ui.extension")
 local CommandsCache = require("pi.cache.commands")
 local Tasks = require("pi.tasks")
+local ResumeLayout = require("pi.sessions.resume_layout")
 
 ---@class pi.StartupSection
 ---@field header string
@@ -98,6 +111,59 @@ local registry = {}
 ---@type table<pi.TabId, pi.Chat>
 local tab_chats = {}
 
+--- Lightweight canonical-cwd reservation counts, held across the synchronous
+--- window in which a child process is being started. Not an exclusive lock:
+--- several children may share one worktree. Its only job is the release guard
+--- (see `release_session_worktree`): an owner closing right as a spawn starts
+--- must not delete the checkout before the new process is registered.
+---@type table<string, integer>
+local cwd_reservations = {}
+
+--- Canonical form used by the reservation counter and its release guard.
+---@param path string?
+---@return string?
+local function canonical_cwd_path(path)
+    if type(path) ~= "string" or path == "" then
+        return nil
+    end
+    return vim.fn.resolve(path)
+end
+
+--- Hold a canonical cwd while a child process is being registered.
+---@param path string?
+---@return string? key Canonical key (nil when the path was unusable).
+function M.reserve_cwd(path)
+    local key = canonical_cwd_path(path)
+    if not key then
+        return nil
+    end
+    cwd_reservations[key] = (cwd_reservations[key] or 0) + 1
+    return key
+end
+
+--- Drop one reservation taken by `M.reserve_cwd`.
+---@param path string?
+function M.release_cwd(path)
+    local key = canonical_cwd_path(path)
+    if not key then
+        return
+    end
+    local count = (cwd_reservations[key] or 0) - 1
+    if count > 0 then
+        cwd_reservations[key] = count
+    else
+        cwd_reservations[key] = nil
+    end
+end
+
+--- True while `path` has an in-flight spawn/revive reservation.
+---@param path string?
+---@return boolean
+function M.cwd_reserved(path)
+    local key = canonical_cwd_path(path)
+    return key ~= nil and (cwd_reservations[key] or 0) > 0
+end
+
 --- Which session id each tab's chat is currently bound to.
 ---@type table<pi.TabId, string>
 local tab_session_id = {}
@@ -118,6 +184,273 @@ end
 local function alloc_temp_session_id()
     next_temp_id = next_temp_id + 1
     return ("tmp-%d"):format(next_temp_id)
+end
+
+--- Resolve the working directory a session process should start in.
+--- Explicit cwd (a worktree path) wins; otherwise the process keeps the
+--- historical behavior of inheriting Neovim's cwd.
+---@param opts? pi.SessionCreateOpts
+---@return string
+local function resolve_session_cwd(opts)
+    if opts and type(opts.cwd) == "string" and opts.cwd ~= "" then
+        return opts.cwd
+    end
+    return vim.fn.getcwd()
+end
+
+--- Resolve the cwd a resumed session should anchor to.
+---
+--- A session file records the cwd it was created in, but a process that was
+--- deliberately started in a specific directory (a worktree or a sub-session)
+--- must keep *that* cwd: adopting the file's value there would create a ghost
+--- cwd after a revive (the checkout moved/was recreated) and desync path
+--- anchors from the running process. A cwd that no longer exists on disk is
+--- never adopted.
+---@param session pi.Session
+---@param session_path string
+---@return string?
+local function resumed_session_cwd(session, session_path)
+    local process_cwd = session._process_cwd
+    if type(process_cwd) ~= "string" or process_cwd == "" then
+        local worktree = session.worktree
+        process_cwd = type(worktree) == "table" and worktree.path or nil
+    end
+    if type(process_cwd) ~= "string" or process_cwd == "" then
+        local assigned = session.assigned_worktree
+        process_cwd = type(assigned) == "table" and assigned.path or nil
+    end
+    if type(process_cwd) == "string" and process_cwd ~= "" then
+        return vim.fn.isdirectory(process_cwd) == 1 and process_cwd or nil
+    end
+
+    local info = require("pi.sessions.history").parse(session_path)
+    local file_cwd = info and info.cwd
+    if type(file_cwd) == "string" and file_cwd ~= "" and vim.fn.isdirectory(file_cwd) == 1 then
+        return file_cwd
+    end
+    return nil
+end
+
+--- Re-attach worktree metadata after a resume.
+---
+--- A session object loses its process-only metadata when its conversation is
+--- replaced by a resumed file; if the resolved cwd is a linked worktree, the
+--- worktree info must be re-detected (pure filesystem read) so that later
+--- close/release and `pi.worktree_ship` still resolve their target. Without it
+--- a resumed worktree session looked like an ordinary session (`worktree=nil`)
+--- and was never released or shipped.
+---@param session pi.Session
+---@param cwd string?
+---@return table?
+local function rebind_resumed_worktree(session, cwd)
+    if type(cwd) ~= "string" or cwd == "" or vim.fn.isdirectory(cwd) == 0 then
+        return session.worktree
+    end
+    local ok, Worktree = pcall(require, "pi.worktree")
+    if not ok or type(Worktree) ~= "table" or type(Worktree.detect) ~= "function" then
+        return session.worktree
+    end
+    local detected = Worktree.detect(cwd)
+    if type(detected) ~= "table" or detected.kind ~= "linked" then
+        -- The resumed cwd is not a managed checkout (e.g. worktree → main):
+        -- a worktree field left from the previous conversation would make
+        -- release/`pi.worktree_ship` point at an unrelated checkout.
+        session.worktree = nil
+        return nil
+    end
+    session.worktree = detected
+    return detected
+end
+
+--- Best-effort relock so the lock reason learns the *agent* pid.
+---
+--- The create-time lock can only record the Neovim pid; the agent process pid
+--- exists only once the RPC child is running. `bind` runs on every
+--- `refresh_state`, so `_worktree_lock_refreshed` keeps this to one relock per
+--- session. A failure is a warning only — the create-time lock still protects
+--- the checkout, so it must never break the session.
+--- Contract: `Worktree.lock(info, { session_id, pid }, cb)` with `cb(ok, err)`.
+---@param session pi.Session
+---@param worktree pi.WorktreeInfo
+---@param id string
+local function relock_session_worktree(session, worktree, id)
+    if session._worktree_lock_refreshed then
+        return
+    end
+    -- A borrowed checkout is never relocked: its lock is not ours.
+    if type(session.assigned_worktree) == "table" then
+        return
+    end
+    local job_id = type(session.rpc) == "table" and session.rpc._job_id or nil
+    if type(job_id) ~= "number" then
+        return
+    end
+    local ok_pid, pid = pcall(vim.fn.jobpid, job_id)
+    if not ok_pid or type(pid) ~= "number" or pid <= 0 then
+        return
+    end
+    local ok, Worktree = pcall(require, "pi.worktree")
+    if not ok or type(Worktree) ~= "table" or type(Worktree.lock) ~= "function" then
+        return
+    end
+    session._worktree_lock_refreshed = true
+    pcall(Worktree.lock, worktree, { session_id = id, pid = pid }, function(locked, err)
+        if locked == nil and err then
+            Notify.warn("worktree lock failed: " .. tostring(err))
+        end
+    end)
+end
+
+--- Publish the backend-assigned session id/file onto the session's worktree
+--- metadata, so the worktree index can map worktree <-> session (for
+--- `pi.worktree_*`, revive and the sessions list).
+---
+--- No-op for ordinary sessions and until both id and file are known. Lazy
+--- pcall'd require keeps the manager independent of the worktree module's
+--- load state (and lets specs stub it). Contract:
+--- `Worktree.bind(info, { session_id, session_file }) -> ok, err`.
+---@param session pi.Session
+local function bind_session_worktree(session)
+    -- An assigned worktree belongs to whoever created it: this child must never
+    -- publish a session binding into its metadata (no bind, no release).
+    if type(session.assigned_worktree) == "table" then
+        return
+    end
+    local worktree = session.worktree
+    if type(worktree) ~= "table" then
+        return
+    end
+    local id = session.id
+    if type(id) ~= "string" or id == "" or id:match("^tmp%-") then
+        return
+    end
+    if type(session.session_file) ~= "string" or session.session_file == "" then
+        return
+    end
+    local ok, Worktree = pcall(require, "pi.worktree")
+    if not ok or type(Worktree) ~= "table" or type(Worktree.bind) ~= "function" then
+        return
+    end
+    local ok_bind, bound, bind_err = pcall(Worktree.bind, worktree, {
+        session_id = id,
+        session_file = session.session_file,
+    })
+    if not ok_bind then
+        Notify.warn("worktree bind failed: " .. tostring(bound))
+    elseif bound == false and bind_err then
+        Notify.warn("worktree bind failed: " .. tostring(bind_err))
+    else
+        relock_session_worktree(session, worktree, id)
+    end
+end
+
+--- Two paths point at the same directory (normalizes symlinks and trailing
+--- separators). Used by the release guard: a live session reached through a
+--- symlinked/`~/` cwd must not be missed.
+---@param a string?
+---@param b string?
+---@return boolean
+local function same_path(a, b)
+    if type(a) ~= "string" or a == "" or type(b) ~= "string" or b == "" then
+        return false
+    end
+    if a == b then
+        return true
+    end
+    return vim.fn.resolve(a) == vim.fn.resolve(b)
+end
+
+--- Another *live* session whose process runs in `path`.
+---
+--- A worktree must never be released under a session that still uses it as
+--- cwd (a revived/reused child sharing the same checkout would lose its cwd
+--- mid-run). The closing session itself is already removed from the registry
+--- on every release path, so any hit here is a different process.
+---@param session pi.Session
+---@param path string
+---@return pi.Session?
+local function session_using_cwd(session, path)
+    for _, other in pairs(registry) do
+        if other ~= session and other.rpc and other.rpc:is_running() then
+            local worktree = other.worktree
+            local assigned = other.assigned_worktree
+            if
+                same_path(other.cwd, path)
+                or same_path(other._process_cwd, path)
+                or (type(worktree) == "table" and same_path(worktree.path, path))
+                or (type(assigned) == "table" and same_path(assigned.path, path))
+            then
+                return other
+            end
+        end
+    end
+    return nil
+end
+
+--- Hand a closed session's worktree back to `pi.worktree` for cleanup.
+---
+--- Runs at most once per session, always after the process stopped (a
+--- worktree must never be removed under a live cwd) and on the main loop (the
+--- release side shells out to git). Ordinary sessions are a no-op, so the
+--- old behavior is unchanged.
+---
+--- Ownership: the sessions manager is the release authority — every path that
+--- closes a session (`close_session`, `M.stop`, `_process_exit`) funnels here,
+--- with the once-only guard below. `pi.subsessions`/the reaper only release
+--- worktrees no live session owns any more, and their late call is a no-op
+--- here because the directory is already gone.
+--- Contract: `Worktree.release(info, cb)` with `cb(removed, err)`.
+---@param session pi.Session
+local function release_session_worktree(session)
+    -- Only an *owned* worktree is ever released. An explicitly assigned
+    -- checkout belongs to the user/owner: stop, close, crash and the reaper
+    -- must all leave it alone.
+    if type(session.assigned_worktree) == "table" then
+        return
+    end
+    local worktree = session.worktree
+    if type(worktree) ~= "table" then
+        return
+    end
+    if session._worktree_released then
+        return
+    end
+    session._worktree_released = true
+    local path = type(worktree.path) == "string" and worktree.path or nil
+    vim.schedule(function()
+        -- A concurrent/leftover release (subsessions close, reaper, or another
+        -- instance) may already have removed the checkout: nothing left to do,
+        -- and calling release would only report a spurious "kept" error.
+        if path and vim.fn.isdirectory(path) == 0 then
+            return
+        end
+        if path and M.cwd_reserved(path) then
+            -- A spawn/revive is registering a child in this checkout right now
+            -- (the live-session check cannot see it yet): keep it.
+            return
+        end
+        if path and session_using_cwd(session, path) then
+            -- A different live session still runs in this checkout: keep it.
+            -- That session's own close will release it (or it legitimately
+            -- outlives this one and keeps the directory).
+            return
+        end
+        local ok, Worktree = pcall(require, "pi.worktree")
+        if not ok or type(Worktree) ~= "table" or type(Worktree.release) ~= "function" then
+            return
+        end
+        local ok_release, release_err = pcall(Worktree.release, worktree, function(removed, err)
+            if removed == false then
+                -- Dirty or ahead of its base: deliberately kept, nothing lost.
+                -- The path is the actionable part for the user; the reason is
+                -- only useful for debugging.
+                Notify.info("Worktree kept" .. (path and (": " .. path) or "") .. (err and (" (" .. err .. ")") or ""))
+            end
+        end)
+        if not ok_release then
+            Notify.warn("worktree release failed: " .. tostring(release_err))
+        end
+    end)
 end
 
 --- Keep `pinned_model` in sync with `pinned_config.model` for callers not yet migrated.
@@ -290,6 +623,15 @@ local function bind_chat_to_session(session, chat, tab)
     end
 
     chat:bind_agent(make_agent(session.rpc))
+    -- The tab now views a (possibly different-cwd) session: prompt history,
+    -- drafts, tool-path shortening and diff anchors are workspace-scoped, so
+    -- the chat must follow this session's cwd (worktree sessions have their
+    -- own). Session creation already did this; view switches did not.
+    -- Guarded because tests drive this with minimal chat shims; a real
+    -- `pi.Chat` always implements set_cwd.
+    if type(chat.set_cwd) == "function" then
+        chat:set_cwd(session.cwd)
+    end
     session.chat = chat
     session.attached_tab = tab
     session.tab = tab
@@ -497,12 +839,93 @@ local function update_todo_mirror(session, tool_name, result)
     end
 end
 
+--- Forward one bg-tasks lifecycle payload to the task registry, stamped with
+--- the owning session/tab so the registry (and the :PiTasks panel) can scope
+--- rows per session. Shared by the live path (a pushed custom message) and
+--- history replay, so a resumed session folds its transcript the way the
+--- extension itself does and the two tables cannot disagree about a task's
+--- command or state.
+---@param details table pi2_bg_task payload (kind/taskId/command/...)
+---@param timestamp integer? message timestamp (task start/end time)
+---@param session_id string? owning session id (nil = unknown ownership)
+---@param tab integer? owning tabpage handle (panel display)
+---@return boolean consumed
+local function apply_bg_task_event(details, timestamp, session_id, tab)
+    if type(details) ~= "table" then
+        return false
+    end
+    local ok, consumed = pcall(Tasks.handle_event, {
+        type = "pi2_bg_task",
+        details = details,
+        timestamp = timestamp,
+    }, session_id, tab)
+    if not ok then
+        Notify.warn("Background task event failed: " .. tostring(consumed))
+        return false
+    end
+    return consumed == true
+end
+
+--- Fold a replayed `pi2_bg_task` custom message (role="custom") into the task
+--- registry. A transcript entry is not conversation content, so it renders
+--- nothing; but it is the only record of a task's command, and a resumed
+--- session's history re-renders `wait_task` / `stop_task` / `task_input`
+--- blocks from it. Without this fold those blocks fall back to a bare task id
+--- (and the id of a task that already exited in a previous pi process is
+--- exactly what a resumed session has in front of it). Panel side effects
+--- (auto-open/auto-close) are deliberately skipped: replaying a session must
+--- not pop panels.
+---@param message table replayed message (role="custom")
+---@param session_id string? owning session id
+---@param tab integer? owning tabpage handle
+local function replay_bg_task_message(message, session_id, tab)
+    if message.customType ~= "pi2_bg_task" then
+        return
+    end
+    -- The dedupe (a repeated `started` must not un-finish a tracked row) and
+    -- the registry call both live in Tasks.absorb_message, which the
+    -- sub-session viewer calls too: one rule for the parent's transcript and
+    -- a child's, so a task's command/state cannot differ between the two.
+    -- A raise is downgraded to a warning, as in `apply_bg_task_event`: a
+    -- replayed transcript must not break the rebuild it is part of.
+    local ok, err = pcall(Tasks.absorb_message, message, session_id, tab)
+    if not ok then
+        Notify.warn("Background task event failed: " .. tostring(err))
+    end
+end
+
+--- Render the UI-only line(s) for a bg-tasks delivery report.
+---
+--- The `pi2_bg_task` message is model-facing: it lands in the transcript and in
+--- the agent's context, and the frontend deliberately renders no custom message
+--- as conversation content. This helper derives ONE dim line per reported task
+--- from that same content (`pi.tasks_note`), so the user sees what the model was
+--- told without anything being added to the context and without a second
+--- delivery channel. Panel pings and other customTypes yield no lines, and a
+--- detached session has no chat to draw into.
+---
+--- Runs on the RPC callback thread; rendering is scheduled inside the history.
+---@param message table custom message object (role="custom")
+---@param chat pi.Chat? owning chat (nil = detached session, nothing to draw)
+local function render_bg_task_note(message, chat)
+    if message.customType ~= "pi2_bg_task" or not chat then
+        return
+    end
+    local ok, err = pcall(function()
+        for _, line in ipairs(require("pi.tasks_note").lines(message.content)) do
+            chat:append_system_note({ { line, "PiSystemNote" } })
+        end
+    end)
+    if not ok then
+        Notify.warn("Background task note failed: " .. tostring(err))
+    end
+end
+
 --- Consume a pi2_bg_task custom message pushed by the bg-tasks extension:
---- forward the lifecycle event to the task registry, stamped with the owning
---- session/tab so the registry (and the :PiTasks panel) can scope rows
---- per session. Terminal states surface through the panel row and the
---- agent's own triggerTurn report — no extra vim.notify on top. Runs on the
---- RPC callback thread: every user-facing touch (Notify) is vim.schedule'd.
+--- forward the lifecycle event to the task registry, then act on the panel.
+--- Terminal states surface through the panel row and the agent's own
+--- triggerTurn report — no extra vim.notify on top. Runs on the RPC callback
+--- thread: every user-facing touch (Notify) is vim.schedule'd.
 ---@param message table custom message object (role="custom", customType="pi2_bg_task")
 ---@param session_id string? owning session id (task ownership routing; nil = unknown)
 ---@param tab integer? owning tabpage handle (panel display)
@@ -511,16 +934,7 @@ local function handle_bg_task_message(message, session_id, tab)
     if type(details) ~= "table" then
         return
     end
-    local ok, consumed = pcall(Tasks.handle_event, {
-        type = "pi2_bg_task",
-        details = details,
-        timestamp = message.timestamp,
-    }, session_id, tab)
-    if not ok then
-        Notify.warn("Background task event failed: " .. tostring(consumed))
-        return
-    end
-    if not consumed then
+    if not apply_bg_task_event(details, message.timestamp, session_id, tab) then
         return
     end
     local tasks_cfg = Config.options.tasks_panel or {}
@@ -530,7 +944,12 @@ local function handle_bg_task_message(message, session_id, tab)
     -- focus leaves — never yank a panel the user is reading. pi.ui.tasks is
     -- lazy-required as in the auto-open path.
     if
-        (details.kind == "completed" or details.kind == "failed" or details.kind == "stopped")
+        (
+            details.kind == "completed"
+            or details.kind == "failed"
+            or details.kind == "stopped"
+            or details.kind == "unknown"
+        )
         and tab ~= nil
         and not Tasks.has_running(session_id)
     then
@@ -658,6 +1077,7 @@ function M.refresh_state(session)
             vim.schedule(function()
                 capture_session_id(session, res.data)
                 capture_session_file(session, res.data)
+                bind_session_worktree(session)
                 if session.chat then
                     session.chat:update_state(res.data)
                     refresh_model_ambiguity(session, res.data)
@@ -696,6 +1116,7 @@ local function refresh_state_and_pin(session)
                 capture_config_pin(session, res.data)
                 capture_session_id(session, res.data)
                 capture_session_file(session, res.data)
+                bind_session_worktree(session)
                 if session.chat then
                     session.chat:update_state(res.data)
                     refresh_model_ambiguity(session, res.data)
@@ -882,6 +1303,10 @@ function M.handle_event(session, msg)
             require("pi.quickfix").on_tool_start(msg.toolName, msg.toolCallId, args)
         end
     elseif t == "tool_execution_end" then
+        -- Capture the cwd at event time: the scheduled quickfix/reload work
+        -- runs later and the session may have been rebound to another cwd
+        -- (worktree fork/revive) by then.
+        local session_cwd = session.cwd
         if chat then
             -- pi 1.1.0+ carries the monotonic tool duration (ms) as a sibling
             -- of `result` on the event; forward it on the result table so the
@@ -892,7 +1317,7 @@ function M.handle_event(session, msg)
             end
             chat:on_tool_end(msg.toolName or "tool", msg.toolCallId, msg.result, msg.isError)
             vim.schedule(function()
-                require("pi.quickfix").on_tool_end(msg.toolName, msg.toolCallId, msg.result, msg.isError)
+                require("pi.quickfix").on_tool_end(msg.toolName, msg.toolCallId, msg.result, msg.isError, session_cwd)
             end)
         end
         update_todo_mirror(session, msg.toolName, msg.result)
@@ -903,7 +1328,7 @@ function M.handle_event(session, msg)
             local changed_path = get_changed_file_path(args)
             if changed_path then
                 vim.schedule(function()
-                    require("pi.reload").on_file_changed(changed_path)
+                    require("pi.reload").on_file_changed(changed_path, session_cwd)
                 end)
             end
         end
@@ -1053,8 +1478,15 @@ function M.handle_event(session, msg)
         if was_registered and session.parent_id and session.id then
             -- Ordering matters: Batch.on_child_settled reads the manifest's
             -- `failed` status to settle the running batch item, so patch first.
+            -- The workspace must be explicit: a crashed child may run in its
+            -- own worktree cwd, while its manifest row lives in the parent's
+            -- workspace (and Neovim's cwd is neither).
             local Manifest = require("pi.subsessions.manifest")
-            Manifest.patch(session.id, { status = "failed", last_active_at = Manifest.iso_now() })
+            Manifest.patch(
+                session.id,
+                { status = "failed", last_active_at = Manifest.iso_now() },
+                Manifest.workspace(session)
+            )
             require("pi.subsessions").on_child_settled(session)
         end
         if chat then
@@ -1067,6 +1499,10 @@ function M.handle_event(session, msg)
         end
         -- The session object is gone from the registry; drop its todo state.
         prune_todo_state(session)
+        -- The process (and its cwd) is gone: hand the worktree back. The
+        -- once-only guard makes this a no-op when close_session()/stop()
+        -- already released it before the async exit dispatch arrived.
+        release_session_worktree(session)
     elseif t == "response" then
         -- Normally handled by rpc:send() one-shot callbacks. Late error
         -- responses (e.g. async prompt failures like auth errors) arrive
@@ -1081,13 +1517,17 @@ function M.handle_event(session, msg)
     elseif t == "message_start" then
         local message = msg.message
         if type(message) == "table" and message.role == "custom" then
-            -- Custom extension messages never render in chat history. The
-            -- bg-tasks extension's pi2_bg_task lifecycle feeds the task
-            -- registry (and the :PiTasks panel) instead; other customTypes
-            -- are dropped, matching the previous de-facto behavior.
+            -- Custom extension messages never render as a user/assistant block.
+            -- The bg-tasks extension's pi2_bg_task lifecycle feeds the task
+            -- registry (and the :PiTasks panel) instead, and its DELIVERY
+            -- reports (completions, check-ins, the startup orphan summary)
+            -- leave one dim UI-only line per task, derived from the very text
+            -- the model already got. Other customTypes are dropped, matching
+            -- the previous de-facto behavior.
             if message.customType == "pi2_bg_task" then
                 handle_bg_task_message(message, session.id, session.attached_tab)
             end
+            render_bg_task_note(message, chat)
         elseif chat then
             chat:on_message_start(msg)
         end
@@ -1255,12 +1695,15 @@ function M.list()
     ---@type pi.Session[]
     local result = {}
     for _, session in pairs(registry) do
-        if session.attached_tab then
+        -- A session whose tabpage is already gone is not shown: `cleanup()` runs
+        -- on `vim.schedule`, so a just-closed tab would otherwise render a
+        -- phantom row at the end (an unranked handle) until the next tick.
+        if session.attached_tab and rank[session.attached_tab] then
             result[#result + 1] = session
         end
     end
     table.sort(result, function(a, b)
-        return (rank[a.attached_tab] or math.huge) < (rank[b.attached_tab] or math.huge)
+        return rank[a.attached_tab] < rank[b.attached_tab]
     end)
     return result
 end
@@ -1323,12 +1766,28 @@ end
 
 --- Create a background session process without binding a tab chat UI.
 ---@param tab pi.TabId RPC job identity (usually the parent's tab).
----@param opts? { subagent?: boolean, tools?: string[] } `tools` is the child's tool allowlist (see `pi.SubagentConfig.tools`); nil inherits every tool.
+---@param opts? pi.SessionCreateOpts
 ---@return pi.Session?
 function M.create_detached(tab, opts)
     opts = opts or {}
+    local cwd = resolve_session_cwd(opts)
+    local explicit_cwd = type(opts.cwd) == "string" and opts.cwd ~= ""
+    local worktree = opts.worktree
+    local assigned_worktree = opts.assigned_worktree
     local rpc = Rpc.new(tab)
-    if not rpc:start({ subagent = opts.subagent, tools = opts.tools }) then
+    if
+        not rpc:start({
+            subagent = opts.subagent,
+            tools = opts.tools,
+            cwd = cwd,
+            -- The extension channel only needs the directory the child runs
+            -- in: an owned worktree or an explicitly assigned one.
+            worktree_path = (type(worktree) == "table" and worktree.path)
+                or (type(assigned_worktree) == "table" and assigned_worktree.path)
+                or nil,
+            extra_args = opts.args,
+        })
+    then
         return nil
     end
 
@@ -1339,7 +1798,10 @@ function M.create_detached(tab, opts)
         attention = { pending = {} },
         startup_announcements = {},
         system_errors = {},
-        cwd = vim.fn.getcwd(),
+        cwd = cwd,
+        _process_cwd = explicit_cwd and cwd or nil,
+        worktree = worktree,
+        assigned_worktree = assigned_worktree,
         changed_files = {},
     }
 
@@ -1361,11 +1823,15 @@ function M.close_session(session)
         detach_tab(session.attached_tab)
     end
     Attention.clear_session(session)
+    -- Process first, worktree second: the backend's cwd must be gone before
+    -- the directory is (see release_session_worktree's once-only guard, which
+    -- also absorbs the later _process_exit dispatch).
     session.rpc:stop()
     if session.id then
         registry[session.id] = nil
     end
     prune_todo_state(session)
+    release_session_worktree(session)
     require("pi.ui.sessions").request_refresh()
 end
 
@@ -1388,6 +1854,9 @@ function M.new_tab()
     local session = M.get_or_create()
     if session then
         session.chat:ensure_shown_and_focus_prompt()
+        -- Join the checkout's block instead of landing behind every other
+        -- checkout's tabs — the same ordering model :PiSessions groups rows by.
+        require("pi.sessions.tab_order").place_for(session)
     end
 end
 
@@ -1409,7 +1878,16 @@ function M.get_or_create(opts)
 
     local rpc = Rpc.new(tab)
 
-    if not rpc:start() then
+    local cwd = resolve_session_cwd(opts)
+    local explicit_cwd = type(opts.cwd) == "string" and opts.cwd ~= ""
+    local worktree = opts.worktree
+    if
+        not rpc:start({
+            cwd = cwd,
+            worktree_path = type(worktree) == "table" and worktree.path or nil,
+            extra_args = opts.args,
+        })
+    then
         Notify.error("Failed to start process")
         return nil
     end
@@ -1430,7 +1908,9 @@ function M.get_or_create(opts)
         attention = { pending = {} },
         startup_announcements = {},
         system_errors = {},
-        cwd = vim.fn.getcwd(),
+        cwd = cwd,
+        _process_cwd = explicit_cwd and cwd or nil,
+        worktree = worktree,
         changed_files = {},
     }
 
@@ -1469,10 +1949,13 @@ function M.stop()
     end
 
     Attention.clear_session(session)
+    -- Same ordering/once-only contract as close_session: the process stops
+    -- first, then its worktree is handed off for cleanup.
     session.rpc:stop()
     detach_tab(tab)
     registry[session_id] = nil
     prune_todo_state(session)
+    release_session_worktree(session)
     require("pi.ui.sessions").request_refresh()
 end
 
@@ -1714,6 +2197,21 @@ local function replay_messages(session, messages)
                 pending_agent_end = false
             end
             session.chat:on_bash_replay(msg)
+        elseif role == "custom" then
+            -- Extension lifecycle entries (the bg-tasks extension's
+            -- pi2_bg_task messages) never render as conversation content, but
+            -- they carry two things: the task table, which is folded in
+            -- transcript order so a tool block replayed from here —
+            -- wait_task's body leads with the command the task runs — resolves
+            -- the command instead of a bare id (folding in order also means
+            -- the terminal entries that follow a `started` one land on the same
+            -- record, exactly as in the live path, and pending_agent_end is
+            -- left alone: a custom entry is not a conversation turn), and a
+            -- delivery report, whose one dim UI-only line is rendered from the
+            -- same content the resumed model sees. Every caller starts from a
+            -- cleared buffer, so the lines are drawn once per report.
+            replay_bg_task_message(msg, session.id, session.attached_tab or session.tab)
+            render_bg_task_note(msg, session.chat)
         end
     end
     -- Flush any remaining pending agent_end
@@ -1922,6 +2420,29 @@ function load_session(session, session_path, opts, callback)
 
         Attention.end_session_transition(session, true)
         session.session_file = session_path
+        -- A resumed session anchors to the cwd its process actually runs in
+        -- (explicit worktree/sub-session cwd), falling back to the cwd recorded
+        -- in the session file only when no process cwd is fixed. Nonexistent
+        -- directories are never adopted (a moved/recreated checkout can leave
+        -- the header pointing at a ghost path).
+        local target_cwd = resumed_session_cwd(session, session_path)
+        if type(target_cwd) == "string" and target_cwd ~= session.cwd then
+            session.cwd = target_cwd
+            vim.schedule(function()
+                if session.chat then
+                    session.chat:set_cwd(target_cwd)
+                end
+            end)
+        end
+        -- The loaded file does not carry worktree metadata; re-detect it from
+        -- the resolved cwd so release/Ship keep finding their target. An
+        -- assigned worktree is the parent's, not this session's: never turn it
+        -- into an owned one (that would make close release someone else's
+        -- checkout).
+        if type(session.assigned_worktree) ~= "table" then
+            rebind_resumed_worktree(session, session.cwd)
+        end
+        bind_session_worktree(session)
         if opts.rebind_parent_context ~= false then
             require("pi.subsessions").on_parent_resumed(session, session_path)
         end
@@ -1993,13 +2514,57 @@ function load_session(session, session_path, opts, callback)
     end
 end
 
+---@class pi.ResumeSessionInfo : pi.SessionInfo
+---@field worktree? string Managed worktree name this session runs in.
+---@field worktree_info? table Worktree metadata (`pi.WorktreeInfo`) for that checkout.
+
+---@class pi.SessionSelectItem
+---@field session pi.ResumeSessionInfo
+---@field file string
+---@field worktree? table Managed worktree the session runs in (resume target).
+---@field worktree_info? table Alias for `worktree` — the resume layout reads either spelling.
+
+--- Two worktree info tables describe the same checkout (identity or path).
+---@param a any
+---@param b any
+---@return boolean
+local function same_worktree(a, b)
+    if type(a) ~= "table" or type(b) ~= "table" then
+        return false
+    end
+    if a == b then
+        return true
+    end
+    return same_path(a.path, b.path)
+end
+
+--- Resume context for a picker item (nil = historical in-place resume).
+---
+--- The recorded cwd is used for **every** session, not only worktree rows: a
+--- worktree → main resume (or any plain session recorded in another directory)
+--- must restart the process in that cwd instead of resuming the transcript in
+--- the directory the old process happens to run in.
+---@param item pi.SessionSelectItem
+---@return pi.ResumeTarget?
+local function resume_target_for(item)
+    local worktree = type(item.worktree) == "table" and item.worktree or nil
+    local cwd = worktree and type(worktree.path) == "string" and worktree.path or nil
+    if type(cwd) ~= "string" or cwd == "" then
+        cwd = item.session.cwd
+    end
+    if type(cwd) ~= "string" or cwd == "" then
+        return nil
+    end
+    return { cwd = cwd, worktree = worktree, session_id = item.session.id }
+end
+
 --- Shared renderer for resume-picker rows: date + display name or first message.
----@param session pi.SessionInfo
+--- Which checkout a session belongs to is the picker's group title, never a
+--- per-row suffix (`pi.sessions.resume_layout` renders both backends).
+---@param session pi.ResumeSessionInfo
 ---@return string
 local function format_resume_item(session)
-    local date = session.timestamp:match("^(%d%d%d%d%-%d%d%-%d%d)") or session.timestamp
-    local label = session.name or (session.first_message ~= "" and session.first_message or "(empty)")
-    return date .. "  " .. label
+    return ResumeLayout.format_session(session)
 end
 
 --- Find a live session in another tab backed by the given session file.
@@ -2019,8 +2584,15 @@ local function find_live_elsewhere(session_path, exclude_tab)
 end
 
 --- Open a past session picked from :PiResume: optionally move to a fresh
---- tabpage first, create the destination tab's session when needed, then
---- switch to `session_path`.
+--- tabpage first, restart the process when the target cwd differs from the
+--- running one, then switch to `session_path`.
+---
+--- A backend process cannot change cwd mid-flight, so resuming a session that
+--- belongs to another directory (typically a managed worktree, opened from the
+--- main checkout) closes the current process and starts a new one in the target
+--- cwd before the session file is switched. That keeps the process cwd and the
+--- UI anchor (`session.cwd`) identical instead of running the new transcript
+--- from the old directory.
 ---
 --- If the conversation is still live in another tab, a confirm dialog guards
 --- against spawning a second backend process writing the same session file
@@ -2028,44 +2600,191 @@ end
 ---@param session_path string
 ---@param opts? pi.SessionCreateOpts
 ---@param new_tab? boolean
-local function open_resume_target(session_path, opts, new_tab)
-    local function start()
+---@param resume? pi.ResumeTarget Managed-worktree target (cwd + metadata).
+local function open_resume_target(session_path, opts, new_tab, resume)
+    ---@param target pi.ResumeTarget?
+    local function start(target)
         if new_tab then
             vim.cmd("tabnew")
         end
-        local session = M.get_or_create(opts)
+        local target_cwd = target and target.cwd or nil
+        local target_worktree = target and target.worktree or nil
+        local current = M.get()
+        if current and type(target_cwd) == "string" and target_cwd ~= "" then
+            local process_cwd = current._process_cwd or current.cwd
+            if not same_path(process_cwd, target_cwd) then
+                if current.chat and current.chat:is_streaming() then
+                    Notify.warn("Wait for the agent to finish before resuming in another directory")
+                    return
+                end
+                -- Stop first: the new process must start in the target cwd so
+                -- `session.cwd` and the backend's cwd never diverge.
+                M.close_session(current)
+                current = M.get()
+            end
+        end
+
+        local session = current
+        if not session then
+            local create_opts = opts
+            if type(target_cwd) == "string" and target_cwd ~= "" then
+                create_opts = {
+                    cwd = target_cwd,
+                    worktree = target_worktree,
+                    layout = opts and opts.layout or nil,
+                }
+            end
+            session = M.get_or_create(create_opts)
+        end
         if not session then
             return
+        end
+        if type(target_worktree) == "table" and not same_worktree(session.worktree, target_worktree) then
+            -- Adopt the checkout metadata before the switch, so release/Ship
+            -- see it immediately after the resume.
+            session.worktree = target_worktree
+        end
+        if new_tab then
+            -- A resume opened in a new tab joins its checkout's block in the
+            -- tabline; an in-place resume keeps the current tab where it is.
+            require("pi.sessions.tab_order").place_for(session)
         end
         session.chat:show({ loading = true })
         load_session(session, session_path)
     end
 
-    -- For an in-place open the destination is the current tab: reopening this
-    -- tab's own live copy is the normal self-switch, so exclude it from the
-    -- conflict check. A new-tab open conflicts with any live copy.
-    local live = find_live_elsewhere(session_path, new_tab and nil or current_tab())
-    if not live then
-        start()
+    ---@param target pi.ResumeTarget?
+    local function proceed(target)
+        -- For an in-place open the destination is the current tab: reopening
+        -- this tab's own live copy is the normal self-switch, so exclude it from
+        -- the conflict check. A new-tab open conflicts with any live copy.
+        local live = find_live_elsewhere(session_path, new_tab and nil or current_tab())
+        if not live then
+            start(target)
+            return
+        end
+        Dialog.confirm({
+            title = "Session already open",
+            message = "This conversation is still running in another tab. Opening it again spawns a second"
+                .. " process writing the same session file (they will diverge). Continue?",
+        }, function(confirmed)
+            if confirmed then
+                start(target)
+            end
+        end)
+    end
+
+    if resume and (resume.cwd or resume.worktree) then
+        -- Recover a removed worktree (legacy integration record / snapshot) before
+        -- touching any process. On failure this reports why and opens nothing -
+        -- it never falls back to the main checkout.
+        require("pi.worktree_session").prepare_resume_target(resume, function(target)
+            vim.schedule(function()
+                if not target then
+                    return
+                end
+                proceed(target)
+            end)
+        end)
         return
     end
-    Dialog.confirm({
-        title = "Session already open",
-        message = "This conversation is still running in another tab. Opening it again spawns a second"
-            .. " process writing the same session file (they will diverge). Continue?",
-    }, function(confirmed)
-        if confirmed then
-            start()
-        end
-    end)
+    proceed(nil)
 end
+
+--- Picker context shared by both backends: the main checkout's group title and
+--- the checkout the caller currently runs in (which the layout puts first).
+---
+--- `Worktree.detect` is pure filesystem work (and cached), so naming the main
+--- partition and locating the current checkout spawns no git subprocess;
+--- anything unexpected falls back to the directory's basename, and the anchor
+--- keeps working (just without a repository root) when detection fails.
+---@class pi.ResumeContext
+---@field repo_name string Title of the main-checkout partition
+---@field current pi.ResumeAnchor Checkout the current session runs in
+
+--- The current session's workspace is the anchor, because a worktree session
+--- runs in its checkout while Neovim's cwd stays wherever it was started;
+--- without a session the editor's cwd is all there is.
+---@return pi.ResumeContext
+local function resume_context()
+    local session = M.get()
+    local cwd = session and type(session.cwd) == "string" and session.cwd ~= "" and session.cwd or vim.fn.getcwd()
+    local repo_root = nil
+    local ok, Worktree = pcall(require, "pi.worktree")
+    if ok and type(Worktree) == "table" and type(Worktree.detect) == "function" then
+        local detected, info = pcall(Worktree.detect, cwd)
+        if detected and type(info) == "table" and type(info.repo_root) == "string" and info.repo_root ~= "" then
+            repo_root = info.repo_root
+        end
+    end
+    return {
+        repo_name = vim.fs.basename(repo_root or cwd),
+        current = { cwd = cwd, repo_root = repo_root },
+    }
+end
+
+--- Picker rows for the collected items: one partition per checkout, optionally
+--- narrowed by the prompt. `pi.sessions.resume_layout` owns every decision.
+---@param items pi.SessionSelectItem[]
+---@param query? string
+---@param context? pi.ResumeContext
+---@return pi.ResumeRow[]
+local function resume_rows(items, query, context)
+    context = context or resume_context()
+    ---@type pi.ResumeRow[]
+    local rows = ResumeLayout.rows(items, {
+        query = query,
+        repo_name = context.repo_name,
+        current = context.current,
+    })
+    return rows
+end
+
+--- Order-preserving telescope sorter: rows already arrive filtered and ordered
+--- from `pi.sessions.resume_layout`, so telescope must not re-score them.
+---
+--- Telescope versions differ: `config.values.empty_sorter` only exists in newer
+--- builds (the installed ones expose `telescope.sorters.empty()` instead), so
+--- resolve the first API that exists. A re-scoring fallback still beats a
+--- picker that throws on a missing field. Exposed as a test hook so the
+--- resolution is checked against the real plugin, not only a stub.
+---@return table? sorter
+function M._resume_sorter()
+    local ok_conf, conf = pcall(require, "telescope.config")
+    ---@type table?
+    local values = nil
+    if ok_conf and type(conf) == "table" and type(conf.values) == "table" then
+        values = conf.values
+    end
+    if values and type(values.empty_sorter) == "function" then
+        return values.empty_sorter()
+    end
+    local ok_sorters, sorters = pcall(require, "telescope.sorters")
+    if ok_sorters and type(sorters) == "table" and type(sorters.empty) == "function" then
+        return sorters.empty()
+    end
+    if values and type(values.generic_sorter) == "function" then
+        return values.generic_sorter()
+    end
+    return nil
+end
+
+-- Defined below; the pickers reopen themselves from group rows and after a
+-- deletion, so the two backend functions need it in scope.
+---@type fun(items: pi.SessionSelectItem[], opts: pi.SessionCreateOpts?)
+local show_resume_picker
 
 --- Open the resume list through a dedicated telescope picker.
 --- Returns false when telescope is unavailable so the caller falls back to
 --- the generic vim.ui.select flow below.
 ---
+--- Rows and ordering come from `pi.sessions.resume_layout`, so the finder is
+--- dynamic (recomputed per prompt) and the sorter is empty: filtering and
+--- ordering already happened, telescope only paints.
+---
 --- Keybindings (hinted in the picker title): <CR>/o open in the current tab,
---- t/<C-t> open in a new tab, <C-x> delete the selected session(s).
+--- t/<C-t> open in a new tab, <C-x> delete the selected session(s). Group title
+--- rows are not sessions: the keys step to the next session row.
 ---@param items pi.SessionSelectItem[]
 ---@param opts? pi.SessionCreateOpts
 ---@return boolean handled
@@ -2078,14 +2797,66 @@ local function open_with_telescope(items, opts)
     local themes = require("telescope.themes")
     local pickers = require("telescope.pickers")
     local finders = require("telescope.finders")
-    local conf = require("telescope.config").values
     local actions = require("telescope.actions")
     local action_state = require("telescope.actions.state")
 
-    ---@param item pi.SessionSelectItem
+    local context = resume_context()
+    --- Rows behind the current prompt; a group row is only a title, so the
+    --- selection helpers walk this list to find the next session row.
+    ---@type pi.ResumeRow[]
+    local current_rows = {}
+
+    ---@param row pi.ResumeRow
     ---@return table telescope entry
-    local function entry_maker(item)
-        return { value = item, display = format_resume_item(item.session), ordinal = format_resume_item(item.session) }
+    local function entry_maker(row)
+        local entry = { value = row, ordinal = row.text }
+        if row.kind == "group" then
+            -- Title row: painted like the :PiSessions worktree header (and
+            -- non-resumable, see below). `display` must return the text plus a
+            -- list of `{ {start, end}, hl_group }` blocks — telescope passes the
+            -- second value straight to `hi_display`, which iterates it.
+            entry.display = function(e)
+                local text = e.value.text
+                return text, { { { 0, #text }, "PiSessionsListWorktree" } }
+            end
+        else
+            entry.display = row.text
+        end
+        return entry
+    end
+
+    ---@param prompt string
+    ---@return pi.ResumeRow[]
+    local function rows_for(prompt)
+        current_rows = resume_rows(items, prompt, context)
+        return current_rows
+    end
+
+    --- Session behind the selection; a group title resolves to the next session
+    --- row (wrapping around), so every open key acts on a resumable row.
+    ---@param prompt_bufnr integer
+    ---@return pi.SessionSelectItem?
+    local function selected_item(prompt_bufnr)
+        local selection = action_state.get_selected_entry(prompt_bufnr)
+        if not selection or type(selection.value) ~= "table" then
+            return nil
+        end
+        if selection.value.kind == "session" then
+            return selection.value.item
+        end
+        local count = #current_rows
+        if count == 0 then
+            return nil
+        end
+        -- `entry.index` is the 1-based position in the rows the finder shows.
+        local index = tonumber(selection.index) or 0
+        for offset = 1, count do
+            local row = current_rows[((index + offset - 1) % count) + 1]
+            if row.kind == "session" then
+                return row.item
+            end
+        end
+        return nil
     end
 
     -- NOTE: pickers.new(opts, defaults) lets `opts` (this first table) win on
@@ -2099,17 +2870,17 @@ local function open_with_telescope(items, opts)
                 results_title = " <CR>/o open · t/<C-t> new tab · <C-x> delete ",
             }),
             {
-                finder = finders.new_table({ results = items, entry_maker = entry_maker }),
-                sorter = conf.generic_sorter(),
+                finder = finders.new_dynamic({ entry_maker = entry_maker, fn = rows_for }),
+                sorter = M._resume_sorter(),
                 attach_mappings = function(prompt_bufnr, map)
                     local function open(new_tab)
-                        local selection = action_state.get_selected_entry(prompt_bufnr)
-                        if not selection then
+                        local item = selected_item(prompt_bufnr)
+                        if not item then
                             return
                         end
                         actions.close(prompt_bufnr)
                         vim.schedule(function()
-                            open_resume_target(selection.value.file, opts, new_tab)
+                            open_resume_target(item.file, opts, new_tab, resume_target_for(item))
                         end)
                     end
 
@@ -2130,14 +2901,18 @@ local function open_with_telescope(items, opts)
                     end)
 
                     map({ "n", "i" }, "<C-x>", function()
-                        local targets = {} ---@type string[]
+                        ---@type pi.SessionSelectItem[]
+                        local targets = {}
                         for _, entry in ipairs(action_state.get_multi_selection(prompt_bufnr)) do
-                            targets[#targets + 1] = entry.value.file
+                            local row = entry.value
+                            if type(row) == "table" and row.kind == "session" then
+                                targets[#targets + 1] = row.item
+                            end
                         end
                         if #targets == 0 then
-                            local selection = action_state.get_selected_entry(prompt_bufnr)
-                            if selection then
-                                targets[1] = selection.value.file
+                            local item = selected_item(prompt_bufnr)
+                            if item then
+                                targets[1] = item
                             end
                         end
                         if #targets == 0 then
@@ -2149,11 +2924,11 @@ local function open_with_telescope(items, opts)
                         end
                         ---@type table<string, boolean>
                         local deleted = {}
-                        for _, path in ipairs(targets) do
-                            deleted[path] = true
-                            local ok, err = os.remove(path)
+                        for _, target in ipairs(targets) do
+                            deleted[target.file] = true
+                            local ok, err = os.remove(target.file)
                             if not ok then
-                                Notify.warn("Failed to delete session: " .. (err or path))
+                                Notify.warn("Failed to delete session: " .. (err or target.file))
                             end
                         end
                         local remaining = {}
@@ -2168,9 +2943,9 @@ local function open_with_telescope(items, opts)
                             Notify.info("No sessions remaining")
                             return
                         end
-                        action_state
-                            .get_current_picker(prompt_bufnr)
-                            :refresh(finders.new_table({ results = remaining, entry_maker = entry_maker }))
+                        -- The dynamic finder re-runs `rows_for`, so a plain
+                        -- refresh re-groups the surviving sessions.
+                        action_state.get_current_picker(prompt_bufnr):refresh()
                     end)
                     return true
                 end,
@@ -2180,31 +2955,313 @@ local function open_with_telescope(items, opts)
     return true
 end
 
----@param sessions pi.SessionInfo[]
----@return pi.SessionInfo[]
-local function filter_top_level_sessions(sessions)
+--- Predicate answering "is this session id somebody's sub-session?".
+---
+--- Child bookkeeping lives in the **parent's** workspace manifest, so a row's
+--- parentage is only decidable against the workspace(s) it could belong to:
+--- Neovim's cwd for a child spawned from the main checkout into a `sub-*`
+--- worktree, the checkout itself when the parent ran there.
+---@param cwds string[] Workspaces whose manifests record the children
+---@return fun(id: string?): boolean
+local function child_session_check(cwds)
     local Manifest = require("pi.subsessions.manifest")
+    return function(id)
+        if type(id) ~= "string" or id == "" then
+            return false
+        end
+        for _, cwd in ipairs(cwds) do
+            local ok, child = pcall(Manifest.is_child_session, id, cwd)
+            if ok and child then
+                return true
+            end
+        end
+        return false
+    end
+end
+
+--- Drop sub-session transcripts: they are reopened through `:PiSubSwitch`, not
+--- the resume picker.
+---@param sessions pi.SessionInfo[]
+---@param cwds string[] Workspaces whose manifests record the children
+---@return pi.SessionInfo[]
+local function filter_top_level_sessions(sessions, cwds)
+    local is_child = child_session_check(cwds)
     ---@type pi.SessionInfo[]
     local out = {}
     for _, session in ipairs(sessions) do
-        if not Manifest.is_child_session(session.id) then
+        if not is_child(session.id) then
             out[#out + 1] = session
         end
     end
     return out
 end
 
----@param current_session_file? string
----@return string?
-local function find_continue_session_path(current_session_file)
+--- Collect resume entries: sessions of Neovim's cwd plus those of every linked
+--- worktree of the same repository — git's own view, so a checkout created
+--- outside pi (`git worktree add ../x`) is included too. Checkouts git still
+--- reports as missing/prunable and checkouts deleted but recoverable from a
+--- snapshot (`Worktree.snapshot_worktrees`) are enumerated as well; they only
+--- surface in the picker when a resumable (top-level) session lives there.
+---
+--- Cross-worktree resume must not require `:cd` into the checkout: candidate
+--- worktrees are enumerated through the git-side module and each checkout's
+--- session directory is read through `History.list(cwd)` (which is a pure path
+--- encoding, so it also works for a directory that no longer exists). Rows
+--- carry the worktree name for display and the info table so opening one can
+--- start the process in that cwd — or recover the checkout first.
+---
+--- Falls back to the historical single-workspace list when there is nothing to
+--- discover (no worktree module, no `list`/`snapshot_worktrees`, and neither a
+--- `.worktrees`, a snapshot store, nor git's linked-worktree registry) — plain
+--- sessions keep their exact old behaviour and ordering.
+---@param callback fun(items: pi.ResumeSessionInfo[])
+local function collect_resume_sessions(callback)
     local History = require("pi.sessions.history")
-    local sessions_list = filter_top_level_sessions(History.list())
+    ---@type pi.ResumeSessionInfo[]
+    local items = {}
+    ---@type table<string, pi.ResumeSessionInfo>
+    local by_path = {}
+    local merged = false
+
+    ---@param info pi.SessionInfo
+    ---@param worktree? table
+    local function add(info, worktree)
+        if type(info) ~= "table" or type(info.path) ~= "string" then
+            return
+        end
+        local existing = by_path[info.path]
+        if existing then
+            -- The current cwd's list was added first and saw no worktree; a
+            -- per-worktree listing can still name it (Neovim may run inside a
+            -- linked checkout).
+            if type(worktree) == "table" and not existing.worktree_info then
+                existing.worktree = worktree.name
+                existing.worktree_info = worktree
+                merged = true
+            end
+            return
+        end
+        ---@cast info pi.ResumeSessionInfo
+        local entry = info
+        if type(worktree) == "table" then
+            entry.worktree = worktree.name
+            entry.worktree_info = worktree
+            merged = true
+        end
+        by_path[info.path] = entry
+        items[#items + 1] = entry
+    end
+
+    for _, info in ipairs(filter_top_level_sessions(History.list(), { vim.fn.getcwd() })) do
+        add(info)
+    end
+
+    local ok, Worktree = pcall(require, "pi.worktree")
+    if not ok or type(Worktree) ~= "table" then
+        callback(items)
+        return
+    end
+    local has_list = type(Worktree.list) == "function"
+    local has_snapshots = type(Worktree.snapshot_worktrees) == "function"
+    if not has_list and not has_snapshots then
+        callback(items)
+        return
+    end
+
+    local repo = nil
+    if type(Worktree.detect) == "function" then
+        local detected = Worktree.detect(vim.fn.getcwd())
+        if type(detected) == "table" then
+            repo = detected
+        end
+    end
+    local repo_root = (repo and repo.repo_root) or vim.fn.getcwd()
+    local common_dir = (repo and repo.common_dir) or (repo_root .. "/.git")
+    -- Workspaces whose manifests can record a child's parentage: Neovim's cwd,
+    -- plus (per checkout, below) the repository's main checkout. The main
+    -- checkout is what matters while Neovim runs inside a linked worktree or a
+    -- subdirectory: a `sub-*` checkout is created from the workspace its parent
+    -- session runs in — usually the main checkout — so without consulting that
+    -- manifest the dead checkouts come back as one-row partitions.
+    ---@type string[]
+    local child_manifest_cwds = { vim.fn.getcwd() }
+    if type(repo_root) == "string" and repo_root ~= "" and repo_root ~= child_manifest_cwds[1] then
+        child_manifest_cwds[#child_manifest_cwds + 1] = repo_root
+    end
+
+    --- Child-manifest scopes for one checkout: the shared workspaces plus the
+    --- checkout itself (duplicates are harmless — `Manifest.load` caches).
+    ---@param checkout string
+    ---@return string[]
+    local function child_manifest_scopes(checkout)
+        local cwds = {}
+        for _, cwd in ipairs(child_manifest_cwds) do
+            cwds[#cwds + 1] = cwd
+        end
+        cwds[#cwds + 1] = checkout
+        return cwds
+    end
+    local has_worktrees_dir = vim.fn.isdirectory(repo_root .. "/.worktrees") == 1
+    local has_snapshot_dir = vim.fn.isdirectory(common_dir .. "/pi2-worktree-snapshots") == 1
+    -- git's registry of linked worktrees (`<git common dir>/worktrees/<name>`).
+    -- A directory probe, so "does this repository have other checkouts?" is
+    -- answered without spawning git; it keeps cross-checkout resume working for
+    -- repositories whose checkouts were created outside pi.
+    local has_linked_registry = vim.fn.isdirectory(common_dir .. "/worktrees") == 1
+    if not has_worktrees_dir and not has_snapshot_dir and not has_linked_registry then
+        -- Nothing to discover here: keep the historical synchronous
+        -- single-workspace picker and never spawn git for it.
+        callback(items)
+        return
+    end
+
+    ---@type table<string, table>
+    local worktrees = {}
+    --- Every linked worktree git reports is a resume candidate, wherever it
+    --- lives: a checkout the user created themselves (`git worktree add ../x`)
+    --- is as resumable as a pi-managed one. `Worktree.list` already skips
+    --- checkouts whose directory is gone, except prunable pi-managed ones whose
+    --- transcripts are still worth locating. Managed-ness stays in the info
+    --- table (name, base_sha, mode) for the badge, `Ship`/`Apply` and the
+    --- session binding — it never decides visibility.
+    ---@param entry any
+    local function add_worktree(entry)
+        if type(entry) ~= "table" then
+            return
+        end
+        local info = {}
+        for k, v in pairs(entry) do
+            info[k] = v
+        end
+        local path = type(info.path) == "string" and info.path or nil
+        if type(path) ~= "string" or path == "" then
+            return
+        end
+        info.path = vim.fs.normalize(path)
+        local prev = worktrees[path]
+        -- Keep the richer record (snapshot-only rows and prunable git records
+        -- may describe the same checkout).
+        if not prev or (type(info.name) == "string" and type(prev.name) ~= "string") then
+            worktrees[path] = info
+        end
+    end
+
+    local list_done = not has_list
+    local list_err = nil
+    local function apply()
+        local sorted = {}
+        for _, worktree in pairs(worktrees) do
+            sorted[#sorted + 1] = worktree
+        end
+        table.sort(sorted, function(a, b)
+            return tostring(a.path) < tostring(b.path)
+        end)
+        local function run()
+            if list_err ~= nil and list_err ~= "" then
+                Notify.warn("Could not list repository worktrees: " .. tostring(list_err))
+            end
+            for _, worktree in ipairs(sorted) do
+                -- Missing/prunable checkouts have no directory, but their
+                -- session files still live in the per-cwd agent directory;
+                -- History.list() only encodes the path, so this works.
+                --
+                -- Children are dropped here as well as in the cwd list: a
+                -- subagent's transcript belongs to `:PiSubSwitch`, and a dead
+                -- `sub-*` checkout holding one must not turn into a picker
+                -- partition of its own. The scopes cover the case where Neovim
+                -- itself runs in a linked checkout or a subdirectory, so the
+                -- child row is only recorded in the main checkout's manifest.
+                local listed =
+                    filter_top_level_sessions(History.list(worktree.path), child_manifest_scopes(worktree.path))
+                for _, info in ipairs(listed) do
+                    add(info, worktree)
+                end
+            end
+            if merged then
+                table.sort(items, function(a, b)
+                    return a.modified > b.modified
+                end)
+            end
+            callback(items)
+        end
+        if vim.in_fast_event() then
+            vim.schedule(run)
+        else
+            run()
+        end
+    end
+
+    -- Snapshot entries are collected **before** `Worktree.list` hands its reply
+    -- to `apply()`: `snapshot_worktrees` is synchronous while git's list may
+    -- answer later (or, in a spec, immediately), and `apply()` must never run
+    -- against a half-populated candidate set.
+    if has_snapshots then
+        -- `snapshot_worktrees(cwd)` is synchronous: it returns the checkouts
+        -- deleted but still recoverable from a snapshot sidecar.
+        local called, snapshots = pcall(Worktree.snapshot_worktrees, vim.fn.getcwd())
+        if not called then
+            list_err = snapshots
+        elseif type(snapshots) == "table" then
+            for _, entry in ipairs(snapshots) do
+                add_worktree(entry)
+            end
+        end
+    end
+
+    if has_list then
+        local called, call_err = pcall(Worktree.list, vim.fn.getcwd(), function(list, err)
+            if list_done then
+                return
+            end
+            list_done = true
+            if type(list) == "table" then
+                for _, entry in ipairs(list) do
+                    add_worktree(entry)
+                end
+            else
+                list_err = err
+            end
+            apply()
+        end)
+        if not called then
+            list_done = true
+            list_err = call_err
+            apply()
+        end
+    end
+
+    if not has_list then
+        apply()
+    end
+end
+
+--- Newest resumable session for `cwd` (default: Neovim's cwd), excluding the
+--- file currently loaded.
+---@param current_session_file? string
+---@param cwd? string Workspace to list (the session process cwd, not Neovim's)
+---@return string?
+local function find_continue_session_path(current_session_file, cwd)
+    local History = require("pi.sessions.history")
+    local sessions_list = filter_top_level_sessions(History.list(cwd), { cwd or vim.fn.getcwd() })
     for _, session in ipairs(sessions_list) do
         if session.path ~= current_session_file then
             return session.path
         end
     end
     return nil
+end
+
+--- Open a continued session through the same safe path as `:PiResume` (restart
+--- the process when its cwd differs, never reuse the wrong process).
+---@param session_path string
+---@param opts? pi.SessionCreateOpts
+local function continue_into_session(session_path, opts)
+    local info = require("pi.sessions.history").parse(session_path)
+    local target = nil
+    if type(info) == "table" and type(info.cwd) == "string" and info.cwd ~= "" then
+        target = { cwd = info.cwd, session_id = info.id }
+    end
+    open_resume_target(session_path, opts, false, target)
 end
 
 ---@param session pi.Session
@@ -2248,8 +3305,7 @@ function M.continue_session(opts)
             show_no_previous_sessions(session)
             return
         end
-        session.chat:show({ loading = true })
-        load_session(session, session_path)
+        continue_into_session(session_path, opts)
         return
     end
 
@@ -2268,14 +3324,17 @@ function M.continue_session(opts)
                 return
             end
 
-            local session_path = find_continue_session_path(state.sessionFile)
+            -- List the workspace the process actually runs in, not Neovim's
+            -- cwd (they differ for every worktree session): otherwise the
+            -- "most recent conversation" belongs to a different directory.
+            local cwd = session._process_cwd or session.cwd
+            local session_path = find_continue_session_path(state.sessionFile, cwd)
             if not session_path then
                 show_no_previous_sessions(session)
                 return
             end
 
-            session.chat:show({ loading = true })
-            load_session(session, session_path)
+            continue_into_session(session_path, opts)
         end)
     end)
     if not sent then
@@ -2283,29 +3342,11 @@ function M.continue_session(opts)
     end
 end
 
---- Show a picker to resume a past session.
+--- Render the resume picker for the collected items (telescope or
+--- `vim.ui.select`) and open the chosen session.
+---@param items pi.SessionSelectItem[]
 ---@param opts? pi.SessionCreateOpts
-function M.resume_session(opts)
-    local History = require("pi.sessions.history")
-    local sessions_list = filter_top_level_sessions(History.list())
-    if #sessions_list == 0 then
-        Notify.info("No sessions found")
-        return
-    end
-
-    ---@class pi.SessionSelectItem
-    ---@field session pi.SessionInfo
-    ---@field file string
-
-    ---@type pi.SessionSelectItem[]
-    local items = {}
-    for i, session in ipairs(sessions_list) do
-        items[i] = {
-            session = session,
-            file = session.path,
-        }
-    end
-
+function show_resume_picker(items, opts)
     -- Telescope gets a purpose-built picker (dedicated keybindings plus a
     -- fixed key-hint title); every other backend keeps the generic
     -- vim.ui.select rendering below.
@@ -2313,15 +3354,23 @@ function M.resume_session(opts)
         return
     end
 
-    vim.ui.select(items, {
+    -- The same rows the telescope finder gets (partition titles included),
+    -- computed once: `vim.ui.select` has no dynamic finder, and choosing a
+    -- title only reopens the picker.
+    local rows = resume_rows(items, nil)
+
+    vim.ui.select(rows, {
         prompt = "Resume session",
         kind = "pi-resume-session",
-        -- Pass picker items with a `file` field so backends like snacks.nvim
-        -- can preview the raw session file when preview is enabled. Other
-        -- vim.ui.select implementations ignore extra fields and render via
-        -- `format_item`. Same row rendering as the telescope picker above.
-        format_item = function(item)
-            return format_resume_item(item.session)
+        -- Rows carry their session item (with `file`) so a backend that
+        -- previews raw session files can find one; other vim.ui.select
+        -- implementations ignore extra fields and render via `format_item`.
+        -- Same row rendering as the telescope picker above.
+        format_item = function(row)
+            if row.kind == "session" then
+                return format_resume_item(row.item.session)
+            end
+            return row.text
         end,
         snacks = {
             -- snacks.nvim (if installed) overrides vim.ui.select with its picker.
@@ -2333,7 +3382,7 @@ function M.resume_session(opts)
                 config = function(layout)
                     for _, box in ipairs(layout.layout) do
                         if box.win == "list" then
-                            box.height = math.floor(math.max(math.min(#items, vim.o.lines * 0.8 - 10), 2))
+                            box.height = math.floor(math.max(math.min(#rows, vim.o.lines * 0.8 - 10), 2))
                         end
                     end
                 end,
@@ -2354,34 +3403,48 @@ function M.resume_session(opts)
             },
             actions = {
                 resume_new_tab = function(picker)
-                    local selected = picker:selected({ fallback = true })
-                    if #selected == 0 then
+                    ---@type pi.SessionSelectItem?
+                    local item = nil
+                    for _, sel in ipairs(picker:selected({ fallback = true })) do
+                        local row = sel.item
+                        if type(row) == "table" and row.kind == "session" then
+                            item = row.item
+                            break
+                        end
+                    end
+                    if not item then
                         return
                     end
                     picker:close()
                     vim.schedule(function()
-                        open_resume_target(selected[1].item.file, opts, true)
+                        open_resume_target(item.file, opts, true, resume_target_for(item))
                     end)
                 end,
                 delete_session = function(picker)
-                    local selected = picker:selected({ fallback = true })
-                    if #selected == 0 then
+                    ---@type pi.SessionSelectItem[]
+                    local targets = {}
+                    for _, sel in ipairs(picker:selected({ fallback = true })) do
+                        local row = sel.item
+                        if type(row) == "table" and row.kind == "session" then
+                            targets[#targets + 1] = row.item
+                        end
+                    end
+                    if #targets == 0 then
                         return
                     end
-                    local n = #selected
+                    local n = #targets
                     local msg = n == 1 and "Delete session?" or ("Delete %d sessions?"):format(n)
                     if vim.fn.confirm(msg, "&Yes\n&No", 2) ~= 1 then
                         return
                     end
                     ---@type table<string, boolean>
                     local deleted = {}
-                    for _, sel in ipairs(selected) do
-                        local path = sel.item.file
-                        local ok, err = os.remove(path)
+                    for _, target in ipairs(targets) do
+                        local ok, err = os.remove(target.file)
                         if ok then
-                            deleted[path] = true
+                            deleted[target.file] = true
                         else
-                            Notify.warn("Failed to delete session: " .. (err or path))
+                            Notify.warn("Failed to delete session: " .. (err or target.file))
                         end
                     end
                     for i = #items, 1, -1 do
@@ -2389,20 +3452,55 @@ function M.resume_session(opts)
                             table.remove(items, i)
                         end
                     end
+                    picker:close()
                     if #items == 0 then
-                        picker:close()
                         Notify.info("No sessions remaining")
-                    else
-                        picker:refresh()
+                        return
                     end
+                    -- Reopen instead of refresh: the rows (titles included) are
+                    -- recomputed from the surviving items.
+                    show_resume_picker(items, opts)
                 end,
             },
         },
-    }, function(item)
-        if not item then
+    }, function(row)
+        if not row then
             return
         end
-        open_resume_target(item.file, opts)
+        if row.kind ~= "session" then
+            -- A group title is not resumable: reopen the full list.
+            vim.schedule(function()
+                show_resume_picker(items, opts)
+            end)
+            return
+        end
+        open_resume_target(row.item.file, opts, nil, resume_target_for(row.item))
+    end)
+end
+
+--- Show a picker to resume a past session: this cwd's sessions plus the
+--- sessions of every linked worktree of the same repository.
+---
+--- Worktree rows carry their checkout metadata, so opening one restarts the
+--- process in that cwd instead of resuming the transcript in the main checkout.
+---@param opts? pi.SessionCreateOpts
+function M.resume_session(opts)
+    collect_resume_sessions(function(sessions_list)
+        if #sessions_list == 0 then
+            Notify.info("No sessions found")
+            return
+        end
+
+        ---@type pi.SessionSelectItem[]
+        local items = {}
+        for i, session in ipairs(sessions_list) do
+            items[i] = {
+                session = session,
+                file = session.path,
+                worktree = session.worktree_info,
+            }
+        end
+        show_resume_picker(items, opts)
     end)
 end
 
@@ -2559,6 +3657,7 @@ function M._reset()
     end
     mirror_shims = {}
     detached_shim = nil
+    cwd_reservations = {}
     next_temp_id = 0
 end
 

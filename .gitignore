@@ -1,8 +1,10 @@
 /.agents/gigs/
 /.agents/notes/
 
-# Python bytecode from scripts/ (checks, docs-links).
+# Python bytecode from scripts/ (checks, docs-links) and ruff's cache.
 __pycache__/
+*.pyc
+.ruff_cache/
 
 # Stray per-session checkouts; real worktrees live outside the repo.
 /.worktrees/

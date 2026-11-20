@@ -1,0 +1,318 @@
+"""The check framework: findings, the rule registry, the runner, and self-tests.
+
+Three design rules, all of them consequences of past fake-green incidents
+(gotcha G25):
+
+* **A missing tool is an error, not a skip.** `run()` raises `CheckError` when a
+  binary it needs is absent; that error is reported and makes the run exit 2.
+  Skipping a check because a tool vanished is how a suite reports green while
+  checking nothing.
+* **Every rule ships a failing fixture.** `self_test()` refuses to pass a rule
+  that declares no fixture or whose fixtures do not include both a clean tree
+  and a tree that must produce findings. If the gate has never been seen to
+  fail, it is not a gate.
+* **Findings are `path:line: severity: [rule] message`.** Grep-able, clickable
+  in an editor, and stable enough to diff in CI logs.
+
+Severities
+----------
+    error  the code is wrong; blocks (the default)
+    warn   a fact about the tree (nothing to verify) or a real defect that the
+           rule cannot localize; blocks too — a warn is not a mute
+    info   ADVISORY: printed, counted, and included in `--json`, but it never
+           changes the exit code. Reserved for a heuristic whose premise static
+           analysis cannot prove (e.g. "this callback may run on a fast event"),
+           where a false positive must not be able to block a merge on its own.
+           A rule that can prove its finding uses `error`.
+
+Exit codes
+----------
+    0   clean: every rule ran and reported nothing blocking
+    1   findings: at least one blocking (error/warn) finding exists
+    2   broken gate: no blocking findings, but at least one rule could not run
+
+Findings deliberately outrank a broken gate: a run that found real violations
+must not be reported as "the gate is broken", or the violations get ignored
+while someone debugs the harness. Errors are always printed to stderr, and
+`--json` always carries both `findings` and `errors`, so nothing is hidden when
+both happen at once.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import json
+import os
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Iterator, Mapping, Sequence
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
+
+
+class CheckError(RuntimeError):
+    """A check could not run at all (missing tool, unreadable tree).
+
+    Distinct from a finding: findings mean "the code is wrong", a CheckError
+    means "the gate is broken". The runner reports the two with different exit
+    codes so CI never confuses them, and findings win when both occur (a real
+    violation must not be reported as a harness problem).
+    """
+
+
+@dataclass
+class Finding:
+    """One violated rule, at one location.
+
+    `severity` is one of `error` / `warn` (both blocking) or `info` (advisory: it
+    is printed and counted by `--self-test` but never affects the exit code).
+    """
+
+    check: str
+    message: str
+    path: str = ""
+    line: int = 0
+    severity: str = "error"
+
+    def render(self) -> str:
+        where = f"{self.path}:{self.line}" if self.line else (self.path or "<repo>")
+        return f"{where}: {self.severity}: [{self.check}] {self.message}"
+
+    def as_dict(self) -> dict:
+        return {
+            "check": self.check,
+            "message": self.message,
+            "path": self.path,
+            "line": self.line,
+            "severity": self.severity,
+        }
+
+
+@dataclass
+class Fixture:
+    """A tree under `fixtures/<rule>/` with the finding count it must produce.
+
+    `expect = 0` proves the rule does not fire on compliant code; `expect > 0`
+    proves it fires on the defect it exists for. Both are mandatory.
+
+    Two optional knobs cover tools that must be *refused* rather than exercised:
+    `env` is applied to `os.environ` only while this fixture runs (so a rule can
+    be pointed at a specific binary without leaking into other fixtures), and
+    `expect_error` means the fixture passes only if `run()` raises `CheckError`
+    instead of returning findings. An `expect_error` fixture counts as neither a
+    clean nor a failing fixture for the meta-rule.
+    """
+
+    name: str
+    root: Path
+    expect: int
+    what: str
+    env: dict[str, str] = field(default_factory=dict)
+    expect_error: bool = False
+
+
+class Check:
+    """Base class for a rule.
+
+    Subclasses set `name`/`summary`, implement `run`, and declare `fixtures()`.
+    Nothing here knows about git, CI, or nvim: `run(root)` takes any directory
+    tree, which is what makes the fixtures possible.
+    """
+
+    name: str = ""
+    summary: str = ""
+    requires: Sequence[str] = ()
+
+    def run(self, root: Path) -> list[Finding]:  # pragma: no cover - interface
+        raise NotImplementedError
+
+    def fixtures(self) -> list[Fixture]:
+        return []
+
+    # -- helpers ---------------------------------------------------------
+    def finding(self, message: str, path: str = "", line: int = 0, severity: str = "error") -> Finding:
+        return Finding(check=self.name, message=message, path=path, line=line, severity=severity)
+
+    def fixture(
+        self,
+        name: str,
+        expect: int,
+        what: str,
+        env: dict[str, str] | None = None,
+        expect_error: bool = False,
+    ) -> Fixture:
+        return Fixture(
+            name=name,
+            root=FIXTURES / self.name / name,
+            expect=expect,
+            what=what,
+            env=dict(env or {}),
+            expect_error=expect_error,
+        )
+
+
+def load_checks() -> list[Check]:
+    """Import the rule list. Explicit, not discovery-based: reviewers see it."""
+    from .rules import ALL
+
+    return list(ALL)
+
+
+def run_checks(root: Path, only: Sequence[str] | None = None) -> tuple[list[Finding], list[str], int]:
+    """Run every (or the selected) check. Returns (findings, errors, checks_run)."""
+    checks = load_checks()
+    if only:
+        unknown = [n for n in only if n not in {c.name for c in checks}]
+        if unknown:
+            return [], [f"unknown check(s): {', '.join(unknown)} (known: {', '.join(c.name for c in checks)})"], 0
+        checks = [c for c in checks if c.name in set(only)]
+
+    findings: list[Finding] = []
+    errors: list[str] = []
+    for check in checks:
+        try:
+            findings.extend(check.run(root))
+        except CheckError as exc:
+            errors.append(f"[{check.name}] {exc}")
+        except Exception as exc:  # a broken rule must not look like a clean run
+            errors.append(f"[{check.name}] crashed: {type(exc).__name__}: {exc}")
+    return findings, errors, len(checks)
+
+
+@contextlib.contextmanager
+def env_overrides(env: Mapping[str, str]) -> Iterator[None]:
+    """Apply `env` to `os.environ` for the duration of the block, then restore.
+
+    Keys that were absent before are deleted again, so a fixture cannot leak a
+    `LUAJIT_BIN` (or anything else) into the next fixture or the caller.
+    """
+    saved = {key: os.environ.get(key) for key in env}
+    os.environ.update(env)
+    try:
+        yield
+    finally:
+        for key, previous in saved.items():
+            if previous is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = previous
+
+
+def self_test() -> int:
+    """Prove each rule both passes clean trees and fails dirty ones.
+
+    Also enforces the meta-rule: a rule with no fixtures, or with fixtures that
+    never exercise the failure path, is itself a failure. Fixtures marked
+    `expect_error` prove the opposite direction — that the rule refuses an input
+    (e.g. an untrustworthy parser binary) instead of trusting it — and count as
+    neither clean nor failing for the meta-rule.
+    """
+    failures: list[str] = []
+    checks = load_checks()
+    if not checks:
+        print("self-test: no checks registered", file=sys.stderr)
+        return 1
+
+    for check in checks:
+        fixtures = check.fixtures()
+        if not fixtures:
+            failures.append(f"[{check.name}] declares no fixtures — a gate that cannot fail is not a gate (G25)")
+            continue
+        scored = [fx for fx in fixtures if not fx.expect_error]
+        if not any(fx.expect == 0 for fx in scored):
+            failures.append(f"[{check.name}] has no clean fixture (expect=0): cannot prove it stays quiet")
+        if not any(fx.expect > 0 for fx in scored):
+            failures.append(f"[{check.name}] has no failing fixture (expect>0): cannot prove it can fire")
+
+        for fx in fixtures:
+            if not fx.root.is_dir():
+                failures.append(f"[{check.name}] fixture '{fx.name}' missing: {fx.root}")
+                continue
+            try:
+                with env_overrides(fx.env):
+                    got = check.run(fx.root)
+            except CheckError as exc:
+                if fx.expect_error:
+                    continue
+                failures.append(f"[{check.name}] fixture '{fx.name}' could not run: {exc}")
+                continue
+            if fx.expect_error:
+                failures.append(
+                    f"[{check.name}] fixture '{fx.name}': expected CheckError, but the gate reported "
+                    f"{len(got)} finding(s) instead of refusing the input ({fx.what})"
+                )
+                continue
+            if len(got) != fx.expect:
+                rendered = "; ".join(f.render() for f in got) or "none"
+                failures.append(
+                    f"[{check.name}] fixture '{fx.name}': expected {fx.expect} finding(s), "
+                    f"got {len(got)} ({fx.what}) — {rendered}"
+                )
+
+    if failures:
+        print("self-test: FAIL", file=sys.stderr)
+        for line in failures:
+            print(f"  {line}", file=sys.stderr)
+        return 1
+
+    total = sum(len(check.fixtures()) for check in checks)
+    print(f"self-test: ok — {len(checks)} check(s), {total} fixture(s), every check fires and stays quiet")
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="python3 -m scripts.checks",
+        description=(
+            "Static gates for pi.nvim. Exit 0 = clean, 1 = blocking findings, "
+            "2 = broken gate (no blocking findings). Findings outrank a broken gate."
+        ),
+    )
+    parser.add_argument("--root", default=str(REPO_ROOT), help="tree to check (default: repo root)")
+    parser.add_argument("--only", action="append", metavar="NAME", help="run one check (repeatable)")
+    parser.add_argument("--list", action="store_true", help="list checks and exit")
+    parser.add_argument("--self-test", action="store_true", help="prove every check can fail, using fixtures")
+    parser.add_argument("--json", action="store_true", help="machine-readable output")
+    args = parser.parse_args(argv)
+
+    if args.list:
+        for check in load_checks():
+            extra = f" (needs: {', '.join(check.requires)})" if check.requires else ""
+            print(f"{check.name:16} {check.summary}{extra}")
+        return 0
+
+    if args.self_test:
+        return self_test()
+
+    root = Path(args.root).resolve()
+    findings, errors, count = run_checks(root, args.only)
+    blocking = [f for f in findings if f.severity != "info"]
+    advisory = len(findings) - len(blocking)
+
+    for err in errors:
+        print(f"error: {err}", file=sys.stderr)
+
+    if args.json:
+        print(json.dumps({"findings": [f.as_dict() for f in findings], "errors": errors, "checks": count}, indent=2))
+    else:
+        for finding in sorted(findings, key=lambda f: (f.path, f.line, f.check)):
+            print(finding.render())
+        if blocking:
+            print(f"\n{len(blocking)} finding(s) from {count} check(s)", file=sys.stderr)
+        elif errors:
+            pass  # the errors above are the whole story
+        elif advisory:
+            print(f"ok: {count} check(s), 0 blocking findings ({advisory} advisory)", file=sys.stderr)
+        else:
+            print(f"ok: {count} check(s), 0 findings", file=sys.stderr)
+
+    # Findings win: real violations must never be reported as "the gate broke".
+    # Only an `info` finding is advisory, and an advisory note is not a finding.
+    if blocking:
+        return 1
+    if errors:
+        return 2
+    return 0

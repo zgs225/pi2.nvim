@@ -14,6 +14,19 @@ Neovim plugin (Lua) — a frontend for the [pi coding agent](https://github.com/
 
 > **Developing or testing a feature?** Read `.agents/skills/develop/SKILL.md` first. It is the operational playbook: the three-layer test stack (unit / headless-e2e / GUI automation), the non-obvious Neovim-Lua gotchas, the standard places a change lands, and the verification discipline. `AGENTS.md` (this file) stays the authority on architecture and style.
 
+## Startup cost is a hard budget (iron rule)
+
+`pi` is **lazy-loaded inside the first `<leader>ap`**, so everything `pi.setup()` does synchronously is time the user spends staring at a frozen editor — on every Neovim start, over state that only grows (`~/.pi/agent/sessions` is routinely multi-GB and thousands of files on a long-lived machine). A startup freeze is a **bug**, never an acceptable trade-off.
+
+1. **Nothing on the setup path may scale with stored history.** `pi.setup()` registers autocmds/commands and nothing else. The startup status rebuild (`pi.subsessions.rebuild_statuses`) is the single exception and must stay in the hundreds of milliseconds, never seconds: no `History.parse` / `History.list` per file, no full-JSONL decode per manifest row, no `git` call, no synchronous child process.
+2. **Budget cost per row and per file, not per call.** One extra read per manifest row becomes 1.4 k reads of files up to 12 MB. A full decode per row cost 5–9 s on the author's tree; reading transcript tails plus a filename index brought it to ~0.5 s.
+3. **Cheap answer first.** Session ids resolve from the `<timestamp>_<id>.jsonl` filename convention (verify with the one-line header, not a parse); an unchanged mtime means the status inferred last time still holds; only then read content.
+4. **Never read a transcript end-to-end to look at its end.** Use `pi.subsessions.read`'s tail reader (`open_tail`) instead of `read_jsonl` for "last entry / run status / last assistant turn": it walks backwards, reads each byte once, and skips lines that cannot describe a turn before decoding them.
+5. **What cannot be made cheap is deferred, not blocking** — schedule it off the keypress path so the delay stays invisible.
+6. **Measure when you touch the path**, and put the number in the change: time `require("pi.sessions.manager")` plus `require("pi").setup({})` under the real config (a `PI_DEV_DIR` run does not run `setup` by itself, so call it). A few added milliseconds need a reason in the description.
+
+`tests/subsessions_rebuild_spec.lua` and `tests/subsessions_read_spec.lua` encode this contract (no per-file parse on the fast path, no re-decode of an unchanged transcript, decode counts bounded by the tail window); `doc/troubleshooting.md` documents the user-visible side.
+
 ## Layout
 
 Use `find lua -type f` for the authoritative file list — don't rely on any snapshot. Directory-level map:
@@ -63,12 +76,14 @@ Key source files (under `$(npm root -g)/@earendil-works/pi-coding-agent/`):
 - **Scheduling**: any code touching Neovim UI from an RPC callback must be wrapped in `vim.schedule()`.
 - **Config access**: always go through `require("pi.config").options`, never cache config values at module load time.
 - **No globals**: all state lives in module-level locals or class fields.
-- **Formatting**: stylua, configured in `.stylua.toml` (4-space indent, double quotes, 120 cols). Run `make format` to apply and `make style` to check. stylua's built-in default indent is **Tabs**, so the config file pins Spaces — never run a bare `stylua .` without it.
+- **Formatting**: Lua via stylua (`.stylua.toml`: 4-space indent, double quotes, 120 cols), Python under `scripts/` via ruff (`ruff.toml`: same 4/120/double-quote conventions). Run `make format` to apply and `make style` to check. stylua's built-in default indent is **Tabs**, so the config file pins Spaces — never run a bare `stylua .` without it.
 
 ## Verification
 
-- There **is** a test harness now: hermetic plenary unit tests (`make test`, specs in `tests/`) and a headless boot check (`make smoke`). For keymap / insert-mode / visual behavior there is also an xdotool+wmctrl+maim GUI-automation stack over the nvim RPC socket. The full playbook — when to use each layer, the pitfalls, the isolation recipe, and the gotchas — is in `.agents/skills/develop/` (see its `references/testing.md` and `references/gotchas.md`). Verify changes at the cheapest layer that can observe the behavior, and escalate to a GUI screenshot for anything visual.
-- Formatting and static checks are gated too: `make style` (stylua `--check`) and `make lint` (lua-language-server `--check` over `lua/`, config `.luarc.json`). Both run in CI and must stay green; `make lint` is environment-independent (bundled luv types only, no vim runtime dependency).
+- Four layers, all documented in `.agents/skills/develop/` (`references/testing.md`, `references/checks.md`, `references/gotchas.md`): hermetic plenary unit tests (`make test`), a headless boot check (`make smoke`), an xdotool/wezterm + RPC GUI-automation stack for real keybindings and pixels, and the static gates below. Verify changes at the cheapest layer that can observe the behavior, and escalate to a GUI screenshot for anything visual.
+- Static gates, all mandatory before pushing: `make style` (stylua + `ruff format --check`), `make lint` (lua-language-server `--check` over `lua/` with the strict `.luarc.json`, over `tests/` and `scripts/e2e/` with `.luarc-tests.json`, plus `ruff check` over `scripts/`), `make check` (the LuaJIT parse gate for G24; the docs-sync rules for `:Pi*` commands, keymaps, config keys, highlight groups and public API; and the source rules G19 config three-spots, G20 config-read-at-call-time, G14 spec-scope, G1/G2 expr-mapping and G17/G18 test-isolation, plus the advisory G26 uv-fast-event), `make docs-links`. `parse-luajit` probes the parser's grammar instead of trusting its name: a `LUAJIT_BIN` that accepts Lua 5.3 syntax fails the gate with exit 2 instead of reporting green. `make check-selftest` must pass whenever `scripts/checks/` changes — it proves every check can still fail. CI (`.github/workflows/lint.yml`) runs the same commands; `make lint` is environment-independent (bundled luv types only, no vim runtime dependency).
+- Tool versions come from `.mise.toml` (`mise install` once; CI reads the same file), so the gates behave identically on every machine.
+- A rule a machine can decide belongs in `scripts/checks/rules/` with fixtures, not only in prose here — see `references/checks.md`. Prose states the rule; the check enforces it.
 - Reading files or reviewing diffs is not verification.
 - If a change can only be checked through interactive UI behavior, say so clearly instead of claiming success — or prove it with a GUI screenshot per the skill.
 - In the final report, state exactly what was verified and what could not be verified in this environment.

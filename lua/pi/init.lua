@@ -165,6 +165,29 @@ function M.abort()
     local Subsessions = require("pi.subsessions")
     local Attention = require("pi.attention")
 
+    -- Every manifest / batch row here belongs to the session's workspace, which
+    -- is the parent's cwd (a child carries it in `manifest_cwd`) and not
+    -- necessarily Neovim's cwd.
+    local workspace = Manifest.workspace(session)
+
+    --- Manifest row of a session, read from the workspace that owns it, falling
+    --- back to locating the row across workspaces.
+    ---@param target pi.Session?
+    ---@return table? entry
+    ---@return string? cwd workspace that owns the row
+    local function manifest_entry_of(target)
+        if not target or type(target.id) ~= "string" then
+            return nil, nil
+        end
+        local cwd = Manifest.workspace(target)
+        local entry = Manifest.load(cwd)[target.id]
+        if type(entry) == "table" then
+            return entry, cwd
+        end
+        local located, located_cwd = Manifest.locate(target.id, cwd)
+        return located, located_cwd or cwd
+    end
+
     ---@param target pi.Session?
     local function send_abort(target)
         if not target then
@@ -175,7 +198,7 @@ function M.abort()
         -- before the settle arrives — the watermark is what tells the two runs
         -- apart (see Subsessions.mark_child_aborted).
         if target.id then
-            local entry = Manifest.load()[target.id]
+            local entry = manifest_entry_of(target)
             if type(entry) == "table" and type(entry.run_generation) == "number" then
                 pcall(function()
                     Subsessions.mark_child_aborted(target.id, entry.run_generation)
@@ -199,7 +222,7 @@ function M.abort()
         if not target or not target.id then
             return nil
         end
-        local entry = Manifest.load()[target.id]
+        local entry = manifest_entry_of(target)
         if
             type(entry) == "table"
             and type(entry.parent_id) == "string"
@@ -216,11 +239,12 @@ function M.abort()
 
     -- Interrupt every active child of `lineage` (abort only, processes stay alive).
     ---@param lineage string
-    local function interrupt_children(lineage)
+    ---@param cwd? string workspace that owns the lineage's child rows
+    local function interrupt_children(lineage, cwd)
         if type(lineage) ~= "string" or lineage == "" then
             return
         end
-        local ok, children = pcall(Manifest.children_of, lineage)
+        local ok, children = pcall(Manifest.children_of, lineage, cwd)
         if not ok or type(children) ~= "table" then
             return
         end
@@ -241,15 +265,18 @@ function M.abort()
     if is_child then
         send_abort(session)
 
+        -- This child's own rows live in its parent's workspace.
+        local entry, cwd = manifest_entry_of(session)
+        cwd = cwd or workspace
+
         -- Stop in-flight interactive spawns owned by this child (a grandchild
         -- that has not received its task yet). This is the child's own lineage,
         -- never the parent's.
         pcall(function()
-            Subsessions.mark_lineage_aborted(Manifest.lineage_for_session(session))
+            Subsessions.mark_lineage_aborted(Manifest.lineage_for_session(session, cwd))
         end)
 
         local generation
-        local entry = session.id and Manifest.load()[session.id]
         if type(entry) == "table" and type(entry.run_generation) == "number" then
             generation = entry.run_generation
         end
@@ -257,15 +284,16 @@ function M.abort()
             Batch.interrupt_items_for_child(session.id, {
                 generation = generation,
                 reason = "cancelled: user aborted",
+                cwd = cwd,
             })
         end)
 
         -- A child can own children of its own (:PiSubNew from its view).
-        interrupt_children(Manifest.lineage_for_session(session))
+        interrupt_children(Manifest.lineage_for_session(session, cwd), cwd)
         return
     end
 
-    local lineage = Manifest.lineage_for_session(session)
+    local lineage = Manifest.lineage_for_session(session, workspace)
     local parent_key = (lineage ~= "" and lineage) or session.id
 
     send_abort(session)
@@ -275,9 +303,9 @@ function M.abort()
             Subsessions.mark_lineage_aborted(parent_key)
         end)
         pcall(function()
-            Batch.abort_for_parent(parent_key)
+            Batch.abort_for_parent(parent_key, workspace)
         end)
-        interrupt_children(parent_key)
+        interrupt_children(parent_key, workspace)
     end
 end
 
@@ -416,6 +444,121 @@ end
 --- while the agent is streaming; cancellable by extensions.
 function M.clone()
     require("pi.fork").clone()
+end
+
+--- Start a fresh conversation in a new git worktree (`pi.worktree_new`): the
+--- worktree is created under `<repo>/.worktrees/<name>` on a detached HEAD and
+--- a new tab runs its pi process with that directory as cwd. The current tab's
+--- session is left untouched. Refused when the current session already runs in
+--- a worktree (no nesting).
+---@param opts? pi.WorktreeOpts
+function M.worktree_new(opts)
+    require("pi.worktree_session").new(opts)
+end
+
+--- Fork the current conversation into a new git worktree (`pi.worktree_fork`):
+--- a new tab runs a fresh pi process in the worktree, bootstrapped from this
+--- session's active branch via `--fork <session file>`. The parent session and
+--- its file are left untouched. Refused while streaming, for an empty
+--- conversation, and when the current session already runs in a worktree.
+---@param opts? pi.WorktreeOpts
+function M.worktree_fork(opts)
+    require("pi.worktree_session").fork(opts)
+end
+
+--- Open a fresh session in an **existing** directory
+--- (`:Pi worktree=<name>` / `:PiNewTab worktree=<name>`, `:PiSessions` → `n` / `N`):
+--- nothing is ever removed, so a failure leaves the user's work alone. `name`
+--- resolves to `<repo>/.worktrees/<name>` — a managed linked checkout, or an
+--- error naming how to create one (the `:Pi*` commands pass `create = true`,
+--- which creates the checkout first; the Lua default is an existing checkout
+--- only). `cwd` wins over `name` and may be any existing directory: a linked
+--- worktree is attached as worktree metadata (e.g. chat badge, `pi.worktree_*`
+--- targets), while the main checkout or a plain project dir starts an ordinary
+--- session there. `repo_cwd` scopes `name` resolution and creation to an
+--- explicit repository instead of the current tab's repository. The current
+--- tabpage is used when `new_tab = false` (refused
+--- while it already runs a session, before anything is created), a new tab
+--- otherwise (default). A checkout created by this call is released again when
+--- the session fails to start. Starting a session is silent; failures notify.
+---@param opts pi.WorktreeOpenOpts
+---@param callback? fun(session: pi.Session?, err?: string)
+function M.worktree_open(opts, callback)
+    require("pi.worktree_session").open_existing(opts, callback)
+end
+
+--- Move the current worktree session onto an explicit branch
+--- (`pi.worktree_branch`), since worktrees start on a detached HEAD.
+---@param branch string
+function M.worktree_branch(branch)
+    require("pi.worktree_session").branch(branch)
+end
+
+--- Review a worktree's patch in the diff-review panel and apply it to the
+--- main checkout's working tree on explicit accept (`pi.worktree_apply`).
+--- Never commits, never touches the index, and never applies automatically.
+--- The patch includes untracked files, relative to the worktree's base
+--- commit. Refused when the diff is empty; a conflicting apply leaves both
+--- checkouts untouched.
+---@param opts? pi.WorktreeTargetOpts Target `name` (default: this session's worktree).
+function M.worktree_apply(opts)
+    require("pi.worktree_session").apply(opts)
+end
+
+--- Prefill the worktree session's chat prompt with ship instructions
+--- (`pi.worktree_ship`): absolute worktree path, detached HEAD/base commit, and
+--- commit/push/PR/conflict requirements. The prompt is not sent and nothing
+--- is committed on the user's behalf. Switches to the target session's tab
+--- when it is a different (attached) session, otherwise reports why it cannot.
+---@param opts? pi.WorktreeTargetOpts Target `name` (default: this session's worktree).
+function M.worktree_ship(opts)
+    require("pi.worktree_session").ship(opts)
+end
+
+--- Remove a worktree after an explicit confirmation (`pi.worktree_remove`):
+--- refuses while a session process still runs in it, warns about dirty/ahead
+--- work, snapshots the patch first (when `worktree.snapshot_before_remove` is
+--- enabled) and refuses to delete when the snapshot fails.
+---@param opts? pi.WorktreeTargetOpts Target `name` (default: this session's worktree).
+function M.worktree_remove(opts)
+    require("pi.worktree_session").remove(opts)
+end
+
+--- Run the worktree retention sweep now (`pi.worktree_gc`): the same prune that
+--- runs automatically after a create, exposed for manual and scripted use.
+--- Only checkouts carrying pi2 metadata are ever pruned — a hand-made
+--- `git worktree add` is never touched — and a dirty or ahead checkout is kept.
+--- API only: no command, no keymap.
+---@param opts? pi.WorktreeRetentionOpts
+---@param callback? fun(report: pi.WorktreeRetentionReport?, err: string?)
+function M.worktree_gc(opts, callback)
+    opts = opts or {}
+    local loaded, Retention = pcall(require, "pi.worktree_retention")
+    if not loaded or type(Retention) ~= "table" or type(Retention.run) ~= "function" then
+        if callback then
+            callback(nil, "worktree_gc: pi.worktree_retention unavailable")
+        end
+        return
+    end
+    Retention.run(opts, callback)
+end
+
+--- Release `git worktree lock`s this plugin set whose owning processes are gone
+--- (`pi.worktree_sweep_locks`). A lock set by someone else, recorded on another
+--- host, or bearing no pid at all is never released. API only: no command, no
+--- keymap.
+---@param opts? { cwd?: string } Repository scope (default: process cwd).
+---@param callback? fun(report: pi.WorktreeSweepReport?, err: string?)
+function M.worktree_sweep_locks(opts, callback)
+    opts = opts or {}
+    local loaded, Worktree = pcall(require, "pi.worktree")
+    if not loaded or type(Worktree) ~= "table" or type(Worktree.sweep_locks) ~= "function" then
+        if callback then
+            callback(nil, "worktree_sweep_locks: pi.worktree unavailable")
+        end
+        return
+    end
+    Worktree.sweep_locks(opts.cwd, callback)
 end
 
 --- Toggle the sessions overview list (:PiSessions): a live list of all

@@ -103,16 +103,26 @@ local function wipe_stale_buf(name)
     end
 end
 
+--- Resolve a tool-argument path to an absolute one.
+---
+--- Tool arguments are relative to the workspace the pi process runs in, which is
+--- the session cwd — not necessarily Neovim's cwd (a worktree session, or a
+--- resumed session started elsewhere). Resolving against the wrong base would
+--- make the review read *and write* the main checkout's copy of the file, so the
+--- caller always passes the session cwd; omitting it keeps the old behaviour.
 ---@param path string?
+---@param base? string workspace cwd (default: Neovim's current cwd)
 ---@return string?
-local function abs(path)
+local function abs(path, base)
     if not path then
         return nil
     end
     if vim.startswith(path, "/") then
         return path
     end
-    return vim.fn.getcwd() .. "/" .. path
+    local dir = (type(base) == "string" and vim.trim(base) ~= "") and vim.trim(base):gsub("[\\/]+$", "")
+        or vim.fn.getcwd()
+    return dir .. "/" .. path
 end
 
 -- AI models cannot reliably reproduce Unicode characters outside the basic
@@ -348,11 +358,11 @@ end
 --- Open a diff review for a tool call.
 ---@param payload { prompt: string, toolName: string, toolInput: table }
 ---@param callback fun(result: string) Called with json-encoded review result, or "Reject" for no-note rejection/backcompat
----@param opts? { timeout?: integer, on_timeout?: fun() }
+---@param opts? { timeout?: integer, on_timeout?: fun(), cwd?: string } `cwd` is the session's workspace (default: Neovim's cwd) and anchors relative tool paths.
 function M.open(payload, callback, opts)
     opts = opts or {}
     local input = payload.toolInput
-    local path = abs(input.path)
+    local path = abs(input.path, opts.cwd)
     if not path then
         callback("Reject")
         return

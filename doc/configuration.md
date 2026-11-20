@@ -208,6 +208,58 @@ require("pi").setup({
         enabled = true,
     },
 
+    -- Git worktree isolation (`pi.worktree_*`; no :Pi command). A worktree
+    -- session runs its pi process with a linked checkout
+    -- under <repo>/.worktrees/<name> (detached HEAD) as cwd. See
+    -- doc/worktrees.md.
+    worktree = {
+        -- Command run inside a freshly created worktree, before its session
+        -- process starts. A string[] executed directly (no shell) with the
+        -- worktree root as cwd; nil = no setup step. A non-zero exit keeps
+        -- the checkout on disk but fails the creation (no session starts).
+        setup_cmd = nil, -- e.g. { "mise", "install" }
+        -- Run the `[setup]` commands a repository declares in its own
+        -- .pi-worktrees.toml (default false). A cloned repository is untrusted
+        -- input, so its commands only run when you say so; a repository that
+        -- declares them is reported once while this is off. See
+        -- doc/worktrees.md#repository-configuration.
+        repo_setup = false,
+        -- Base commit new checkouts start from: "head" (default; the commit the
+        -- creating session's checkout is on), "fresh" (the repository's remote
+        -- default branch, origin/HEAD — re-fetched at most once per 24h, capped
+        -- at 5s, falling back to the cached ref then local HEAD), or nothing
+        -- else (a per-item revision overrides it, see subagent.worktree). A
+        -- repository's .pi-worktrees.toml base_ref overrides both.
+        base_ref = "head",
+        -- Snapshot a worktree's patch (base commit → now, untracked files
+        -- included) before pi.worktree_remove / Worktree.remove deletes it.
+        -- When false, the confirmation warns that the work is lost.
+        snapshot_before_remove = true,
+        -- Prefix the chat-title worktree badge with ⚠ when the session's cwd
+        -- differs from Neovim's cwd (the usual case for a worktree session:
+        -- starting one does not :cd the editor). Set false for the plain
+        -- `󰙅 <name>` badge — the path anchors then differ silently.
+        warn_on_cwd_mismatch = true,
+        -- Take a `git worktree lock` on every checkout we create and unlock it
+        -- again when the checkout is removed (default true), so an external
+        -- `git worktree prune` / `remove` cannot delete a checkout an agent is
+        -- still working in. A reason that is not ours is never touched, and a
+        -- foreign lock keeps the checkout on release ("Worktree kept: …").
+        lock = true,
+        -- Deferred cleanup, scheduled after a checkout is created (never at
+        -- startup, never on the create path). ONLY checkouts carrying π's own
+        -- <git dir>/pi2-worktree.json metadata are ever pruned: a hand-made
+        -- `git worktree add` checkout is never touched. See
+        -- doc/worktrees.md#locking-and-retention.
+        retention = {
+            enabled = true,     -- run the sweep after a create
+            max_count = 25,     -- keep the newest N π-managed checkouts per repository
+            max_age_days = 14,  -- … prune ones whose checkout directory (top-level mtime, so a deep edit may not count) has not changed for this many days
+            snapshot_days = 30, -- keep the snapshots of a removed checkout this many days
+            sweep_locks = true, -- release stale π locks before pruning
+        },
+    },
+
     -- Sub-sessions (子会话). When enabled (default), injects extensions/subagent.ts
     -- into parent RPC processes so the Agent can spawn and steer child sessions
     -- (children get extensions/subagent-child.ts: a worker system-prompt note only).
@@ -217,6 +269,14 @@ require("pi").setup({
         max_children = 5,           -- max live child processes per parent lineage (auto-closes oldest settled child to make room; dead don't count)
         report_mode = "last_message", -- completion report uses child's last assistant output
         default_config = "inherit",   -- "inherit" parent model/thinking, or "default"
+        -- Child checkouts created by a dispatch item's `worktree.create`.
+        worktree = {
+            -- Run worktree.setup_cmd in a freshly created child checkout
+            -- (default false: a dispatch already pays a git checkout plus the
+            -- .worktreeinclude copy, and an install per child is expensive). A
+            -- dispatch item's `create.setup` overrides it.
+            setup = false,
+        },
         -- tools = { "read", "grep", "find", "ls" }, -- child tool allowlist: replaces the whole selection (nil = inherit every tool)
         max_batch_size = 5,           -- max items per dispatch_subagents batch
         batch_timeout_ms = 300000,    -- default wait_subagents timeout (5 min)
@@ -235,6 +295,7 @@ require("pi").setup({
             height = 0.75,            -- lines (>=1) or fraction of editor height (<1, default 0.75)
             border = "rounded",       -- float border style (default "rounded")
             statusline = true,        -- show statusline in float footer (context, model, thinking level)
+            worktree = true,          -- show which checkout the viewed session ran in as a `󰙅 <name>` footer badge (linked worktrees only; `statusline = false` hides it too)
             todo = {
                 enabled = true,       -- show the todo footer chunk and the `T` panel
                 auto_open = false,    -- auto-open the panel when todos first appear (empty → non-empty)
@@ -277,8 +338,8 @@ require("pi").setup({
     title = {
         enabled = true,
         max_chars = 40, -- hard cap on generated titles (truncated with …)
-        -- lang = "zh-CN", -- nil (default) = title language follows the conversation
-        -- model = "openai/gpt-4o-mini", -- pinned generation model; nil = the session's own model
+        lang = nil, -- nil (default) = title language follows the conversation, e.g. "zh-CN"
+        model = nil, -- pinned generation model ("provider/modelId"); nil = the session's own model
     },
 
     -- Session todo list. When enabled (default), pi2.nvim injects the bundled
@@ -329,6 +390,13 @@ require("pi").setup({
             height = 0.4, -- fraction (<1) of editor height, or lines (>=1)
             border = "rounded",
         },
+        -- `x` in the list asks before closing, per scope: a sub-session's RPC
+        -- process (child row), a session's π tab — process stopped and tabpage
+        -- closed (session row), every π tab of a checkout (worktree group
+        -- header). All default to true; false closes without the prompt.
+        confirm_close_child = true,
+        confirm_close_session = true,
+        confirm_close_group = true,
     },
 
     -- Background tasks panel (:PiTasks): a live list of the background bash
@@ -350,6 +418,25 @@ require("pi").setup({
         auto_open = false,
         -- Note: the float layout is fixed (editor-centered at 0.5 x 0.4 with a
         -- rounded border); width/height/position apply to the side layout only.
+    },
+
+    -- Idle-wake policy for the background-bash extension. A completion that
+    -- lands while the agent is idle normally starts a turn of its own; that
+    -- turn is priced by the whole conversation, so it is spent under a policy
+    -- rather than per event. See doc/extensions.md#the-idle-wake-gate.
+    background_tasks = {
+        -- May an idle completion start a turn? "budgeted" (default) allows
+        -- `wake_budget` wakes per user prompt and holds the rest for the next
+        -- prompt; "always" wakes on every completion; "never" only ever
+        -- delivers at a turn boundary or on the next user prompt.
+        wake_on_idle = "budgeted",
+        -- Idle wakes allowed per user prompt under "budgeted" (0…10).
+        -- Replenished by the next user input, not by a clock.
+        wake_budget = 2,
+        -- Hold a wake when the last request is older than this, because it
+        -- would re-read the conversation uncached. Default 300000 = the
+        -- 5-minute prompt-cache lifetime; 0 disables the window.
+        wake_cache_window_ms = 300000,
     },
 
     -- Session diff review (:PiDiff): one floating panel — an outer border
@@ -469,7 +556,7 @@ Notes on a few fields:
 - `panels.<panel>.name` takes a `fun(tab_id): string` that computes the underlying buffer name per tab — useful for distinguishing multiple π conversations in `:buffers`, statuslines, or tab bars.
 - Several fields (`diff.keys`, `dialog.keys`, `zen.keys`) accept **key specs** — plain strings, `{ key, modes = ... }` tables, or lists of those. See [Keymaps](keymaps.md#key-specs).
 
-`subagent.tools` narrows the tools a **child** sub-session may call; it is deliberately absent from the defaults table because `nil` *is* the default — every child inherits every tool, the pre-feature behavior. Set it to a list of tool names (`{ "read", "grep", "find", "ls" }`) and each child spawned from then on runs with `pi --tools read,grep,find,ls`. That list **replaces** the child's whole tool selection rather than adding to it, so it must name every tool the child needs, and an empty array is rejected (`tools must list at least one tool; omit it to inherit every tool`) instead of meaning "no tools". One pi-side limit makes it a soft constraint: `--tools` only filters the tools declared to the model, so MCP tools stay callable regardless. A single `dispatch_subagents` spawn can override the setting per item, and the resolved allowlist is persisted per child — see [Sessions → Constraining a child's tools](sessions.md#constraining-a-childs-tools).
+`subagent.tools` narrows the tools a **child** sub-session may call; it is deliberately absent from the defaults table because `nil` *is* the default — every child inherits every tool, the pre-feature behavior. Set it to a list of tool names (`{ "read", "grep", "find", "ls" }`) and each child spawned from then on runs with `pi --tools read,grep,find,ls`. That list **replaces** the child's whole tool selection rather than adding to it, so it must name every tool the child needs, and an empty array is rejected (`tools must list at least one tool; omit it to inherit every tool`) instead of meaning "no tools". MCP is the one exception to "the list is the whole switch": pi keeps MCP tools registered whatever the list says, but their default `codemode` exposure leaves them reachable only from `codemode` or `tool_search`, which the allowlist itself can filter away. A child whose list names neither is spawned with `--no-mcp`, so it connects no server and pi does not warn that its MCP tools are unreachable; name `codemode` / `tool_search` (`mcp__…`, patterns and `+`/`-` entries count too) to keep MCP in that child. A single `dispatch_subagents` spawn can override the setting per item, and the resolved allowlist is persisted per child — see [Sessions → Constraining a child's tools](sessions.md#constraining-a-childs-tools).
 
 ## CLI args and version gating
 

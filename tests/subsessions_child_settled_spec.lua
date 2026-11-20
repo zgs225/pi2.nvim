@@ -535,6 +535,55 @@ describe("subsession completion reporting", function()
         assert.is_nil(entry.last_error)
     end)
 
+    it("books a settle whose transcript cannot be found and warns", function()
+        -- No `session_file` and no reachable transcript: the run still ended, so
+        -- the row must leave `active` (the idle reaper skips it forever
+        -- otherwise) and the drop must be announced, never silent.
+        local Notify = require("pi.notify")
+        local real_warn = Notify.warn
+        local real_find_path = Read.find_path
+        local warned = {}
+        Notify.warn = function(msg)
+            warned[#warned + 1] = msg
+        end
+        Read.find_path = function()
+            return nil
+        end
+        local ok, err = pcall(function()
+            Manifest.upsert("child-gone", {
+                parent_id = "lineage-gone",
+                name = "gone",
+                task_prompt = "t",
+                config = {},
+                status = "active",
+                reported = false,
+                created_at = "t",
+                last_active_at = "t",
+                agent_spawned = false,
+                run_generation = 1,
+            })
+
+            Subsessions.on_child_settled({
+                id = "child-gone",
+                session_file = nil,
+                rpc = make_mock_rpc({}),
+            })
+
+            assert.is_true(
+                vim.wait(3000, function()
+                    local entry = Manifest.load()["child-gone"]
+                    return entry and entry.status == "completed"
+                end, 10),
+                "a settle with no transcript must still book the run"
+            )
+            assert.equals(1, #warned)
+            assert.is_truthy(warned[1]:find("gone", 1, true))
+        end)
+        Notify.warn = real_warn
+        Read.find_path = real_find_path
+        assert(ok, err)
+    end)
+
     it("rebuild restores a failed item with the recorded reason", function()
         Manifest.upsert("child-rebuild", {
             parent_id = "parent-rebuild",

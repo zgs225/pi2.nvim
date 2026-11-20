@@ -34,7 +34,7 @@
  */
 
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { readFileSync, existsSync, readdirSync } from "node:fs";
+import { readFileSync, existsSync, readdirSync, statSync, accessSync, constants as fsConstants } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { Type } from "typebox";
@@ -109,6 +109,45 @@ function isChildEntry(id: string): boolean {
 	return id !== "" && !id.startsWith("__");
 }
 
+/** True when `path` is an existing, readable regular file. */
+function isReadableFile(path: string): boolean {
+	try {
+		if (!statSync(path).isFile()) return false;
+		accessSync(path, fsConstants.R_OK);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * The checkout this child runs in, projected for list_subagents.
+ *
+ * Prefers `assigned_worktree` (a checkout the dispatch borrowed or adopted by
+ * name — owned by someone else) and falls back to the row's own `worktree` (a
+ * checkout this spawn created). `owned` / `reused` tell the parent which of the
+ * two it is: an `owned` checkout is released automatically once clean, an
+ * adopted/borrowed one is never touched. Absent/blank rows stay undefined —
+ * JSON.stringify drops the key and keeps the documented shape.
+ */
+function childWorktree(
+	entry: any,
+): { path: string; name?: string; owned?: boolean; reused?: boolean } | undefined {
+	const typed = entry?.assigned_worktree;
+	const source =
+		typed && typeof typed.path === "string" && typed.path !== ""
+			? typed
+			: entry?.worktree && typeof entry.worktree.path === "string" && entry.worktree.path !== ""
+				? entry.worktree
+				: undefined;
+	if (!source) return undefined;
+	const projected: { path: string; name?: string; owned?: boolean; reused?: boolean } = { path: source.path };
+	if (typeof source.name === "string" && source.name !== "") projected.name = source.name;
+	if (source.owned === true) projected.owned = true;
+	if (source.reused === true) projected.reused = true;
+	return projected;
+}
+
 function toolResult(data: unknown) {
 	const text = typeof data === "string" ? data : JSON.stringify(data, null, 2);
 	return {
@@ -161,6 +200,34 @@ function findSessionFile(id: string): string | undefined {
 	return undefined;
 }
 
+/**
+ * Transcript path recorded for `id` in this parent's manifest, if readable.
+ *
+ * The manifest row's `session_file` is authoritative, and it is the only way to
+ * read a child that lives in another checkout: a child assigned a linked
+ * worktree keeps its JSONL in *that* worktree's session directory, so the
+ * filename scan below (which only looks at the parent's cwd) cannot find it.
+ *
+ * Only a row this session owns is used — an id must resolve to a child entry
+ * whose `parent_id` matches this session's lineage. A row of another parent
+ * (another manifest, or a sibling lineage) must never be projected from here,
+ * and an unknown id simply falls through to the fallback scan. A recorded file
+ * that vanished or is unreadable falls through too, so a stale path cannot turn
+ * into a thrown read.
+ */
+function recordedTranscriptPath(id: string, ctx: ExtensionContext): string | undefined {
+	if (!isChildEntry(id)) return undefined;
+	const parent = parentSessionId(ctx);
+	if (!parent) return undefined;
+	const manifest = loadManifest();
+	const entry = manifest[id];
+	if (!entry || typeof entry !== "object") return undefined;
+	if (entry.parent_id !== resolveLineage(parent, manifest)) return undefined;
+	const file = entry.session_file;
+	if (typeof file !== "string" || file === "") return undefined;
+	return isReadableFile(file) ? file : undefined;
+}
+
 function projectTail(path: string, tail: number): string[] {
 	const lines = readFileSync(path, "utf8").split("\n").filter(Boolean);
 	const slice = lines.slice(-tail);
@@ -188,6 +255,79 @@ function projectTail(path: string, tail: number): string[] {
 	});
 }
 
+/**
+ * The checkout a spawn item runs its child in. Two mutually exclusive shapes:
+ *
+ * - `{ path }` — **borrow** an existing linked worktree. The extension never
+ *   mutates git state here: the path must already be a linked worktree of the
+ *   parent's repository, and nothing creates, prunes, merges or resets it.
+ * - `{ create }` — **create** a checkout for this child, or **adopt** the one
+ *   its `name` already resolves to (kept as is, never reset). The base is a
+ *   strategy: `"head"` (default; the parent checkout's HEAD), `"fresh"` (the
+ *   repository's remote default branch), or an explicit revision. A checkout
+ *   the spawn created is owned and released when it settles clean; an adopted
+ *   one belongs to whoever had it and is left untouched.
+ *
+ * Spawn-only on purpose: a reused child keeps the checkout it already runs in
+ * (see the reuse variant below).
+ */
+const WorktreeCreateSchema = Type.Object(
+	{
+		base: Type.Optional(
+			Type.String({
+				description:
+					"Base the new checkout starts from: 'head' (default; the parent checkout's HEAD, including its checked-out commit), 'fresh' (the repository's remote default branch, i.e. origin/HEAD), or any revision git accepts — a branch, tag, remote ref or sha, e.g. 'origin/main' or 'v1.2.0'. Validated by git; an unknown revision fails the item with the list of corrections to try.",
+			}),
+		),
+		name: Type.Optional(
+			Type.String({
+				description:
+					"Checkout name under <repo>/.worktrees/ (1-64 chars: letters, digits, '.', '_', '-'). Omit for a generated 'sub-…' name. If the name already resolves to a linked worktree of the same repository it is reused as is (base is then ignored), so a repeated dispatch or a follow-up task lands in the work already there.",
+			}),
+		),
+		setup: Type.Optional(
+			Type.Boolean({
+				description:
+					"Run worktree.setup_cmd (dependency install etc.) inside the new checkout. Default false — a dispatch already pays a git checkout plus the .worktreeinclude copy, and running an install per child is slow. Ignored when an existing checkout is reused.",
+			}),
+		),
+	},
+	{ description: "Create a checkout for this child (or adopt the one `name` already names)." },
+);
+
+const WorktreeRefSchema = Type.Union(
+	[
+		Type.Object(
+			{
+				path: Type.String({
+					description:
+						"Absolute path of the existing linked worktree, e.g. '/home/me/repo/.worktrees/auth-review'. It must already exist and belong to the parent's repository. Relative paths, paths outside that repository, and paths that are not linked worktrees are rejected.",
+				}),
+			},
+			{
+				description:
+					"Borrow an existing linked worktree. Never created, reset or removed by this tool; the checkout is left exactly as it is when the child finishes.",
+			},
+		),
+		Type.Object(
+			{
+				create: Type.Union([Type.Boolean(), WorktreeCreateSchema], {
+					description:
+						"`true` creates a checkout with the defaults; an object chooses the base strategy, name and setup.",
+				}),
+			},
+			{
+				description:
+					"Create (or adopt by name) a checkout for this child. A checkout this spawn creates is owned: it is released automatically when it settles with no uncommitted work and no commits of its own, and kept (with its path reported) otherwise. Nothing is ever merged or applied for you.",
+			},
+		),
+	],
+	{
+		description:
+			"Checkout to run the new child in. Give either `path` (borrow an existing linked worktree of the parent's repository) or `create` (make one, or adopt the one `name` already names) — not both. Omitted: the child inherits the parent's cwd and edits the same working tree. Giving several items the same `path` or `name` deliberately shares that checkout; no isolation between those children is guaranteed, so give each child exclusive files. A worktree is file-level isolation only, not a sandbox.",
+	},
+);
+
 const ItemRefSchema = Type.Optional(
 	Type.String({
 		description:
@@ -202,9 +342,9 @@ const ItemRefSchema = Type.Optional(
  *
  * The union is documentation, not enforcement: these TypeBox objects do not set
  * `additionalProperties: false`, so a payload that adds `name` / `model` /
- * `thinking_level` / `tools` to a reuse item still validates against the reuse
- * variant. lua/pi/subsessions/batch.lua:normalize_item is the enforcement point
- * and fails such an item with a self-correcting error.
+ * `thinking_level` / `tools` / `worktree` to a reuse item still validates
+ * against the reuse variant. lua/pi/subsessions/batch.lua:normalize_item is the
+ * enforcement point and fails such an item with a self-correcting error.
  *
  * Union-of-objects is safe even for Google: pi only converts tool schemas to
  * the legacy `parameters` / strict OpenAPI form for tools that opt in via
@@ -238,6 +378,7 @@ const DispatchItemSchema = Type.Union([
 					"Tool allowlist for the new child (e.g. ['read', 'grep', 'find', 'ls'] for a read-only scout). Replaces the whole tool selection, so list every tool the child needs. Omit to inherit every tool. Rejected on reuse items (`{ target, message }`) — the child keeps its configuration.",
 			}),
 		),
+		worktree: Type.Optional(WorktreeRefSchema),
 	}),
 	Type.Object({
 		ref: ItemRefSchema,
@@ -247,7 +388,7 @@ const DispatchItemSchema = Type.Union([
 		}),
 		message: Type.String({
 			description:
-				"Follow-up message for that child. It keeps its prior conversation and its own model/thinking level. The spawn-only fields (`name`, `model`, `thinking_level`, `tools`) are rejected here rather than ignored.",
+				"Follow-up message for that child. It keeps its prior conversation, its own model/thinking level and the checkout it already runs in. The spawn-only fields (`name`, `model`, `thinking_level`, `tools`, `worktree`) are rejected here rather than ignored — a revival cannot move a child to another worktree.",
 		}),
 	}),
 ]);
@@ -263,7 +404,7 @@ export default function subagentBridge(pi: ExtensionAPI) {
 		label: "List Sub-agents",
 		promptSnippet: "List sub-agent sessions owned by this session (including dormant ones)",
 		description:
-			"List sub-agents owned by the current parent session, including dormant, completed, failed and interrupted children. Call this before dispatch_subagents when continuing prior work. Returns { subagents: [{ id, name, status, model, thinking_level, parent_epoch, last_active_at, error? }] } — empty when the session id is not known yet. `status` is one of 'active', 'completed', 'failed', 'interrupted', 'dormant'; `error` is present on a child whose last run failed and carries the provider/runtime reason (e.g. a quota or auth error). Use `id` (UUID) as the target — not the display name. Closed (dormant) children remain reusable.",
+			"List sub-agents owned by the current parent session, including dormant, completed, failed and interrupted children. Call this before dispatch_subagents when continuing prior work. Returns { subagents: [{ id, name, status, model, thinking_level, parent_epoch, last_active_at, worktree?, error? }] } — empty when the session id is not known yet. `status` is one of 'active', 'completed', 'failed', 'interrupted', 'dormant'; `error` is present on a child whose last run failed and carries the provider/runtime reason (e.g. a quota or auth error). `worktree` is present for a child that runs in its own checkout and reports `{ path, name?, owned?, reused? }`: `path` is the absolute checkout, `owned` marks one this dispatch created (released automatically once clean), `reused` one adopted by name from an earlier run; the field is absent for a child running in the parent's cwd. Use `id` (UUID) as the target — not the display name. Closed (dormant) children remain reusable.",
 		parameters: Type.Object({}),
 		async execute(_toolCallId, _params, _signal, _onUpdate, ctx) {
 			const parent = parentSessionId(ctx);
@@ -280,6 +421,12 @@ export default function subagentBridge(pi: ExtensionAPI) {
 					model: e.config?.model,
 					thinking_level: e.config?.thinking_level,
 					last_active_at: e.last_active_at,
+					// The checkout the child actually runs in: a borrowed/adopted one
+					// (`assigned_worktree`, never owned) or one this dispatch created
+					// (`worktree`, owned and released when clean). undefined is dropped
+					// by JSON.stringify, so a child in the parent's cwd keeps the
+					// documented shape.
+					worktree: childWorktree(e),
 					// Only set for a failed last run; JSON.stringify drops undefined, so
 					// a healthy row keeps the documented shape.
 					error: e.last_error,
@@ -293,15 +440,17 @@ export default function subagentBridge(pi: ExtensionAPI) {
 		label: "Read Sub-agent",
 		promptSnippet: "Read the projected tail of a sub-agent's session log",
 		description:
-			"Read the projected tail of a sub-agent session log (observation only, no host round-trip). Use it to inspect what a child is doing or how it finished without dispatching new work. Returns { lines: string[] }, one line per non-empty JSONL line in the returned window (the last `tail` of them), each prefixed with its 1-based position in that window. A line renders as `[n] <role>: <content>` only when it parses as a JSON object with type 'message' and a message.role; `content` is then cut at 500 characters, so tool calls and tool results appear as truncated compact JSON rather than their full text, and a failed assistant turn appends ` (error: <errorMessage>)` so the reason survives its empty content. Every other line collapses to `[n] (entry)` — that includes thinking records and any line that does not parse as JSON. Unknown ids return { error: 'session file not found' }.",
+			"Read the projected tail of a sub-agent session log (observation only, no host round-trip). Use it to inspect what a child is doing or how it finished without dispatching new work. The transcript is the `session_file` this parent's manifest records for the id when that file is readable — the only way to read a child dispatched into another linked worktree, whose JSONL lives in that checkout's session directory — and otherwise a file found by scanning this workspace's session directory (filename suffix, then JSONL header id). Returns { lines: string[] }, one line per non-empty JSONL line in the returned window (the last `tail` of them), each prefixed with its 1-based position in that window. A line renders as `[n] <role>: <content>` only when it parses as a JSON object with type 'message' and a message.role; `content` is then cut at 500 characters, so tool calls and tool results appear as truncated compact JSON rather than their full text, and a failed assistant turn appends ` (error: <errorMessage>)` so the reason survives its empty content. Every other line collapses to `[n] (entry)` — that includes thinking records and any line that does not parse as JSON. Unknown ids, and ids belonging to another parent's lineage, return { error: 'session file not found' }.",
 		parameters: Type.Object({
 			target: Type.String({ description: "Sub-agent session id (UUID) from list_subagents." }),
 			tail: Type.Optional(
 				Type.Number({ description: "Number of trailing JSONL entries to project (default 50)." }),
 			),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-			const path = findSessionFile(params.target);
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			// Recorded path first: authoritative, and the only way to reach a
+			// child whose JSONL lives in another checkout.
+			const path = recordedTranscriptPath(params.target, ctx) ?? findSessionFile(params.target);
 			if (!path) return toolResult({ error: "session file not found" });
 			return toolResult({ lines: projectTail(path, params.tail ?? 50) });
 		},
@@ -312,7 +461,7 @@ export default function subagentBridge(pi: ExtensionAPI) {
 		label: "Dispatch Sub-agents",
 		promptSnippet: "Run sub-agent tasks in parallel (fan out, or reuse an existing child)",
 		description:
-			"Run one or more sub-agent tasks in parallel. Each item is either { task, ... } (spawn a new child) or { target, message } (reuse an existing id from list_subagents). Prefer reuse when list_subagents already has a matching child — dormant, completed, failed and interrupted ids are revived automatically; do not spawn a new child only because status is not active. Spawn items take an optional `name`, `model`, `thinking_level` and `tools` (the last replaces the child's whole tool selection, so list every tool it needs); on reuse items those four spawn-only fields are rejected rather than ignored (the revived child keeps its own configuration), and `target` must belong to this session's lineage. Returns the batch snapshot { batch_id, status, summary, items }, where `status` is 'running' until terminal ('completed', 'partial', 'failed' or 'cancelled'), item statuses are 'queued', 'spawning', 'running', 'ok', 'failed' or 'cancelled', and `summary` counts { total, done, ok, failed, cancelled, running }. A batch is limited to subagent.max_batch_size items (default 5) and to subagent.max_children concurrent children per parent lineage (default 5; dormant target revivals count toward the cap alongside new spawns, while reusing an alive child does not; hitting the cap auto-closes the oldest settled child outside this batch's reuse targets to make room, failing only if all live children are active); exceeding either returns { error } with no batch_id, as does an item that is neither a valid spawn nor a valid reuse. Collect results with wait:true, or poll_subagents / wait_subagents on the returned batch_id. Default failure policy: collect_errors.",
+			"Run one or more sub-agent tasks in parallel. Each item is either { task, ... } (spawn a new child) or { target, message } (reuse an existing id from list_subagents). Prefer reuse when list_subagents already has a matching child — dormant, completed, failed and interrupted ids are revived automatically; do not spawn a new child only because status is not active. Spawn items take an optional `name`, `model`, `thinking_level`, `tools` and `worktree` (the checkout to run that child in: `{ path }` borrows an existing linked worktree of this repository, `{ create }` makes one — or adopts the one its `name` already names, which is how a follow-up task lands in earlier work; `create.base` is 'head' (default), 'fresh' or any revision; a checkout this spawn created is released once it settles clean and kept otherwise. `tools` and `worktree` replace the child's whole tool selection and its cwd, respectively, so list every tool it needs); on reuse items those five spawn-only fields are rejected rather than ignored (the revived child keeps its own configuration and checkout), and `target` must belong to this session's lineage. Returns the batch snapshot { batch_id, status, summary, items }, where `status` is 'running' until terminal ('completed', 'partial', 'failed' or 'cancelled'), item statuses are 'queued', 'spawning', 'running', 'ok', 'failed' or 'cancelled', and `summary` counts { total, done, ok, failed, cancelled, running }. A batch is limited to subagent.max_batch_size items (default 5) and to subagent.max_children concurrent children per parent lineage (default 5; dormant target revivals count toward the cap alongside new spawns, while reusing an alive child does not; hitting the cap auto-closes the oldest settled child outside this batch's reuse targets to make room, failing only if all live children are active); exceeding either returns { error } with no batch_id, as does an item that is neither a valid spawn nor a valid reuse. Collect results with wait:true, or poll_subagents / wait_subagents on the returned batch_id. Default failure policy: collect_errors.",
 		parameters: Type.Object({
 			items: Type.Array(DispatchItemSchema, {
 				description:

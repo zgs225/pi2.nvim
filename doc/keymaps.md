@@ -13,8 +13,8 @@ What the plugin does bind on its own:
 - `T` inside the sub-session viewer float toggles the viewed session's todo list panel (see [Usage → In the sub-session viewer](usage.md#in-the-sub-session-viewer)).
 - `dd` / `x` to remove an entry in the attachments buffer.
 - The [diff review](diff-review.md) keys inside the diff tab.
-- The `:PiDiff` session diff review: in the panel's file list, moving the cursor previews the file's diff, `<CR>`/`o` jumps to its first changed line, `<C-f>`/`<C-b>`/`<C-d>`/`<C-u>` scroll the diff on the right; in the diff area, `<CR>`/`o` jumps to the line under the cursor; `q` closes the whole review (see [Session diff review](diff-review.md#session-diff-review-pidiff)).
-- The [sessions overview](sessions.md#sessions-overview-pisessions) keys inside the list.
+- The `:PiDiff` session diff review: in the panel's file list, moving the cursor previews the file's diff, `<CR>`/`o` jumps to its first changed line, `<C-f>`/`<C-b>`/`<C-d>`/`<C-u>` scroll the diff on the right; in the diff area, `<CR>`/`o` jumps to the line under the cursor; `q` closes the whole review (see [Session diff review](diff-review.md#session-diff-review-pidiff)). When the panel was opened by [`pi.worktree_apply`](worktrees.md#applying-a-patch), an extra `a` applies the reviewed patch to the main checkout.
+- The [sessions overview](sessions.md#sessions-overview-pisessions) keys inside the list, including `x` to close the sub-session under the cursor, the session's π tab, or every π tab of a worktree group (each scope asks first unless its `sessions_list.confirm_close_*` switch is off), `n` for a fresh session in the row's checkout and `N` to open the row's main checkout or pick/create one of its worktrees (both insert the new tab next to that checkout's worktree group instead of at the end of the tabline), and `S` to reorder the tabline into the list's order (same as `:PiSessionsSync`).
 - The [background tasks](#background-tasks-panel-pitasks) panel keys inside the list.
 
 ## Background tasks panel (`:PiTasks`)
@@ -26,7 +26,8 @@ What the plugin does bind on its own:
 | `<CR>` / `o` | Open this task's output in a vsplit (cursor stays in the list) |
 | `a` / `i` | Open the output and focus it |
 | `p` | Preview the output live in a float (command + metadata header); press `p` again to close |
-| `x` | Stop the task under the cursor (asks for confirmation first) |
+| `x` | Stop the task under the cursor (asks for confirmation, then SIGTERMs its process group and SIGKILLs it if it has not exited after 5 s) |
+| `D` | Delete the task's log file from disk (asks for confirmation; finished tasks only — a running task is refused, stop it with `x` first) |
 | `A` | Toggle between the current session's tasks (default) and all sessions' tasks |
 | `R` | Redraw the list |
 | `q` | Close the panel |

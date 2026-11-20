@@ -71,8 +71,13 @@ local function start_running_item(target)
         batch_id = res.batch_id
     end)
     assert.is_string(batch_id, "batch dispatch failed")
+    -- 10 s, not 1 s: `make test` runs one child nvim per spec file (~170 in
+    -- parallel on a 2-core CI runner), and this poll watches a batch item reach
+    -- `running` through scheduled callbacks. A 1 s budget expires under that
+    -- load and the spec fails with the batch item still `queued` — the same
+    -- flake class `references/testing.md` (Layer 1) records.
     assert.is_true(
-        vim.wait(1000, function()
+        vim.wait(10000, function()
             local snap = Batch.poll(batch_id)
             return snap ~= nil and snap.items[1] ~= nil and snap.items[1].status == "running"
         end, 10),

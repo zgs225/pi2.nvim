@@ -42,11 +42,12 @@ local function usage(input, output, cache_read, cache_write, cost)
     }
 end
 
+local entry_seq = 0
+
 --- Build a session entry.
 ---@param type string
 ---@param data table
 ---@return table
-local entry_seq = 0
 local function entry(type, data)
     local result = vim.deepcopy(data)
     result.type = type

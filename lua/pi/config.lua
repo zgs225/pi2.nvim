@@ -233,6 +233,9 @@
 ---@field width? integer Window width for left/right placement in the side layout (default 40)
 ---@field height? integer Window height for top/bottom placement in the side layout (default 12)
 ---@field float pi.SessionsListFloatConfig Float window sizing when the current tab uses the float layout
+---@field confirm_close_child? boolean Ask before `x` on a sub-session row closes that child's RPC process (default true)
+---@field confirm_close_session? boolean Ask before `x` on a session row closes its PiTab — process stopped and tabpage closed (default true)
+---@field confirm_close_group? boolean Ask before `x` on a worktree group header closes every PiTab in that checkout (default true)
 
 ---@class pi.TasksPanelConfig
 ---@field mode "follow"|"side"|"float" How the panel opens: "side" or "float" explicitly, or "follow" the current tab's chat layout (default "follow")
@@ -240,6 +243,11 @@
 ---@field width integer Window width for left/right placement in the side layout (default 40)
 ---@field height integer Window height for top/bottom placement in the side layout (default 12)
 ---@field auto_open? boolean Open the tasks panel when a background task starts in the current tab (default false)
+
+---@class pi.BackgroundTasksConfig
+---@field wake_on_idle? "always"|"budgeted"|"never" May a completion that lands while the agent is idle start a turn of its own? "budgeted" (default) allows `wake_budget` wakes per user prompt and then holds the rest for the next prompt; "always" wakes on every completion; "never" only ever delivers at a turn boundary or on the next user prompt (see doc/extensions.md#the-idle-wake-gate)
+---@field wake_budget? integer Idle wakes allowed per user prompt under "budgeted" (default 2, 0…10). Replenished by the next user input, not by a clock
+---@field wake_cache_window_ms? integer How old the last request may be before an idle wake is held instead of spent: a wake past the prompt-cache lifetime re-reads the whole conversation at full input price (default 300000 = the 5-minute cache TTL; 0 disables the window)
 
 ---@class pi.DiffReviewListConfig
 ---@field position? "left"|"right" Side window placement (default "left")
@@ -250,6 +258,22 @@
 ---@field height? number Height in lines (>=1) or fraction of editor height (<1, default 0.8)
 ---@field border? string|string[] Float border style (default "rounded")
 ---@field list pi.DiffReviewListConfig Side file-list window
+
+---@class pi.WorktreeRetentionConfig
+---@field enabled? boolean Run the deferred retention sweep after a checkout is created (default true)
+---@field max_count? integer Keep this many most recent pi-managed checkouts per repository (default 25)
+---@field max_age_days? number Remove pi-managed checkouts whose checkout directory (its top-level mtime, so an edit deep inside may not count) has not changed for this many days (default 14)
+---@field snapshot_days? number Keep snapshots of removed checkouts this many days (default 30)
+---@field sweep_locks? boolean Release stale pi locks before pruning (default true)
+
+---@class pi.WorktreeConfig
+---@field setup_cmd? string[] Command run inside a freshly created worktree before the creation callback fires. Executed directly (no shell) with the worktree root as cwd; a non-zero exit keeps the worktree in place and fails the creation. The command sees `PI_ROOT_WORKTREE_PATH` (the repository's main checkout) and `PI_WORKTREE_PATH` (the new checkout).
+---@field repo_setup? boolean Run the `setup` commands a repository declares in its `.pi-worktrees.toml` (default false). Off by default because a cloned repository is untrusted input: its commands would otherwise run on checkout. See `doc/worktrees.md#repository-configuration`.
+---@field base_ref? "head"|"fresh" Base commit new worktrees start from *unless* the repository's `.pi-worktrees.toml` declares one: `"head"` (default) detaches at the checkout the creating session runs in, `"fresh"` at the repository's remote default branch (`origin/HEAD`, re-fetched at most once per 24h with a 5s cap, falling back to the cached ref then local `HEAD`). A `create.base` on a sub-agent dispatch item overrides it per item.
+---@field snapshot_before_remove? boolean Write a patch snapshot before removing a worktree (`Worktree.remove`, `pi.worktree_remove`) (default true)
+---@field warn_on_cwd_mismatch? boolean Prefix the chat-title worktree badge with `⚠` when the session's cwd differs from Neovim's cwd (default true). false keeps the plain `󰙅 <name>` badge instead
+---@field lock? boolean Take a `git worktree lock` on every checkout we create and release it when the checkout is removed (default true). Prevents an external `git worktree prune` / `remove` from deleting a checkout an agent is still working in.
+---@field retention? pi.WorktreeRetentionConfig
 
 ---@class pi.DialogKeys
 ---@field confirm? pi.KeySpecs
@@ -303,6 +327,7 @@
 ---@field height? number Height in lines (>=1) or fraction of editor height (<1, default 0.75)
 ---@field border? string|string[] Float border style (default "rounded")
 ---@field statusline? boolean Show statusline in viewer footer (default true)
+---@field worktree? boolean Show the viewed session's worktree in that footer as a `󰙅 <name>` badge — the checkout the conversation ran in, which the title (display name + status) and the token/model chunks cannot say. Only a *linked* worktree is badged, and only the footer carries it, so `statusline = false` hides it too (default true).
 ---@field todo? pi.SubagentViewerTodoConfig Todo footer chunk and `T` list panel inside the viewer
 
 ---@class pi.SubagentViewerTodoConfig
@@ -324,8 +349,12 @@
 ---@field show_full_ids? boolean Show full UUIDs in sub-agent tool rows (default false; truncated)
 ---@field reap_after_minutes? number Minutes a settled child process idles before auto-close (default 30; 0 disables event-driven reaping)
 ---@field reap_sweep_minutes? number Minutes between periodic idle sweeps (default 10; 0 disables the sweep)
+---@field worktree? pi.SubagentWorktreeConfig Child checkouts created by dispatch items
 ---@field sessions_list? pi.SubagentSessionsListConfig
 ---@field viewer? pi.SubagentViewerConfig Float window sizing for the sub-session viewer
+
+---@class pi.SubagentWorktreeConfig
+---@field setup? boolean Run `worktree.setup_cmd` in a freshly created child checkout (default false: a dispatch already pays a `git worktree add` plus the `.worktreeinclude` copy, and dependency installs would run once per child). A dispatch item's `create.setup` overrides it.
 
 ---@class pi.SubagentSessionsListConfig
 ---@field show_dormant? boolean Show closed (dormant) children in :PiSessions (default false; use :PiSubSwitch)
@@ -355,12 +384,14 @@
 ---@field quickfix pi.QuickfixConfig
 ---@field abort pi.AbortConfig
 ---@field tree pi.TreeConfig
+---@field worktree pi.WorktreeConfig
 ---@field subagent pi.SubagentConfig
 ---@field vision pi.VisionConfig
 ---@field title pi.TitleConfig
 ---@field todo pi.TodoConfig
 ---@field sessions_list pi.SessionsListConfig
 ---@field tasks_panel pi.TasksPanelConfig
+---@field background_tasks pi.BackgroundTasksConfig Idle-wake policy for the bundled background-bash extension (see doc/extensions.md#the-idle-wake-gate)
 ---@field diff_review pi.DiffReviewConfig
 ---@field zen pi.ZenConfig
 ---@field prompt pi.PromptConfig
@@ -503,6 +534,21 @@ local defaults = {
     tree = {
         enabled = true,
     },
+    worktree = {
+        setup_cmd = nil,
+        repo_setup = false,
+        base_ref = "head",
+        snapshot_before_remove = true,
+        warn_on_cwd_mismatch = true,
+        lock = true,
+        retention = {
+            enabled = true,
+            max_count = 25,
+            max_age_days = 14,
+            snapshot_days = 30,
+            sweep_locks = true,
+        },
+    },
     subagent = {
         enabled = true,
         max_children = 5,
@@ -517,6 +563,9 @@ local defaults = {
         show_full_ids = false,
         reap_after_minutes = 30,
         reap_sweep_minutes = 10,
+        worktree = {
+            setup = false,
+        },
         sessions_list = {
             collapse_children = false,
             show_dormant = false,
@@ -528,6 +577,7 @@ local defaults = {
             height = 0.75,
             border = "rounded",
             statusline = true,
+            worktree = true,
             todo = {
                 enabled = true,
                 auto_open = false,
@@ -567,6 +617,9 @@ local defaults = {
             height = 0.4,
             border = "rounded",
         },
+        confirm_close_child = true,
+        confirm_close_session = true,
+        confirm_close_group = true,
     },
     tasks_panel = {
         mode = "follow",
@@ -574,6 +627,11 @@ local defaults = {
         width = 40,
         height = 12,
         auto_open = false,
+    },
+    background_tasks = {
+        wake_on_idle = "budgeted",
+        wake_budget = 2,
+        wake_cache_window_ms = 300000,
     },
     diff_review = {
         width = 0.8,
@@ -664,7 +722,14 @@ function M.setup(opts)
         opts.verbs = nil
     end
 
-    M.options = vim.tbl_deep_extend("force", defaults, opts or {})
+    -- Deepcopy `defaults` into the merge: tbl_deep_extend keeps a *reference*
+    -- to the first source's nested tables, so `options.subagent` used to BE
+    -- `defaults.subagent`. Any in-place write to a nested option (the natural
+    -- thing a test or a user plugin does) then landed in the module-local
+    -- defaults and survived every later setup() (G31). Copying here makes
+    -- "setup() restores the defaults" true again, at the cost of one deepcopy
+    -- of a small table per setup() call (setup is a once-per-session call).
+    M.options = vim.tbl_deep_extend("force", vim.deepcopy(defaults), opts or {})
 
     -- Resolve verbs: merge or replace based on use_defaults.
     if user_verbs then
@@ -694,6 +759,11 @@ function M.setup(opts)
     -- The bundled todo extension re-reads its options from a runtime file on
     -- every context event; same live-reload rationale as title/vision.
     require("pi.todo.tool_ui").publish(M.options.todo)
+
+    -- The bundled bg-tasks extension re-reads its idle-wake policy from a
+    -- runtime file at every wake decision; same live-reload rationale. The
+    -- file also carries `present`, which the module refreshes on focus changes.
+    require("pi.tasks").publish(M.options.background_tasks)
 end
 
 --- Resolve a config value that may be a function, merging the result with

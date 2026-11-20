@@ -1,0 +1,45 @@
+# Reproducible toolchain for pi.nvim's *gates* (the `make` targets that can fail).
+#
+# Why this file exists: a gate is only a gate if it behaves the same on every
+# machine. `make style` / `make lint` / `make check` shell out to three binaries,
+# and "whatever version happens to be on PATH" turns a green run into a coin
+# flip (stylua's defaults changed between minors; lua-language-server's
+# diagnostic set changes between versions). The versions below are pinned
+# exactly, no `latest`.
+#
+#   mise trust          # once per checkout
+#   mise install        # install the three pinned tools
+#   make check          # run the static gates (style / lint / parse / docs)
+#
+# `.github/workflows/lint.yml` reads the stylua + lua-language-server versions
+# out of this file, so a version bump happens here and nowhere else.
+#
+# Deliberately NOT managed here:
+#   neovim    — the gates are the *only* thing this file pins; the test layers
+#               must run on the nvim you actually use the plugin in, so pin it
+#               with your system/nvim manager (`make test` needs nvim +
+#               plenary.nvim, see .agents/skills/develop/references/testing.md).
+#   python3   — `scripts/checks/**` is stdlib-only and runs on 3.8+; a system
+#               python (or the one CI ships) is enough, and pinning an
+#               interpreter for a 500-line linter is not worth the install cost.
+#               The *linter* is pinned (`ruff` below) — the interpreter is not the
+#               contract, the gate is.
+#   gt        — gitea-cli, the issue-tracker workflow tool, not a build
+#               dependency. See .agents/skills/develop/references/gitea.md.
+[tools]
+stylua = "2.5.2"
+"aqua:LuaLS/lua-language-server" = "3.18.2"
+# ruff — formats and lints the Python under `scripts/` (the gates themselves).
+# Without it the newest, most-edited code in the repo had no gate at all:
+# stylua only sees Lua and lua-language-server only sees `lua/`.
+ruff = "0.17.5"
+# LuaJIT 2.1 — the parser family Neovim embeds, and therefore the authority for
+# "does this file load on Neovim stable" (gotcha G24): it rejects the Lua 5.3
+# operators (`&`, `|`, `~`, `<<`, `>>`, `//`) that a newer Lua parser would let
+# through, while accepting the LuaJIT/Lua 5.2 extensions this repo does use
+# (`goto` + `::label::`). Pinned to one conda-forge build so every machine
+# parses byte-identically. `make parse LUAJIT_BIN=/usr/bin/luajit` overrides it
+# for a distro/pkgsrc build, but a version number is only a claim: the gate probes
+# the binary's grammar first (see `scripts/checks/rules/parse_luajit.py`) and
+# refuses one that accepts Lua 5.3 syntax — measured, some 2.1 builds do.
+luajit = "2.1.1744318430"
