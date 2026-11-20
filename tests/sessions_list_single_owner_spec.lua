@@ -90,7 +90,7 @@ end
 --- Parent row ids that render `child_id` (must be 0 or 1 after the fix).
 ---@param rows pi.SessionsListRow[]
 ---@param child_id string
----@return string?[]
+---@return (string|nil)[]
 local function parents_of(rows, child_id)
     local ids = {}
     for _, carrier in ipairs(carriers(rows)) do

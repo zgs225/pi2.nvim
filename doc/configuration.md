@@ -338,8 +338,8 @@ require("pi").setup({
     title = {
         enabled = true,
         max_chars = 40, -- hard cap on generated titles (truncated with …)
-        -- lang = "zh-CN", -- nil (default) = title language follows the conversation
-        -- model = "openai/gpt-4o-mini", -- pinned generation model; nil = the session's own model
+        lang = nil, -- nil (default) = title language follows the conversation, e.g. "zh-CN"
+        model = nil, -- pinned generation model ("provider/modelId"); nil = the session's own model
     },
 
     -- Session todo list. When enabled (default), pi2.nvim injects the bundled
@@ -418,6 +418,25 @@ require("pi").setup({
         auto_open = false,
         -- Note: the float layout is fixed (editor-centered at 0.5 x 0.4 with a
         -- rounded border); width/height/position apply to the side layout only.
+    },
+
+    -- Idle-wake policy for the background-bash extension. A completion that
+    -- lands while the agent is idle normally starts a turn of its own; that
+    -- turn is priced by the whole conversation, so it is spent under a policy
+    -- rather than per event. See doc/extensions.md#the-idle-wake-gate.
+    background_tasks = {
+        -- May an idle completion start a turn? "budgeted" (default) allows
+        -- `wake_budget` wakes per user prompt and holds the rest for the next
+        -- prompt; "always" wakes on every completion; "never" only ever
+        -- delivers at a turn boundary or on the next user prompt.
+        wake_on_idle = "budgeted",
+        -- Idle wakes allowed per user prompt under "budgeted" (0…10).
+        -- Replenished by the next user input, not by a clock.
+        wake_budget = 2,
+        -- Hold a wake when the last request is older than this, because it
+        -- would re-read the conversation uncached. Default 300000 = the
+        -- 5-minute prompt-cache lifetime; 0 disables the window.
+        wake_cache_window_ms = 300000,
     },
 
     -- Session diff review (:PiDiff): one floating panel — an outer border

@@ -1815,7 +1815,25 @@ function M.on_child_settled(child, aborted)
             return
         end
 
+        -- A settled run with no transcript anywhere is still a settled run: no
+        -- report exists to deliver, but returning here would leave the row
+        -- `active` (a status the idle reaper treats as "a run is in flight", so
+        -- it would never be closed) and drop the settle without a word. Booking
+        -- it and warning is the only honest degradation — the row has to say the
+        -- run ended, and the user has to know its report is not coming.
         if not path then
+            Manifest.patch(child.id, {
+                status = final_status,
+                last_error = Manifest.REMOVE,
+                last_active_at = Manifest.iso_now(),
+            }, manifest_cwd)
+            Notify.warn(
+                string.format(
+                    "sub-session %q settled with no readable transcript — its report was not delivered",
+                    entry.name or child.id
+                )
+            )
+            after_completed(parent)
             return
         end
         if not report or report == "" then

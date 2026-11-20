@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Validate relative markdown links and anchors in README.md and doc/*.md."""
+
 import os
 import re
 import sys
@@ -70,7 +71,9 @@ for rel in files:
         if anchor:
             anchors = collect_anchors(os.path.join(ROOT, dest))
             if anchor not in anchors:
-                failures.append(f"{rel}: anchor '#{anchor}' not found in {dest} (have: {sorted(a for a in anchors if a.startswith(anchor[:6]))}...)")
+                failures.append(
+                    f"{rel}: anchor '#{anchor}' not found in {dest} (have: {sorted(a for a in anchors if a.startswith(anchor[:6]))}...)"
+                )
 
 print(f"checked {checked} relative links across {len(files)} files")
 if failures:

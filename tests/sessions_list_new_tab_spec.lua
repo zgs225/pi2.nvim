@@ -33,7 +33,7 @@ local WORKTREES = {
     [GONE_DIR] = { kind = "linked", name = "gone", path = GONE_DIR, repo_root = MAIN_DIR },
 }
 
----@param opts? { id?: string, tab?: integer, cwd?: string, worktree?: table }
+---@param opts? { id?: string, tab?: pi.TabId, cwd?: string, worktree?: table }
 ---@return pi.Session
 local function fake_session(opts)
     opts = opts or {}

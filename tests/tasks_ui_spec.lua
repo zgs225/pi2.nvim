@@ -267,6 +267,25 @@ describe("tasks panel UI", function()
             assert.are.equal("PiTasksListStopped", stopped_chunks[1][3])
         end)
 
+        it("renders an unknown exit as the dim glyph, not a failure", function()
+            -- `unknown` means nobody watched the exit, not that it failed: a
+            -- filled red dot would contradict the report that produced it.
+            local base = now_ms()
+            seed({ id = "u1", status = "unknown", start_time = base - 20000, end_time = base - 15000 })
+            local row
+            for _, r in ipairs(Tasks.build_rows(base)) do
+                if r.task.id == "u1" then
+                    row = r
+                end
+            end
+            assert.is_not_nil(row)
+            local line, chunks = Panel.format_line(row, 0, 80, base)
+            assert.is_truthy(line:find("◌", 1, true), "unknown uses the hollow glyph")
+            assert.is_nil(line:find("●", 1, true), "unknown must not use the failure glyph")
+            assert.are.equal("PiTasksListUnknown", chunks[1][3])
+            assert.are.equal("unknown", row.status_label)
+        end)
+
         it("truncates the command summary to the indent-adjusted budget", function()
             local task = seed({ id = "run1", command = string.rep("x", 200) })
             local row = Tasks.build_rows(task.start_time + 1000)[1]
@@ -852,7 +871,7 @@ describe("tasks panel UI", function()
     end)
 
     describe("stop key (x)", function()
-        it("confirms, marks the task stopped, and signals the pid", function()
+        it("confirms, marks the task stopped, and signals its process group", function()
             seed({ id = "run1", pid = 987654321 })
             Panel.open()
             vim.api.nvim_set_current_win(Panel.win(vim.api.nvim_get_current_tabpage()))
@@ -867,6 +886,34 @@ describe("tasks panel UI", function()
             local stopped = Tasks.get("run1")
             assert.are.equal("stopped", stopped.status)
             assert.is_not_nil(stopped.end_time)
+        end)
+
+        it("stops through the shared group-kill helper, not a bare-pid kill", function()
+            -- The panel used to call uv.kill(pid) itself, which left the
+            -- children of `npm run dev` running. It now goes through
+            -- pi.tasks.stop -> kill_group, so the group (and its guard against
+            -- pid 0/1) is the one place that decides.
+            seed({ id = "run1", pid = 4242 })
+            Panel.open()
+            vim.api.nvim_set_current_win(Panel.win(vim.api.nvim_get_current_tabpage()))
+
+            local orig_confirm = vim.fn.confirm
+            local orig_kill_group = Tasks.kill_group
+            local seen = nil
+            vim.fn.confirm = function()
+                return 1
+            end
+            Tasks.kill_group = function(pid, signum)
+                seen = { pid = pid, signum = signum }
+                return true
+            end
+            press("x")
+            vim.fn.confirm = orig_confirm
+            Tasks.kill_group = orig_kill_group
+
+            assert.is_not_nil(seen, "the panel must signal through pi.tasks.kill_group")
+            assert.are.equal(4242, seen.pid)
+            assert.are.equal("stopped", Tasks.get("run1").status)
         end)
 
         it("keeps the task running when the confirmation is declined", function()
@@ -1032,6 +1079,33 @@ describe("tasks panel UI", function()
             assert.is_not_nil(preview)
             local lines = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(preview), 0, -1, false)
             assert.is_truthy(lines[3]:find("stopped (signal SIGTERM)", 1, true), "header shows the stop signal")
+
+            vim.fn.delete(path)
+        end)
+
+        it("renders an unknown exit in the preview header, not as stopped", function()
+            -- An unknown task has no signal and no exit code; without its own
+            -- branch the header would fall through to `stopped`.
+            local path = vim.fn.tempname()
+            vim.fn.writefile({ "gone" }, path)
+            seed({
+                id = "unk1",
+                command = "sleep 100",
+                status = "unknown",
+                pid = 11,
+                start_time = now_ms() - 3000,
+                end_time = now_ms() - 1000,
+                output_file = path,
+            })
+            Panel.open()
+            vim.api.nvim_set_current_win(Panel.win(vim.api.nvim_get_current_tabpage()))
+
+            press("p")
+            local preview = find_win_by_name("pi://task-preview/unk1")
+            assert.is_not_nil(preview)
+            local lines = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(preview), 0, -1, false)
+            assert.is_truthy(lines[3]:find("exit status unknown", 1, true), "header says the exit is unknowable")
+            assert.is_nil(lines[3]:find("stopped", 1, true), "an unknown exit is not a stop")
 
             vim.fn.delete(path)
         end)
@@ -1211,5 +1285,36 @@ describe("tasks panel UI", function()
             Panel._render = orig
             assert.are.equal(1, renders)
         end)
+    end)
+end)
+
+describe("pi.tasks panel row for a held report", function()
+    before_each(function()
+        Tasks._reset()
+    end)
+
+    it("shows the hold reason on a finished row", function()
+        local base = now_ms()
+        seed({
+            id = "held1",
+            command = "make test",
+            status = "completed",
+            start_time = base - 65000,
+            end_time = base - 5000,
+            exit_code = 0,
+            held_reason = "cache",
+        })
+        local row = Tasks.build_rows(base)[1]
+        local line = Panel.format_line(row, 0, 120)
+        assert.is_truthy(line:find("held1", 1, true))
+        assert.is_truthy(line:find("held (cache)", 1, true), "the row must say why the report is waiting: " .. line)
+    end)
+
+    it("keeps a delivered row clean", function()
+        local base = now_ms()
+        seed({ id = "plain1", status = "completed", start_time = base - 65000, end_time = base - 5000 })
+        local row = Tasks.build_rows(base)[1]
+        local line = Panel.format_line(row, 0, 120)
+        assert.is_nil(line:find("held", 1, true))
     end)
 end)

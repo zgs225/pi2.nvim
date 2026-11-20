@@ -154,7 +154,7 @@ local function format_ago(ms)
 end
 
 --- Highlight group of a row's status dot at a given animation tick. Running
---- blinks every tick; failure is a steady red, success/stopped a dim ◌.
+--- blinks every tick; failure is a steady red, success/stopped/unknown a dim ◌.
 ---@param row pi.TasksRow
 ---@param tick integer
 ---@return string
@@ -168,6 +168,9 @@ function M.dot_hl(row, tick)
     end
     if status == "completed" then
         return "PiTasksListSuccess"
+    end
+    if status == "unknown" then
+        return "PiTasksListUnknown"
     end
     return "PiTasksListStopped"
 end
@@ -195,7 +198,7 @@ function M.format_line(row, tick, width, now_ms, current_session_id)
     now_ms = now_ms or uv.now()
     local task = row.task
     local running = task.status == "running"
-    local dot = (task.status == "completed" or task.status == "stopped") and "◌" or "●"
+    local dot = (task.status == "completed" or task.status == "stopped" or task.status == "unknown") and "◌" or "●"
     local spinner = running and M.spinner_frame(tick) or nil
     local foreign = current_session_id ~= nil and task.session_id ~= nil and task.session_id ~= current_session_id
 
@@ -213,6 +216,12 @@ function M.format_line(row, tick, width, now_ms, current_session_id)
             time = format_duration(row.duration_ms)
         end
         subtitle = subtitle .. " · " .. time
+    end
+    -- A finished task whose report is waiting for the next user prompt says so
+    -- (`held (cache)`): the wake gate spends no turn on it, so the row is the
+    -- only place the user can see that the result is sitting there undelivered.
+    if task.held_reason then
+        subtitle = subtitle .. " · held (" .. task.held_reason .. ")"
     end
 
     local prefix = dot .. " " .. (spinner and spinner .. " " or "")
@@ -427,13 +436,13 @@ function M._render()
         end
     end
 
-    -- Title counts cover the filtered rows; terminal = completed/failed/stopped.
+    -- Title counts cover the filtered rows; terminal = completed/failed/stopped/unknown.
     local running, finished = 0, 0
     for _, row in ipairs(rows) do
         local status = row.task.status
         if status == "running" then
             running = running + 1
-        elseif status == "completed" or status == "failed" or status == "stopped" then
+        elseif status == "completed" or status == "failed" or status == "stopped" or status == "unknown" then
             finished = finished + 1
         end
     end
@@ -756,6 +765,12 @@ local function preview_status(task)
     if task.status == "failed" then
         return task.exit_code and ("failed (exit " .. task.exit_code .. ")") or "failed"
     end
+    -- Before the signal fallback: an unknown task has no signal, so it would
+    -- otherwise read as `stopped` — the very contradiction this status exists
+    -- to avoid.
+    if task.status == "unknown" then
+        return "exit status unknown"
+    end
     if task.signal then
         return "stopped (signal " .. task.signal .. ")"
     end
@@ -1041,9 +1056,11 @@ end
 
 -- Stop (x) --------------------------------------------------------------------
 
---- Stop the task under the cursor: confirm first, then optimistically mark it
---- stopped locally and signal the process. The authoritative stopped state
---- arrives later from the backend's pi2_bg_task event.
+--- Stop the task under the cursor: confirm first, then signal the task's
+--- process GROUP (not the bare pid) and optimistically mark it stopped locally.
+--- The authoritative stopped state arrives later from the backend's
+--- pi2_bg_task event. `Tasks.stop` owns both halves so the escalation rules and
+--- the group semantics live in one place.
 local function stop_under_cursor()
     local row, task = row_task_under_cursor()
     if not row or not task then
@@ -1058,10 +1075,7 @@ local function stop_under_cursor()
     if choice ~= 1 then
         return
     end
-    Tasks.mark_stopped(task.id)
-    if task.pid then
-        pcall(uv.kill, task.pid, "sigterm")
-    end
+    Tasks.stop(task.id)
 end
 
 -- Buffer & windows ------------------------------------------------------------

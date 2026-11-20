@@ -839,12 +839,93 @@ local function update_todo_mirror(session, tool_name, result)
     end
 end
 
+--- Forward one bg-tasks lifecycle payload to the task registry, stamped with
+--- the owning session/tab so the registry (and the :PiTasks panel) can scope
+--- rows per session. Shared by the live path (a pushed custom message) and
+--- history replay, so a resumed session folds its transcript the way the
+--- extension itself does and the two tables cannot disagree about a task's
+--- command or state.
+---@param details table pi2_bg_task payload (kind/taskId/command/...)
+---@param timestamp integer? message timestamp (task start/end time)
+---@param session_id string? owning session id (nil = unknown ownership)
+---@param tab integer? owning tabpage handle (panel display)
+---@return boolean consumed
+local function apply_bg_task_event(details, timestamp, session_id, tab)
+    if type(details) ~= "table" then
+        return false
+    end
+    local ok, consumed = pcall(Tasks.handle_event, {
+        type = "pi2_bg_task",
+        details = details,
+        timestamp = timestamp,
+    }, session_id, tab)
+    if not ok then
+        Notify.warn("Background task event failed: " .. tostring(consumed))
+        return false
+    end
+    return consumed == true
+end
+
+--- Fold a replayed `pi2_bg_task` custom message (role="custom") into the task
+--- registry. A transcript entry is not conversation content, so it renders
+--- nothing; but it is the only record of a task's command, and a resumed
+--- session's history re-renders `wait_task` / `stop_task` / `task_input`
+--- blocks from it. Without this fold those blocks fall back to a bare task id
+--- (and the id of a task that already exited in a previous pi process is
+--- exactly what a resumed session has in front of it). Panel side effects
+--- (auto-open/auto-close) are deliberately skipped: replaying a session must
+--- not pop panels.
+---@param message table replayed message (role="custom")
+---@param session_id string? owning session id
+---@param tab integer? owning tabpage handle
+local function replay_bg_task_message(message, session_id, tab)
+    if message.customType ~= "pi2_bg_task" then
+        return
+    end
+    -- The dedupe (a repeated `started` must not un-finish a tracked row) and
+    -- the registry call both live in Tasks.absorb_message, which the
+    -- sub-session viewer calls too: one rule for the parent's transcript and
+    -- a child's, so a task's command/state cannot differ between the two.
+    -- A raise is downgraded to a warning, as in `apply_bg_task_event`: a
+    -- replayed transcript must not break the rebuild it is part of.
+    local ok, err = pcall(Tasks.absorb_message, message, session_id, tab)
+    if not ok then
+        Notify.warn("Background task event failed: " .. tostring(err))
+    end
+end
+
+--- Render the UI-only line(s) for a bg-tasks delivery report.
+---
+--- The `pi2_bg_task` message is model-facing: it lands in the transcript and in
+--- the agent's context, and the frontend deliberately renders no custom message
+--- as conversation content. This helper derives ONE dim line per reported task
+--- from that same content (`pi.tasks_note`), so the user sees what the model was
+--- told without anything being added to the context and without a second
+--- delivery channel. Panel pings and other customTypes yield no lines, and a
+--- detached session has no chat to draw into.
+---
+--- Runs on the RPC callback thread; rendering is scheduled inside the history.
+---@param message table custom message object (role="custom")
+---@param chat pi.Chat? owning chat (nil = detached session, nothing to draw)
+local function render_bg_task_note(message, chat)
+    if message.customType ~= "pi2_bg_task" or not chat then
+        return
+    end
+    local ok, err = pcall(function()
+        for _, line in ipairs(require("pi.tasks_note").lines(message.content)) do
+            chat:append_system_note({ { line, "PiSystemNote" } })
+        end
+    end)
+    if not ok then
+        Notify.warn("Background task note failed: " .. tostring(err))
+    end
+end
+
 --- Consume a pi2_bg_task custom message pushed by the bg-tasks extension:
---- forward the lifecycle event to the task registry, stamped with the owning
---- session/tab so the registry (and the :PiTasks panel) can scope rows
---- per session. Terminal states surface through the panel row and the
---- agent's own triggerTurn report — no extra vim.notify on top. Runs on the
---- RPC callback thread: every user-facing touch (Notify) is vim.schedule'd.
+--- forward the lifecycle event to the task registry, then act on the panel.
+--- Terminal states surface through the panel row and the agent's own
+--- triggerTurn report — no extra vim.notify on top. Runs on the RPC callback
+--- thread: every user-facing touch (Notify) is vim.schedule'd.
 ---@param message table custom message object (role="custom", customType="pi2_bg_task")
 ---@param session_id string? owning session id (task ownership routing; nil = unknown)
 ---@param tab integer? owning tabpage handle (panel display)
@@ -853,16 +934,7 @@ local function handle_bg_task_message(message, session_id, tab)
     if type(details) ~= "table" then
         return
     end
-    local ok, consumed = pcall(Tasks.handle_event, {
-        type = "pi2_bg_task",
-        details = details,
-        timestamp = message.timestamp,
-    }, session_id, tab)
-    if not ok then
-        Notify.warn("Background task event failed: " .. tostring(consumed))
-        return
-    end
-    if not consumed then
+    if not apply_bg_task_event(details, message.timestamp, session_id, tab) then
         return
     end
     local tasks_cfg = Config.options.tasks_panel or {}
@@ -872,7 +944,12 @@ local function handle_bg_task_message(message, session_id, tab)
     -- focus leaves — never yank a panel the user is reading. pi.ui.tasks is
     -- lazy-required as in the auto-open path.
     if
-        (details.kind == "completed" or details.kind == "failed" or details.kind == "stopped")
+        (
+            details.kind == "completed"
+            or details.kind == "failed"
+            or details.kind == "stopped"
+            or details.kind == "unknown"
+        )
         and tab ~= nil
         and not Tasks.has_running(session_id)
     then
@@ -1440,13 +1517,17 @@ function M.handle_event(session, msg)
     elseif t == "message_start" then
         local message = msg.message
         if type(message) == "table" and message.role == "custom" then
-            -- Custom extension messages never render in chat history. The
-            -- bg-tasks extension's pi2_bg_task lifecycle feeds the task
-            -- registry (and the :PiTasks panel) instead; other customTypes
-            -- are dropped, matching the previous de-facto behavior.
+            -- Custom extension messages never render as a user/assistant block.
+            -- The bg-tasks extension's pi2_bg_task lifecycle feeds the task
+            -- registry (and the :PiTasks panel) instead, and its DELIVERY
+            -- reports (completions, check-ins, the startup orphan summary)
+            -- leave one dim UI-only line per task, derived from the very text
+            -- the model already got. Other customTypes are dropped, matching
+            -- the previous de-facto behavior.
             if message.customType == "pi2_bg_task" then
                 handle_bg_task_message(message, session.id, session.attached_tab)
             end
+            render_bg_task_note(message, chat)
         elseif chat then
             chat:on_message_start(msg)
         end
@@ -1614,12 +1695,15 @@ function M.list()
     ---@type pi.Session[]
     local result = {}
     for _, session in pairs(registry) do
-        if session.attached_tab then
+        -- A session whose tabpage is already gone is not shown: `cleanup()` runs
+        -- on `vim.schedule`, so a just-closed tab would otherwise render a
+        -- phantom row at the end (an unranked handle) until the next tick.
+        if session.attached_tab and rank[session.attached_tab] then
             result[#result + 1] = session
         end
     end
     table.sort(result, function(a, b)
-        return (rank[a.attached_tab] or math.huge) < (rank[b.attached_tab] or math.huge)
+        return rank[a.attached_tab] < rank[b.attached_tab]
     end)
     return result
 end
@@ -1770,6 +1854,9 @@ function M.new_tab()
     local session = M.get_or_create()
     if session then
         session.chat:ensure_shown_and_focus_prompt()
+        -- Join the checkout's block instead of landing behind every other
+        -- checkout's tabs — the same ordering model :PiSessions groups rows by.
+        require("pi.sessions.tab_order").place_for(session)
     end
 end
 
@@ -2110,6 +2197,21 @@ local function replay_messages(session, messages)
                 pending_agent_end = false
             end
             session.chat:on_bash_replay(msg)
+        elseif role == "custom" then
+            -- Extension lifecycle entries (the bg-tasks extension's
+            -- pi2_bg_task messages) never render as conversation content, but
+            -- they carry two things: the task table, which is folded in
+            -- transcript order so a tool block replayed from here —
+            -- wait_task's body leads with the command the task runs — resolves
+            -- the command instead of a bare id (folding in order also means
+            -- the terminal entries that follow a `started` one land on the same
+            -- record, exactly as in the live path, and pending_agent_end is
+            -- left alone: a custom entry is not a conversation turn), and a
+            -- delivery report, whose one dim UI-only line is rendered from the
+            -- same content the resumed model sees. Every caller starts from a
+            -- cleared buffer, so the lines are drawn once per report.
+            replay_bg_task_message(msg, session.id, session.attached_tab or session.tab)
+            render_bg_task_note(msg, session.chat)
         end
     end
     -- Flush any remaining pending agent_end
@@ -2541,6 +2643,11 @@ local function open_resume_target(session_path, opts, new_tab, resume)
             -- Adopt the checkout metadata before the switch, so release/Ship
             -- see it immediately after the resume.
             session.worktree = target_worktree
+        end
+        if new_tab then
+            -- A resume opened in a new tab joins its checkout's block in the
+            -- tabline; an in-place resume keeps the current tab where it is.
+            require("pi.sessions.tab_order").place_for(session)
         end
         session.chat:show({ loading = true })
         load_session(session, session_path)

@@ -17,6 +17,7 @@ local Ft = require("pi.filetypes")
 local Highlights = require("pi.ui.highlights")
 local ChildFilter = require("pi.subsessions.sessions_list")
 local Sidebar = require("pi.ui.sidebar")
+local TabOrder = require("pi.sessions.tab_order")
 
 local ns = vim.api.nvim_create_namespace("pi-sessions-list")
 
@@ -276,47 +277,9 @@ end
 --- Worktree glyph shared by the group header and the sub-session row suffix.
 local WORKTREE_GLYPH = "󰙅"
 
----@class pi.SessionsListWorktree
----@field kind "main"|"linked"
----@field name string worktree directory name
----@field path string worktree root
----@field repo_root? string main checkout root (linked worktrees)
-
---- Memoized `pi.worktree.detect` per directory. Detection is filesystem-only
---- (no git), so it is safe on the render path — the blink/spinner timers call
---- `_render` every 120–500 ms. Dirty/ahead state is Chat-side only.
----@type table<string, pi.SessionsListWorktree|false>
-local worktree_cache = {}
-
----@param dir string
----@return pi.SessionsListWorktree?
-local function detect_worktree(dir)
-    local cached = worktree_cache[dir]
-    if cached ~= nil then
-        return cached or nil
-    end
-    local info = nil
-    local ok, mod = pcall(require, "pi.worktree")
-    if ok and type(mod) == "table" and type(mod.detect) == "function" then
-        local detected = mod.detect(dir)
-        if type(detected) == "table" and type(detected.path) == "string" and type(detected.name) == "string" then
-            info = detected
-        end
-    end
-    worktree_cache[dir] = info or false
-    return info
-end
-
---- Worktree of a session, keyed by its cwd (nil for non-git directories).
----@param session pi.Session?
----@return pi.SessionsListWorktree?
-local function session_worktree(session)
-    local cwd = session and session.cwd
-    if type(cwd) ~= "string" or cwd == "" then
-        return nil
-    end
-    return detect_worktree(cwd)
-end
+--- Checkout detection and block order live in `pi.sessions.tab_order`, shared by
+--- this list and every path that opens a session tab (so the rows and the tabline
+--- always derive their grouping from the same detection).
 
 --- Name and display path of an *assigned* worktree (`{ kind = "linked", path,
 --- name? }`): the checkout a sub-session was handed, which is another checkout of
@@ -407,7 +370,7 @@ local function group_by_worktree(flat)
                 ungrouped[#ungrouped + 1] = row
             end
         else
-            local info = session_worktree(row.session)
+            local info = TabOrder.worktree_of(row.session)
             bucket = nil
             if info then
                 local root = info.path
@@ -1496,6 +1459,7 @@ local HELP_ENTRIES = {
     { "H", "Toggle hidden / prior-conversation sub-sessions (all sessions)" },
     { "h", "Toggle hidden / prior-conversation sub-sessions of this session" },
     { "R", "Refresh the list" },
+    { "S", "Sync the tabline to this list's order" },
     { "q", "Close the list" },
     { "?", "Toggle this help" },
 }
@@ -1716,7 +1680,7 @@ local function group_close_targets(group_id)
         if session.view_parent_id then
             root = Sessions.get_by_id(session.view_parent_id) or session
         end
-        local info = session_worktree(root)
+        local info = TabOrder.worktree_of(root)
         if info and info.path == group_id then
             local sessions = { session }
             if root ~= session then
@@ -2035,9 +1999,9 @@ local function row_worktree_label(row)
     if type(group) ~= "string" or group == "" then
         return nil
     end
-    -- Cached per directory (`worktree_cache`): one filesystem read on the
+    -- Cached per directory (`TabOrder.detect`): one filesystem read on the
     -- keypress, never a git subprocess.
-    local info = detect_worktree(group)
+    local info = TabOrder.detect(group)
     if type(info) ~= "table" or info.kind ~= "linked" then
         return nil
     end
@@ -2135,63 +2099,19 @@ end
 --- tabline, so a session opened in a group whose tabs are not the last ones
 --- would land behind every other checkout's tabs.
 ---
---- The anchor is the group's last tab in tabline order, which is also the
---- group's last row (rows keep tabline order inside a group), so the new tab
---- joins its group's block in both. Group order follows first appearance too,
---- so the block itself keeps its place in the tabline. A folded group renders
---- no member rows, so its live sessions answer instead.
+--- `pi.sessions.tab_order` owns the answer: it is the same model the rows are
+--- grouped by, so the anchor cannot disagree with what the list shows — and it is
+--- computed from the live sessions, not from the last render, so a list that was
+--- never opened (or was last rendered flat) cannot change where the tab lands.
+--- The anchor is the block's last tab, from the tabline; a checkout with no block
+--- yet is inserted before the trailing ungrouped rows.
 ---
 --- nil when nothing should move: a flat list keeps tabline order (appending is
---- already correct), and a checkout with no group yet is listed last — which is
---- exactly where its new tab lands anyway.
+--- already correct), and a checkout with no sibling block has no anchor.
 ---@param checkout string? checkout path resolved from the row (`M.row_checkout`)
 ---@return pi.TabId?
 function M.tab_anchor(checkout)
-    if type(checkout) ~= "string" or checkout == "" then
-        return nil
-    end
-    -- Grouping is decided per render: without a group id on any row the list is
-    -- flat, and tabline order is the row order.
-    local grouped = false
-    for _, row in ipairs(rows) do
-        if row.group_id ~= nil then
-            grouped = true
-            break
-        end
-    end
-    if not grouped then
-        return nil
-    end
-
-    ---@type table<pi.TabId, integer>
-    local rank = {}
-    for index, tab in ipairs(vim.api.nvim_list_tabpages()) do
-        rank[tab] = index
-    end
-    local anchor, anchor_rank = nil, 0
-    ---@param tab any
-    local function consider(tab)
-        local position = type(tab) == "number" and rank[tab] or nil
-        if position and position > anchor_rank then
-            anchor, anchor_rank = tab, position
-        end
-    end
-    for _, row in ipairs(rows) do
-        if (row.depth == nil or row.depth == 0) and row.group_id == checkout then
-            consider(row.tab)
-        end
-    end
-    if not anchor then
-        -- Collapsed group: its member rows are folded away, so ask the live
-        -- sessions that belong to that checkout instead.
-        for _, session in ipairs(require("pi.sessions.manager").list()) do
-            local info = session_worktree(session)
-            if info and info.path == checkout then
-                consider(session.tab)
-            end
-        end
-    end
-    return anchor
+    return TabOrder.anchor(checkout)
 end
 
 --- Open a fresh π session in a new tab rooted at the checkout under the cursor
@@ -2409,6 +2329,26 @@ local function new_worktree_under_cursor()
             )
         end)
     end)
+end
+
+--- Reorder the tabline into this list's order (`S` / `:PiSessionsSync`) and
+--- report how many tabs moved.
+---
+--- Explicit only: Neovim has no event for a user `:tabmove`, so an automatic pass
+--- could not tell a deliberate reorder from drift and would keep snapping tabs
+--- back under the user. Placement of *new* tabs (`pi.sessions.tab_order.place`)
+--- is automatic; this reconciles a tabline that already drifted.
+---@return integer moved
+function M.sync_tabs()
+    local moved = TabOrder.reconcile()
+    local Notify = require("pi.notify")
+    if moved == 0 then
+        Notify.info("Tabline already follows the session list")
+    else
+        Notify.info(("Moved %d tab(s) into list order"):format(moved))
+    end
+    M.request_refresh()
+    return moved
 end
 
 --- Toggle fold/unfold for the session under cursor.
@@ -2714,9 +2654,12 @@ local function ensure_buf()
         name_cache = setmetatable({}, { __mode = "k" })
         -- A repository can appear (git init / worktree add) while the list is
         -- open; R re-detects the worktrees along with the names.
-        worktree_cache = {}
+        TabOrder.reset()
         M._render()
     end, vim.tbl_extend("force", map_opts, { desc = "Refresh session list" }))
+    vim.keymap.set("n", "S", function()
+        M.sync_tabs()
+    end, vim.tbl_extend("force", map_opts, { desc = "Sync the tabline to this list's order" }))
     vim.keymap.set("n", "q", function()
         M.close()
     end, vim.tbl_extend("force", map_opts, { desc = "Close session list" }))
@@ -2985,7 +2928,7 @@ function M._reset()
     child_completion_seen = {}
     parent_folds = {}
     parent_hidden = {}
-    worktree_cache = {}
+    TabOrder.reset()
 end
 
 return M

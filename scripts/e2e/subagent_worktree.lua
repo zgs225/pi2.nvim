@@ -217,8 +217,8 @@ end
 -- ---------------------------------------------------------------------------
 
 ---@class E2EFakeProvider
----@field server uv.uv_tcp_t
----@field port integer
+---@field server? uv.uv_tcp_t
+---@field port? integer
 ---@field calls integer
 ---@field command string Tool-call command the child is told to run.
 ---@field clients table<integer, uv.uv_tcp_t>

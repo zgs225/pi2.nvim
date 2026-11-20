@@ -10,6 +10,7 @@
 local Config = require("pi.config")
 local Rpc = require("pi.rpc")
 local Sessions = require("pi.sessions.manager")
+local TabOrder = require("pi.sessions.tab_order")
 
 Config.setup({})
 
@@ -117,6 +118,76 @@ describe("sessions list order (issue #63)", function()
         table.sort(by_handle)
         assert.are_not.same(by_handle, visual)
         assert.are.same(visual, listed_tabs())
+    end)
+
+    it("drops a session whose tabpage is gone", function()
+        -- TabClosed cleanup runs on vim.schedule, so a just-closed tab's session
+        -- is briefly still attached to an invalid handle. It must not render as a
+        -- phantom row at the end of the list.
+        Sessions._register_for_test({
+            id = "stale-tab",
+            attached_tab = 987654,
+            tab = 987654,
+            cwd = "/tmp",
+            rpc = {
+                is_running = function()
+                    return true
+                end,
+                stop = function() end,
+            },
+        })
+
+        assert.are.equal(0, #Sessions.list())
+    end)
+
+    it("places a new tab inside its checkout's block", function()
+        local main_dir = vim.fn.tempname() .. "-main"
+        local wt_dir = vim.fn.tempname() .. "-wt"
+        vim.fn.mkdir(main_dir, "p")
+        vim.fn.mkdir(wt_dir, "p")
+        local real_worktree = package.loaded["pi.worktree"]
+        package.loaded["pi.worktree"] = {
+            detect = function(dir)
+                if dir == main_dir then
+                    return { kind = "main", name = "main", path = main_dir, repo_root = main_dir }
+                end
+                if dir == wt_dir then
+                    return { kind = "linked", name = "wt", path = wt_dir, repo_root = main_dir }
+                end
+                return nil
+            end,
+        }
+        TabOrder.reset()
+        local original_cwd = vim.fn.getcwd()
+        local ok, err = pcall(function()
+            vim.cmd("cd " .. vim.fn.fnameescape(main_dir))
+            Sessions.get_or_create()
+            vim.cmd("tabnew")
+            vim.cmd("cd " .. vim.fn.fnameescape(wt_dir))
+            Sessions.get_or_create()
+            vim.cmd("tabnew")
+            vim.cmd("cd " .. vim.fn.fnameescape(main_dir))
+            Sessions.get_or_create()
+            local main_last = vim.api.nvim_get_current_tabpage()
+
+            -- Open a new main-checkout session from tab 1: `:tabnew` inserts the
+            -- tab at position 2, outside its block, so placement has to move it.
+            vim.cmd("tabfirst")
+            Sessions.new_tab()
+
+            local visual = visual_tabs()
+            assert.are.equal(4, #visual, "expected four tabs")
+            local new_tab = vim.api.nvim_get_current_tabpage()
+            assert.are.equal(main_last, visual[3], "the pre-existing block keeps its tabs")
+            assert.are.equal(new_tab, visual[4], "the new tab joined its block's last tab")
+            assert.are.same(visual, listed_tabs())
+        end)
+        vim.cmd("cd " .. vim.fn.fnameescape(original_cwd))
+        package.loaded["pi.worktree"] = real_worktree
+        TabOrder.reset()
+        if not ok then
+            error(err)
+        end
     end)
 
     it("follows the tabline after :tabmove", function()

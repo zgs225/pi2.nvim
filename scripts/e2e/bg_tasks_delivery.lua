@@ -201,7 +201,7 @@ end
 local function wait_settled(backend, since, what, timeout_ms)
     local ev = wait_event(backend, function(e)
         return e.type == "agent_settled" and e._n > since
-    end, timeout_ms or 180_000, what)
+    end, timeout_ms or 180000, what)
     check(ev ~= nil, "settled: " .. what, { since = since, stderr = backend.stderr })
 end
 
@@ -212,7 +212,7 @@ local function start_task(backend, command)
     send(backend, { id = "bash-" .. tostring(since), type = "bash", command = command })
     local response = wait_event(backend, function(e)
         return e.type == "response" and e.command == "bash" and e._n > since
-    end, 30_000, "bash response")
+    end, 30000, "bash response")
     check(response ~= nil and response.success ~= false, "bash command accepted", { response = response })
     return since
 end
@@ -229,7 +229,7 @@ local function start_long_run(backend)
     })
     local started = wait_event(backend, function(e)
         return e.type == "agent_start" and e._n > since
-    end, 60_000, "agent_start")
+    end, 60000, "agent_start")
     check(started ~= nil, "long run started", { stderr = backend.stderr })
     return since
 end
@@ -311,7 +311,7 @@ local function case_e1()
     -- Nobody prompts: the completion itself must start the turn.
     local started = wait_event(backend, function(e)
         return e.type == "agent_start" and e._n > since
-    end, 60_000, "idle-wake agent_start")
+    end, 60000, "idle-wake agent_start")
     check(started ~= nil, "E1 idle completion starts a turn on its own", { stderr = backend.stderr })
     step("E1 idle wake turn started")
     wait_settled(backend, since, "E1 wake turn")

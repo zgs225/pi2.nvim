@@ -113,6 +113,25 @@ describe("subsession batch", function()
         assert.equals(2, snap.summary.ok)
     end)
 
+    it("does not claim a settle for a row with no run generation", function()
+        -- Rows written before the `run_generation` watermark existed cannot be
+        -- matched to a batch item generation, so the settle must refuse the row
+        -- (return false) rather than complete whichever item is running now.
+        Manifest.upsert("child-legacy", {
+            parent_id = "parent-1",
+            name = "legacy",
+            task_prompt = "t",
+            config = {},
+            status = "active",
+            reported = false,
+            created_at = Manifest.iso_now(),
+            last_active_at = Manifest.iso_now(),
+            agent_spawned = true,
+        })
+
+        assert.is_false(Batch.on_child_settled("child-legacy", { ok = true, output = "x" }))
+    end)
+
     it("poll reports partial when one item fails", function()
         Subsessions.spawn = function(_parent, opts, callback)
             local id = "child-" .. opts.name
@@ -878,6 +897,8 @@ describe("subsession batch", function()
         end)
     end)
 
+    -- Nested option tables are replaced, never mutated in place: an in-place write would land in
+    -- the module-local `defaults` through `tbl_deep_extend`'s aliasing (G31).
     describe("dispatch concurrency limit and auto-reap", function()
         local parent
 
@@ -1109,7 +1130,8 @@ describe("subsession batch", function()
         end)
 
         it("does not count alive reuse as a new spawn and does not reap the reuse target during auto-reap", function()
-            Config.options.subagent.max_children = 2
+            Config.options.subagent =
+                vim.tbl_deep_extend("force", vim.deepcopy(Config.options.subagent), { max_children = 2 })
 
             -- C1 is settled-but-alive, and older than C2. C1 is the reuse target.
             Manifest.upsert("child-C1", {
@@ -1196,7 +1218,8 @@ describe("subsession batch", function()
         it(
             "rejects dispatch when active + alive reuse saturates quota and auto-reap cannot reap reuse target",
             function()
-                Config.options.subagent.max_children = 2
+                Config.options.subagent =
+                    vim.tbl_deep_extend("force", vim.deepcopy(Config.options.subagent), { max_children = 2 })
 
                 Manifest.upsert("child-A", {
                     parent_id = "parent-limit-test",

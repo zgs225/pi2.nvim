@@ -47,7 +47,7 @@ end
 ---@param opts? table see fake_session
 local function fetchable_session(opts)
     local s = fake_session(opts)
-    ---@type fun[]
+    ---@type function[]
     local in_flight = {}
     s.send_count = 0
     s.rpc.send = function(_, req, cb)

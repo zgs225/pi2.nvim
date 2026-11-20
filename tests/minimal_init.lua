@@ -16,7 +16,14 @@ local root = repo_root()
 -- user-provided PLENARY_PATH env var.
 local plenary = vim.env.PLENARY_PATH or vim.fn.expand("~/.local/share/nvim/lazy/plenary.nvim")
 
-for _, path in ipairs({ plenary, root }) do
+-- render-markdown: OPTIONAL test dependency for the render contract spec
+-- (G6/G7/G9). Only prepended when present, so the suite still runs on a machine
+-- without it; the spec skips itself instead. Being on 'runtimepath' is not the
+-- same as being loaded — the children run with `--noplugin` (plenary passes it),
+-- so a spec must call setup()/manager.init() itself (G8).
+local render_markdown = vim.env.RENDER_MARKDOWN_PATH or vim.fn.expand("~/.local/share/nvim/lazy/render-markdown.nvim")
+
+for _, path in ipairs({ plenary, root, render_markdown }) do
     if vim.uv.fs_stat(path) then
         vim.opt.runtimepath:prepend(path)
     end

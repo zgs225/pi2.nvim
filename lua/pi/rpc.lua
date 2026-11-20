@@ -398,11 +398,18 @@ function Rpc:start(opts)
     -- file on every context event, so option changes apply without respawning
     -- the RPC process (same rationale as the title file).
     require("pi.todo.tool_ui").publish(Config.options.todo)
+    -- Same rationale for the bg-tasks idle-wake policy: a process spawned before
+    -- any setup() call must still see the resolved policy, and the module also
+    -- republishes `present` on focus changes.
+    require("pi.tasks").publish(Config.options.background_tasks)
     local env = {
         PI_NVIM_VISION_FILE = require("pi.vision").state_path(),
         PI_NVIM_TITLE_FILE = require("pi.title").state_path(),
         PI_NVIM_SCOPE_FILE = scope_path,
         PI_NVIM_TODO_FILE = require("pi.todo.tool_ui").state_path(),
+        -- The bg-tasks extension re-reads its idle-wake policy (and whether a
+        -- human is at the editor) from this file at every wake decision.
+        PI_NVIM_BG_TASKS_FILE = require("pi.tasks").state_path(),
     }
     -- Extensions (e.g. subagent.ts) must know this process runs inside an
     -- isolated git worktree. The spawn-time env is the only channel that

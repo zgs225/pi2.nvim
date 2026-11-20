@@ -65,7 +65,7 @@ local function has(argv, needle)
     return table.concat(argv, " "):find(needle, 1, true) ~= nil
 end
 
----@param argv string[]
+---@param argv_list string[]
 ---@param needle string
 ---@return integer
 local function index_of(argv_list, needle)

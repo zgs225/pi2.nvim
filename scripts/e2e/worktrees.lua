@@ -268,7 +268,7 @@ local function wait_notice(pat, ms, from)
 end
 
 local orig_select = vim.ui.select
----@type string
+---@type string?
 S.select_answer = "Yes"
 vim.ui.select = function(items, opts, on_choice)
     local prompt = (opts and opts.prompt) or ""
@@ -571,7 +571,7 @@ local DialogLog = { selects = {}, inputs = {} }
 --- real: `pi.worktree.list` / `pi.worktree.create`,
 --- `pi.worktree_session.open_existing`, `git`, and the spawned
 --- `pi --mode rpc` processes.
----@param answers { select?: fun(options: string[]): string?, input?: string? }
+---@param answers { select?: fun(options: string[]): (string?), input?: string? }
 ---@param fn fun()
 local function with_worktree_dialogs(answers, fn)
     local Dialog = require("pi.ui.dialog")

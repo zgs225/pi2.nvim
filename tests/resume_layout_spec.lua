@@ -202,8 +202,19 @@ describe("pi resume layout", function()
             current = { cwd = "/elsewhere/project", repo_root = "/elsewhere/repo" },
         })
 
-        assert.equals("group:󰙅 polish", summary(rows)[1])
-        assert.equals("group:pi2.nvim", summary(rows)[6])
+        -- The whole order, not just the leader: with no anchor hit the pin must
+        -- not disturb any pair, so this pure-recency ladder is the half the
+        -- e2e (which always runs inside a checkout) cannot see.
+        assert.are.same({
+            "group:󰙅 polish",
+            "2025-06-05  polish a",
+            "group:󰙅 fix-auth",
+            "2025-06-03  auth a",
+            "2025-06-04  auth b",
+            "group:pi2.nvim",
+            "2025-06-01  main a",
+            "2025-06-02  main b",
+        }, summary(rows))
     end)
 
     it("keeps the current partition first while a query filters", function()

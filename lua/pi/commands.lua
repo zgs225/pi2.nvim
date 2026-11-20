@@ -266,6 +266,10 @@ function M.setup()
         Pi.sessions()
     end, { desc = "Toggle π sessions overview list" })
 
+    vim.api.nvim_create_user_command("PiSessionsSync", function()
+        require("pi.ui.sessions").sync_tabs()
+    end, { desc = "Reorder π tabs into :PiSessions list order" })
+
     vim.api.nvim_create_user_command("PiTasks", function()
         Pi.tasks()
     end, { desc = "Toggle π background tasks panel" })

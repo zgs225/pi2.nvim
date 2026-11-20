@@ -1,2 +1,6 @@
 /.agents/gigs/
 /.agents/notes/
+__pycache__/
+*.pyc
+.ruff_cache/
+/.worktrees/

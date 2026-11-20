@@ -85,6 +85,9 @@ local function set_defaults()
     )
     vim.api.nvim_set_hl(0, "PiCompactionText", { default = true, fg = comment.fg, italic = true, nocombine = true })
     vim.api.nvim_set_hl(0, "PiCompactionHint", { default = true, fg = comment.fg, italic = true, nocombine = true })
+    -- One dim line per background-task report the model already received: a
+    -- system remark, not conversation content, so it links to Comment.
+    vim.api.nvim_set_hl(0, "PiSystemNote", { default = true, link = "Comment" })
     vim.api.nvim_set_hl(0, "PiMessageDateTime", { default = true, fg = comment.fg })
     -- Delivered steer/follow-up tag: a subdued mark on the message label that
     -- records how the message entered the conversation. Pending queue entries
@@ -250,6 +253,7 @@ local function set_defaults()
     vim.api.nvim_set_hl(0, "PiTasksListSuccess", { default = true, link = "DiagnosticOk" })
     vim.api.nvim_set_hl(0, "PiTasksListFailure", { default = true, link = "DiagnosticError" })
     vim.api.nvim_set_hl(0, "PiTasksListStopped", { default = true, link = "DiagnosticWarn" })
+    vim.api.nvim_set_hl(0, "PiTasksListUnknown", { default = true, link = "DiagnosticWarn" })
     if cursorline.bg then
         vim.api.nvim_set_hl(0, "PiTasksListCurrent", { default = true, bg = cursorline.bg, bold = true })
     else
