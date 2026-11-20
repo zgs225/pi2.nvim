@@ -304,10 +304,12 @@ describe("sub-session checkout create/adopt", function()
             assert.is_nil(err)
             assert.is_not_nil(child)
 
-            -- `head` is the strategy default; it is resolved from the parent's
-            -- checkout (the linked worktree), ...
+            -- No strategy is chosen here: an empty `kind` hands the decision to
+            -- `Worktree.resolve_base` (repository `.pi-worktrees.toml`, then
+            -- `worktree.base_ref`, then HEAD), resolved from the parent's checkout
+            -- (the linked worktree), ...
             assert.are.equal(1, #wt.calls.base)
-            assert.are.equal("head", wt.calls.base[1].kind)
+            assert.are.equal("", wt.calls.base[1].kind)
             assert.are.equal(parent_wt, wt.calls.base[1].cwd)
             assert.are.equal(workspace, wt.calls.base[1].repo)
 
@@ -316,7 +318,7 @@ describe("sub-session checkout create/adopt", function()
             local create = wt.calls.create[1]
             assert.are.equal(workspace, create.cwd)
             assert.are.equal("subagent", create.mode)
-            assert.are.equal("resolved-head", create.base)
+            assert.are.equal("resolved-", create.base)
             assert.is_false(create.setup, "setup_cmd is opt-in for child checkouts")
             assert.is_nil(create.name, "the generated sub-… name is the worktree module's job")
 
@@ -329,7 +331,7 @@ describe("sub-session checkout create/adopt", function()
             assert.is_not_nil(entry)
             assert.is_true(entry.worktree.owned == true, "the row records ownership")
             assert.is_nil(entry.assigned_worktree, "the row records no assignment")
-            assert.are.equal("resolved-head", entry.worktree.base_sha)
+            assert.are.equal("resolved-", entry.worktree.base_sha)
         end)
 
         it("passes an explicit base and an explicit setup opt-in through", function()
@@ -342,7 +344,7 @@ describe("sub-session checkout create/adopt", function()
             assert.is_true(wt.calls.create[1].setup)
         end)
 
-        it("uses worktree.base_ref = fresh when the item asks for no specific base", function()
+        it("defers the base when the item asks for nothing and lets worktree.base_ref decide", function()
             Config.setup({
                 agent_dir = agent_dir,
                 subagent = { enabled = true, max_children = 10, batch_timeout_ms = 2000 },
@@ -350,7 +352,9 @@ describe("sub-session checkout create/adopt", function()
             })
             local _, err = spawn_and_wait({ task = "work", worktree = { create = true } })
             assert.is_nil(err)
-            assert.are.equal("fresh", wt.calls.base[1].kind)
+            -- An empty kind hands the choice to `Worktree.resolve_base`, which consults
+            -- the repository's `.pi-worktrees.toml`, then `worktree.base_ref`, then HEAD.
+            assert.are.equal("", wt.calls.base[1].kind)
         end)
 
         it("records a borrowed path as an assignment, never as owned", function()

@@ -28,6 +28,7 @@ local M = {}
 
 local Config = require("pi.config")
 local Notify = require("pi.notify")
+local RepoConfig = require("pi.worktree_config")
 local Worktree = require("pi.worktree")
 
 local uv = vim.uv
@@ -95,16 +96,24 @@ local function resolve_key(path)
     return path
 end
 
---- Merge `worktree.retention` (config, read at call time — never cached) with
---- the per-call `opts`. `opts` wins; anything absent on both sides falls back to
---- the spec defaults. Negative values are clamped to 0 (a `max_count` of 0
---- means "keep nothing beyond the age rule").
+--- Merge `worktree.retention` (config, read at call time — never cached) with a
+--- repository's `.pi-worktrees.toml` `[retention]` and the per-call `opts`.
+---
+--- Precedence is `opts` > repository > user config > defaults: a repository that
+--- commits a retention policy is stating a fact about itself (its checkouts are
+--- expensive, keep fewer), while the user keeps the last word per call.
+--- `enabled` and `sweep_locks` are user-level switches; they are read before the
+--- sweep knows which repository it is in, so a repository cannot set them.
+--- Negative values are clamped to 0 (a `max_count` of 0 means "keep nothing
+--- beyond the age rule").
 ---@param opts? pi.WorktreeRetentionOpts
+---@param repo_root? string Repository whose config overrides the user config
 ---@return pi.WorktreeRetentionSettings
-local function merged_settings(opts)
+local function merged_settings(opts, repo_root)
     local call_opts = type(opts) == "table" and opts or {}
     local cfg = Config.options.worktree or {}
     local retention = type(cfg.retention) == "table" and cfg.retention or {}
+    local repo = RepoConfig.retention(repo_root)
 
     ---@param key string
     ---@param fallback boolean
@@ -124,7 +133,7 @@ local function merged_settings(opts)
     ---@param fallback number
     ---@return number
     local function number(key, fallback)
-        local value = tonumber(call_opts[key]) or tonumber(retention[key]) or fallback
+        local value = tonumber(call_opts[key]) or tonumber(repo[key]) or tonumber(retention[key]) or fallback
         return math.max(value, 0)
     end
 
@@ -344,6 +353,11 @@ function M.run(opts, cb)
                 report.repo_root = info.repo_root
             end
         end
+
+        -- 1b. Repository config, now that the root is known: a `[retention]` block in
+        -- the repository's `.pi-worktrees.toml` overrides the user config for this
+        -- repository (`enabled` was already read and stays a user-level switch).
+        settings = merged_settings(call_opts, report.repo_root)
 
         ---@param entry pi.WorktreeListEntry
         ---@return boolean

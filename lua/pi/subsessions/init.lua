@@ -624,20 +624,18 @@ local function repository_scope(parent_cwd)
     return parent_cwd or "", nil
 end
 
---- Effective base strategy of a create request: the per-item `base`, else
---- `worktree.base_ref`, else `head`. Anything but `fresh` degrades to `head`
---- rather than inventing a strategy.
+--- Effective base strategy of a create request: the per-item `base`, else the
+--- repository's `.pi-worktrees.toml` `base_ref`, else `worktree.base_ref`, else
+--- `head`. The last three are decided by `Worktree.resolve_base` when this
+--- answers `""` — one place, so a child checkout and a hand-started worktree of
+--- the same repository start from the same commit.
 ---@param requested string?
----@return string kind `"head"`, `"fresh"`, or an explicit revision.
+---@return string kind An explicit revision, or `""` to defer to `resolve_base`.
 local function resolve_base_kind(requested)
     if type(requested) == "string" and vim.trim(requested) ~= "" then
         return vim.trim(requested)
     end
-    local cfg = Config.options.worktree or {}
-    if type(cfg.base_ref) == "string" and vim.trim(cfg.base_ref) == "fresh" then
-        return "fresh"
-    end
-    return "head"
+    return ""
 end
 
 --- Prepare the checkout a `create` request asks for: adopt the one `name`
