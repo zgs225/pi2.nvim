@@ -34,8 +34,23 @@
 --
 -- Isolation (G17/G18): agent dir / prompt history / draft are temp paths set
 -- before `require("pi")`, and `_agent.send` is stubbed (no model call).
+--
+-- G18 is asserted, not just measured: the real sessions dir is counted before
+-- the isolation lines and re-counted before the summary, and the temp agent dir
+-- must contain no `*.jsonl`. With `_agent.send` stubbed the RPC send never
+-- happens, so the backend writes no transcript — the deltas below must be 0.
 
-vim.env.PI_CODING_AGENT_DIR = vim.fn.tempname()
+local real_sessions_dir = vim.fn.expand("~/.pi/agent/sessions")
+--- @param dir string
+--- @return integer
+local function count_jsonl(dir)
+    return #vim.fn.globpath(dir, "**/*.jsonl", false, true)
+end
+
+local real_sessions_before = count_jsonl(real_sessions_dir)
+local agent_dir = vim.fn.tempname()
+
+vim.env.PI_CODING_AGENT_DIR = agent_dir
 require("pi.prompt_history")._set_base_dir(vim.fn.tempname())
 require("pi.draft")._set_path(vim.fn.tempname() .. "/draft.txt")
 
@@ -189,6 +204,30 @@ end)
 if not ok_body then
     check("e2e body completed without error", false, tostring(err))
 end
+
+-- G18: no model call => no transcript. A run that polluted the user's sessions
+-- dir (or left a session behind in the temp agent dir) fails here.
+local real_sessions_after = count_jsonl(real_sessions_dir)
+check(
+    "G18: real sessions dir jsonl count unchanged",
+    real_sessions_after == real_sessions_before,
+    ("got=%d want=%d delta=%+d dir=%s"):format(
+        real_sessions_after,
+        real_sessions_before,
+        real_sessions_after - real_sessions_before,
+        real_sessions_dir
+    )
+)
+local temp_jsonl = vim.fn.globpath(agent_dir, "**/*.jsonl", false, true)
+check(
+    "G18: temp agent dir has no session transcript",
+    #temp_jsonl == 0,
+    ("got=%d want=0 dir=%s%s"):format(
+        #temp_jsonl,
+        agent_dir,
+        #temp_jsonl > 0 and (" files=" .. vim.inspect(temp_jsonl)) or ""
+    )
+)
 
 if #failures > 0 then
     print("SIDE FOCUS E2E: " .. #failures .. " failed — " .. table.concat(failures, ", "))
