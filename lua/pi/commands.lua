@@ -323,9 +323,33 @@ function M.setup()
     end, { desc = "Paste an image from the clipboard as π attachment" })
 
     vim.api.nvim_create_user_command("PiCompact", function(cmd)
-        local instructions = cmd.args ~= "" and cmd.args or nil
-        Pi.compact(instructions)
-    end, { nargs = "?", desc = "Compact π conversation context" })
+        if cmd.bang then
+            -- `:PiCompact!` compacts immediately, never through the dialog.
+            Pi.compact(cmd.args ~= "" and cmd.args or nil)
+            return
+        end
+        if cmd.args ~= "" then
+            Pi.compact(cmd.args)
+            return
+        end
+        require("pi.ui.compaction_dialog").open()
+    end, {
+        nargs = "?",
+        bang = true,
+        desc = "Compact the current context (opens a focus dialog when called without args)",
+    })
+
+    vim.api.nvim_create_user_command("PiCompactAbort", function()
+        Pi.compact_abort()
+    end, { desc = "Abort the running compaction" })
+
+    vim.api.nvim_create_user_command("PiCompactRetry", function()
+        Pi.compact_retry()
+    end, { desc = "Retry the last failed compaction with the same focus" })
+
+    vim.api.nvim_create_user_command("PiCompactions", function()
+        require("pi.ui.compactions").toggle()
+    end, { desc = "Show the compaction timeline for the current session" })
 
     vim.api.nvim_create_user_command("PiToggleAutoCompaction", function()
         Pi.toggle_auto_compaction()
