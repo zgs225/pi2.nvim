@@ -34,6 +34,10 @@
 ---@field conversation_epoch? integer Incremented on each /new in this tab; sub-sessions tag their parent_epoch.
 ---@field _detached_busy? boolean Session-level run is active until `agent_settled` (also when a chat is bound).
 ---@field _detached_compacting? boolean Compaction running (detached or captured on unbind).
+---@field compaction pi.CompactionState Every compaction this session ran, with the numbers the panel reports (see `pi.compaction.state`).
+---@field model_state? table Last `get_state` payload (model + context window), so a `compaction_end` can derive the budget without another round trip.
+---@field _compaction_focus? string Focus text handed to the next `:PiCompact`, recorded on the compaction it lands in.
+---@field _compaction_warned? table<string, boolean> Warn-once latches per session (`pathological`), so a refresh loop cannot spam the user.
 ---@field _detached_retrying? boolean Auto-retry backoff (detached or captured on unbind).
 ---@field _busy_started_at? integer Run clock (`vim.uv.hrtime()/1e9`); first `agent_start` of the run.
 ---@field _busy_verb? string Active-verb snapshot for view-switch restore.
@@ -81,6 +85,8 @@ local Extension = require("pi.ui.extension")
 local CommandsCache = require("pi.cache.commands")
 local Tasks = require("pi.tasks")
 local ResumeLayout = require("pi.sessions.resume_layout")
+local CompactionState = require("pi.compaction.state")
+local CompactionSettings = require("pi.compaction.settings")
 
 ---@class pi.StartupSection
 ---@field header string
@@ -798,6 +804,158 @@ local function restore_active_agent_status(session)
     end
 end
 
+-- ============================================================================
+-- Compaction wiring
+-- ============================================================================
+
+--- The session's compaction state, created on first use: sessions assembled by
+--- tests or by a shim path do not have to carry one.
+---@param session pi.Session
+---@return pi.CompactionState
+local function compaction_state(session)
+    if not session.compaction then
+        session.compaction = CompactionState.new()
+    end
+    return session.compaction
+end
+
+--- Derive the session's compaction budget from the last `get_state` payload and
+--- push it to the chat UI.
+---
+--- Called on every `refresh_state` and after every `compaction_end`. The window
+--- comes from the cached payload (no RPC round trip: the compaction path is
+--- already busy rebuilding the transcript), and the reserve/keep values from
+--- pi's own settings files, which `pi.compaction.settings` caches per file
+--- stamp.
+---@param session pi.Session
+---@return pi.CompactionBudget? budget `nil` when the window is unknown
+local function push_budget(session)
+    local state = session.model_state
+    local model = type(state) == "table" and state.model or nil
+    local window = tonumber(type(model) == "table" and model.contextWindow or nil)
+    local effective = CompactionSettings.resolve(
+        session.cwd or session._process_cwd,
+        type(model) == "table" and model.provider or nil,
+        type(model) == "table" and model.id or nil
+    )
+    local budget = CompactionSettings.budget(effective, window)
+    -- The cast keeps this file lintable while `Chat:set_compaction_budget` is
+    -- owned by the chat-UI task; the call is nil-guarded either way.
+    local chat = session.chat --[[@as any]]
+    if chat and chat.set_compaction_budget then
+        chat:set_compaction_budget(budget)
+    end
+    return budget
+end
+
+--- Warn once per session when the compaction settings cannot cut anything
+--- (`keepRecentTokens` at or above the auto-compaction threshold, pi #12076).
+---
+--- Invalid settings are deliberately silent here: `pi.compaction.settings`
+--- already reports the offending dotted path once per file stamp, and blaming
+--- the same typo twice is noise.
+---@param session pi.Session
+---@param budget pi.CompactionBudget?
+local function warn_budget_once(session, budget)
+    if type(budget) ~= "table" or not budget.pathological then
+        return
+    end
+    session._compaction_warned = session._compaction_warned or {}
+    if session._compaction_warned.pathological then
+        return
+    end
+    session._compaction_warned.pathological = true
+    local format_tokens = require("pi.stats").format_tokens
+    Notify.warn(
+        "Compaction cannot cut anything: keepRecentTokens ("
+            .. format_tokens(budget.keep)
+            .. ") ≥ the compaction budget ("
+            .. format_tokens(budget.threshold)
+            .. " tokens). Lower compaction.keepRecentTokens in pi settings or use a larger context window."
+    )
+end
+
+--- Warn once per session when compactions keep firing without freeing context:
+--- a giant tool output or file read is refilling the window faster than the
+--- compactor can cut it. The message quotes the exact occupancy the detector
+--- judged on, so the user can see which side is growing.
+---@param session pi.Session
+local function warn_thrash(session)
+    local state = session.compaction
+    if not state or state.warned_thrash then
+        return
+    end
+    local thrash = CompactionState.thrash(state)
+    if not thrash then
+        return
+    end
+    state.warned_thrash = true
+    local format_tokens = require("pi.stats").format_tokens
+    local records = state.records
+    local recent = {} ---@type string[]
+    for index = math.max(1, #records - 2), #records do
+        recent[#recent + 1] = format_tokens(records[index].tokens_before)
+    end
+    Notify.warn(
+        "Compaction is not freeing context (last "
+            .. thrash.count
+            .. ": "
+            .. table.concat(recent, " → ")
+            .. "). A giant tool output or file read may be refilling the window; run :PiCompact with a focus that drops it, or read in smaller chunks."
+    )
+end
+
+--- One-line excerpt of a summarization error for the compaction status text.
+---@param message string?
+---@return string excerpt "" when there is nothing worth showing
+local function short_error(message)
+    if type(message) ~= "string" then
+        return ""
+    end
+    local flat = vim.trim((message:gsub("%s+", " ")))
+    if flat == "" then
+        return ""
+    end
+    if vim.fn.strchars(flat) > 40 then
+        flat = vim.fn.strcharpart(flat, 0, 39) .. "…"
+    end
+    return flat
+end
+
+--- Whether the summarization retry in flight belongs to the compaction status
+--- (branch summaries run while the agent is idle and keep their own state).
+---@param session pi.Session
+---@param msg pi.RpcEvent
+---@return boolean
+local function is_compaction_retry(session, msg)
+    local retry = session.compaction and session.compaction.retry
+    local source = msg.source or (retry and retry.source)
+    if source == "compaction" then
+        return true
+    end
+    if source == "branchSummary" then
+        return false
+    end
+    return session.chat ~= nil and session.chat:is_compacting() == true
+end
+
+--- Status text for a summarization retry: the attempt counter plus the
+--- (truncated) provider error, so a stuck compaction explains itself instead of
+--- spinning silently.
+---@param retry pi.CompactionRetry
+---@return string
+local function retry_status_text(retry)
+    local text = "summary retry " .. tostring(retry.attempt or 1)
+    if retry.max_attempts then
+        text = text .. "/" .. tostring(retry.max_attempts)
+    end
+    local excerpt = short_error(retry.error)
+    if excerpt ~= "" then
+        text = text .. " (" .. excerpt .. ")"
+    end
+    return text
+end
+
 ---@param args any
 ---@return table?
 local function normalize_tool_args(args)
@@ -1115,11 +1273,13 @@ function M.refresh_state(session)
             vim.schedule(function()
                 capture_session_id(session, res.data)
                 capture_session_file(session, res.data)
+                session.model_state = res.data
                 bind_session_worktree(session)
                 if session.chat then
                     session.chat:update_state(res.data)
                     refresh_model_ambiguity(session, res.data)
                 end
+                warn_budget_once(session, push_budget(session))
             end)
         end
     end)
@@ -1154,6 +1314,11 @@ local function refresh_state_and_pin(session)
                 capture_config_pin(session, res.data)
                 capture_session_id(session, res.data)
                 capture_session_file(session, res.data)
+                -- Cached only: deriving the budget here would read pi's
+                -- settings on the session-creation path (see
+                -- `tests/compaction_events_spec.lua`). A later refresh_state or
+                -- the next compaction_end pushes it.
+                session.model_state = res.data
                 bind_session_worktree(session)
                 if session.chat then
                     session.chat:update_state(res.data)
@@ -1275,6 +1440,7 @@ function M.handle_event(session, msg)
 
     if t == "agent_start" then
         mark_run_start(session)
+        CompactionState.on_turn(compaction_state(session))
         -- A new run supersedes the previous turn's outcome.
         session._last_stop_reason = nil
         session._last_error_message = nil
@@ -1382,6 +1548,7 @@ function M.handle_event(session, msg)
             end
         end
     elseif t == "compaction_start" or t == "auto_compaction_start" then
+        CompactionState.start(compaction_state(session), msg)
         session._detached_compacting = true
         if chat then
             chat:set_compacting(true)
@@ -1389,6 +1556,17 @@ function M.handle_event(session, msg)
         end
     elseif t == "compaction_end" or t == "auto_compaction_end" then
         session._detached_compacting = false
+        -- The record must exist before the rebuild replays the transcript: the
+        -- replayed `<compaction>` message looks its record up by summary text
+        -- and occupancy, so the history block can render the numbers only when
+        -- `finish` already appended them.
+        local record = CompactionState.finish(compaction_state(session), msg)
+        if type(session._compaction_focus) == "string" then
+            -- The session is authoritative for the focus the user asked for; the
+            -- state's own value (from the start event's customInstructions) stays
+            -- when the user gave none here.
+            record.custom_instructions = session._compaction_focus
+        end
         if type(msg.errorMessage) == "string" and msg.errorMessage ~= "" then
             require("pi.ui.sessions").mark_error(session)
         end
@@ -1411,6 +1589,8 @@ function M.handle_event(session, msg)
                 chat:flush_compaction_queue(msg.willRetry == true)
             end
         end
+        warn_budget_once(session, push_budget(session))
+        warn_thrash(session)
     elseif t == "auto_retry_start" then
         session._detached_retrying = true
         mark_run_start(session)
@@ -1445,6 +1625,10 @@ function M.handle_event(session, msg)
         -- status; branch summaries run while the agent is idle, so there is
         -- nothing to restore either way. Surface the error in debug mode only
         -- (on_error would render a scary red block for a transient hiccup).
+        CompactionState.retry(compaction_state(session), msg)
+        if chat and is_compaction_retry(session, msg) then
+            set_chat_status(session, { type = "compaction", text = retry_status_text(session.compaction.retry) })
+        end
         if Config.options.debug then
             vim.schedule(function()
                 vim.notify(
@@ -1460,17 +1644,26 @@ function M.handle_event(session, msg)
             end)
         end
     elseif t == "summarization_retry_attempt_start" then
+        CompactionState.retry(compaction_state(session), msg)
         if chat and msg.source == "branchSummary" then
             -- navigateTree summarization runs while the agent is idle: show a
-            -- lightweight busy state. Compaction-source retries keep the
-            -- existing compaction status untouched.
+            -- lightweight busy state.
             chat:set_status({ type = "summary", text = "Summarizing branch…" })
+        elseif chat and is_compaction_retry(session, msg) then
+            -- A compaction retry re-runs the summariser while the user is
+            -- staring at "Compacting…": show which attempt it is on and why.
+            set_chat_status(session, { type = "compaction", text = retry_status_text(session.compaction.retry) })
         end
     elseif t == "summarization_retry_finished" then
         -- Retry loop ended. During compaction, compaction_end restores the
         -- status; only the branchSummary state (agent idle) needs settling.
-        if chat and not chat:is_compacting() then
-            restore_active_agent_status(session)
+        CompactionState.retry(compaction_state(session), msg)
+        if chat then
+            if chat:is_compacting() then
+                set_chat_status(session, { type = "compaction" })
+            else
+                restore_active_agent_status(session)
+            end
         end
     elseif t == "extension_ui_request" then
         vim.schedule(function()
@@ -1737,6 +1930,32 @@ function M.get_for_tab(tab)
     return nil
 end
 
+--- Remember the focus text a `:PiCompact` should hand the compactor.
+---
+--- Stored on the session so the compaction it starts can record it, and on the
+--- state so the dialog can offer it again. Blank text clears the pending focus.
+---@param session pi.Session
+---@param text string?
+function M.set_compaction_focus(session, text)
+    if not session then
+        return
+    end
+    local focus = type(text) == "string" and text ~= "" and text or nil
+    session._compaction_focus = focus
+    CompactionState.set_focus(compaction_state(session), focus)
+end
+
+--- The compaction state of a session (default: the current tab's session).
+---@param session pi.Session?
+---@return pi.CompactionState?
+function M.get_compaction_state(session)
+    session = session or M.get()
+    if not session then
+        return nil
+    end
+    return session.compaction
+end
+
 --- List sessions currently attached to a tab, in tabline order.
 ---
 --- Tabpage handles reflect creation order, not position: a tab created while
@@ -1861,6 +2080,7 @@ function M.create_detached(tab, opts)
         worktree = worktree,
         assigned_worktree = assigned_worktree,
         changed_files = {},
+        compaction = CompactionState.new(),
     }
 
     registry[session.id] = session
@@ -1970,6 +2190,7 @@ function M.get_or_create(opts)
         _process_cwd = explicit_cwd and cwd or nil,
         worktree = worktree,
         changed_files = {},
+        compaction = CompactionState.new(),
     }
 
     registry[session.id] = session
@@ -2248,7 +2469,17 @@ local function replay_messages(session, messages)
                 session.chat:on_agent_end()
                 pending_agent_end = false
             end
-            session.chat:append_compaction_summary(msg.summary or "", tonumber(msg.tokensBefore) or 0)
+            -- A replay only carries the summary text and the occupancy, so the
+            -- matching record is found by both (the newest one wins). Passing
+            -- it lets the history block render the numbers the live compaction
+            -- reported; an unmatched replay renders as before.
+            local summary = msg.summary or ""
+            local tokens_before = tonumber(msg.tokensBefore) or 0
+            session.chat:append_compaction_summary(
+                summary,
+                tokens_before,
+                CompactionState.match(compaction_state(session), summary, tokens_before)
+            )
         elseif role == "bashExecution" then
             if pending_agent_end then
                 session.chat:on_agent_end()
