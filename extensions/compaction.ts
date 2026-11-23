@@ -1,9 +1,8 @@
 /**
  * Compaction control for pi.nvim (Gitea #127).
  *
- * One bundled extension, four layers. This file implements L1, L2 and L3 plus
- * the owner/conflict detection and carries the skeleton for the rest, so a
- * follow-up task extends ONE file instead of inventing a second:
+ * One bundled extension, four layers. This file implements all four plus the
+ * owner/conflict detection, so the whole feature lives in ONE file:
  *
  *  - L1 `cleaner` (default on, this file): bound the file lists pi appends to a
  *    summary, and keep the summarisation INPUT clean.
@@ -14,16 +13,23 @@
  *    one deterministic state snapshot (todos, background tasks, sub-agents, git,
  *    compaction facts) and replay it into the NEXT request exactly once through
  *    the `context` hook.
- *  - L4 `prune`: opt-in tool-result pruning (follow-up task).
+ *  - L4 `prune` (opt-in, this file): at a TURN BOUNDARY, once the context passes
+ *    `prune.high_water` of the model window, replace the oldest tool results in
+ *    the request view with a byte-stable pointer, keeping the last
+ *    `prune.min_turns` turns verbatim. The session transcript keeps every
+ *    original: this is a per-request view through the `context` hook, never a
+ *    `context_edit` and never an appended entry.
  *
  * ## Owner / conflict detection
  *
  * Compaction handlers chain last-wins: another loaded extension may replace our
  * summary. When a successful compaction reports `fromExtension` with
  * `details.engine !== "pi2"`, a DIFFERENT extension supplied it. pi.nvim then
- * warns once per session and L2/L4 stand down for the rest of the session; L1
+ * warns once per session and L2 stands down for the rest of the session; L1
  * cleaning and the L3 snapshot stay active (they cost nothing and keep the
- * state note correct).
+ * state note correct). L4 is orthogonal to the summary — it edits the request
+ * view, not the compaction — so an active prune set keeps being applied; only
+ * NEW prune decisions stop once a foreign summariser owns the session.
  *
  * ## Why L1 exists
  *
@@ -67,8 +73,8 @@
  * frozen at spawn, the file is re-read on every compaction event, so a live
  * `setup()` applies without respawning pi (same pattern as extensions/todo.ts).
  * Outside pi.nvim the file is absent and the defaults below apply. This file
- * reads the `enabled`, `cleaner`, `checkpoint`, `state` and `owner` sections; L4
- * reads its own keys when it lands.
+ * reads the `enabled`, `cleaner`, `checkpoint`, `state`, `prune` and `owner`
+ * sections.
  */
 
 import type {
@@ -92,6 +98,10 @@ const DEFAULT_MAX_MODIFIED = 100;
 const DEFAULT_MAX_WORDS = 1500;
 /** Default character budget of the L3 snapshot, in tokens (`max_tokens * 4` chars). */
 const DEFAULT_STATE_MAX_TOKENS = 1000;
+/** Default trigger for L4: prune once the context passes this share of the window. */
+const DEFAULT_PRUNE_HIGH_WATER = 0.7;
+/** Default floor for L4: never prune a tool result from one of the last N turns. */
+const DEFAULT_PRUNE_MIN_TURNS = 8;
 /** Output limit used when the summarisation model does not report `maxTokens`. */
 const DEFAULT_CHECKPOINT_MAX_TOKENS = 8192;
 /** Never ask for less than this, even when the window is nearly full. */
@@ -179,6 +189,15 @@ interface StateSettings {
 	max_tokens: number;
 }
 
+/** The L4 tool-result pruning options, as published by pi.nvim. */
+interface PruneSettings {
+	enabled: boolean;
+	/** Share of the model window that triggers a prune batch (0..1). */
+	high_water: number;
+	/** Turns left verbatim at the tail of the request. */
+	min_turns: number;
+}
+
 /** The owner/conflict detection switch, as published by pi.nvim. */
 interface OwnerSettings {
 	detect: boolean;
@@ -190,6 +209,7 @@ interface CompactionRuntimeConfig {
 	cleaner: CleanerSettings;
 	checkpoint: CheckpointSettings;
 	state: StateSettings;
+	prune: PruneSettings;
 	owner: OwnerSettings;
 }
 
@@ -215,6 +235,11 @@ function defaultConfig(): CompactionRuntimeConfig {
 		state: {
 			enabled: true,
 			max_tokens: DEFAULT_STATE_MAX_TOKENS,
+		},
+		prune: {
+			enabled: false,
+			high_water: DEFAULT_PRUNE_HIGH_WATER,
+			min_turns: DEFAULT_PRUNE_MIN_TURNS,
 		},
 		owner: {
 			detect: true,
@@ -270,6 +295,17 @@ function checkpointLanguage(value: unknown, fallback: CheckpointLanguage): Check
 }
 
 /**
+ * Clamp a hand-edited decimal into `[min, max]`. `high_water` is a share of the
+ * window, so it is not an integer like the other knobs.
+ */
+function clampNumber(value: unknown, fallback: number, min: number, max: number): number {
+	if (typeof value !== "number" || !Number.isFinite(value)) {
+		return fallback;
+	}
+	return Math.min(max, Math.max(min, value));
+}
+
+/**
  * Re-read the runtime config file. A missing, unreadable or unparsable file is
  * NOT an error (pi.nvim may not be running, or the file may be caught
  * mid-rewrite): every key falls back to its default independently.
@@ -321,6 +357,13 @@ function readConfig(): CompactionRuntimeConfig {
 	if (rawOwner !== null && typeof rawOwner === "object") {
 		const owner = rawOwner as Record<string, unknown>;
 		config.owner.detect = booleanOr(owner.detect, config.owner.detect);
+	}
+	const rawPrune = parsed.prune;
+	if (rawPrune !== null && typeof rawPrune === "object") {
+		const prune = rawPrune as Record<string, unknown>;
+		config.prune.enabled = booleanOr(prune.enabled, config.prune.enabled);
+		config.prune.high_water = clampNumber(prune.high_water, config.prune.high_water, 0.3, 0.95);
+		config.prune.min_turns = clampInteger(prune.min_turns, config.prune.min_turns, 1, 100);
 	}
 	return config;
 }
@@ -1129,7 +1172,9 @@ interface SessionEntryLike {
 	message?: {
 		role?: string;
 		toolName?: string;
+		toolCallId?: string;
 		details?: unknown;
+		content?: unknown;
 	};
 }
 
@@ -1588,6 +1633,276 @@ function publishStateSnapshot(
 	}
 }
 
+// ---------------------------------------------------------------------------
+// L4: tool-result pruning at a turn boundary (opt-in through `prune.enabled`)
+// ---------------------------------------------------------------------------
+
+/** Custom entry that persists the active prune set, so a resume prunes the same ids. */
+const PRUNE_ENTRY_TYPE = "pi2-compaction-prune";
+
+/**
+ * A `read` result smaller than this is not worth a pointer: the pointer line is
+ * itself ~90 chars, so the saving would be nil or negative.
+ */
+const PRUNE_MIN_READ_CHARS = 400;
+
+/** The shape `ctx.getContextUsage()` returns (pi's `ContextUsage`). */
+interface ContextUsageLike {
+	tokens?: number | null;
+	contextWindow?: number;
+	percent?: number | null;
+	/** Present in some builds; it wins over `percent` when it is a number. */
+	fraction?: number;
+}
+
+/** One tool result old enough to be replaced by a pointer. */
+interface PruneCandidate {
+	id: string;
+	toolName: string;
+	chars: number;
+}
+
+/** One entry of the active prune set. */
+interface PrunedRow {
+	id: string;
+	toolName: string;
+}
+
+/** The active prune set and what the decision that produced it claimed. */
+interface PruneState {
+	/** Oldest first (branch order) and cumulative: a pruned result stays pruned. */
+	pruned: PrunedRow[];
+	savedChars: number;
+	atFraction: number;
+}
+
+/**
+ * The pointer that replaces a pruned tool result. BYTE-STABLE for a given
+ * `(toolName, toolCallId)` on purpose: the text must never churn between
+ * requests (that would defeat the prompt cache), and nothing is lost, so it
+ * names the session transcript as the place the original still lives.
+ */
+export function prunePointer(toolName: string, toolCallId: string): string {
+	return `[pruned tool result: ${toolName} ${toolCallId}; original retained in the session transcript]`;
+}
+
+/** One message of `event.messages`, as far as pruning cares. */
+interface PrunableMessage {
+	role?: unknown;
+	toolCallId?: unknown;
+	toolName?: unknown;
+}
+
+/**
+ * Pure request-view transform: replace the CONTENT of every `toolResult`
+ * message whose `toolCallId` is in `ids` with the pointer line, keeping the role
+ * and every other field. Returns a NEW array; the input is never mutated (the
+ * session transcript is what keeps the originals).
+ */
+export function pruneToolResults<T>(messages: readonly T[], ids: ReadonlySet<string>): T[] {
+	const out: T[] = [];
+	for (const message of messages) {
+		const typed = message as PrunableMessage;
+		const toolCallId = typed?.toolCallId;
+		if (
+			typed === null ||
+			typeof typed !== "object" ||
+			typed.role !== "toolResult" ||
+			typeof toolCallId !== "string" ||
+			!ids.has(toolCallId)
+		) {
+			out.push(message);
+			continue;
+		}
+		const toolName = typeof typed.toolName === "string" && typed.toolName !== "" ? typed.toolName : "tool";
+		out.push({
+			...(message as Record<string, unknown>),
+			content: [{ type: "text", text: prunePointer(toolName, toolCallId) }],
+		} as T);
+	}
+	return out;
+}
+
+/** The active prune set; `undefined` until the first decision (or a resume seed). */
+let activePrune: PruneState | undefined;
+/** Signature of the last APPENDED decision: an identical one is not re-recorded. */
+let lastPruneSignature: string | undefined;
+/** Whether the persisted set was already looked for (the session may be a resume). */
+let pruneSeeded = false;
+
+/** Stable identity of a decision, for the "append the entry once" dedupe. */
+function pruneSignature(state: PruneState): string {
+	return `${state.savedChars}|${state.pruned.map((row) => `${row.toolName}:${row.id}`).join(",")}`;
+}
+
+/**
+ * 0..1 context usage, or `undefined` when pi cannot report it (it does not
+ * right after a compaction, before the next response). `percent` is pi's own
+ * 0..100 value; the raw token estimate is the last resort rather than a guess.
+ */
+function usageFraction(usage: ContextUsageLike | undefined): number | undefined {
+	if (!usage) {
+		return undefined;
+	}
+	if (typeof usage.fraction === "number" && Number.isFinite(usage.fraction)) {
+		return usage.fraction;
+	}
+	if (typeof usage.percent === "number" && Number.isFinite(usage.percent)) {
+		return usage.percent / 100;
+	}
+	if (
+		typeof usage.tokens === "number" &&
+		typeof usage.contextWindow === "number" &&
+		usage.contextWindow > 0
+	) {
+		return usage.tokens / usage.contextWindow;
+	}
+	return undefined;
+}
+
+/**
+ * The prune view of the session branch. A candidate is a tool result OLDER than
+ * the last `minTurns` turns, where a turn is one assistant response plus the
+ * tool results it produced — so the tail of every request stays verbatim and
+ * the newest assistant/tool pair can never be pruned.
+ *
+ * Everything here is in-memory: no file is read and no process is spawned, the
+ * branch is already loaded by the session manager.
+ */
+function branchPruneView(entries: SessionEntryLike[], minTurns: number): PruneCandidate[] {
+	const assistants: number[] = [];
+	for (let index = 0; index < entries.length; index += 1) {
+		const entry = entries[index];
+		const message = entry.type === "message" ? entry.message : undefined;
+		if (message?.role === "assistant") {
+			assistants.push(index);
+		}
+	}
+	// `minTurns >= 1` by config, so the last assistant message is always kept.
+	const keep = Math.max(1, minTurns);
+	const keepFrom = assistants.length > 0 ? assistants[Math.max(0, assistants.length - keep)] : entries.length;
+	const candidates: PruneCandidate[] = [];
+	for (let index = 0; index < keepFrom; index += 1) {
+		const entry = entries[index];
+		const message = entry.type === "message" ? entry.message : undefined;
+		if (!message || message.role !== "toolResult") {
+			continue;
+		}
+		const id = message.toolCallId;
+		const toolName = message.toolName;
+		if (typeof id !== "string" || id === "" || typeof toolName !== "string" || toolName === "") {
+			continue;
+		}
+		const chars = messageText(message).length;
+		if (toolName === "read" && chars < PRUNE_MIN_READ_CHARS) {
+			continue;
+		}
+		candidates.push({ id, toolName, chars });
+	}
+	return candidates;
+}
+
+/**
+ * Decide the next active set: keep every id that was already pruned and is still
+ * in the branch, then add the OLDEST remaining candidates until the estimate
+ * saved covers the overshoot (`tokens - high_water * window`).
+ *
+ * Never prunes more than needed, never un-prunes (that would churn the cached
+ * prefix), never touches the last `min_turns` turns (those are not candidates).
+ * The trigger is the fraction pi reported; `chars/4` only measures how much a
+ * batch of candidates is worth.
+ */
+function planPrune(args: {
+	candidates: PruneCandidate[];
+	active: PruneState | undefined;
+	prune: PruneSettings;
+	usage: ContextUsageLike;
+	fraction: number;
+}): PruneState | undefined {
+	const window = typeof args.usage.contextWindow === "number" ? args.usage.contextWindow : 0;
+	if (window <= 0) {
+		return undefined;
+	}
+	const tokens =
+		typeof args.usage.tokens === "number" && Number.isFinite(args.usage.tokens)
+			? args.usage.tokens
+			: Math.ceil(args.fraction * window);
+	const target = Math.floor(args.prune.high_water * window);
+	const need = Math.max(0, tokens - target) * 4;
+	const previous = new Set((args.active?.pruned ?? []).map((row) => row.id));
+	const pruned: PrunedRow[] = [];
+	let savedChars = 0;
+	for (const candidate of args.candidates) {
+		const already = previous.has(candidate.id);
+		if (!already && savedChars >= need) {
+			// Enough: later candidates are NOT pruned (bounded, newest-first savings).
+			continue;
+		}
+		pruned.push({ id: candidate.id, toolName: candidate.toolName });
+		savedChars += candidate.chars;
+	}
+	if (pruned.length === 0) {
+		return undefined;
+	}
+	return { pruned, savedChars, atFraction: args.fraction };
+}
+
+/** Ids of a persisted decision; anything malformed is dropped, never thrown. */
+function readPrunedRows(data: unknown): PrunedRow[] {
+	const rows = (data as { pruned?: unknown } | undefined)?.pruned;
+	if (!Array.isArray(rows)) {
+		return [];
+	}
+	const out: PrunedRow[] = [];
+	for (const row of rows) {
+		if (row === null || typeof row !== "object") {
+			continue;
+		}
+		const id = (row as { id?: unknown }).id;
+		const toolName = (row as { toolName?: unknown }).toolName;
+		if (typeof id !== "string" || id === "" || typeof toolName !== "string" || toolName === "") {
+			continue;
+		}
+		out.push({ id, toolName });
+	}
+	return out;
+}
+
+/**
+ * Seed the active set from the newest persisted decision, ONCE per process
+ * lifetime: a resumed session must serve the SAME pointer text the previous
+ * process served, instead of starting from an empty set.
+ */
+function seedPruneFromBranch(ctx: ExtensionContext): void {
+	if (pruneSeeded) {
+		return;
+	}
+	pruneSeeded = true;
+	try {
+		const entries = ctx.sessionManager.getBranch() as unknown as SessionEntryLike[];
+		for (let index = entries.length - 1; index >= 0; index -= 1) {
+			const entry = entries[index];
+			if (entry.type !== "custom" || entry.customType !== PRUNE_ENTRY_TYPE) {
+				continue;
+			}
+			const pruned = readPrunedRows(entry.data);
+			if (pruned.length === 0) {
+				return;
+			}
+			const data = entry.data as { savedChars?: unknown; atFraction?: unknown };
+			activePrune = {
+				pruned,
+				savedChars: typeof data.savedChars === "number" ? data.savedChars : 0,
+				atFraction: typeof data.atFraction === "number" ? data.atFraction : 0,
+			};
+			lastPruneSignature = pruneSignature(activePrune);
+			return;
+		}
+	} catch {
+		// Best effort: without a seed the next turn boundary simply decides again.
+	}
+}
+
 export default function compaction(pi: ExtensionAPI): void {
 	pi.on("session_before_compact", async (event, ctx) => {
 		const config = readConfig();
@@ -1745,6 +2060,78 @@ export default function compaction(pi: ExtensionAPI): void {
 		return { messages };
 	});
 
-	// L4 prune: implemented in a follow-up (opt-in tool-result pruning before a
-	// summarisation starts, driven by `prune.high_water` / `prune.min_turns`).
+	// L4 prune, turn-boundary half: ONE decision per batch, taken only once the
+	// context crosses `prune.high_water`, applied by the `context` hook on the
+	// NEXT request. Deciding here — not per request — is what keeps the prefix
+	// stable: one decision covers a whole batch of turns instead of churning the
+	// cached prefix on every turn.
+	pi.on("turn_end", async (_event, ctx) => {
+		const config = readConfig();
+		if (!config.enabled || !config.prune.enabled) {
+			return;
+		}
+		// A foreign summariser owns the SUMMARY, not the request view, so an active
+		// prune set keeps being applied (see `session_shutdown`/`context`); only a
+		// NEW decision stops once another extension owns the session's compaction.
+		if (ownerConflict) {
+			return;
+		}
+		try {
+			seedPruneFromBranch(ctx);
+			const usage = ctx.getContextUsage() as ContextUsageLike | undefined;
+			const fraction = usageFraction(usage);
+			if (usage === undefined || fraction === undefined || fraction < config.prune.high_water) {
+				return;
+			}
+			const candidates = branchPruneView(
+				ctx.sessionManager.getBranch() as unknown as SessionEntryLike[],
+				config.prune.min_turns,
+			);
+			const next = planPrune({ candidates, active: activePrune, prune: config.prune, usage, fraction });
+			if (!next) {
+				return;
+			}
+			const signature = pruneSignature(next);
+			const unchanged = signature === lastPruneSignature;
+			activePrune = next;
+			if (unchanged) {
+				// An identical decision adds nothing: no second custom entry.
+				return;
+			}
+			lastPruneSignature = signature;
+			pi.appendEntry(PRUNE_ENTRY_TYPE, {
+				pruned: next.pruned,
+				savedChars: next.savedChars,
+				atFraction: next.atFraction,
+			});
+		} catch {
+			// Pruning is an optimisation: never fail a turn over it.
+		}
+	});
+
+	// L4 prune, request half: apply the active set to the request view. Only
+	// `toolResult` CONTENT changes — the role and every other field stay, nothing
+	// is appended and nothing is persisted, so the session transcript keeps every
+	// original byte (the pointer says where).
+	pi.on("context", async (event, ctx) => {
+		const config = readConfig();
+		if (!config.enabled || !config.prune.enabled) {
+			return undefined;
+		}
+		seedPruneFromBranch(ctx);
+		const active = activePrune;
+		if (!active || active.pruned.length === 0) {
+			return undefined;
+		}
+		const ids = new Set(active.pruned.map((row) => row.id));
+		return { messages: pruneToolResults(event.messages, ids) };
+	});
+
+	pi.on("session_shutdown", async () => {
+		// A new session (reload/new/resume/fork) starts with no request view; a
+		// resumed one re-seeds from its persisted `pi2-compaction-prune` entry.
+		activePrune = undefined;
+		lastPruneSignature = undefined;
+		pruneSeeded = false;
+	});
 }

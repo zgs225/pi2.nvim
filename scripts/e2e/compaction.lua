@@ -91,6 +91,24 @@
 --   A17 L2 stands down for the rest of the session (no second checkpoint
 --       request), while L1 and the L3 snapshot keep working
 --
+-- Phase 7 (L4 prune) is a fresh session on a 12000-token model window with
+-- `prune.enabled = true`, `high_water = 0.2`, `min_turns = 1`: four turns each
+-- read a 4000-char file carrying its own `PRUNE-SENTINEL-<n>`:
+--   A18 once the context crosses the high water mark, the OLDEST tool result is
+--       a pointer line in the request body and its sentinel body is GONE, while
+--       the most recent turn's tool result is still delivered in full (the last
+--       turn is never pruned)
+--   A19 the same pointer text is byte-identical on every following request and
+--       no request ever un-prunes (the prefix does not churn)
+--   A20 a `pi2-compaction-prune` custom entry exists (ids, savedChars,
+--       atFraction; an identical decision is recorded once), the session JSONL
+--       still holds the original sentinel, and the pointer is NEVER persisted
+--   A22 a FRESH process that opens the same session file (extension instance
+--       rebuilt, in-memory set empty) re-seeds the decision from that entry and
+--       serves the byte-identical pointer instead of the pruned body
+--   A21 the negative control: the same conversation with `prune.enabled =
+--       false` delivers every full body, writes no pointer and no prune entry
+--
 -- Needs the pi binary, nothing else (the provider is fake), so it can run in CI:
 --
 --   make e2e-compaction
@@ -172,6 +190,31 @@ local TODO_STATE_UPDATED = {
 -- so a competing extension loaded AFTER ours supplies the summary and ours has
 -- to notice that it lost (and stand its checkpoint layer down).
 local COMPETITOR_MARKER = "COMPETITOR-SUMMARY-1"
+
+-- Phase 7/8 (L4 prune). The same scripted conversation twice: once with
+-- `prune.enabled = true` and once with it off (the negative control). The second
+-- model has a SMALL window, so `high_water` is reachable after a couple of turns
+-- without any real provider, while `reserveTokens` 0 keeps auto-compaction out
+-- of the way (its threshold becomes the whole window, far above this run).
+local PRUNE_MODEL_ID = "e2e-small"
+-- 20000 tokens x 0.3 = 6000: the window FILLS after a couple of 8000-char read
+-- results (the fake provider reports the real prompt size), while the whole
+-- conversation plus the prompt stays well below the 20000 auto-compaction
+-- threshold (reserveTokens 0), so the phase can never be turned into a
+-- summarisation by accident.
+--
+-- `high_water` is 0.3, the contract's floor, not the issue's 0.2: pi.nvim clamps
+-- the published value into 0.3..0.95, so a 0.2 would be normalised away before
+-- the extension ever saw it (the extension's own clamp accepts 0.2, but a test
+-- that relies on a value the publisher cannot produce would be asserting a
+-- configuration that does not exist).
+local PRUNE_CONTEXT_WINDOW = 20000
+local PRUNE_HIGH_WATER = 0.3
+local PRUNE_MIN_TURNS = 1
+local PRUNE_FILES = 5
+local PRUNE_CHARS = 8000
+local PRUNE_SENTINEL_PREFIX = "PRUNE-SENTINEL-"
+local PRUNE_POINTER_PREFIX = "[pruned tool result:"
 local COMPETITOR_SOURCE = [=[
 export default function competitor(pi: any) {
     pi.on("session_before_compact", async (event: any) => ({
@@ -252,23 +295,34 @@ local function sse_chunk(delta_json, finish)
 end
 
 --- A final usage-only chunk, the shape `stream_options.include_usage` produces.
+---
+--- `prompt_tokens` is derived from the real request size (`chars/4`), because
+--- `ctx.getContextUsage()` prefers the last assistant message's reported usage
+--- over its own estimate: a constant here would make the L4 prune trigger see a
+--- context that never grows.
+---@param prompt_tokens integer
 ---@return string
-local function sse_usage_chunk()
-    return ('data: {"id":"chatcmpl-e2e","object":"chat.completion.chunk","created":0,"model":"%s","choices":[],"usage":{"prompt_tokens":900,"completion_tokens":40,"total_tokens":940}}\n\n'):format(
-        MODEL_ID
+local function sse_usage_chunk(prompt_tokens)
+    local completion = 40
+    return ('data: {"id":"chatcmpl-e2e","object":"chat.completion.chunk","created":0,"model":"%s","choices":[],"usage":{"prompt_tokens":%d,"completion_tokens":%d,"total_tokens":%d}}\n\n'):format(
+        MODEL_ID,
+        prompt_tokens,
+        completion,
+        prompt_tokens + completion
     )
 end
 
 ---@param index integer
 ---@param name string
 ---@param args table
+---@param tool_call_id? string explicit id, so a phase can name the result it prunes
 ---@return string
-local function tool_call_chunk(index, name, args)
+local function tool_call_chunk(index, name, args, tool_call_id)
     local arguments = vim.json.encode(vim.json.encode(args))
     return sse_chunk(
-        ('{"tool_calls":[{"index":%d,"id":"call_%d","type":"function","function":{"name":"%s","arguments":%s}}]}'):format(
+        ('{"tool_calls":[{"index":%d,"id":"%s","type":"function","function":{"name":"%s","arguments":%s}}]}'):format(
             index,
-            index,
+            tool_call_id or ("call_%d"):format(index),
             name,
             arguments
         )
@@ -276,24 +330,26 @@ local function tool_call_chunk(index, name, args)
 end
 
 ---@param text string
+---@param prompt_tokens integer
 ---@return string
-local function text_turn(text)
+local function text_turn(text, prompt_tokens)
     return sse_headers()
         .. sse_chunk(('{"role":"assistant","content":%s}'):format(vim.json.encode(text)))
         .. sse_chunk("{}", "stop")
-        .. sse_usage_chunk()
+        .. sse_usage_chunk(prompt_tokens)
         .. "data: [DONE]\n\n"
 end
 
----@param calls table[] list of { name, args }
+---@param calls table[] list of { name, args, toolCallId? }
+---@param prompt_tokens integer
 ---@return string
-local function tool_turn(calls)
+local function tool_turn(calls, prompt_tokens)
     local chunks = { sse_headers(), sse_chunk('{"role":"assistant","content":""}') }
     for index, call in ipairs(calls) do
-        chunks[#chunks + 1] = tool_call_chunk(index - 1, call[1], call[2])
+        chunks[#chunks + 1] = tool_call_chunk(index - 1, call[1], call[2], call[3])
     end
     chunks[#chunks + 1] = sse_chunk("{}", "tool_calls")
-    chunks[#chunks + 1] = sse_usage_chunk()
+    chunks[#chunks + 1] = sse_usage_chunk(prompt_tokens)
     chunks[#chunks + 1] = "data: [DONE]\n\n"
     return table.concat(chunks)
 end
@@ -339,7 +395,7 @@ end
 
 ---@class CompactionE2EProvider
 ---@field server? uv.uv_tcp_t
----@field mode "l1"|"checkpoint"|"fallback"|"state" which scripted conversation is active
+---@field mode "l1"|"checkpoint"|"fallback"|"state"|"prune" which scripted conversation is active
 ---@field turn integer conversation requests answered so far (per phase)
 ---@field summarizations string[] flattened text of every native summarisation request
 ---@field checkpoint_requests string[] flattened text of every L2 checkpoint request
@@ -347,6 +403,7 @@ end
 ---@field temp_paths string[]
 ---@field project_paths string[]
 ---@field big_path string
+---@field prune_paths string[] the L4 fixture files, one read per turn
 
 --- The L2 checkpoint request carries a section only OUR prompt asks for.
 ---@param text string
@@ -411,14 +468,25 @@ local function word_count(text)
 end
 
 ---@param provider CompactionE2EProvider
+---@param prompt_tokens integer the answering request's size, echoed in the usage chunk
 ---@return string
-local function respond(provider)
+local function respond(provider, prompt_tokens)
     provider.turn = provider.turn + 1
     local turn = provider.turn
+    ---@param text string
+    ---@return string
+    local function say(text)
+        return text_turn(text, prompt_tokens)
+    end
+    ---@param calls table[] list of { name, args, toolCallId? }
+    ---@return string
+    local function tools(calls)
+        return tool_turn(calls, prompt_tokens)
+    end
 
     if provider.mode == "state" then
         if turn == 1 then
-            return tool_turn({
+            return tools({
                 { "todo_write", { todos = TODO_STATE_INITIAL } },
                 { "read", { path = provider.big_path } },
             })
@@ -426,29 +494,42 @@ local function respond(provider)
         if turn == 5 then
             -- A manual `compact` needs fresh content past keepRecentTokens, so the
             -- turns before each later compaction read the big file again.
-            return tool_turn({ { "read", { path = provider.big_path } } })
+            return tools({ { "read", { path = provider.big_path } } })
         end
         if turn == 8 then
             -- The second todo_write replaces the whole list (full-replacement
             -- semantics): one item is completed, one is added.
-            return tool_turn({
+            return tools({
                 { "todo_write", { todos = TODO_STATE_UPDATED } },
                 { "read", { path = provider.big_path } },
             })
         end
-        return text_turn(("State phase turn %d."):format(turn))
+        return say(("State phase turn %d."):format(turn))
     end
     if provider.mode == "checkpoint" then
         if turn == 1 or turn == 3 then
-            return tool_turn({ { "read", { path = provider.big_path } } })
+            return tools({ { "read", { path = provider.big_path } } })
         end
-        return text_turn("Read the large project file again.")
+        return say("Read the large project file again.")
     end
     if provider.mode == "fallback" then
         if turn == 1 then
-            return tool_turn({ { "read", { path = provider.big_path } } })
+            return tools({ { "read", { path = provider.big_path } } })
         end
-        return text_turn("Read the large project file.")
+        return say("Read the large project file.")
+    end
+
+    if provider.mode == "prune" then
+        -- Odd turns read the next L4 fixture (a 4000-char result with its own
+        -- sentinel), even turns answer with text. The explicit toolCallId is what
+        -- the assertions name, so "which result was pruned" is unambiguous.
+        local index = math.floor((turn + 1) / 2)
+        if turn % 2 == 1 and provider.prune_paths[index] then
+            return tools({
+                { "read", { path = provider.prune_paths[index] }, ("call_prune_%d"):format(index) },
+            })
+        end
+        return say(("Prune phase turn %d."):format(turn))
     end
 
     if turn == 1 then
@@ -461,22 +542,22 @@ local function respond(provider)
         for _, path in ipairs(provider.project_paths) do
             calls[#calls + 1] = { "read", { path = path } }
         end
-        return tool_turn(calls)
+        return tools(calls)
     end
     if turn == 2 then
-        return text_turn("Read all 120 files.")
+        return say("Read all 120 files.")
     end
     if turn == 3 then
         -- Phase 2, first prompt: a text-only turn. It must come BEFORE the big
         -- read, because the second compaction has to have a user-message span to
         -- summarize -- only then does pi call the update prompt with
         -- `<previous-summary>`, which is where A4 can observe the strip.
-        return text_turn("Acknowledged. Reading the large file next.")
+        return say("Acknowledged. Reading the large file next.")
     end
     if turn == 4 then
-        return tool_turn({ { "read", { path = provider.big_path } } })
+        return tools({ { "read", { path = provider.big_path } } })
     end
-    return text_turn("Read the large file.")
+    return say("Read the large file.")
 end
 
 ---@param provider CompactionE2EProvider
@@ -484,23 +565,26 @@ end
 ---@return string
 local function handle_request(provider, body)
     local text = body_text(body)
+    -- The whole request, in the unit pi's estimate uses: a real provider reports
+    -- the prompt size it was billed for, and `ctx.getContextUsage()` prefers it.
+    local prompt_tokens = math.max(1, math.floor(#body / 4))
     if is_checkpoint_request(text) then
         provider.checkpoint_requests[#provider.checkpoint_requests + 1] = text
         if provider.mode == "fallback" then
             -- An EMPTY completion: the extension must fail open and let pi's
             -- native summariser run.
-            return text_turn("")
+            return text_turn("", prompt_tokens)
         end
-        return text_turn(checkpoint_summary(text))
+        return text_turn(checkpoint_summary(text), prompt_tokens)
     end
     if is_summarization(text) then
         provider.summarizations[#provider.summarizations + 1] = text
-        return text_turn(SUMMARY_TEXT)
+        return text_turn(SUMMARY_TEXT, prompt_tokens)
     end
     -- A conversation request: this is what the model was actually handed, so it
     -- is the ground truth for "the snapshot rode exactly one request".
     provider.requests[#provider.requests + 1] = text
-    return respond(provider)
+    return respond(provider, prompt_tokens)
 end
 
 ---@param provider CompactionE2EProvider
@@ -571,6 +655,15 @@ local function write_agent_dir(dir, port)
                         maxTokens = 4096,
                         cost = { input = 0, output = 0, cacheRead = 0, cacheWrite = 0 },
                     },
+                    {
+                        -- The L4 prune phase needs a window small enough for
+                        -- `high_water` to be reachable within a few turns.
+                        id = PRUNE_MODEL_ID,
+                        name = "E2E Small Window",
+                        contextWindow = PRUNE_CONTEXT_WINDOW,
+                        maxTokens = 2048,
+                        cost = { input = 0, output = 0, cacheRead = 0, cacheWrite = 0 },
+                    },
                 },
             },
         },
@@ -580,9 +673,19 @@ local function write_agent_dir(dir, port)
     f:close()
     -- keepRecentTokens small enough that a manual `compact` summarizes the
     -- whole first span and keeps only the tail; a big window so auto-compaction
-    -- never fires during the run.
+    -- never fires during the run. The small model reserves NOTHING, so its
+    -- auto-compaction threshold is the whole window: the prune phase must never
+    -- be turned into a summarisation by accident.
     local s = assert(io.open(dir .. "/settings.json", "w"))
-    s:write('{"compaction":{"reserveTokens":16384,"keepRecentTokens":2000}}')
+    s:write(vim.json.encode({
+        compaction = {
+            reserveTokens = 16384,
+            keepRecentTokens = 2000,
+            modelOverrides = {
+                [PROVIDER .. "/" .. PRUNE_MODEL_ID] = { reserveTokens = 0, keepRecentTokens = 2000 },
+            },
+        },
+    }))
     s:close()
 end
 
@@ -646,6 +749,28 @@ local function create_fixture_files()
     local big_path = project_dir .. "/big-project-file.txt"
     write_lines(big_path, big_lines)
     return temp_paths, project_paths, big_path
+end
+
+--- The L4 fixtures: `PRUNE_FILES` files of ~`PRUNE_CHARS` chars, each carrying
+--- its own `PRUNE-SENTINEL-<n>` marker. A read of one is a big tool result
+--- (~1000 tokens), which is what makes the high water mark reachable and what a
+--- pruned pointer must replace.
+---@return string[] paths
+local function create_prune_files()
+    local dir = PROJECT_ROOT .. "/prune"
+    local paths = {}
+    local line_count = math.floor(PRUNE_CHARS / 40)
+    for file_index = 1, PRUNE_FILES do
+        local sentinel = ("%s%d"):format(PRUNE_SENTINEL_PREFIX, file_index)
+        local lines = { sentinel .. " starts the file" }
+        for line = 1, line_count do
+            lines[#lines + 1] = ("prune filler line %03d for file %d abcd"):format(line, file_index)
+        end
+        local path = ("%s/prune-%d.txt"):format(dir, file_index)
+        write_lines(path, lines)
+        paths[#paths + 1] = path
+    end
+    return paths
 end
 
 --- Run a command, returning its exit code and stdout.
@@ -821,6 +946,22 @@ local function run_compact(backend, what)
     return response
 end
 
+--- `get_session_stats` data: the L4 phase reports the context history it prunes on.
+---@param backend CompactionE2EBackend
+---@param what string
+---@return table?
+local function session_stats(backend, what)
+    local since = #backend.events
+    send(backend, { type = "get_session_stats" })
+    local response = wait_event(backend, function(ev)
+        return ev.type == "response" and ev.command == "get_session_stats" and ev._n > since
+    end, 30000, what)
+    if response == nil or response.success == false then
+        return nil
+    end
+    return type(response.data) == "table" and response.data or nil
+end
+
 -- ---------------------------------------------------------------------------
 -- Session JSONL (ground truth)
 -- ---------------------------------------------------------------------------
@@ -869,6 +1010,32 @@ local function custom_entries(entries, custom_type)
         end
     end
     return out
+end
+
+--- Every `.jsonl` of a session dir, concatenated: the raw ground truth for
+--- "the original is still in the transcript, byte for byte".
+---@param session_dir string
+---@return string
+local function session_jsonl_text(session_dir)
+    local names = vim.fn.readdir(session_dir)
+    table.sort(names)
+    local parts = {}
+    for _, name in ipairs(names) do
+        if name:match("%.jsonl$") then
+            parts[#parts + 1] = read_file(session_dir .. "/" .. name) or ""
+        end
+    end
+    return table.concat(parts, "\n")
+end
+
+--- The pointer line the extension must produce for one tool call. Byte-for-byte
+--- the same string `prunePointer()` builds, on purpose: a different wording in
+--- the test would let a drifting pointer pass.
+---@param tool_name string
+---@param tool_call_id string
+---@return string
+local function prune_pointer(tool_name, tool_call_id)
+    return ("[pruned tool result: %s %s; original retained in the session transcript]"):format(tool_name, tool_call_id)
 end
 
 --- Body of the `<read-files>` block a summary ends with.
@@ -956,6 +1123,7 @@ local function main()
     vim.env.PI_NVIM_COMPACTION_FILE = config_path
 
     local temp_paths, project_paths, big_path = create_fixture_files()
+    local prune_paths = create_prune_files()
     ---@type CompactionE2EProvider
     local provider = {
         mode = "l1",
@@ -966,6 +1134,7 @@ local function main()
         temp_paths = temp_paths,
         project_paths = project_paths,
         big_path = big_path,
+        prune_paths = prune_paths,
     }
     start_fake_provider(provider)
     local addr = provider.server:getsockname()
@@ -1683,9 +1852,291 @@ local function main()
     stop_backend(conflict_backend)
     step("A17 L2 stood down after the conflict, L1 + L3 still active, one notice total")
 
+    -- -----------------------------------------------------------------------
+    -- Phase 7 (A18-A20): L4 prune ON. A fresh session on the SMALL-window model
+    -- (`PRUNE_CONTEXT_WINDOW`), `high_water = 0.2` and `min_turns = 1`: four
+    -- turns each read a 4000-char fixture with its own sentinel, so the window
+    -- fills, the oldest results become pointers and the newest turn stays whole.
+    -- -----------------------------------------------------------------------
+    --- The L4 scripted conversation: `PRUNE_FILES` prompts, each answered by a
+    --- read turn (one ~1000-token result) and a text turn. Returns the context
+    --- percent `get_session_stats` reported after each prompt.
+    ---@param backend CompactionE2EBackend
+    ---@return table[] percents
+    local function run_prune_conversation(backend)
+        local percents = {}
+        for index = 1, PRUNE_FILES do
+            run_turn(backend, ("Read prune file %d."):format(index), 180000)
+            local stats = session_stats(backend, ("session stats after prune prompt %d"):format(index))
+            local usage = stats and stats.contextUsage
+            percents[#percents + 1] = type(usage) == "table" and usage.percent or nil
+        end
+        check(provider.turn == PRUNE_FILES * 2, "the prune phase ran every scripted turn", { turn = provider.turn })
+        return percents
+    end
+
+    ---@param session_name string
+    ---@return CompactionE2EBackend
+    local function start_prune_backend(session_name)
+        local backend = start_backend(RUN_ROOT .. "/" .. session_name, PROJECT_ROOT .. "/prune")
+        send(backend, { type = "set_model", provider = PROVIDER, modelId = PRUNE_MODEL_ID })
+        local pinned = wait_event(backend, function(ev)
+            return ev.type == "response" and ev.command == "set_model"
+        end, 30000, "set_model (" .. session_name .. ")")
+        check(pinned ~= nil and pinned.success ~= false, "the small-window model is selected", {
+            stderr = backend.stderr,
+        })
+        return backend
+    end
+
+    write_runtime_config(config_path, {
+        enabled = true,
+        prune = { enabled = true, high_water = PRUNE_HIGH_WATER, min_turns = PRUNE_MIN_TURNS },
+    })
+    provider.mode = "prune"
+    provider.turn = 0
+    local prune_mark = #provider.requests
+    local prune_backend = start_prune_backend("sessions-prune")
+    local prune_percents = run_prune_conversation(prune_backend)
+    local prune_reqs = {}
+    for index = prune_mark + 1, #provider.requests do
+        prune_reqs[#prune_reqs + 1] = provider.requests[index]
+    end
+    check(#prune_reqs >= PRUNE_FILES * 2 - 1, "the prune phase issued conversation requests", {
+        count = #prune_reqs,
+    })
+    local oldest_id = "call_prune_1"
+    local newest_id = ("call_prune_%d"):format(PRUNE_FILES)
+    local last = prune_reqs[#prune_reqs]
+    check(last ~= nil, "the prune phase has a final conversation request")
+    check(
+        last:find(prune_pointer("read", oldest_id), 1, true) ~= nil,
+        "the final request replaces the OLDEST tool result with its pointer",
+        { pointer = prune_pointer("read", oldest_id) }
+    )
+    check(
+        last:find(PRUNE_SENTINEL_PREFIX .. "1", 1, true) == nil,
+        "the pruned result's sentinel body is GONE from the request",
+        { request = #prune_reqs }
+    )
+    check(
+        last:find(PRUNE_SENTINEL_PREFIX .. PRUNE_FILES, 1, true) ~= nil,
+        "the most recent turn's tool result is delivered in full"
+    )
+    check(last:find(prune_pointer("read", newest_id), 1, true) == nil, "the newest turn is never pruned")
+    step(
+        ("A18 oldest result pruned (pointer for %s), its body gone, newest turn (%s) intact; context %% per prompt: %s"):format(
+            oldest_id,
+            newest_id,
+            table.concat(
+                vim.tbl_map(function(value)
+                    return tostring(value)
+                end, prune_percents),
+                " -> "
+            )
+        )
+    )
+
+    -- A19: the pointer text never churns, and the set never shrinks.
+    local pointer_texts = {}
+    for _, text in ipairs(prune_reqs) do
+        for pointer in text:gmatch("%[pruned tool result:[^%]]*%]") do
+            local id = pointer:match("^%[pruned tool result: %S+ (%S+);")
+            check(id ~= nil, "the pointer names its tool call", { pointer = pointer })
+            pointer_texts[id] = pointer_texts[id] or {}
+            pointer_texts[id][pointer] = true
+        end
+    end
+    local pointer_ids = vim.tbl_keys(pointer_texts)
+    check(#pointer_ids > 0, "at least one pointer rode the prune-phase requests")
+    for _, id in ipairs(pointer_ids) do
+        local variants = vim.tbl_keys(pointer_texts[id])
+        check(#variants == 1, "a pruned result keeps ONE fixed pointer text (no churn)", {
+            id = id,
+            variants = variants,
+        })
+    end
+    local previous_pointers = 0
+    for index, text in ipairs(prune_reqs) do
+        local pointers = count_occurrences(text, PRUNE_POINTER_PREFIX)
+        check(pointers >= previous_pointers, "no request un-prunes a tool result (the prefix does not churn)", {
+            request = index,
+            pointers = pointers,
+            previous = previous_pointers,
+        })
+        previous_pointers = pointers
+    end
+    step(
+        ("A19 %d distinct pruned ids, one pointer text each, monotone pointer count (max %d per request)"):format(
+            #pointer_ids,
+            previous_pointers
+        )
+    )
+
+    -- A20: the decision is persisted, deduped, and NOTHING is lost.
+    local prune_entries = session_entries(prune_backend.session_dir)
+    local prune_compactions = by_type(prune_entries, "compaction")
+    check(#prune_compactions == 0, "the prune phase never compacted (the window was not exceeded)", {
+        count = #prune_compactions,
+    })
+    local prune_rows = custom_entries(prune_entries, "pi2-compaction-prune")
+    check(#prune_rows >= 1, "the extension persisted at least one prune decision", { count = #prune_rows })
+    local previous_signature = nil
+    for _, row in ipairs(prune_rows) do
+        local data = row.data or {}
+        check(type(data.pruned) == "table" and #data.pruned > 0, "the decision names the pruned ids", { data = data })
+        check(
+            type(data.savedChars) == "number" and data.savedChars > 0,
+            "the decision records the character estimate it saved",
+            { data = data }
+        )
+        check(
+            type(data.atFraction) == "number" and data.atFraction >= PRUNE_HIGH_WATER,
+            "the decision records the reported fraction that triggered it",
+            { data = data }
+        )
+        local ids = {}
+        for _, pruned in ipairs(data.pruned) do
+            check(
+                type(pruned.id) == "string" and type(pruned.toolName) == "string",
+                "every decision row carries an id and a toolName",
+                { row = pruned }
+            )
+            ids[#ids + 1] = pruned.id
+        end
+        local joined = table.concat(ids, ",")
+        check(joined ~= previous_signature, "an identical decision is never appended twice", {
+            signature = joined,
+        })
+        previous_signature = joined
+    end
+    local first_decision = prune_rows[1].data or {}
+    local first_row = (first_decision.pruned or {})[1] or {}
+    check(
+        first_row.id == oldest_id and first_row.toolName == "read",
+        "the first decision starts with the OLDEST tool result",
+        { row = first_row }
+    )
+    local prune_jsonl = session_jsonl_text(prune_backend.session_dir)
+    check(
+        count_occurrences(prune_jsonl, PRUNE_SENTINEL_PREFIX .. "1") >= 1,
+        "the session transcript still holds the pruned result's original bytes"
+    )
+    check(
+        count_occurrences(prune_jsonl, PRUNE_POINTER_PREFIX) == 0,
+        "the pointer is a request view only: it is never persisted"
+    )
+    local prune_errors = {}
+    for _, ev in ipairs(prune_backend.events) do
+        if ev.type == "extension_error" then
+            prune_errors[#prune_errors + 1] = ev
+        end
+    end
+    check(#prune_errors == 0, "the prune path raised no extension_error", { errors = prune_errors })
+    stop_backend(prune_backend)
+    step(
+        ("A20 %d prune decisions, deduped by id set, %d chars claimed saved, original sentinel still in the JSONL"):format(
+            #prune_rows,
+            (prune_rows[#prune_rows].data or {}).savedChars or 0
+        )
+    )
+
+    -- A22: the decision survives a process restart. A FRESH pi opens the prune
+    -- session's file, so the extension instance is rebuilt from scratch and its
+    -- in-memory set is empty: the SAME pointer has to come back out of the
+    -- persisted `pi2-compaction-prune` entry, and no pruned body may reappear.
+    local prune_session_path
+    for _, name in ipairs(vim.fn.readdir(prune_backend.session_dir)) do
+        if name:match("%.jsonl$") then
+            prune_session_path = prune_backend.session_dir .. "/" .. name
+        end
+    end
+    check(prune_session_path ~= nil, "the prune session is on disk")
+    local resumed_backend = start_prune_backend("sessions-prune-resume")
+    send(resumed_backend, { type = "switch_session", sessionPath = prune_session_path })
+    local switched = wait_event(resumed_backend, function(ev)
+        return ev.type == "response" and ev.command == "switch_session"
+    end, 60000, "switch_session (prune resume)")
+    check(switched ~= nil and switched.success ~= false, "the resumed backend switched onto the prune session", {
+        response = switched,
+        stderr = resumed_backend.stderr,
+    })
+    -- The resumed conversation continues with a plain text answer (every scripted
+    -- read has been used already), so the request carries only history.
+    provider.turn = PRUNE_FILES * 2
+    local resumed_mark = #provider.requests
+    run_turn(resumed_backend, "Continue after the restart.", 180000)
+    local resumed_request = provider.requests[resumed_mark + 1]
+    check(resumed_request ~= nil, "the resumed session issued a conversation request")
+    check(
+        resumed_request:find(prune_pointer("read", oldest_id), 1, true) ~= nil,
+        "a resumed process serves the SAME pointer text",
+        { pointer = prune_pointer("read", oldest_id) }
+    )
+    check(
+        resumed_request:find(PRUNE_SENTINEL_PREFIX .. "1", 1, true) == nil,
+        "the resumed request does not bring the pruned body back"
+    )
+    local resumed_errors = {}
+    for _, ev in ipairs(resumed_backend.events) do
+        if ev.type == "extension_error" then
+            resumed_errors[#resumed_errors + 1] = ev
+        end
+    end
+    check(#resumed_errors == 0, "the resume path raised no extension_error", { errors = resumed_errors })
+    stop_backend(resumed_backend)
+    step("A22 a fresh process re-seeds the persisted decision and serves the identical pointer")
+
+    -- -----------------------------------------------------------------------
+    -- Phase 8 (A21): the negative control. Same conversation, same model, same
+    -- window — only `prune.enabled` is false. Every body must be delivered and
+    -- nothing may be recorded.
+    -- -----------------------------------------------------------------------
+    write_runtime_config(config_path, {
+        enabled = true,
+        prune = { enabled = false, high_water = PRUNE_HIGH_WATER, min_turns = PRUNE_MIN_TURNS },
+    })
+    provider.mode = "prune"
+    provider.turn = 0
+    local control_mark = #provider.requests
+    local control_backend = start_prune_backend("sessions-prune-off")
+    run_prune_conversation(control_backend)
+    local control_reqs = {}
+    for index = control_mark + 1, #provider.requests do
+        control_reqs[#control_reqs + 1] = provider.requests[index]
+    end
+    check(#control_reqs >= PRUNE_FILES * 2 - 1, "the control phase issued conversation requests", {
+        count = #control_reqs,
+    })
+    for index, text in ipairs(control_reqs) do
+        check(count_occurrences(text, PRUNE_POINTER_PREFIX) == 0, "prune.enabled=false never replaces a tool result", {
+            request = index,
+        })
+    end
+    local control_last = control_reqs[#control_reqs]
+    check(control_last ~= nil, "the control phase has a final conversation request")
+    check(
+        control_last:find(PRUNE_SENTINEL_PREFIX .. "1", 1, true) ~= nil,
+        "with pruning off the OLDEST tool result body is delivered in full"
+    )
+    local control_entries = session_entries(control_backend.session_dir)
+    check(
+        #custom_entries(control_entries, "pi2-compaction-prune") == 0,
+        "with pruning off no prune decision is recorded"
+    )
+    local control_errors = {}
+    for _, ev in ipairs(control_backend.events) do
+        if ev.type == "extension_error" then
+            control_errors[#control_errors + 1] = ev
+        end
+    end
+    check(#control_errors == 0, "the control path raised no extension_error", { errors = control_errors })
+    stop_backend(control_backend)
+    step("A21 negative control: prune off delivers every full body, no pointer, no decision")
+
     stop_backend(backend)
     print(
-        ("ALL compaction cases passed (cleaner bounds + strips, checkpoint summaries structured/deduped, fail open, state snapshot injected once per change, owner conflict detected) in %.2fs"):format(
+        ("ALL compaction cases passed (cleaner bounds + strips, checkpoint summaries structured/deduped, fail open, state snapshot injected once per change, owner conflict detected, tool results pruned at a turn boundary with the newest turn intact and the negative control untouched) in %.2fs"):format(
             (uv.hrtime() - run_started) / 1e9
         )
     )
