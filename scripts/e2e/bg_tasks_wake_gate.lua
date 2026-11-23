@@ -1,23 +1,28 @@
--- Headless e2e: a completion must NOT start a turn when the idle-wake gate holds it.
+-- Headless e2e: a completion must not buy a provider request when the
+-- completion-wake gate holds it.
 --
--- A completion that lands while the agent is idle wakes it (`sendMessage(...,
--- { triggerTurn: true })`), and that wake is one full provider request whose
--- price is the whole CONVERSATION, not the report. The gate
--- (`idleWakeHold` in `extensions/bg-tasks.ts`) holds the wake when a human is
--- not at the editor, when the prompt cache has expired, when the task predates
--- the newest user message, or when the prompt's wake allowance is spent — and it
--- is published by the frontend through `PI_NVIM_BG_TASKS_FILE`.
+-- A completion that would start a turn — while the agent is idle, or at a
+-- boundary where the model has just produced its final answer — is one full
+-- provider request whose price is the whole CONVERSATION, not the report. The
+-- gate (`completionWakeHold` in `extensions/bg-tasks.ts`) holds it when the
+-- policy is `never` (the default), when a human is not at the editor, when the
+-- prompt cache has expired, when the task predates the newest user message,
+-- when the policy is `failure` and the burst has no failure, when this run
+-- already bought its one continuation, or when the prompt's allowance is spent
+-- — and it is published by the frontend through `PI_NVIM_BG_TASKS_FILE`.
 --
 -- This script drives that end-to-end against the real stack: a `pi --mode rpc`
 -- child with the bundled `extensions/bg-tasks.ts`, a scripted fake
 -- OpenAI-compatible provider on 127.0.0.1 (no account, no network, no model
 -- call), and the request bodies the provider actually received as ground truth.
 --
--- Two cases, one per policy edge:
---   A `wake_on_idle = "never"`            -> hold reason "policy"
---   B `wake_on_idle = "budgeted"`, budget 0 -> hold reason "budget"
+-- Four cases:
+--   A idle,     `never`                    -> hold reason "policy", no turn
+--   B idle,     `budgeted` budget 0        -> hold reason "budget", no turn
+--   C boundary, `never`                    -> no continuation, next prompt carries it
+--   D boundary, `budgeted` budget 1        -> one continuation, in history afterwards
 --
--- Scripted turns (both cases):
+-- Idle cases (A/B):
 --   T1  ONE background bash call, blocked on a marker file under the run dir
 --   T2  plain assistant text — the run ends with the task still blocked, so its
 --       completion arrives with nobody attached and the session idle
@@ -25,14 +30,21 @@
 --   T3  answer to the next user prompt — the report must ride THIS request
 --   T4  answer to a third prompt — the report must NOT be injected again
 --
+-- Boundary cases (C/D): the marker is released when T2's request arrives and the
+-- fake provider answers 400 ms later, so the task exits while the model is
+-- producing its FINAL answer (no tool results left at `turn_end`):
+--   T1  the same background call; T2 the final answer
+--   C: no T3 until the next user prompt, which carries the held report once
+--   D: T3 is the one paid continuation; the report is then history, one copy
+--
 -- Assertions, all behavioural:
---   G1 the held completion starts NO turn (no `agent_start` after the release)
+--   G1 a held completion starts NO turn (no `agent_start` after the release)
 --   G2 the transcript carries a panel message whose `details.held` names the
 --      expected reason (a silent hold would be indistinguishable from a loss)
 --   G3 the report is NOT persisted and NOT woken before the user speaks
---   G4 the next user prompt's request carries the report exactly once
---   G5 the request after that carries it zero times (confirmed, not re-injected)
---   G6 exactly the scripted number of assistant turns ran (no wake turn)
+--   G4 the next request carries the report exactly once (injection or history)
+--   G5 a later request adds NO second copy (confirmed, not re-injected)
+--   G6 exactly the scripted number of provider turns ran (no panel-ping turn)
 --
 -- Needs the pi binary, nothing else (the provider is fake), which is why it runs
 -- in CI (.github/workflows/e2e.yml). Not part of `make test`:
@@ -145,6 +157,9 @@ end
 ---@field bodies table<integer, string> raw request body per turn
 ---@field task_ids string[]
 ---@field missing_task_ids boolean?
+---@field release_turn integer? write `release_marker` when this turn's request arrives
+---@field release_marker string?
+---@field delay_ms integer? wait this long before answering `release_turn`
 
 ---@param provider GateE2EProvider
 ---@return string
@@ -179,10 +194,19 @@ local function respond(provider)
 end
 
 ---@param command string
+---@param opts? { release_turn?: integer, release_marker?: string, delay_ms?: integer }
 ---@return GateE2EProvider
-local function start_fake_provider(command)
+local function start_fake_provider(command, opts)
     ---@type GateE2EProvider
-    local provider = { turn = 0, bodies = {}, task_ids = {}, command = command }
+    local provider = {
+        turn = 0,
+        bodies = {},
+        task_ids = {},
+        command = command,
+        release_turn = opts and opts.release_turn,
+        release_marker = opts and opts.release_marker,
+        delay_ms = opts and opts.delay_ms,
+    }
     local server = assert(uv.new_tcp())
     assert(server:bind("127.0.0.1", 0))
     provider.server = server
@@ -212,7 +236,23 @@ local function start_fake_provider(command)
                 return
             end
             answered = true
-            provider.bodies[provider.turn + 1] = body
+            local next_turn = provider.turn + 1
+            provider.bodies[next_turn] = body
+            if provider.release_turn == next_turn and provider.release_marker ~= nil then
+                -- The boundary case: let the task exit while the model is still
+                -- producing this turn's final answer, so the report reaches
+                -- `turn_end` with no tool results left (the paid path).
+                write_file(provider.release_marker, "go")
+                local response = respond(provider)
+                local timer = assert(uv.new_timer())
+                timer:start(provider.delay_ms or 400, 0, function()
+                    timer:close()
+                    pcall(client.write, client, response, function()
+                        pcall(client.close, client)
+                    end)
+                end)
+                return
+            end
             local response = respond(provider)
             pcall(client.write, client, response, function()
                 pcall(client.close, client)
@@ -618,6 +658,138 @@ local function run_case(name, prefs, expected_reason)
 end
 
 -- ---------------------------------------------------------------------------
+-- Boundary case: the task exits while the model is producing its FINAL answer
+-- (no tool results left at `turn_end`). Under `never` the report must not buy a
+-- continuation and must ride the next user prompt; under `budgeted` it may buy
+-- exactly one continuation, and the next prompt must not carry it again.
+-- ---------------------------------------------------------------------------
+
+---@param name string
+---@param prefs table
+---@param expect_continuation boolean
+local function run_boundary_case(name, prefs, expect_continuation)
+    local case_root = RUN_ROOT .. "/" .. name
+    vim.fn.mkdir(case_root, "p")
+    local agent_dir = case_root .. "/agent"
+    local prefs_path = case_root .. "/bg-tasks.json"
+    write_file(prefs_path, vim.json.encode(prefs))
+
+    local marker = case_root .. "/release"
+    local command = ("while [ ! -f '%s' ]; do sleep 0.02; done; echo boundary-%s"):format(marker, name)
+
+    local provider = start_fake_provider(command, {
+        release_turn = 2,
+        release_marker = marker,
+        delay_ms = 400,
+    })
+    local addr = provider.server:getsockname()
+    local port = type(addr) == "table" and addr.port or nil
+    check(type(port) == "number" and port > 0, "fake provider did not bind a port", { addr = addr })
+    write_agent_dir(agent_dir, port)
+
+    local backend = start_backend(case_root .. "/sessions", case_root .. "/cwd", agent_dir, prefs_path)
+    send(backend, { id = name .. "-model", type = "set_model", provider = PROVIDER, modelId = MODEL_ID })
+    local pinned = wait_event(backend, function(ev)
+        return ev.type == "response" and ev.command == "set_model"
+    end, 30000, "set_model")
+    check(pinned ~= nil and pinned.success ~= false, "fake model selected", {
+        pinned = pinned,
+        stderr = backend.stderr,
+    })
+
+    local since = #backend.events
+    send(backend, { id = name .. "-prompt-1", type = "prompt", message = "Start it in the background." })
+    local settled = wait_event(backend, function(ev)
+        return ev.type == "agent_settled" and ev._n > since
+    end, 60000, "the first scripted run settles")
+    check(settled ~= nil, "the first scripted run settles", { stderr = backend.stderr })
+    check(provider.missing_task_ids == nil, "the bash result must carry the task id", { turn = provider.turn })
+    check(#provider.task_ids == 1, "the task id was read out of the tool result", { ids = provider.task_ids })
+    local task_id = provider.task_ids[1]
+    local needle = report_needle(task_id)
+
+    if expect_continuation then
+        check(provider.turn == 3, "the final answer's report buys ONE continuation", { turns = provider.turn })
+        local carried = body_text(provider.bodies[3] or "")
+        check(count_plain(carried, needle) == 1, "the continuation request carries the report once", {
+            hits = count_plain(carried, needle),
+            needle = needle,
+            body = carried:sub(-1200),
+        })
+        step(("%s: boundary report bought one continuation"):format(name))
+    else
+        check(provider.turn == 2, "a held final-answer report buys no continuation", { turns = provider.turn })
+        local wake = wait_event(backend, function(ev)
+            return ev.type == "agent_start" and ev._n > settled._n
+        end, BLOCK_TIMEOUT_MS, "no wake turn")
+        check(wake == nil, "a held final-answer report must not start a turn", {
+            wake = wake,
+            stderr = backend.stderr,
+        })
+        vim.wait(300, function()
+            return false
+        end)
+        local held = held_entries(read_session(backend.session_dir))
+        check(#held == 1, "exactly one panel message announces the hold", { held = held })
+        check(held[1].held == "policy", "the hold names the policy", { got = held[1].held, want = "policy" })
+        check(held[1].taskId == task_id, "the hold names the task", { got = held[1].taskId, want = task_id })
+        step(("%s: boundary report held, no continuation, no wake"):format(name))
+    end
+
+    -- The next user prompt: under `never` it carries the held report exactly
+    -- once; under `budgeted` it must not, because the continuation already did.
+    local before_prompt = #backend.events
+    send(backend, { id = name .. "-prompt-2", type = "prompt", message = "What happened?" })
+    local prompt_run = wait_event(backend, function(ev)
+        return ev.type == "agent_start" and ev._n > before_prompt
+    end, 30000, "the user prompt starts a turn")
+    check(prompt_run ~= nil, "the user's next prompt starts a turn", { stderr = backend.stderr })
+    local prompt_settled = wait_event(backend, function(ev)
+        return ev.type == "agent_settled" and ev._n > prompt_run._n
+    end, 60000, "the prompt's run settles")
+    check(prompt_settled ~= nil, "the prompt's run settles", { stderr = backend.stderr })
+
+    local body_index = expect_continuation and 4 or 3
+    local carried = body_text(provider.bodies[body_index] or "")
+    local hits = count_plain(carried, needle)
+    -- Under `never` the held report is injected into this request once and then
+    -- confirmed. Under `budgeted` the continuation persisted it as a boundary
+    -- entry, so it is history here: exactly one copy, never a second injection.
+    check(hits == 1, "the next prompt carries exactly one copy of the report", {
+        hits = hits,
+        needle = needle,
+        body = carried:sub(-1200),
+    })
+    step(("%s: next prompt carries one copy (%s)"):format(name, expect_continuation and "history" or "injection"))
+
+    -- A later prompt must not carry it again.
+    send(backend, { id = name .. "-prompt-3", type = "prompt", message = "Anything else?" })
+    local third = wait_event(backend, function(ev)
+        return ev.type == "agent_start" and ev._n > prompt_settled._n
+    end, 30000, "the third prompt starts a turn")
+    check(third ~= nil, "the third prompt starts a turn", { stderr = backend.stderr })
+    local third_settled = wait_event(backend, function(ev)
+        return ev.type == "agent_settled" and ev._n > third._n
+    end, 60000, "the third run settles")
+    check(third_settled ~= nil, "the third run settles", { stderr = backend.stderr })
+
+    local later_index = expect_continuation and 5 or 4
+    local later = body_text(provider.bodies[later_index] or "")
+    local again = count_plain(later, needle)
+    -- A persisted boundary entry stays in history (one copy). An ephemeral
+    -- injection is confirmed and must not appear again (zero copies).
+    local want_later = expect_continuation and 1 or 0
+    check(again == want_later, "a later request adds no second copy", { hits = again, want = want_later })
+    check(provider.turn == later_index, "exactly the scripted provider turns ran", {
+        turns = provider.turn,
+        want = later_index,
+    })
+    step(("%s: a later prompt does not carry it again"):format(name))
+
+    stop_backend(backend)
+end
+
+-- ---------------------------------------------------------------------------
 
 local function main()
     check(vim.fn.executable("pi") == 1, "pi binary not found in PATH (required for this e2e)")
@@ -626,21 +798,37 @@ local function main()
     -- `present: true` and `wake_cache_window_ms: 0` isolate the policy gate from
     -- the presence and cache rules, so a failure names the rule that broke.
     run_case("never", {
-        wake_on_idle = "never",
+        wake_on_completion = "never",
         wake_budget = 2,
         wake_cache_window_ms = 0,
         present = true,
     }, "policy")
 
     run_case("budget", {
-        wake_on_idle = "budgeted",
+        wake_on_completion = "budgeted",
         wake_budget = 0,
         wake_cache_window_ms = 0,
         present = true,
     }, "budget")
 
+    -- The paid boundary: the task exits while the model is writing its final
+    -- answer, so `turn_end` has no tool results left.
+    run_boundary_case("boundary-never", {
+        wake_on_completion = "never",
+        wake_budget = 2,
+        wake_cache_window_ms = 0,
+        present = true,
+    }, false)
+
+    run_boundary_case("boundary-budget", {
+        wake_on_completion = "budgeted",
+        wake_budget = 1,
+        wake_cache_window_ms = 0,
+        present = true,
+    }, true)
+
     print(
-        ("ALL bg-tasks idle-wake gate cases passed (a held completion starts no turn, says why, and rides\nthe next user prompt exactly once) in %.2fs"):format(
+        ("ALL bg-tasks completion-wake gate cases passed (a held completion starts no turn, says why, and\nrides the next user prompt exactly once) in %.2fs"):format(
             (uv.hrtime() - run_started) / 1e9
         )
     )

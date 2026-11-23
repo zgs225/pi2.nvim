@@ -447,6 +447,15 @@ local function main()
     vim.env.PI_CODING_AGENT_DIR = agent_dir
     vim.env.PI_OFFLINE = "1"
 
+    -- This script checks the COALESCING, not the cost gate: opt into a paid
+    -- wake explicitly, because the default policy is `never` and would (rightly)
+    -- hold both completions for the next user prompt.
+    local prefs_path = RUN_ROOT .. "/bg-tasks.json"
+    local prefs = assert(io.open(prefs_path, "w"))
+    prefs:write(vim.json.encode({ wake_on_completion = "always", present = true }))
+    prefs:close()
+    vim.env.PI_NVIM_BG_TASKS_FILE = prefs_path
+
     local provider = start_fake_provider()
     local addr = provider.server:getsockname()
     local port = type(addr) == "table" and addr.port or nil

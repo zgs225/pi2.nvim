@@ -418,20 +418,22 @@ require("pi").setup({
         -- rounded border); width/height/position apply to the side layout only.
     },
 
-    -- Idle-wake policy for the background-bash extension. A completion that
-    -- lands while the agent is idle normally starts a turn of its own; that
-    -- turn is priced by the whole conversation, so it is spent under a policy
-    -- rather than per event. See doc/extensions.md#the-idle-wake-gate.
+    -- Completion-wake policy for the background-bash extension. A completion
+    -- that would buy a provider request (while the agent is idle, or after its
+    -- final answer) is spent under a policy rather than per event; a report
+    -- that rides a turn already making a request is always free. See
+    -- doc/extensions.md#the-completion-wake-gate.
     background_tasks = {
-        -- May an idle completion start a turn? "budgeted" (default) allows
-        -- `wake_budget` wakes per user prompt and holds the rest for the next
-        -- prompt; "always" wakes on every completion; "never" only ever
-        -- delivers at a turn boundary or on the next user prompt.
-        wake_on_idle = "budgeted",
-        -- Idle wakes allowed per user prompt under "budgeted" (0…10).
-        -- Replenished by the next user input, not by a clock.
+        -- May a completion buy a turn? "never" (default) delivers it on a later
+        -- turn without starting one; "budgeted" allows `wake_budget` paid turns
+        -- per prompt; "failure" only when the burst contains a failure;
+        -- "always" buys one on every completion. The old `wake_on_idle` key is
+        -- still read as a fallback.
+        wake_on_completion = "never",
+        -- Paid turns allowed per user prompt under "budgeted" and "failure"
+        -- (0…10). Replenished by the next user input, not by a clock.
         wake_budget = 2,
-        -- Hold a wake when the last request is older than this, because it
+        -- Hold a paid turn when the last request is older than this, because it
         -- would re-read the conversation uncached. Default 300000 = the
         -- 5-minute prompt-cache lifetime; 0 disables the window.
         wake_cache_window_ms = 300000,

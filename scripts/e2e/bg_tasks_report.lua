@@ -501,6 +501,15 @@ local function main()
     vim.env.PI_CODING_AGENT_DIR = agent_dir
     vim.env.PI_OFFLINE = "1"
 
+    -- These cases exercise the delivery ladder, not the cost gate: opt into a
+    -- paid wake explicitly. The default policy is `never`, which would (rightly)
+    -- hold the report for the next user prompt.
+    local prefs_path = RUN_ROOT .. "/bg-tasks.json"
+    local prefs = assert(io.open(prefs_path, "w"))
+    prefs:write(vim.json.encode({ wake_on_completion = "always", present = true }))
+    prefs:close()
+    vim.env.PI_NVIM_BG_TASKS_FILE = prefs_path
+
     local provider = start_fake_provider()
     local addr = provider.server:getsockname()
     local port = type(addr) == "table" and addr.port or nil

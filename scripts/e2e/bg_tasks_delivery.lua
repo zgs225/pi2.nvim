@@ -412,6 +412,14 @@ local function main()
     print("run root : " .. RUN_ROOT)
     check(read_file(EXTENSION) ~= nil, "bg-tasks extension exists at " .. EXTENSION)
 
+    -- This script checks the DELIVERY LADDER, including the idle wake; the
+    -- default policy is `never`, so opt in to paid wakes explicitly.
+    local prefs_path = RUN_ROOT .. "/bg-tasks.json"
+    local prefs = assert(io.open(prefs_path, "w"))
+    prefs:write(vim.json.encode({ wake_on_completion = "always", present = true }))
+    prefs:close()
+    vim.env.PI_NVIM_BG_TASKS_FILE = prefs_path
+
     case_e1()
     case_e2()
     case_e3()
