@@ -118,7 +118,7 @@ require("pi").setup({
             cache = { icon = "󰆼" },
             cost = { icon = "" },
             compaction = { icon = false },
-            context = { icon = "", warn = 70, error = 90 },
+            context = { icon = "", warn = 70, error = 90, countdown = true },
             attention = { icon = "󰵚", counter = false },
             -- provider: "ambiguous" (default) appends a [provider] suffix
             -- when the same model id is served by several providers/endpoints,
@@ -442,6 +442,72 @@ require("pi").setup({
         -- would re-read the conversation uncached. Default 300000 = the
         -- 5-minute prompt-cache lifetime; 0 disables the window.
         wake_cache_window_ms = 300000,
+    },
+
+    -- Compaction observability and the bundled pi2-compaction extension.
+    -- See doc/usage.md#compaction-timeline and doc/extensions.md.
+    compaction = {
+        -- The compaction timeline panel.
+        panel = {
+            -- "float" (default) or "side" (the tab's right column).
+            mode = "float",
+            -- Float width in columns ("side" uses it as the column width).
+            width = 100,
+            -- Float height in rows.
+            height = 22,
+        },
+        -- The bundled extensions/compaction.ts. Every option is re-read from a
+        -- runtime file on each compaction event, so setup() changes apply live.
+        extension = {
+            -- Inject the extension into every pi process (default true).
+            enabled = true,
+            -- L1: bound pi's default summary input, no LLM.
+            cleaner = {
+                enabled = true,
+                -- Keep at most this many read paths (most recent first).
+                max_read = 50,
+                -- Keep at most this many modified paths (written + edited).
+                max_modified = 100,
+                -- Drop OS temp dirs, pi subagent artifacts and editor run files.
+                drop_temp = true,
+                -- Drop build output, caches, lockfiles and dependency directories.
+                drop_build = true,
+                -- Strip <read-files>/<modified-files> from previousSummary before
+                -- the update prompt (they are appended again by pi afterwards).
+                strip_previous_lists = true,
+            },
+            -- L2: take over summary generation (opt-in; pi's summarizer stays the
+            -- default). Structured sections, evidence tags, dedupe, language,
+            -- protected literals, fallback to pi on any failure.
+            checkpoint = {
+                enabled = false,
+                -- "provider/modelId" for the summary request; nil = session model.
+                model = nil,
+                -- nil = session thinking level.
+                thinking_level = nil,
+                -- "auto" (conversation language) | "english" | "conversation".
+                language = "auto",
+                -- Soft length target for the summary body (200…6000).
+                max_words = 1500,
+            },
+            -- L3: inject a compact [pi2 state] snapshot into the first request
+            -- after a compaction (todo / background tasks / sub-agents / git).
+            state = {
+                enabled = true,
+                max_tokens = 1000,
+            },
+            -- L4: replace old tool results with pointers at a turn boundary
+            -- (opt-in; pi still keeps the originals in the session JSONL).
+            prune = {
+                enabled = false,
+                high_water = 0.7,
+                min_turns = 8,
+            },
+            -- Detect a third-party compaction extension taking over and say so once.
+            owner = {
+                detect = true,
+            },
+        },
     },
 
     -- Session diff review (:PiDiff): one floating panel — an outer border
