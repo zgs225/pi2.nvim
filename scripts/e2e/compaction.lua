@@ -71,6 +71,26 @@
 --   A11 pi's native compaction is stored (`fromHook` falsy, no `details.engine`),
 --       the custom entry reports `checkpoint == false`, and pi exits cleanly
 --
+-- Phase 5 (L3 state snapshot) runs a fresh session with `extensions/todo.ts`
+-- loaded, `state.enabled` on and checkpoint off, in a real (tiny) git repo:
+--   A12 a `pi2-compaction-state` custom entry exists whose `text` starts with
+--       the `[pi2 state]` header and folds the unfinished todo, the compaction
+--       facts and the git status; nothing is injected BEFORE the compaction
+--   A13 the FIRST request after the compaction carries the snapshot exactly
+--       once and the next prompt carries it zero times (never per turn)
+--   A14 a second compaction with an unchanged state renders byte-identically,
+--       the same hash, and injects nothing (stable, no second copy)
+--   A15 a changed todo list changes the hash, drops the completed item from the
+--       snapshot and is injected exactly once into the next request
+--
+-- Phase 6 (owner conflict) loads a competing extension AFTER ours, which wins
+-- the `session_before_compact` chain (last handler wins):
+--   A16 the stored compaction is the competitor's (`details.engine` is not
+--       `pi2`), ours emitted ONE conflict notice and no more after a second
+--       contested compaction (per-session rate limit)
+--   A17 L2 stands down for the rest of the session (no second checkpoint
+--       request), while L1 and the L3 snapshot keep working
+--
 -- Needs the pi binary, nothing else (the provider is fake), so it can run in CI:
 --
 --   make e2e-compaction
@@ -80,6 +100,9 @@ local uv = vim.uv
 
 local PLUGIN_ROOT = vim.fn.fnamemodify(vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p"), ":h:h:h")
 local EXTENSION = PLUGIN_ROOT .. "/extensions/compaction.ts"
+-- The L3 phase folds a REAL `todo_write` result, so the bundled todo extension
+-- is loaded next to ours (the snapshot never invents state).
+local TODO_EXTENSION = PLUGIN_ROOT .. "/extensions/todo.ts"
 local TAG = ("%d-%d"):format(uv.os_getpid(), os.time())
 local RUN_ROOT = vim.fn.tempname() .. "-compaction"
 -- The project tree lives OUTSIDE tmpdir(): the cleaner drops everything under
@@ -127,6 +150,41 @@ local SUMMARY_TEXT = table.concat({
     "## Next Steps",
     "1. keep going",
 }, "\n")
+
+-- Phase 5 (L3). The marker is the snapshot's first token: it must appear exactly
+-- once in the request a compaction is replayed into, and never again until the
+-- folded state actually changes.
+local STATE_MARKER = "[pi2 state]"
+local STATE_TODO_ONE = "STATE-TODO-ONE write the snapshot"
+local STATE_TODO_TWO = "STATE-TODO-TWO run the gate"
+local STATE_TODO_THREE = "STATE-TODO-THREE report the sha"
+local TODO_STATE_INITIAL = {
+    { content = STATE_TODO_ONE, status = "in_progress", activeForm = "Writing the snapshot" },
+    { content = STATE_TODO_TWO, status = "pending" },
+}
+local TODO_STATE_UPDATED = {
+    { content = STATE_TODO_ONE, status = "completed" },
+    { content = STATE_TODO_TWO, status = "in_progress", activeForm = "Running the gate" },
+    { content = STATE_TODO_THREE, status = "pending" },
+}
+
+-- Phase 6 (owner conflict). `session_before_compact` handlers chain last-wins,
+-- so a competing extension loaded AFTER ours supplies the summary and ours has
+-- to notice that it lost (and stand its checkpoint layer down).
+local COMPETITOR_MARKER = "COMPETITOR-SUMMARY-1"
+local COMPETITOR_SOURCE = [=[
+export default function competitor(pi: any) {
+    pi.on("session_before_compact", async (event: any) => ({
+        compaction: {
+            summary: "## Competitor summary\nCOMPETITOR-SUMMARY-1",
+            firstKeptEntryId: event.preparation.firstKeptEntryId,
+            tokensBefore: event.preparation.tokensBefore,
+            details: { engine: "competitor" },
+        },
+    }));
+}
+]=]
+local OWNER_CONFLICT_NOTICE = "another compaction extension supplied this summary"
 
 io.stdout:setvbuf("no")
 local run_started = uv.hrtime()
@@ -281,10 +339,11 @@ end
 
 ---@class CompactionE2EProvider
 ---@field server? uv.uv_tcp_t
----@field mode "l1"|"checkpoint"|"fallback" which scripted conversation is active
+---@field mode "l1"|"checkpoint"|"fallback"|"state" which scripted conversation is active
 ---@field turn integer conversation requests answered so far (per phase)
 ---@field summarizations string[] flattened text of every native summarisation request
 ---@field checkpoint_requests string[] flattened text of every L2 checkpoint request
+---@field requests string[] flattened text of every CONVERSATION request (what the model was handed)
 ---@field temp_paths string[]
 ---@field project_paths string[]
 ---@field big_path string
@@ -357,8 +416,30 @@ local function respond(provider)
     provider.turn = provider.turn + 1
     local turn = provider.turn
 
-    if provider.mode == "checkpoint" then
+    if provider.mode == "state" then
         if turn == 1 then
+            return tool_turn({
+                { "todo_write", { todos = TODO_STATE_INITIAL } },
+                { "read", { path = provider.big_path } },
+            })
+        end
+        if turn == 5 then
+            -- A manual `compact` needs fresh content past keepRecentTokens, so the
+            -- turns before each later compaction read the big file again.
+            return tool_turn({ { "read", { path = provider.big_path } } })
+        end
+        if turn == 8 then
+            -- The second todo_write replaces the whole list (full-replacement
+            -- semantics): one item is completed, one is added.
+            return tool_turn({
+                { "todo_write", { todos = TODO_STATE_UPDATED } },
+                { "read", { path = provider.big_path } },
+            })
+        end
+        return text_turn(("State phase turn %d."):format(turn))
+    end
+    if provider.mode == "checkpoint" then
+        if turn == 1 or turn == 3 then
             return tool_turn({ { "read", { path = provider.big_path } } })
         end
         return text_turn("Read the large project file again.")
@@ -416,6 +497,9 @@ local function handle_request(provider, body)
         provider.summarizations[#provider.summarizations + 1] = text
         return text_turn(SUMMARY_TEXT)
     end
+    -- A conversation request: this is what the model was actually handed, so it
+    -- is the ground truth for "the snapshot rode exactly one request".
+    provider.requests[#provider.requests + 1] = text
     return respond(provider)
 end
 
@@ -564,6 +648,42 @@ local function create_fixture_files()
     return temp_paths, project_paths, big_path
 end
 
+--- Run a command, returning its exit code and stdout.
+---@param argv string[]
+---@param cwd string
+---@return integer code
+---@return string out
+local function sh(argv, cwd)
+    local result = vim.system(argv, { text = true, cwd = cwd }):wait()
+    return result.code or -1, result.stdout or ""
+end
+
+--- A real (tiny) git repo for the snapshot's `## Git` section: one committed
+--- file that is later modified, plus one untracked file. The L3 snapshot runs
+--- `git status --short` in the session cwd, so this fixture is that cwd.
+---@return string cwd
+local function create_git_fixture()
+    check(vim.fn.executable("git") == 1, "git is required for the L3 snapshot fixture")
+    local cwd = PROJECT_ROOT .. "/state-project"
+    write_lines(cwd .. "/committed.txt", { "committed line" })
+    ---@param args string[]
+    ---@return string
+    local function git(args)
+        local full = { "git", "-C", cwd }
+        vim.list_extend(full, args)
+        local code, out = sh(full, cwd)
+        check(code == 0, "git " .. table.concat(args, " ") .. " failed", { out = out })
+        return out
+    end
+    git({ "init", "-q" })
+    git({ "add", "committed.txt" })
+    git({ "-c", "user.name=pi2 e2e", "-c", "user.email=e2e@pi2.invalid", "commit", "-q", "-m", "fixture" })
+    -- Modified after the commit (" M committed.txt") and never added ("?? untracked.txt").
+    write_lines(cwd .. "/committed.txt", { "committed line", "modified line" })
+    write_lines(cwd .. "/untracked.txt", { "untracked line" })
+    return cwd
+end
+
 -- ---------------------------------------------------------------------------
 -- RPC backend
 -- ---------------------------------------------------------------------------
@@ -576,27 +696,31 @@ end
 
 ---@param session_dir string
 ---@param cwd string
+---@param extra_extensions? string[] further `-e` paths, loaded AFTER the bundled one
 ---@return CompactionE2EBackend
-local function start_backend(session_dir, cwd)
+local function start_backend(session_dir, cwd, extra_extensions)
     vim.fn.mkdir(session_dir, "p")
     vim.fn.mkdir(cwd, "p")
     ---@type CompactionE2EBackend
     local backend = { job = 0, session_dir = session_dir, events = {}, stderr = "" }
     local partial = { out = "" }
-    backend.job = vim.fn.jobstart({
-        "pi",
-        "--mode",
-        "rpc",
-        "--no-extensions",
-        "-e",
-        EXTENSION,
+    -- Extension load order is argv order, and `session_before_compact` handlers
+    -- chain last-wins: a competitor passed in `extra_extensions` therefore
+    -- replaces our summary (that is what the owner-conflict phase relies on).
+    local argv = { "pi", "--mode", "rpc", "--no-extensions", "-e", EXTENSION }
+    for _, path in ipairs(extra_extensions or {}) do
+        argv[#argv + 1] = "-e"
+        argv[#argv + 1] = path
+    end
+    vim.list_extend(argv, {
         "--no-mcp",
         "--no-skills",
         "--no-prompt-templates",
         "--no-context-files",
         "--session-dir",
         session_dir,
-    }, {
+    })
+    backend.job = vim.fn.jobstart(argv, {
         cwd = cwd,
         on_stdout = function(_, data)
             if not data then
@@ -779,6 +903,38 @@ local function contains(list, value)
     return false
 end
 
+--- How many times `needle` occurs in `text` (plain search, no patterns).
+---@param text string
+---@param needle string
+---@return integer
+local function count_occurrences(text, needle)
+    local count = 0
+    local start = 1
+    while true do
+        local index = text:find(needle, start, true)
+        if index == nil then
+            return count
+        end
+        count = count + 1
+        start = index + #needle
+    end
+end
+
+--- The sections of a snapshot WITHOUT the `## Compaction` facts block. The facts
+--- carry this compaction's token counts, so they differ between two compactions
+--- of an identical state; everything else must be byte-identical.
+---@param text string
+---@return string
+local function state_sections(text)
+    local kept = {}
+    for _, block in ipairs(vim.split(text, "\n\n", { plain = true })) do
+        if block:find("## Compaction", 1, true) ~= 1 then
+            kept[#kept + 1] = block
+        end
+    end
+    return table.concat(kept, "\n\n")
+end
+
 -- ---------------------------------------------------------------------------
 
 local function cleanup()
@@ -806,6 +962,7 @@ local function main()
         turn = 0,
         summarizations = {},
         checkpoint_requests = {},
+        requests = {},
         temp_paths = temp_paths,
         project_paths = project_paths,
         big_path = big_path,
@@ -1205,9 +1362,330 @@ local function main()
     stop_backend(fallback_backend)
     step("A11 empty completion: native compaction stored, checkpoint=false recorded, pi exited cleanly")
 
+    -- -----------------------------------------------------------------------
+    -- Phase 5 (A12-A15): L3 state snapshot. A fresh session in a REAL tiny git
+    -- repo, with `extensions/todo.ts` loaded so the snapshot folds an actual
+    -- `todo_write` result. Checkpoint stays off (that phase is done), the state
+    -- layer stays at its default.
+    -- -----------------------------------------------------------------------
+    provider.mode = "state"
+    provider.turn = 0
+    local state_cwd = create_git_fixture()
+    local _, branch_out = sh({ "git", "-C", state_cwd, "rev-parse", "--abbrev-ref", "HEAD" }, state_cwd)
+    local state_branch = branch_out:gsub("%s+$", "")
+    check(state_branch ~= "", "the git fixture has a branch")
+    write_runtime_config(config_path, {
+        enabled = true,
+        state = { enabled = true, max_tokens = 400 },
+    })
+    local state_backend = start_backend(RUN_ROOT .. "/sessions-state", state_cwd, { TODO_EXTENSION })
+    send(state_backend, { type = "set_model", provider = PROVIDER, modelId = MODEL_ID })
+    local state_pinned = wait_event(state_backend, function(ev)
+        return ev.type == "response" and ev.command == "set_model"
+    end, 30000, "set_model (state)")
+    check(state_pinned ~= nil and state_pinned.success ~= false, "the state-phase model is selected", {
+        stderr = state_backend.stderr,
+    })
+
+    -- Pre-compaction: the todo list is written and the big file read, so the
+    -- NEXT compaction has both state to fold and content to summarize.
+    local pre_mark = #provider.requests
+    run_turn(state_backend, "Record the plan and read the large file.", 180000)
+    check(provider.turn == 2, "the state phase ran both scripted turns", { turn = provider.turn })
+    check(#provider.requests > pre_mark, "the state phase issued conversation requests")
+    check(
+        count_occurrences(provider.requests[pre_mark + 1], STATE_MARKER) == 0,
+        "no snapshot exists before the first compaction (a fresh session injects nothing)"
+    )
+    step("phase 5: todo_write + big read ran, no snapshot injected yet")
+
+    response = run_compact(state_backend, "compact #4 (state)")
+    check(response ~= nil, "the state compaction returned an RPC response")
+    entries = session_entries(state_backend.session_dir)
+    compactions = by_type(entries, "compaction")
+    local state_rows = custom_entries(entries, "pi2-compaction-state")
+    check(#compactions == 1, "one compaction entry in the state session", { count = #compactions })
+    check(#state_rows == 1, "the extension persisted exactly one state snapshot", { count = #state_rows })
+    local snapshot = state_rows[1].data or {}
+
+    -- A12: the record itself.
+    check(type(snapshot.text) == "string" and snapshot.text ~= "", "the snapshot text is a non-empty string", {
+        data = snapshot,
+    })
+    check(
+        snapshot.text:find(STATE_MARKER .. " Post-compaction state snapshot", 1, true) == 1,
+        "the snapshot starts with the [pi2 state] header",
+        { head = snapshot.text:sub(1, 80) }
+    )
+    check(snapshot.reason == "manual", "the snapshot records the compaction reason", { reason = snapshot.reason })
+    check(
+        type(snapshot.hash) == "string" and snapshot.hash:match("^%x%x%x%x%x%x%x%x$") ~= nil,
+        "the snapshot carries an 8-hex-char content hash",
+        { hash = snapshot.hash }
+    )
+    check(type(snapshot.tokensBefore) == "number", "the snapshot records tokensBefore", { data = snapshot })
+    check(
+        type(snapshot.tokensBeforeAfter) == "number" and snapshot.tokensBeforeAfter < snapshot.tokensBefore,
+        "the snapshot records the estimated tokens after (smaller than before)",
+        { data = snapshot }
+    )
+    check(snapshot.text:find("## Compaction", 1, true) ~= nil, "the snapshot carries the compaction facts")
+    check(snapshot.text:find("- reason: manual", 1, true) ~= nil, "the compaction facts name the reason")
+    check(snapshot.text:find(STATE_TODO_ONE, 1, true) ~= nil, "the snapshot carries the unfinished todo item")
+    check(snapshot.text:find("- [ ] ", 1, true) ~= nil, "todo items render as unchecked boxes")
+    check(snapshot.text:find(STATE_TODO_THREE, 1, true) == nil, "no item exists yet that was never written")
+    check(snapshot.text:find("## Git", 1, true) ~= nil, "the snapshot carries the git section")
+    check(snapshot.text:find("root: " .. state_cwd, 1, true) ~= nil, "the git section names the toplevel", {
+        root = state_cwd,
+    })
+    check(
+        snapshot.text:find("branch: " .. state_branch, 1, true) ~= nil,
+        "the git section names the branch",
+        { branch = state_branch }
+    )
+    check(snapshot.text:find("?? untracked.txt", 1, true) ~= nil, "the git section lists the untracked file")
+    check(snapshot.text:find("M committed.txt", 1, true) ~= nil, "the git section lists the modified file")
+    check(snapshot.text:find("[truncated]", 1, true) == nil, "the 400-token budget did not drop a section")
+    step(
+        ("A12 snapshot: %d chars, todos folded, git on %s (%s), hash=%s, %d -> %d tokens"):format(
+            #snapshot.text,
+            state_branch,
+            state_cwd,
+            snapshot.hash,
+            snapshot.tokensBefore,
+            snapshot.tokensBeforeAfter
+        )
+    )
+
+    -- A13: exactly one request carries it, and the next prompt carries none.
+    local rc_mark = #provider.requests
+    run_turn(state_backend, "Continue after the compaction.", 180000)
+    check(provider.turn == 3, "the post-compaction prompt ran", { turn = provider.turn })
+    check(#provider.requests > rc_mark, "the post-compaction prompt issued a request")
+    local injected = provider.requests[rc_mark + 1]
+    check(
+        count_occurrences(injected, STATE_MARKER) == 1,
+        "the FIRST post-compaction request carries the snapshot exactly once",
+        { count = count_occurrences(injected, STATE_MARKER) }
+    )
+    check(injected:find(STATE_TODO_TWO, 1, true) ~= nil, "the injected text is the snapshot's todo state")
+    local next_mark = #provider.requests
+    run_turn(state_backend, "A second prompt with unchanged state.", 180000)
+    check(provider.turn == 4, "the follow-up prompt ran", { turn = provider.turn })
+    local follow_up = provider.requests[next_mark + 1]
+    check(
+        count_occurrences(follow_up, STATE_MARKER) == 0,
+        "a second prompt with unchanged state carries the snapshot ZERO times",
+        { count = count_occurrences(follow_up, STATE_MARKER) }
+    )
+    step("A13 injected once into the first request, never per turn")
+
+    -- A14: an unchanged state is byte-stable and must not be re-injected.
+    run_turn(state_backend, "Read the large file again so the next compaction has work.", 180000)
+    check(provider.turn == 6, "the pre-compaction read ran", { turn = provider.turn })
+    response = run_compact(state_backend, "compact #5 (state unchanged)")
+    check(response ~= nil, "the second state compaction returned an RPC response")
+    entries = session_entries(state_backend.session_dir)
+    state_rows = custom_entries(entries, "pi2-compaction-state")
+    check(#state_rows == 2, "the second compaction persisted a second snapshot", { count = #state_rows })
+    local stable = state_rows[2].data or {}
+    check(stable.hash == snapshot.hash, "an unchanged state hashes identically", {
+        first = snapshot.hash,
+        second = stable.hash,
+    })
+    check(
+        state_sections(stable.text) == state_sections(snapshot.text),
+        "an unchanged state renders byte-identically outside the compaction facts",
+        { first = state_sections(snapshot.text), second = state_sections(stable.text) }
+    )
+    check(stable.text ~= snapshot.text, "the facts still record this compaction (its own token counts)")
+    local stable_mark = #provider.requests
+    run_turn(state_backend, "Nothing changed, keep going.", 180000)
+    check(provider.turn == 7, "the post-compaction prompt after #2 ran", { turn = provider.turn })
+    check(
+        count_occurrences(provider.requests[stable_mark + 1], STATE_MARKER) == 0,
+        "a byte-identical state is NOT injected a second time",
+        { count = count_occurrences(provider.requests[stable_mark + 1], STATE_MARKER) }
+    )
+    step(("A14 unchanged state: same hash %s, same state sections, no fresh injection"):format(stable.hash))
+
+    -- A15: a changed todo list changes the hash and injects exactly once.
+    local update_mark = #provider.requests
+    run_turn(state_backend, "Update the todo list and read the large file.", 180000)
+    check(provider.turn == 9, "the todo update ran both scripted turns", { turn = provider.turn })
+    check(
+        count_occurrences(provider.requests[update_mark + 1], STATE_MARKER) == 0,
+        "the todo update's request carries no stale snapshot"
+    )
+    response = run_compact(state_backend, "compact #6 (state changed)")
+    check(response ~= nil, "the third state compaction returned an RPC response")
+    entries = session_entries(state_backend.session_dir)
+    state_rows = custom_entries(entries, "pi2-compaction-state")
+    check(#state_rows == 3, "the third compaction persisted a third snapshot", { count = #state_rows })
+    local changed = state_rows[3].data or {}
+    check(changed.hash ~= snapshot.hash, "a changed todo list changes the snapshot hash", {
+        before = snapshot.hash,
+        after = changed.hash,
+    })
+    check(changed.text:find(STATE_TODO_THREE, 1, true) ~= nil, "the new snapshot carries the new item")
+    check(
+        changed.text:find(STATE_TODO_ONE, 1, true) == nil,
+        "a completed item is no longer carried in the unfinished list"
+    )
+    local fresh_mark = #provider.requests
+    run_turn(state_backend, "One more prompt after the change.", 180000)
+    check(provider.turn == 10, "the post-change prompt ran", { turn = provider.turn })
+    local fresh = provider.requests[fresh_mark + 1]
+    check(
+        count_occurrences(fresh, STATE_MARKER) == 1,
+        "a changed snapshot is injected exactly once",
+        { count = count_occurrences(fresh, STATE_MARKER) }
+    )
+    check(fresh:find(STATE_TODO_THREE, 1, true) ~= nil, "the injected text is the NEW snapshot")
+    local state_errors = {}
+    for _, ev in ipairs(state_backend.events) do
+        if ev.type == "extension_error" then
+            state_errors[#state_errors + 1] = ev
+        end
+    end
+    check(#state_errors == 0, "the state layer never raised an extension_error", { errors = state_errors })
+    step(("A15 changed state: new hash %s, new item injected exactly once"):format(changed.hash))
+    stop_backend(state_backend)
+
+    -- -----------------------------------------------------------------------
+    -- Phase 6 (A16-A17): owner conflict. The competitor is loaded AFTER ours, so
+    -- it wins the `session_before_compact` chain and supplies the summary. Ours
+    -- must say so ONCE, stand L2 down, and keep L1 + the state snapshot alive.
+    -- -----------------------------------------------------------------------
+    local competitor_path = RUN_ROOT .. "/competitor-compaction.ts"
+    local competitor_file = assert(io.open(competitor_path, "w"))
+    competitor_file:write(COMPETITOR_SOURCE)
+    competitor_file:close()
+    write_runtime_config(config_path, {
+        enabled = true,
+        checkpoint = {
+            enabled = true,
+            model = PROVIDER .. "/" .. MODEL_ID,
+            language = "auto",
+            max_words = CHECKPOINT_MAX_WORDS,
+        },
+        state = { enabled = true },
+        owner = { detect = true },
+    })
+    provider.mode = "checkpoint"
+    provider.turn = 0
+    --- Count the `notify` UI requests that mention the conflict.
+    ---@param target CompactionE2EBackend
+    ---@return integer
+    local function conflict_notices(target)
+        local count = 0
+        for _, ev in ipairs(target.events) do
+            if
+                ev.type == "extension_ui_request"
+                and ev.method == "notify"
+                and type(ev.message) == "string"
+                and ev.message:find(OWNER_CONFLICT_NOTICE, 1, true) ~= nil
+            then
+                count = count + 1
+            end
+        end
+        return count
+    end
+    local conflict_backend = start_backend(RUN_ROOT .. "/sessions-conflict", PROJECT_ROOT .. "/project", {
+        competitor_path,
+    })
+    send(conflict_backend, { type = "set_model", provider = PROVIDER, modelId = MODEL_ID })
+    local conflict_pinned = wait_event(conflict_backend, function(ev)
+        return ev.type == "response" and ev.command == "set_model"
+    end, 30000, "set_model (conflict)")
+    check(conflict_pinned ~= nil and conflict_pinned.success ~= false, "the conflict-phase model is selected", {
+        stderr = conflict_backend.stderr,
+    })
+    run_turn(conflict_backend, "Read the large project file before the contested compaction.", 180000)
+    check(provider.turn == 2, "the conflict phase ran both scripted turns", { turn = provider.turn })
+
+    -- A16: the FIRST contested compaction. Ours is loaded first, so its
+    -- checkpoint request happens; the competitor then replaces the result.
+    local checkpoints_before = #provider.checkpoint_requests
+    response = run_compact(conflict_backend, "compact #7 (contested)")
+    check(response ~= nil, "the contested compaction returned an RPC response")
+    check(
+        #provider.checkpoint_requests == checkpoints_before + 1,
+        "our checkpoint layer ran before the competitor overwrote it (load order)",
+        { before = checkpoints_before, now = #provider.checkpoint_requests }
+    )
+    local conflict_entries = session_entries(conflict_backend.session_dir)
+    local conflict_compactions = by_type(conflict_entries, "compaction")
+    check(#conflict_compactions == 1, "one compaction entry in the conflict session", {
+        count = #conflict_compactions,
+    })
+    local contested = conflict_compactions[1]
+    check(contested.fromHook == true, "the contested compaction came from an extension", {
+        fromHook = contested.fromHook,
+    })
+    local contested_details = contested.details or {}
+    check(
+        contested_details.engine ~= nil and contested_details.engine ~= "pi2",
+        "the stored summary is NOT ours (details.engine is the competitor's)",
+        { details = contested_details }
+    )
+    check(contested_details.engine == "competitor", "the last-loaded extension supplied the summary", {
+        details = contested_details,
+    })
+    check(
+        contested.summary:find(COMPETITOR_MARKER, 1, true) ~= nil,
+        "the stored summary is the competitor's text",
+        { summary = contested.summary }
+    )
+    check(conflict_notices(conflict_backend) == 1, "the conflict notice was emitted exactly once", {
+        count = conflict_notices(conflict_backend),
+    })
+    step("A16 contested compaction: competitor's summary stored, ONE conflict notice emitted")
+
+    -- A17: the SECOND contested compaction must not re-notify and must not run
+    -- our checkpoint layer at all (L2 stood down); L1 and L3 kept working.
+    run_turn(conflict_backend, "Read the large project file once more.", 180000)
+    check(provider.turn == 4, "the pre-compaction turn ran", { turn = provider.turn })
+    checkpoints_before = #provider.checkpoint_requests
+    response = run_compact(conflict_backend, "compact #8 (contested, L2 stood down)")
+    check(response ~= nil, "the second contested compaction returned an RPC response")
+    check(
+        #provider.checkpoint_requests == checkpoints_before,
+        "L2 stood down: no checkpoint request for the second contested compaction",
+        { before = checkpoints_before, now = #provider.checkpoint_requests }
+    )
+    check(conflict_notices(conflict_backend) == 1, "the conflict notice is rate-limited to once per session", {
+        count = conflict_notices(conflict_backend),
+    })
+    conflict_entries = session_entries(conflict_backend.session_dir)
+    conflict_compactions = by_type(conflict_entries, "compaction")
+    check(#conflict_compactions == 2, "two contested compactions are stored", { count = #conflict_compactions })
+    check(
+        (conflict_compactions[2].details or {}).engine == "competitor",
+        "the second contested compaction is the competitor's too",
+        { details = conflict_compactions[2].details }
+    )
+    local conflict_cleaners = custom_entries(conflict_entries, "pi2-compaction-cleaner")
+    check(#conflict_cleaners == 2, "L1 kept recording through the conflict (two cleaner entries)", {
+        count = #conflict_cleaners,
+    })
+    local conflict_states = custom_entries(conflict_entries, "pi2-compaction-state")
+    check(#conflict_states == 2, "L3 kept recording through the conflict (two state snapshots)", {
+        count = #conflict_states,
+    })
+    local conflict_errors = {}
+    for _, ev in ipairs(conflict_backend.events) do
+        if ev.type == "extension_error" then
+            conflict_errors[#conflict_errors + 1] = ev
+        end
+    end
+    check(#conflict_errors == 0, "the conflict path raised no extension_error", { errors = conflict_errors })
+    stop_backend(conflict_backend)
+    step("A17 L2 stood down after the conflict, L1 + L3 still active, one notice total")
+
     stop_backend(backend)
     print(
-        ("ALL compaction cases passed (cleaner bounds + strips, checkpoint summaries structured/deduped, fail open) in %.2fs"):format(
+        ("ALL compaction cases passed (cleaner bounds + strips, checkpoint summaries structured/deduped, fail open, state snapshot injected once per change, owner conflict detected) in %.2fs"):format(
             (uv.hrtime() - run_started) / 1e9
         )
     )
