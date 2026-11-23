@@ -79,10 +79,14 @@ require("pi").setup({
         -- Default layout when opening the chat: "side" or "float".
         default = "side",
         side = {
-            -- Side panel position: "left", "right", or "bottom".
+            -- Split mode only: the edge the chat column is carved out of.
             position = "right",
-            -- Width in columns when position is "left" or "right".
+            -- Split mode only: the chat column width in columns.
             width = 80,
+            -- Tab takeover: "auto" (a tab whose single window shows an unnamed,
+            -- unmodified buffer: a :tabnew window or a start screen such as
+            -- NvChad's nvdash), "always", "never".
+            full_tab = "auto",
             panels = {
                 -- Show winbars on each panel in side layout.
                 history = { winbar = true },

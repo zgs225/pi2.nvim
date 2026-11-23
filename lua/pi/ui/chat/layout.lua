@@ -250,20 +250,14 @@ function Layout:_close_history_win()
     if self._tab and Workspace.chat(self._tab) then
         Workspace.release_chat(self._tab)
     else
-        local hwin = self:history_win()
-        if hwin then
-            pcall(vim.api.nvim_win_close, hwin, false)
-        end
+        Workspace.close_window(self:history_win())
     end
     self._history_win = nil
     self._history:set_win(nil)
 end
 
 function Layout:_close_prompt_win()
-    local pwin = self:prompt_win()
-    if pwin then
-        vim.api.nvim_win_close(pwin, false)
-    end
+    Workspace.close_window(self:prompt_win())
     self._prompt_win = nil
     self._prompt:set_win(nil)
 end
@@ -282,7 +276,7 @@ function Layout:_close_attachments_win()
             vim.cmd("wincmd w")
         end
     end
-    vim.api.nvim_win_close(awin, false)
+    Workspace.close_window(awin)
     self._attachments_win = nil
     if self._tab then
         Workspace.set_attachments(self._tab, nil)

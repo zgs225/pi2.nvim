@@ -131,12 +131,42 @@ local function install_stub()
 end
 
 --- Drop into a pristine single-tab state; sweep stale sessions afterwards.
+---
+--- A test that creates a session leaves its chat windows behind when
+--- `Sessions._reset()` drops the registry (the reset does not hide the layout),
+--- and in full-tab mode those windows are the tab's only ones. Collapse them
+--- and replace a leftover π buffer, so the next test's new chat never wipes a
+--- buffer that is still displayed in a window.
 local function settle_tabs(first_tab)
-    if vim.api.nvim_get_current_tabpage() ~= first_tab then
-        vim.api.nvim_set_current_tabpage(first_tab)
+    -- Flush scheduled callbacks of the session this test just created before
+    -- its buffers are torn down (a pending show_loading would touch a stale
+    -- buffer id in the next test).
+    vim.wait(20)
+    if vim.api.nvim_tabpage_is_valid(first_tab) then
+        if vim.api.nvim_get_current_tabpage() ~= first_tab then
+            vim.api.nvim_set_current_tabpage(first_tab)
+        end
+    end
+    -- Hide the chats the test's sessions left open: sessions/_reset drops the
+    -- registry without touching the layout, and a chat whose buffers are still
+    -- displayed (or still has a scheduled show_loading) breaks the next test.
+    for _, live in ipairs(Sessions.list()) do
+        if live.chat then
+            pcall(function()
+                live.chat:hide()
+            end)
+        end
     end
     vim.cmd("silent! tabonly!")
+    vim.cmd("silent! only")
+    local win = vim.api.nvim_get_current_win()
+    if vim.startswith(vim.bo[vim.api.nvim_get_current_buf()].filetype, "pi-") then
+        -- A π window pins its buffer (winfixbuf), so `:enew` would fail.
+        vim.api.nvim_set_option_value("winfixbuf", false, { win = win })
+        pcall(vim.api.nvim_win_set_buf, win, vim.api.nvim_create_buf(true, false))
+    end
     Sessions._reset()
+    require("pi.ui.workspace")._reset()
 end
 
 local function restore_stub(first_tab)

@@ -17,10 +17,9 @@
 ---@field attachments pi.SidePanelOpts
 
 ---@class pi.SideLayout
----@field position "left"|"right"|"bottom"
----@field width integer
----@field height? integer
----@field full_tab? "auto"|"always"|"never" Tab takeover: "never" (default) keeps the historical split; "auto" takes over an untouched `:tabnew` window; "always" takes over any single-window tab (default lands with the full-tab milestone)
+---@field position "left"|"right" Split-mode side: the edge the chat column is carved out of (ignored in full-tab mode, where the chat column is the middle of the tab)
+---@field width integer Chat column width in split mode (ignored in full-tab mode, where the chat column absorbs the space the side columns leave)
+---@field full_tab? "auto"|"always"|"never" Tab takeover: "auto" (default) takes over a single-window tab whose buffer is unnamed and unmodified (a `:tabnew` window or a plugin start screen such as NvChad's nvdash); "always" takes over any single-window tab; "never" keeps the historical split layout
 ---@field panels pi.SidePanels
 
 ---@class pi.FloatLayout
@@ -458,6 +457,7 @@ local defaults = {
         side = {
             position = "right",
             width = 80,
+            full_tab = "auto",
             panels = {
                 history = { winbar = true },
                 prompt = { winbar = true },

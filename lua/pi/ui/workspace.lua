@@ -407,8 +407,15 @@ function M.plan(tab, side_cfg)
     if requested == "always" then
         return "full"
     end
+    -- "auto" takes over a single window that is not a user's editing view: an
+    -- unnamed, unmodified buffer. That covers a `:tabnew` window and a plugin
+    -- start screen (NvChad's nvdash, alpha, the snacks dashboard — all `nofile`
+    -- buffers with no name), which is the state `<leader>ap` usually meets on a
+    -- fresh editor. The window is borrowed, so its buffer comes back on hide;
+    -- a named buffer (a file, a plugin sidebar) or a modified scratch stays,
+    -- because covering those would hide work the user is looking at.
     local buf = vim.api.nvim_win_get_buf(single)
-    local disposable = vim.bo[buf].buftype == "" and vim.api.nvim_buf_get_name(buf) == "" and not vim.bo[buf].modified
+    local disposable = vim.api.nvim_buf_get_name(buf) == "" and not vim.bo[buf].modified
     return disposable and "full" or "split"
 end
 
@@ -534,10 +541,32 @@ function M.release_chat(tab)
             Winfix.restore(win)
         end
         pcall(vim.fn.winrestview, borrowed.view)
-    elseif chat.history and vim.api.nvim_win_is_valid(chat.history) then
-        pcall(vim.api.nvim_win_close, chat.history, false)
+    elseif chat.history then
+        M.close_window(chat.history)
     end
     schedule_apply(tab)
+end
+
+--- Close `win` unless it is the last frame window of its tab — closing that
+--- would close the tabpage itself (E444 in the last tab). Returns true when the
+--- window was closed.
+---@param win integer?
+---@return boolean
+function M.close_window(win)
+    if not win or not vim.api.nvim_win_is_valid(win) then
+        return false
+    end
+    local tab = vim.api.nvim_win_get_tabpage(win)
+    local frames = 0
+    for _, w in ipairs(vim.api.nvim_tabpage_list_wins(tab)) do
+        if vim.api.nvim_win_get_config(w).relative == "" then
+            frames = frames + 1
+        end
+    end
+    if frames <= 1 then
+        return false
+    end
+    return pcall(vim.api.nvim_win_close, win, false)
 end
 
 --- Insert a new panel window into `edge`'s column at its ORDER position.
