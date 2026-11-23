@@ -145,14 +145,20 @@ describe("sessions list order (issue #63)", function()
         local wt_dir = vim.fn.tempname() .. "-wt"
         vim.fn.mkdir(main_dir, "p")
         vim.fn.mkdir(wt_dir, "p")
+        -- Compare real paths: macOS keeps tempname() under the `/var` ->
+        -- `/private/var` symlink while `session.cwd` is already resolved, so a
+        -- plain string compare never matches and the placement silently looks
+        -- like a no-op (only the tabline order assertion catches it).
+        local main_real = vim.uv.fs_realpath(main_dir) or main_dir
+        local wt_real = vim.uv.fs_realpath(wt_dir) or wt_dir
         local real_worktree = package.loaded["pi.worktree"]
         package.loaded["pi.worktree"] = {
             detect = function(dir)
-                if dir == main_dir then
-                    return { kind = "main", name = "main", path = main_dir, repo_root = main_dir }
+                if dir == main_real then
+                    return { kind = "main", name = "main", path = main_real, repo_root = main_real }
                 end
-                if dir == wt_dir then
-                    return { kind = "linked", name = "wt", path = wt_dir, repo_root = main_dir }
+                if dir == wt_real then
+                    return { kind = "linked", name = "wt", path = wt_real, repo_root = main_real }
                 end
                 return nil
             end,
