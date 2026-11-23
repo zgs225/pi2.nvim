@@ -732,6 +732,28 @@ The agent-response jumps are particularly handy when the agent produced multiple
 
 Like the focus functions, all scroll functions are no-ops when no session is active. See the [Keymaps](keymaps.md) example for typical bindings inside the prompt buffer.
 
+### Turn navigation
+
+Scrolling is line-oriented; reading a conversation is turn-oriented. Two motions jump the history window from one user message to the next or the previous one, without leaving the prompt and without touching your text:
+
+| Key | Action |
+| --- | --- |
+| `]]` | Next turn — the following user message |
+| `[[` | Previous turn |
+
+Both are bound **buffer-locally** on the history buffer *and* on the prompt buffer (normal mode, so `Esc` `]]` from where you type), because the motion moves the *history* window's cursor and viewport while focus stays where it is: you do not have to leave the prompt to re-read an earlier turn. They are ordinary Vim motions here, so a count works — `3]]` skips three turns.
+
+Running out of turns is not a dead end: `]]` past the last turn lands on the very latest line and **re-attaches auto-follow** (see below), which is what you want when you finish reading and rejoin the live output. `[[` at the first turn is a no-op.
+
+The same motion is available from Lua, for your own bindings — `<M-]>` / `<M-[>` work from insert mode, where `[[` is a literal bracket:
+
+```lua
+pi.goto_turn("next")      -- forward one turn
+pi.goto_turn("prev", 2)  -- back two turns
+```
+
+Like the scroll helpers, both are no-ops returning `false` when no session is active or nothing has been rendered yet. A turn jump detaches auto-follow exactly like a scroll, so streaming never yanks you out of an older turn; and every jump records the previous position on the jumplist, so `<C-o>` walks back through turn jumps the way it does through any other jump.
+
 ### Open file under cursor
 
 Tool blocks print the paths they touch, and agent prose often references files. π can open the file on the history line under the cursor in an editor window (never a π panel, so the chat stays visible):

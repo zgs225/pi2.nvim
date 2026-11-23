@@ -555,6 +555,28 @@ function Chat:_set_keymaps()
         self:delete_pending_at_cursor()
     end, { buffer = hbuf, desc = "π: delete queued message under cursor" })
 
+    -- Turn navigation, vim's section-motion pair: `]]` next turn (user
+    -- message), `[[` previous one, counts included (`3]]`). Bound on the prompt
+    -- too (normal mode only — `[[` in insert mode is a literal bracket), and the
+    -- jump moves the *history* window without stealing focus, so it works while
+    -- typing. Past the last turn `]]` lands at the bottom and re-attaches the
+    -- stream.
+    vim.keymap.set("n", "]]", function()
+        self:goto_turn("next", vim.v.count1)
+    end, { buffer = hbuf, desc = "π: next turn" })
+
+    vim.keymap.set("n", "[[", function()
+        self:goto_turn("prev", vim.v.count1)
+    end, { buffer = hbuf, desc = "π: previous turn" })
+
+    vim.keymap.set("n", "]]", function()
+        self:goto_turn("next", vim.v.count1)
+    end, { buffer = pbuf, desc = "π: next turn" })
+
+    vim.keymap.set("n", "[[", function()
+        self:goto_turn("prev", vim.v.count1)
+    end, { buffer = pbuf, desc = "π: previous turn" })
+
     -- Zen toggle key — permanent on the prompt buffer.
     -- Enters zen when inactive, exits when active.
     local zen_cfg = Config.options.zen
@@ -2175,6 +2197,14 @@ end
 --- Scroll the history window to the last agent response in the latest user turn.
 function Chat:scroll_history_to_last_agent_response()
     self._history:scroll_to_last_agent_response()
+end
+
+--- Jump the history window to the next or previous turn (user message).
+---@param direction "next"|"prev"
+---@param count? integer turns to move (default 1)
+---@return boolean moved
+function Chat:goto_turn(direction, count)
+    return self._history:goto_turn(direction, count)
 end
 
 ---@param path string
