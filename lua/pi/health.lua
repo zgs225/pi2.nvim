@@ -349,6 +349,100 @@ M.check = function()
         end
     end
 
+    -- ── Three-column layout ───────────────────────────────────────────
+    -- The layout resolves itself from config at open time, so the only thing
+    -- worth reporting here is a configuration the user cannot see fail:
+    -- an invalid takeover mode, a deprecated position, a chat column the
+    -- columns squeeze below the usable floor, and legacy rows that a full-tab
+    -- layout cannot honor.
+    local Workspace = require("pi.ui.workspace")
+    local layout_cfg = Config.resolve_side_layout()
+    local full_tab = layout_cfg and layout_cfg.full_tab
+    if full_tab == nil or full_tab == "never" or full_tab == "auto" or full_tab == "always" then
+        vim.health.ok("`layout.side.full_tab` = `" .. tostring(full_tab or "never") .. "`")
+    else
+        vim.health.warn("Invalid `layout.side.full_tab`: `" .. tostring(full_tab) .. "`", {
+            'Use "never" (split layout), "auto" (take over an untouched `:tabnew` tab) or "always"',
+        })
+    end
+    if layout_cfg and layout_cfg.position == "bottom" then
+        vim.health.warn('`layout.side.position = "bottom"` is not supported by the three-column layout', {
+            'The chat column opens on the right instead; use "left" or "right"',
+        })
+    end
+
+    --- Column a panel config selects, or nil for a legacy horizontal row.
+    ---@param position any
+    ---@return "left"|"right"|nil
+    local function column_of(position)
+        if position == "left" or position == "right" then
+            return position
+        end
+        return nil
+    end
+
+    local sessions_cfg = Config.options.sessions_list or {}
+    local tasks_cfg = Config.options.tasks_panel or {}
+    local todo_panel_cfg = (Config.options.todo or {}).panel or {}
+    local sessions_col = column_of(sessions_cfg.position) or "left"
+    local tasks_col = column_of(tasks_cfg.position)
+    local todo_col = column_of(todo_panel_cfg.position) or sessions_col
+    -- The first panel in stacking order owns the width of its column.
+    local left_spec, right_spec
+    for _, owner in ipairs({
+        { edge = sessions_col, width = sessions_cfg.width },
+        { edge = tasks_col, width = tasks_cfg.width },
+        { edge = todo_col, width = todo_panel_cfg.width or 40 },
+    }) do
+        if owner.edge == "left" and not left_spec then
+            left_spec = owner.width
+        elseif owner.edge == "right" and not right_spec then
+            right_spec = owner.width
+        end
+    end
+
+    local mode = (full_tab == "auto" or full_tab == "always") and "full" or "split"
+    local columns = Workspace.resolve_columns(left_spec, right_spec, vim.o.columns, mode)
+    local chat_width
+    if mode == "full" then
+        chat_width = columns.flex
+    else
+        chat_width = (layout_cfg and layout_cfg.width) or 80
+        if chat_width < 1 then
+            chat_width = math.floor(vim.o.columns * chat_width)
+        end
+        chat_width = math.floor(chat_width)
+    end
+    if chat_width < columns.min_chat then
+        vim.health.warn(
+            string.format("Chat column is only %d columns wide at %d editor columns", chat_width, vim.o.columns),
+            {
+                "Widen the editor or narrow `sessions_list.width` / `tasks_panel.width` / `todo.panel.width`",
+            }
+        )
+    else
+        vim.health.ok(string.format("Chat column %d columns wide at %d editor columns", chat_width, vim.o.columns))
+    end
+
+    if mode == "full" then
+        for _, panel in ipairs({
+            { name = "sessions_list", position = sessions_cfg.position },
+            { name = "tasks_panel", position = tasks_cfg.position },
+            { name = "todo.panel", position = todo_panel_cfg.position },
+        }) do
+            if panel.position == "top" or panel.position == "bottom" then
+                vim.health.warn(
+                    string.format(
+                        '`%s.position = "%s"` is not part of the full-tab three-column layout',
+                        panel.name,
+                        panel.position
+                    ),
+                    { 'That panel opens in the left column instead; use "left" or "right"' }
+                )
+            end
+        end
+    end
+
     -- ── Image compression tools ────────────────────────────────────────
     local compress_cfg = Config.options.prompt and Config.options.prompt.image_compress or {}
     if compress_cfg.enable ~= false then

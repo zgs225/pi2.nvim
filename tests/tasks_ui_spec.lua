@@ -17,22 +17,23 @@ local Manager = require("pi.sessions.manager")
 ---@type integer[]
 local fake_wins = {}
 
---- Create a fake "sessions" window claimed on the current tab's left edge,
---- mimicking the sessions list before the tasks panel opens.
+--- Create a fake "sessions" window claimed on the current tab's right edge
+--- (the default tasks_panel.position), mimicking the sessions list before the
+--- tasks panel opens.
 ---@return integer
 local function claim_fake_sessions()
-    vim.cmd("topleft 30vsplit")
+    vim.cmd("botright 30vsplit")
     local win = vim.api.nvim_get_current_win()
     fake_wins[#fake_wins + 1] = win
-    Sidebar.claim(vim.api.nvim_get_current_tabpage(), "left", "sessions", win)
+    Sidebar.claim(vim.api.nvim_get_current_tabpage(), "right", "sessions", win)
     return win
 end
 
---- Panel keys currently registered at the current tab's left edge.
+--- Panel keys currently registered at the current tab's right edge.
 ---@return table<string, integer>
-local function left_edge_keys()
+local function right_edge_keys()
     local keys = {}
-    for _, panel in ipairs(Sidebar.panels(vim.api.nvim_get_current_tabpage(), "left")) do
+    for _, panel in ipairs(Sidebar.panels(vim.api.nvim_get_current_tabpage(), "right")) do
         keys[panel.key] = panel.win
     end
     return keys
@@ -737,7 +738,7 @@ describe("tasks panel UI", function()
             assert.is_nil(Panel.win(tab))
             assert.is_false(vim.api.nvim_win_is_valid(panel_win))
             assert.are.equal(other, vim.api.nvim_get_current_tabpage(), "current tabpage untouched")
-            assert.are.equal(0, #Sidebar.panels(tab, "left"), "sidebar claim released")
+            assert.are.equal(0, #Sidebar.panels(tab, "right"), "sidebar claim released")
             vim.cmd("tabclose!")
         end)
 
@@ -747,20 +748,20 @@ describe("tasks panel UI", function()
     end)
 
     describe("sidebar stacking", function()
-        it("claims the left edge while open and releases it on close and toggle", function()
+        it("claims the right edge while open and releases it on close and toggle", function()
             Panel.open()
             local tasks_win = Panel.win(vim.api.nvim_get_current_tabpage())
             assert.is_not_nil(tasks_win)
-            assert.are.equal(tasks_win, left_edge_keys().tasks, "open panel registered on the left edge")
+            assert.are.equal(tasks_win, right_edge_keys().tasks, "open panel registered on the right edge")
 
             Panel.close()
-            assert.is_nil(left_edge_keys().tasks, "close releases the claim")
+            assert.is_nil(right_edge_keys().tasks, "close releases the claim")
 
             Panel.open()
-            assert.is_not_nil(left_edge_keys().tasks)
+            assert.is_not_nil(right_edge_keys().tasks)
             Panel.toggle()
             assert.is_nil(Panel.win(vim.api.nvim_get_current_tabpage()))
-            assert.is_nil(left_edge_keys().tasks, "toggle close releases the claim too")
+            assert.is_nil(right_edge_keys().tasks, "toggle close releases the claim too")
         end)
 
         it("splits into an existing sessions column instead of opening a new one", function()
@@ -771,9 +772,9 @@ describe("tasks panel UI", function()
             assert.is_not_nil(tasks_win)
             assert.are_not.equal(sess_win, tasks_win)
 
-            -- Same column: identical left position and width (the split
-            -- stacks the new window above the sessions window, so row
-            -- starts differ by construction).
+            -- Same column: identical column position and width (the split
+            -- stacks the new window at its ORDER position, so row starts
+            -- differ by construction).
             local sess_pos = vim.api.nvim_win_get_position(sess_win)
             local tasks_pos = vim.api.nvim_win_get_position(tasks_win)
             assert.are.equal(sess_pos[2], tasks_pos[2], "same column: no second sidebar column")
@@ -784,7 +785,7 @@ describe("tasks panel UI", function()
             )
 
             -- Both panels are claimed and restack divides the column height.
-            local keys = left_edge_keys()
+            local keys = right_edge_keys()
             assert.are.equal(sess_win, keys.sessions)
             assert.are.equal(tasks_win, keys.tasks)
             local budget = vim.o.lines - vim.o.cmdheight - 2
@@ -798,7 +799,7 @@ describe("tasks panel UI", function()
 
             -- Closing tasks leaves the sessions panel registered and expands it.
             Panel.close()
-            keys = left_edge_keys()
+            keys = right_edge_keys()
             assert.is_nil(keys.tasks)
             assert.are.equal(sess_win, keys.sessions)
             assert.are.equal(vim.o.lines - vim.o.cmdheight - 1, vim.api.nvim_win_get_height(sess_win))

@@ -134,7 +134,25 @@ local function restore()
     vim.wait(20)
     Sessions.get = real.get
     Sessions.get_or_create = real.get_or_create
+    -- Hide the chats the test's sessions left open: `_reset()` drops the
+    -- registry without touching the layout, and a displayed chat window (or a
+    -- pending scheduled callback of it) breaks the next test.
+    for _, live in ipairs(Sessions.list()) do
+        if live.chat then
+            pcall(function()
+                live.chat:hide()
+            end)
+        end
+    end
+    vim.cmd("silent! only")
+    local win = vim.api.nvim_get_current_win()
+    if vim.startswith(vim.bo[vim.api.nvim_get_current_buf()].filetype, "pi-") then
+        -- A π window pins its buffer (winfixbuf), so `:enew` would fail.
+        vim.api.nvim_set_option_value("winfixbuf", false, { win = win })
+        pcall(vim.api.nvim_win_set_buf, win, vim.api.nvim_create_buf(true, false))
+    end
     Sessions._reset()
+    require("pi.ui.workspace")._reset()
     Rpc.start = real.rpc_start
     Rpc.stop = real.rpc_stop
     Rpc.send = real.rpc_send

@@ -28,7 +28,7 @@ local M = {}
 local Config = require("pi.config")
 local Ft = require("pi.filetypes")
 local Highlights = require("pi.ui.highlights")
-local Sidebar = require("pi.ui.sidebar")
+local Workspace = require("pi.ui.workspace")
 local Tasks = require("pi.tasks")
 
 local ns = vim.api.nvim_create_namespace("pi-tasks-list")
@@ -100,7 +100,7 @@ end
 ---@return { mode: "follow"|"side"|"float", position: string, width: integer, height: integer }
 local function panel_cfg()
     ---@type table
-    local defaults = { mode = "follow", position = "left", width = 40, height = 12 }
+    local defaults = { mode = "follow", position = "right", width = 40, height = 12 }
     return vim.tbl_deep_extend("keep", Config.options.tasks_panel or {}, defaults)
 end
 
@@ -1199,47 +1199,44 @@ end
 --- panels). Focus semantics match the historical behavior: the new panel
 --- window keeps focus.
 ---@param b integer
----@return integer
+---@return integer?
 local function open_side_win(b)
     local cfg = panel_cfg()
     local position = cfg.position or "left"
     local tab = current_tab()
-    local edge = Sidebar.effective_edge(tab, position)
-    local vertical = edge == "left" or edge == "right"
-    local panels = Sidebar.panels(tab, edge)
+    local column = Workspace.column_for(tab, position)
+    if column then
+        -- The workspace owns frame placement (column creation, stacking in
+        -- ORDER position, width pinning); the panel only supplies the buffer.
+        return Workspace.claim_panel(tab, "tasks", b, {
+            edge = column,
+            width = cfg.width,
+            weight = 1,
+            configure = function(win)
+                set_list_win_opts(win)
+                vim.wo[win].winfixwidth = true
+            end,
+        })
+    end
+    -- Legacy horizontal rows (top/bottom): not part of the three-column
+    -- workspace, so they keep the historical split and registry claim.
+    local Sidebar = require("pi.ui.sidebar")
+    local panels = Sidebar.panels(tab, position)
     local win
     if #panels > 0 then
-        -- Stack into the existing column/row instead of opening a new one:
-        -- split the last panel's window so the new window inherits its
-        -- width (vertical edge) or height (horizontal edge).
         vim.api.nvim_set_current_win(panels[#panels].win)
-        vim.cmd(vertical and "split" or "vsplit")
+        vim.cmd("vsplit")
         win = vim.api.nvim_get_current_win()
     else
-        local cmd
-        if position == "right" then
-            cmd = "botright " .. cfg.width .. "vsplit"
-        elseif position == "top" then
-            cmd = "topleft " .. cfg.height .. "split"
-        elseif position == "bottom" then
-            cmd = "botright " .. cfg.height .. "split"
-        else
-            cmd = "topleft " .. cfg.width .. "vsplit"
-        end
+        local cmd = position == "top" and ("topleft " .. cfg.height .. "split")
+            or ("botright " .. cfg.height .. "split")
         vim.cmd(cmd)
         win = vim.api.nvim_get_current_win()
     end
     vim.api.nvim_win_set_buf(win, b)
     set_list_win_opts(win)
-    if position == "top" or position == "bottom" then
-        vim.wo[win].winfixheight = true
-    else
-        vim.wo[win].winfixwidth = true
-    end
-    -- Column/row size along the edge stays owned by the opener (above);
-    -- the claim pins the perpendicular dimension via restack. Float
-    -- windows never reach this function, so they never claim.
-    Sidebar.claim(tab, edge, "tasks", win, { weight = 1 })
+    vim.wo[win].winfixheight = true
+    Sidebar.claim(tab, position, "tasks", win, { weight = 1 })
     return win
 end
 
@@ -1341,21 +1338,35 @@ function M.open()
     end
 end
 
+--- Close the task-output splits opened from `tab`'s panel (`o` / `a`). They
+--- are ordinary splits, not floats, so hiding the whole π UI would otherwise
+--- leave them next to an empty editor. Preview floats close with their list
+--- window through `watch_list_win`, which `close_tab` triggers. Safe for a
+--- background tab.
+---@param tab integer
+function M.close_outputs(tab)
+    if not vim.api.nvim_tabpage_is_valid(tab) then
+        return
+    end
+    for _, win in ipairs(vim.api.nvim_tabpage_list_wins(tab)) do
+        local buf = vim.api.nvim_win_get_buf(win)
+        local name = vim.api.nvim_buf_get_name(buf)
+        if vim.bo[buf].filetype == "pi-task-output" and vim.startswith(name, "pi://task-output/") then
+            pcall(vim.api.nvim_win_close, win, false)
+        end
+    end
+end
+
 --- Close the tasks panel window in `tab` (no-op when absent). Safe to call
 --- for a tab the user is not looking at: closing a window never touches the
 --- current tabpage or focus. Close the window first, then release the
 --- sidebar claim so the remaining edge panels expand.
 ---@param tab integer
 function M.close_tab(tab)
-    local win = win_for(tab)
-    if not win then
-        return
-    end
     wins[tab] = nil
-    if vim.api.nvim_win_is_valid(win) then
-        pcall(vim.api.nvim_win_close, win, false)
-    end
-    Sidebar.release(tab, "tasks")
+    -- Window first, then the claim release + geometry pass (both inside the
+    -- workspace, so the remaining edge panels and the chat column re-expand).
+    Workspace.release_panel(tab, "tasks")
 end
 
 --- Close the tasks panel window in the current tab (no-op when absent).

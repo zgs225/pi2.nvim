@@ -83,4 +83,19 @@ function M.setup()
     })
 end
 
+--- Restore the user's captured window options on `win`. Used when the
+--- workspace hands a borrowed tab window back (full-tab mode): the borrowed
+--- window was reconfigured for the π history render, and returning the user's
+--- buffer alone would leave π's options (no number, no signcolumn, …) behind.
+--- No-op when `setup()` has not captured the defaults (unit tests).
+---@param win integer
+function M.restore(win)
+    if not win or not vim.api.nvim_win_is_valid(win) then
+        return
+    end
+    for name, default in pairs(user_defaults) do
+        pcall(vim.api.nvim_set_option_value, name, default, { win = win })
+    end
+end
+
 return M

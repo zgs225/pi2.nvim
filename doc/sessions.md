@@ -66,7 +66,7 @@ And mid-session management:
 | `:PiSessions` | `pi.sessions()` | Toggle the live overview of all active sessions (name + busy/idle/attention). See [Sessions overview](#sessions-overview-pisessions). |
 | `:PiSessionsSync` | — | Reorder the π tabs into `:PiSessions` list order, so every checkout's tabs form one block (same as `S` in the list). Explicit only: Neovim reports no event for a user `:tabmove`, so an automatic pass could not tell a deliberate reorder from drift. See [Sessions overview](#sessions-overview-pisessions). |
 | `:PiSessionName [name]` | `pi.set_session_name(name?)` | Set a human-readable display name for the current session. Without an argument, opens an input dialog prefilled with the current name. Names appear in the `:PiResume` picker so you can identify long-running conversations at a glance. |
-| `:PiStop` | `pi.stop()` | Tear down the current session entirely, killing the backing `pi --mode rpc` process. Different from `:PiToggleChat`, which just hides the windows while the session keeps running. |
+| `:PiStop` | `pi.stop()` | Tear down the current session entirely, killing the backing `pi --mode rpc` process. Different from `:PiToggleChat`, which just hides the tab's π windows (chat and side panels) while the session keeps running. |
 | `:PiSubNew` | `pi.sub_new()` | Spawn a background sub-session with a task prompt (inherits model/thinking by default). |
 | `:PiSubSwitch` | `pi.sub_switch()` | Picker to switch the current tab's chat to a child sub-session (including dormant). |
 | `:PiSubParent` | `pi.sub_parent()` | Return from a child sub-session view to the parent. |
@@ -223,9 +223,9 @@ require("pi").setup({
         mode = "follow",   -- "follow" | "side" | "float"
         auto_open = false, -- open the list together with the chat
         collapse_subsessions = false, -- collapse sub-sessions by default
-        position = "left", -- side layout: "left" | "right" | "top" | "bottom"
-        width = 40,        -- side layout width for left/right
-        height = 12,       -- side layout height for top/bottom
+        position = "left", -- side column: "left" | "right" ("top"/"bottom" = legacy rows)
+        width = 40,        -- width of the left column this panel owns (fraction <1 = share of the editor)
+        height = 12,       -- legacy row height for top/bottom
         float = { width = 0.5, height = 0.4, border = "rounded" },
         -- `x` in the list: ask before closing a sub-session's process, a
         -- session's π tab, or every π tab of a worktree group (default: true).

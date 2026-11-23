@@ -16,7 +16,7 @@ local Config = require("pi.config")
 local Ft = require("pi.filetypes")
 local Highlights = require("pi.ui.highlights")
 local ChildFilter = require("pi.subsessions.sessions_list")
-local Sidebar = require("pi.ui.sidebar")
+local Workspace = require("pi.ui.workspace")
 local TabOrder = require("pi.sessions.tab_order")
 
 local ns = vim.api.nvim_create_namespace("pi-sessions-list")
@@ -2697,33 +2697,37 @@ local function set_list_win_opts(win)
 end
 
 ---@param b integer
----@return integer
+---@return integer?
 local function open_side_win(b)
     local cfg = Config.options.sessions_list
     local position = cfg.position or "left"
-    local cmd
-    if position == "right" then
-        cmd = "botright " .. cfg.width .. "vsplit"
-    elseif position == "top" then
-        cmd = "topleft " .. cfg.height .. "split"
-    elseif position == "bottom" then
-        cmd = "botright " .. cfg.height .. "split"
-    else
-        cmd = "topleft " .. cfg.width .. "vsplit"
+    local tab = current_tab()
+    local column = Workspace.column_for(tab, position)
+    if column then
+        -- The workspace owns frame placement: it creates the side column at
+        -- the tab's edge (or joins one that already exists), pins the width to
+        -- the session list's config and keeps the chat column inboard of it.
+        return Workspace.claim_panel(tab, "sessions", b, {
+            edge = column,
+            width = cfg.width,
+            weight = 1,
+            configure = function(win)
+                set_list_win_opts(win)
+                vim.wo[win].winfixwidth = true
+            end,
+        })
     end
+    -- Legacy horizontal rows (top/bottom) are not part of the three-column
+    -- workspace: they keep the historical split and registry claim.
+    local cmd = position == "top" and ("topleft " .. cfg.height .. "split") or ("botright " .. cfg.height .. "split")
     vim.cmd(cmd)
     local win = vim.api.nvim_get_current_win()
     vim.api.nvim_win_set_buf(win, b)
     set_list_win_opts(win)
-    if position == "top" or position == "bottom" then
-        vim.wo[win].winfixheight = true
-    else
-        vim.wo[win].winfixwidth = true
-    end
+    vim.wo[win].winfixheight = true
     -- Register with the sidebar stacking coordinator so shared edges are
     -- divided between panels instead of competing (restack runs on claim).
-    local tab = current_tab()
-    Sidebar.claim(tab, Sidebar.effective_edge(tab, position), "sessions", win, { weight = 1 })
+    require("pi.ui.sidebar").claim(tab, position, "sessions", win, { weight = 1 })
     return win
 end
 
@@ -2783,7 +2787,7 @@ local function win_for(tab)
     if win then
         -- The list window died without M.close (external :q / Ctrl-W c, tab
         -- closed): the window is already gone, so drop its stacking claim.
-        Sidebar.release(tab, "sessions")
+        Workspace.release_panel(tab, "sessions")
     end
     wins[tab] = nil
     return nil
@@ -2817,20 +2821,21 @@ function M.open()
 end
 
 --- Close the sessions list window in the current tab (no-op when absent).
+--- Close `tab`'s session-list window (no-op when absent). Safe for a tab the
+--- user is not looking at: releasing a panel claim and closing a window never
+--- change the current tabpage.
+---@param tab pi.TabId
+function M.close_tab(tab)
+    wins[tab] = nil
+    -- Window first, then the claim release + geometry pass (both inside the
+    -- workspace, so the remaining panels and the chat column re-expand).
+    Workspace.release_panel(tab, "sessions")
+end
+
 function M.close()
     show_hidden_children = false
     parent_hidden = {}
-    local tab = current_tab()
-    local win = win_for(tab)
-    if not win then
-        return
-    end
-    wins[tab] = nil
-    if vim.api.nvim_win_is_valid(win) then
-        pcall(vim.api.nvim_win_close, win, false)
-    end
-    -- Window first, then release (release is idempotent).
-    Sidebar.release(tab, "sessions")
+    M.close_tab(current_tab())
 end
 
 --- True when the current window is a `:PiSessions` list.

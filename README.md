@@ -249,7 +249,7 @@ require("pi").setup({
 | `:PiNewTab [worktree=<name>]` | Open a fresh session in a new tabpage (optionally in a worktree — created when the name does not exist) |
 | `:PiContinue [layout=side\|float]` | Continue the most recent session for the current working directory |
 | `:PiResume [layout=side\|float]` | Pick and resume a past session for the current working directory, grouped per checkout — with Telescope: `<CR>`/`o` here, `t`/`<C-t>` in a new tab |
-| `:PiToggleChat` | Toggle chat visibility |
+| `:PiToggleChat` | Toggle the tab's π UI: the chat and the side panels |
 | `:PiToggleLayout` | Switch between side and float layout |
 | `:PiAbort` | Abort the current agent operation |
 | `:PiAbortBash` | Abort the running direct bash (`!`) command |
@@ -345,7 +345,7 @@ Everything below is present in `pi2.nvim` and **not** in upstream `alex35mil/pi.
 - [Open file under cursor (`gf`)](doc/usage.md#open-file-under-cursor) — resolves bare paths, `@mention#L<line>`, and `path:line` from history lines.
 - [Turn navigation (`[[` / `]]`)](doc/usage.md#turn-navigation) — jump the history from one user message to the next/previous one, count-aware, from the history buffer or the prompt; `]]` past the last turn returns to the live bottom and resumes following.
 - [Search results in the quickfix list](doc/usage.md#quickfix) — `grep`/`find` results loaded for `:cnext` / `:cprev`.
-- [Left side panel](doc/usage.md#chat--layouts) — `layout.side.position` accepts `"left"`.
+- [Three-column side layout](doc/usage.md#chat--layouts) — the sessions list on the left, tasks and the todo checklist on the right; a fresh tab is taken over whole, an ordinary `:Pi` keeps your file in the split.
 
 **Sessions & editor integration**
 
