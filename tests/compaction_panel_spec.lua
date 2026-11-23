@@ -205,6 +205,7 @@ describe("compaction panel", function()
             end
         end
         Panel._reset()
+        Config.setup({})
         Sessions.get = real.get
         Sessions.get_compaction_state = real.get_compaction_state
         Dialog.info = real.dialog_info
@@ -424,6 +425,20 @@ describe("compaction panel", function()
             assert.is_truthy(panel_win())
             Panel.toggle()
             assert.is_nil(panel_win())
+        end)
+
+        it('opens in the side column when compaction.panel.mode = "side"', function()
+            Config.setup({ compaction = { panel = { mode = "side", width = 50 } } })
+            local tab = current_tab()
+            open_panel()
+            local win = panel_win()
+            assert.is_truthy(win)
+            -- A split (a second, non-floating window), not a float.
+            assert.equals(2, #vim.api.nvim_tabpage_list_wins(tab))
+            local relative = vim.api.nvim_win_get_config(win).relative
+            assert.is_true(relative == nil or relative == "", "side mode is a split, not a float")
+            Panel.close()
+            assert.equals(1, #vim.api.nvim_tabpage_list_wins(tab))
         end)
 
         it("ignores a close on a tab without a panel", function()
