@@ -110,6 +110,38 @@ function M.flatten_line(text)
     return (text:gsub("[\r\n]+", " "):gsub("%s+", " "))
 end
 
+--- An *optional* string argument as a renderer should read it: the value, or
+--- `nil` when the model passed nothing real.
+---
+--- A JSON `null` already fails a `type(...) == "string"` check (it decodes to
+--- `vim.NIL`), but models routinely **stringify** an optional argument they mean
+--- to omit — the session tree of one author carries 130 `"until": "null"` and
+--- not a single genuine needle among them — and echoing that placeholder back is
+--- noise the reader cannot act on: `until "null"`, `/pat/ in null`.
+---
+--- Only the two serialization artifacts are treated as absent (`null`,
+--- `undefined`, case-insensitively and after trimming). `none` / `nil` / `-` are
+--- deliberately **not** on the list: they are ordinary words a real argument may
+--- carry, and this helper feeds values a user reads, so it must stay predictable.
+--- Arguments whose value *is* the content (`command`, `pattern`, `claim`,
+--- `data`) never go through it.
+---@param value any
+---@return string? text the argument, or nil when it is absent, blank, or a null placeholder
+function M.optional_arg(value)
+    if type(value) ~= "string" then
+        return nil
+    end
+    local trimmed = vim.trim(value)
+    if trimmed == "" then
+        return nil
+    end
+    local lower = trimmed:lower()
+    if lower == "null" or lower == "undefined" then
+        return nil
+    end
+    return value
+end
+
 --- Extract the raw (still escape-bearing) result text.
 ---
 --- Sanitizing deliberately happens at the *write* step, not here: the output
@@ -1239,7 +1271,7 @@ local function wait_task_status(result)
         -- A deadline hit while watching for text: what did not happen is the
         -- point, and "still running" alone does not say the pattern never
         -- appeared.
-        if type(details["until"]) == "string" and details["until"] ~= "" then
+        if M.optional_arg(details["until"]) then
             return "pattern not seen"
         end
         return "still running"
@@ -1409,8 +1441,9 @@ local renderers = {
             -- `wait_task · id` reads the same whether it waits for an exit or
             -- for a readiness line, and the needle is the only thing that says
             -- which.
-            if type(args["until"]) == "string" and args["until"] ~= "" then
-                local needle = M.flatten_line(args["until"])
+            local needle = M.optional_arg(args["until"])
+            if needle then
+                needle = M.flatten_line(needle)
                 if vim.fn.strdisplaywidth(needle) > WAIT_TASK_UNTIL_WIDTH then
                     needle = vim.fn.strcharpart(needle, 0, WAIT_TASK_UNTIL_WIDTH - 1) .. "…"
                 end
@@ -1826,17 +1859,18 @@ local renderers = {
                 return
             end
             local parts = {}
-            if type(args.responseId) == "string" and args.responseId ~= "" then
-                parts[#parts + 1] = args.responseId
-            end
-            if type(args.query) == "string" and args.query ~= "" then
-                parts[#parts + 1] = args.query
+            for _, key in ipairs({ "responseId", "query" }) do
+                local value = M.optional_arg(args[key])
+                if value then
+                    parts[#parts + 1] = value
+                end
             end
             if type(args.queryIndex) == "number" then
                 parts[#parts + 1] = "queryIndex " .. args.queryIndex
             end
-            if type(args.url) == "string" and args.url ~= "" then
-                parts[#parts + 1] = args.url
+            local url = M.optional_arg(args.url)
+            if url then
+                parts[#parts + 1] = url
             end
             if type(args.urlIndex) == "number" then
                 parts[#parts + 1] = "urlIndex " .. args.urlIndex
@@ -2119,10 +2153,11 @@ local renderers = {
                 return
             end
             local pattern = type(args.pattern) == "string" and args.pattern or ""
-            local path = type(args.path) == "string" and args.path ~= "" and args.path or "."
+            local path = M.optional_arg(args.path) or "."
             local line = string.format("/%s/ in %s", pattern, path)
-            if type(args.glob) == "string" and args.glob ~= "" then
-                line = line .. string.format(" (%s)", args.glob)
+            local glob = M.optional_arg(args.glob)
+            if glob then
+                line = line .. string.format(" (%s)", glob)
             end
             if args.limit ~= nil then
                 line = line .. string.format(" limit %s", args.limit)
@@ -2139,7 +2174,7 @@ local renderers = {
                 return
             end
             local pattern = type(args.pattern) == "string" and args.pattern or ""
-            local path = type(args.path) == "string" and args.path ~= "" and args.path or "."
+            local path = M.optional_arg(args.path) or "."
             local line = string.format("%s in %s", pattern, path)
             if args.limit ~= nil then
                 line = line .. string.format(" (limit %s)", args.limit)
@@ -2155,7 +2190,7 @@ local renderers = {
             if not args then
                 return
             end
-            local path = type(args.path) == "string" and args.path ~= "" and args.path or "."
+            local path = M.optional_arg(args.path) or "."
             local line = path
             if args.limit ~= nil then
                 line = line .. string.format(" (limit %s)", args.limit)

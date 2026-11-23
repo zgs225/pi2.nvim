@@ -141,6 +141,28 @@ describe("wait_task renderer", function()
         delete(h2)
     end)
 
+    it("omits a null-placeholder needle instead of echoing it", function()
+        -- Models stringify an optional argument they mean to omit instead of
+        -- dropping it: the author's session tree carries 130 `"until": "null"`
+        -- and not one genuine needle. A body row reading `until "null"` is
+        -- noise the reader cannot act on, so the placeholder reads as absent.
+        local h = History.new(TAB)
+        h:on_tool_start("wait_task", "wtn1", { task_id = "b3f2a1", timeout_ms = 60000, ["until"] = "null" })
+        pump(50)
+        local body = table.concat(lines_of(h:buf()), "\n")
+        assert.is_true(#rows_with(h:buf(), "b3f2a1 (timeout 60s)") == 1, body)
+        assert.is_true(#rows_with(h:buf(), "until") == 0, body)
+        delete(h)
+
+        -- `undefined` is the other serialization artifact, and the check trims
+        -- and ignores case because the placeholder arrives as the model wrote it.
+        local h2 = History.new(TAB)
+        h2:on_tool_start("wait_task", "wtn2", { task_id = "b3f2a1", ["until"] = " UNDEFINED " })
+        pump(50)
+        assert.is_true(#rows_with(h2:buf(), "until") == 0, table.concat(lines_of(h2:buf()), "\n"))
+        delete(h2)
+    end)
+
     it("elides an over-long until needle", function()
         local h = History.new(TAB)
         h:on_tool_start("wait_task", "wtu3", {
@@ -254,6 +276,29 @@ describe("wait_task renderer", function()
         -- `still running` would hide the interesting half: the text never appeared.
         assert.is_true(has_badge(h, "pattern not seen"), virt)
         assert.is_false(has_badge(h, "still running"), virt)
+        delete(h)
+    end)
+
+    it("does not badge a null-placeholder needle as pattern not seen", function()
+        local h = History.new(TAB)
+        h:on_tool_start("wait_task", "wtn3", { task_id = "b3f2a1", timeout_ms = 3000, ["until"] = "null" })
+        pump(50)
+        h:on_tool_end("wait_task", "wtn3", {
+            content = {
+                {
+                    type = "text",
+                    text = '[still running] Task b3f2a1 has not exited after 3.0s. The output never contained "null".',
+                },
+            },
+            details = { taskId = "b3f2a1", status = "still_running", ["until"] = "null", wallTimeSeconds = 3.0 },
+        }, false)
+        pump(60)
+        local virt = table.concat(header_virt(h), "|")
+        -- The badge explains what a needle wait did not see, and this block does
+        -- not show a needle — `pattern not seen` would name nothing. The result
+        -- text still quotes the needle, so nothing is hidden that matters.
+        assert.is_false(has_badge(h, "pattern not seen"), virt)
+        assert.is_true(has_badge(h, "still running"), virt)
         delete(h)
     end)
 
@@ -1477,5 +1522,31 @@ describe("bg-tasks completion-wake gate contract", function()
         assert.is_truthy(src:find("task.held = undefined", 1, true), "an actual delivery clears the hold")
         assert.is_truthy(src:find("report held (${task.held})", 1, true), "list_tasks must explain the hold")
         assert.is_truthy(src:find("held: task.held", 1, true), "the panel must explain the hold")
+    end)
+end)
+
+-- The renderers read optional arguments through one guard, so the rule that
+-- keeps a stringified null out of the chat is pinned in one place: the two
+-- serialization artifacts are absent, ordinary words are values.
+describe("Tools.optional_arg", function()
+    it("treats a missing, blank or null-placeholder argument as absent", function()
+        assert.is_nil(Tools.optional_arg(nil))
+        assert.is_nil(Tools.optional_arg(vim.NIL))
+        assert.is_nil(Tools.optional_arg(2000))
+        assert.is_nil(Tools.optional_arg(""))
+        assert.is_nil(Tools.optional_arg("   "))
+        assert.is_nil(Tools.optional_arg("null"))
+        assert.is_nil(Tools.optional_arg(" Null "))
+        assert.is_nil(Tools.optional_arg("undefined"))
+    end)
+
+    it("keeps a real value, including words that merely look like one", function()
+        -- `none` / `nil` are ordinary words a needle, a path or a filter may
+        -- legitimately carry; widening the list would silently swallow them.
+        assert.are.equal("listening on", Tools.optional_arg("listening on"))
+        assert.are.equal("none", Tools.optional_arg("none"))
+        assert.are.equal("nil", Tools.optional_arg("nil"))
+        assert.are.equal("nulls", Tools.optional_arg("nulls"))
+        assert.are.equal(" lua/pi ", Tools.optional_arg(" lua/pi "))
     end)
 end)
