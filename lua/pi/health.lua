@@ -349,6 +349,115 @@ M.check = function()
         end
     end
 
+    -- ── Bundled compaction extension ───────────────────────────────────
+    -- L1 (bounded file lists), L2 (opt-in structured checkpoint summaries),
+    -- L3 (post-compaction state snapshot), L4 (opt-in tool-result pruning).
+    -- The extension is inert until a compaction event fires, so the only
+    -- user-diagnosable failures are a missing file, a too-old pi, and the
+    -- pathological `keep >= window - reserve` combination.
+    local compaction_cfg = Config.options.compaction or {}
+    local compaction_ext_cfg = compaction_cfg.extension or {}
+    local compaction_path = Cli.compaction_extension_path()
+    if compaction_ext_cfg.enabled == false then
+        vim.health.ok("bundled compaction extension disabled (`compaction.extension.enabled = false`)")
+    elseif vim.uv.fs_stat(compaction_path) then
+        vim.health.ok("bundled compaction extension found (`" .. compaction_path .. "`)")
+    else
+        vim.health.warn("bundled compaction extension not found at " .. compaction_path, {
+            "Reinstall pi2.nvim",
+            "Without it compaction keeps pi's stock behaviour and :PiCompactions shows only pi's own numbers",
+        })
+    end
+
+    local compaction_min = Compat.compaction_min_supported
+    if compaction_ext_cfg.enabled == false then
+        -- Nothing to verify: the user turned the extension off.
+    elseif not pi_version then
+        vim.health.warn(
+            "Could not verify pi version against the compaction extension requirement (pi >= " .. compaction_min .. ")"
+        )
+    else
+        local cmp_compaction = Compat.compare_versions(pi_version, compaction_min)
+        if cmp_compaction == nil then
+            vim.health.warn(
+                "Could not compare pi version `"
+                    .. pi_version
+                    .. "` against the compaction extension minimum `"
+                    .. compaction_min
+                    .. "`"
+            )
+        elseif cmp_compaction < 0 then
+            vim.health.warn(
+                "pi version `"
+                    .. pi_version
+                    .. "` is older than the compaction extension minimum `"
+                    .. compaction_min
+                    .. "`",
+                {
+                    "Upgrade pi to " .. compaction_min .. "+ so the cleaner / checkpoint / state layers load",
+                    "With an older pi the extension fails to load and compaction stays stock — no crash",
+                }
+            )
+        else
+            vim.health.ok(
+                "pi version `"
+                    .. pi_version
+                    .. "` satisfies the compaction extension requirement (pi >= "
+                    .. compaction_min
+                    .. ")"
+            )
+        end
+    end
+
+    local cleaner_cfg = compaction_ext_cfg.cleaner or {}
+    local checkpoint_cfg = compaction_ext_cfg.checkpoint or {}
+    local state_cfg = compaction_ext_cfg.state or {}
+    local prune_cfg = compaction_ext_cfg.prune or {}
+    if compaction_ext_cfg.enabled ~= false then
+        vim.health.ok(
+            string.format(
+                "compaction layers: cleaner %s (read≤%s, modified≤%s) · checkpoint %s · state %s · prune %s",
+                cleaner_cfg.enabled == false and "off" or "on",
+                tostring(cleaner_cfg.max_read or 50),
+                tostring(cleaner_cfg.max_modified or 100),
+                checkpoint_cfg.enabled == true and "on" or "off",
+                state_cfg.enabled == false and "off" or "on",
+                prune_cfg.enabled == true and "on" or "off"
+            )
+        )
+        if checkpoint_cfg.enabled == true and checkpoint_cfg.model == nil then
+            vim.health.ok(
+                "compaction checkpoint uses the session model (no `compaction.extension.checkpoint.model` pinned)"
+            )
+        elseif checkpoint_cfg.enabled == true then
+            vim.health.ok("compaction checkpoint uses `" .. tostring(checkpoint_cfg.model) .. "`")
+        end
+    end
+
+    -- pi's own compaction settings, as the statusline countdown resolves them
+    -- for a session whose window is not known here (global layer + defaults).
+    local compaction_ok, CompactionSettings = pcall(require, "pi.compaction.settings")
+    if compaction_ok then
+        local effective = CompactionSettings.resolve(nil, nil, nil)
+        local source = effective.source == "default" and "defaults" or ("settings.json via " .. effective.source)
+        vim.health.ok(
+            string.format(
+                "pi compaction settings: reserveTokens=%d keepRecentTokens=%d enabled=%s (%s)",
+                effective.reserve,
+                effective.keep,
+                effective.enabled and "true" or "false",
+                source
+            )
+        )
+        if effective.invalid then
+            vim.health.warn("invalid compaction setting `" .. effective.invalid .. "`; the next layer answers for it", {
+                "Fix the value in ~/.pi/agent/settings.json or .pi/settings.json",
+                "The statusline shows `· ?` while it stays invalid",
+            })
+        end
+        vim.health.ok("compaction runtime file: `" .. require("pi.compaction.extension").state_path() .. "`")
+    end
+
     -- ── Three-column layout ───────────────────────────────────────────
     -- The layout resolves itself from config at open time, so the only thing
     -- worth reporting here is a configuration the user cannot see fail:

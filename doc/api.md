@@ -63,7 +63,15 @@ pi.diff_review(session?)      -- review the git diff of every file changed by a 
 pi.set_session_name(name?)    -- set the session display name; without an arg, opens an
                               -- input dialog prefilled with the current name
 pi.compact(instructions?, session?) -- manually compact a session (optional guidance); `c` in
-                              -- :PiSessions compacts the session under the cursor
+                              -- :PiSessions compacts the session under the cursor. The focus
+                              -- is recorded, so the compaction block and :PiCompactions
+                              -- show what was asked for, and a retry repeats it
+pi.compact_abort()            -- abort the compaction that is running (:PiCompactAbort, or a
+                              -- single <Esc> while compacting). Returns false and warns
+                              -- when no compaction is in flight
+pi.compact_retry()            -- re-run the last aborted/failed compaction with the same
+                              -- focus; refused while another compaction runs or when the
+                              -- last one succeeded
 pi.toggle_auto_compaction()   -- flip automatic compaction on/off; the statusline
                               -- `compaction` component (a 󰏗 icon) shows the state
 pi.changed_files()            -- string[]: files modified by edit/write tools this session

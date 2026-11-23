@@ -5,6 +5,7 @@
 ---@field title_min_supported string minimum pi version for the bundled auto-title extension (extensions/title.ts)
 ---@field scoped_models_min_supported string minimum pi version for the bundled model-scope bridge extension (extensions/scoped-models.ts)
 ---@field bg_tasks_min_supported string minimum pi version for the bundled background bash tasks extension (extensions/bg-tasks.ts)
+---@field compaction_min_supported string minimum pi version for the bundled compaction extension (extensions/compaction.ts)
 local M = {
     -- Keep these in sync with release validation notes.
     min_supported = "0.65.2",
@@ -35,6 +36,13 @@ local M = {
     -- fails to load and pi logs the error — sessions keep stock bash, no crash,
     -- and :PiTasks simply stays empty.
     bg_tasks_min_supported = "0.85.1",
+    -- The compaction extension uses session_before_compact / session_compact /
+    -- session_compact_failed with the `preparation.fileOps` Sets, the
+    -- `session_compact` event's `compactionEntry.details`, `pi.appendEntry()`
+    -- and the `context` hook. Those shapes are verified on pi 1.6.0; below the
+    -- floor the extension fails to load and pi logs the error — compaction
+    -- keeps pi's stock behaviour, no crash.
+    compaction_min_supported = "1.6.0",
 }
 
 ---@param version string

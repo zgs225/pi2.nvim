@@ -5,7 +5,7 @@
 What the plugin does bind on its own:
 
 - Submission keys in the prompt buffer (`<CR>`, `<A-CR>`, `<S-CR>` — see [Usage → Prompt](usage.md#prompt)).
-- `<Esc>` / double-`<Esc>` abort gestures (see [Usage → Aborting](usage.md#aborting-with-double-esc)).
+- `<Esc>` / double-`<Esc>` abort gestures (see [Usage → Aborting](usage.md#aborting-with-double-esc)). A single `<Esc>` while a compaction is running aborts that compaction instead of arming the double-`<Esc>` gesture.
 - `<C-p>` / `<C-n>` / `<Up>` / `<Down>` prompt-history recall (see [Usage → Prompt history](usage.md#prompt-history)).
 - `<Tab>` block expand/collapse, `gf` open-file-under-cursor, and `dd` delete-queued-message in the history buffer.
 - `[[` / `]]` turn navigation in the history buffer and in the prompt buffer (normal mode): previous / next turn, count-aware (`3]]`), and `]]` past the last turn returns to the live bottom and resumes following (see [Usage → Turn navigation](usage.md#turn-navigation)).
@@ -17,6 +17,7 @@ What the plugin does bind on its own:
 - The `:PiDiff` session diff review: in the panel's file list, moving the cursor previews the file's diff, `<CR>`/`o` jumps to its first changed line, `<C-f>`/`<C-b>`/`<C-d>`/`<C-u>` scroll the diff on the right; in the diff area, `<CR>`/`o` jumps to the line under the cursor; `q` closes the whole review (see [Session diff review](diff-review.md#session-diff-review-pidiff)). When the panel was opened by [`pi.worktree_apply`](worktrees.md#applying-a-patch), an extra `a` applies the reviewed patch to the main checkout.
 - The [sessions overview](sessions.md#sessions-overview-pisessions) keys inside the list, including `x` to close the sub-session under the cursor, the session's π tab, or every π tab of a worktree group (each scope asks first unless its `sessions_list.confirm_close_*` switch is off), `n` for a fresh session in the row's checkout and `N` to open the row's main checkout or pick/create one of its worktrees (both insert the new tab next to that checkout's worktree group instead of at the end of the tabline), and `S` to reorder the tabline into the list's order (same as `:PiSessionsSync`).
 - The [background tasks](#background-tasks-panel-pitasks) panel keys inside the list.
+- The [compactions timeline](#compactions-panel-picompactions) keys inside the list.
 
 ## Background tasks panel (`:PiTasks`)
 
@@ -35,6 +36,20 @@ What the plugin does bind on its own:
 | `?` | Toggle a help overlay listing these keys |
 
 The output and preview buffers are read-only (`pi-task-output` filetype) and carry a buffer-local `q` that closes their window.
+
+## Compactions panel (`:PiCompactions`)
+
+`:PiCompactions` lists every compaction of the current session, newest first (see [Usage → Compaction timeline](usage.md#compaction-timeline-picompactions)). All mappings are **buffer-local** on the shared list buffer (filetype `pi-compactions`):
+
+| Key | Action |
+| --- | --- |
+| `<CR>` | Jump to this compaction's block in the chat history |
+| `gp` | Show the full summary in a float |
+| `d` | Diff this summary against the previous compaction |
+| `y` | Copy the summary to the clipboard |
+| `r` | Request a new compaction with this one's focus instructions |
+| `q` | Close the panel |
+| `?` | Toggle a help overlay listing these keys |
 
 ## Key specs
 
