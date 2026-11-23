@@ -148,6 +148,7 @@ History._stream_flush_ms = 30
 
 local Ft = require("pi.filetypes")
 local Config = require("pi.config")
+local TurnRate = require("pi.turn_rate")
 local Path = require("pi.path")
 local Tools = require("pi.ui.chat.tools")
 local Ansi = require("pi.ui.chat.ansi")
@@ -2034,7 +2035,7 @@ function History:on_text_delta(delta)
 end
 
 ---@param done_verb? string
----@param opts? { force_completion?: boolean, stop_reason?: string }
+---@param opts? { force_completion?: boolean, stop_reason?: string, rate?: pi.TurnRateSummary }
 function History:on_agent_end(done_verb, opts)
     self:_seal_stream_text()
     vim.schedule(function()
@@ -2062,7 +2063,16 @@ function History:on_agent_end(done_verb, opts)
         local secs = math.floor(elapsed)
         self._agent_start_time = nil
         local force_completion = opts and opts.force_completion == true
-        if secs < 1 and not force_completion then
+        -- Generation speed: measured client-side over the run's decode windows
+        -- (see pi.turn_rate), rendered only when the numbers say something.
+        -- Decided before the duration gate: a fast run whose stream lasted
+        -- under a second still has a rate worth printing (`· <1s · 250 tok/s`),
+        -- while a sub-second run with nothing to measure stays silent.
+        local rate_text
+        if opts and opts.rate and Config.options.turn_stats ~= false then
+            rate_text = TurnRate.format(opts.rate.tokens, opts.rate.secs)
+        end
+        if secs < 1 and not force_completion and not rate_text then
             return
         end
         local verb = done_verb or "Completed"
@@ -2074,7 +2084,11 @@ function History:on_agent_end(done_verb, opts)
         else
             duration = "<1s"
         end
-        local suffix = force_completion and ("  · " .. verb:lower()) or ("  · " .. duration)
+        local parts = { force_completion and verb:lower() or duration }
+        if rate_text then
+            parts[#parts + 1] = rate_text
+        end
+        local suffix = "  · " .. table.concat(parts, " · ")
         -- Aborted/errored turns get a prominent highlight instead of the muted
         -- completion color, so the final state is easy to spot in the history.
         local stop_reason = opts and opts.stop_reason
@@ -2095,8 +2109,12 @@ function History:on_agent_end(done_verb, opts)
                 virt_text_pos = "inline",
             })
         else
-            -- Fallback: standalone line
+            -- Fallback: standalone line. It carries the rate too, so the figure
+            -- does not depend on the last line having room for inline text.
             local text = verb .. " in " .. duration
+            if rate_text then
+                text = text .. " · " .. rate_text
+            end
             local start = self:_append_lines({ "", text })
             vim.api.nvim_buf_set_extmark(self._buf, ns, start + 1, 0, {
                 end_col = #text,

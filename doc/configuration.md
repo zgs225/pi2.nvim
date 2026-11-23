@@ -38,6 +38,9 @@ require("pi").setup({
     show_thinking = true,
     -- Extra blank line between conversation turns (pure whitespace, no drawn rule).
     turn_separator = true,
+    -- Append the run's generation speed (`· 58 tok/s`) to the turn's completion
+    -- marker in the history; false keeps the duration only.
+    turn_stats = true,
     -- Default expand/collapse state for the startup block
     -- (skills, extensions, startup announcements).
     expand_startup_details = true,
