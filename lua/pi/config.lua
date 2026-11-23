@@ -20,6 +20,7 @@
 ---@field position "left"|"right"|"bottom"
 ---@field width integer
 ---@field height? integer
+---@field full_tab? "auto"|"always"|"never" Tab takeover: "never" (default) keeps the historical split; "auto" takes over an untouched `:tabnew` window; "always" takes over any single-window tab (default lands with the full-tab milestone)
 ---@field panels pi.SidePanels
 
 ---@class pi.FloatLayout
@@ -210,8 +211,9 @@
 
 ---@class pi.TodoPanelConfig
 ---@field auto_open? boolean Open the todo side panel automatically when a session has unfinished items (default false)
----@field height? number Stacked panel height: fraction of the shared :PiSessions column when < 1 (default 0.5, an even split), absolute lines when >= 1
+---@field height? number Stacked panel height: fraction of the shared column when < 1 (default 0.5, an even split), absolute lines when >= 1
 ---@field position? "above"|"below" Stacking position relative to the :PiSessions side panel (default "below")
+---@field width? number Column width when the panel opens a side column on its own: columns (>=1) or a fraction of the editor width (<1, default: the sessions-list width)
 ---@field hide_when_empty? boolean Hide the panel while the todo list is empty (default true)
 
 ---@class pi.TodoConfig

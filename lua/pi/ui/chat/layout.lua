@@ -6,7 +6,6 @@
 ---@field _prompt_win integer?
 ---@field _attachments_win integer?
 ---@field _tab integer? Tab the side windows live in (captured on show)
----@field _winclosed_autocmd integer WinClosed handler id (for teardown/tests)
 ---@field _history pi.ChatHistory
 ---@field _prompt pi.ChatPrompt
 ---@field _attachments pi.ChatAttachments
@@ -19,6 +18,7 @@ local Config = require("pi.config")
 local Prompt = require("pi.ui.chat.prompt")
 local Highlights = require("pi.ui.highlights")
 local Render = require("pi.ui.render")
+local Workspace = require("pi.ui.workspace")
 
 --- Low z-index so other floats naturally sit on top.
 local FLOAT_ZINDEX = 10
@@ -181,85 +181,7 @@ function Layout.new(mode, history, prompt, attachments)
         self:_refresh_attachments()
     end)
 
-    -- After any window closes in this layout's tab, re-normalize the side
-    -- column heights (issue #31): closing a full-width window (e.g.
-    -- toggleterm's horizontal terminal, `botright split`) re-distributes the
-    -- freed height to the bottom window of each column frame, ignoring
-    -- 'winfixheight', so the prompt balloons and history stays compressed
-    -- until the next text change. WinClosed fires only when the window count
-    -- decreases — never on manual <C-w>+/drag — so user-adjusted heights are
-    -- preserved. The callback self-guards (tab, mode, π's own windows).
-    self._winclosed_autocmd = vim.api.nvim_create_autocmd("WinClosed", {
-        desc = "pi: re-normalize side column heights after a window closes",
-        callback = function(ev)
-            -- WinClosed's event table carries the closed window id only as
-            -- <afile> (a string), unlike WinNew/WinEnter which set ev.win.
-            -- The current tab at event time is the tab the window lived in.
-            self:_on_win_closed(tonumber(ev.file), vim.api.nvim_get_current_tabpage())
-        end,
-    })
-
     return self
-end
-
---- Handle WinClosed: re-normalize the side column heights after an external
---- window in the layout's tab closes.
----@param closed_win integer? closed window id (nil when the event table is odd)
----@param closed_tab integer tab the closed window lived in
-function Layout:_on_win_closed(closed_win, closed_tab)
-    -- The event-time tab is authoritative: the closed window lived there, and
-    -- by the time the deferred normalize runs the current tab may have moved.
-    if self._tab and closed_tab ~= self._tab then
-        return -- a window closed in another tab; this layout's column is untouched
-    end
-    if self._mode ~= "side" then
-        return -- floats are independent of the frame tree
-    end
-    -- π's own windows close through hide()/set_mode() (nvim_win_close keeps
-    -- the ids in _*_win until the fields are cleared afterwards), and a user
-    -- closing a π window externally leaves a broken layout normalize must not
-    -- fight. Both cases match the raw fields here; a nil closed_win (unexpected
-    -- event table) also lands in this branch and is a safe early return.
-    if closed_win == self._history_win or closed_win == self._prompt_win or closed_win == self._attachments_win then
-        return
-    end
-    -- Defer: WinClosed fires before the closed window's height is handed back
-    -- to the frame tree, so an immediate normalize would be overwritten by
-    -- the redistribution (issue #31). Run once the event loop settles.
-    vim.schedule(function()
-        if self._tab ~= closed_tab then
-            return -- the layout moved tabs while the callback was pending
-        end
-        if self._mode ~= "side" then
-            return
-        end
-        if not self:history_win() or not self:prompt_win() then
-            return -- layout hidden or torn down before the deferred normalize ran
-        end
-        self:_normalize_side_heights()
-    end)
-end
-
---- Re-normalize the side column heights: let history take the full column
---- height, then pin the prompt (and attachments) back to their content
---- heights. Mirrors the height-fixing tail of _refresh_attachments;
---- idempotent when the column is already correct.
-function Layout:_normalize_side_heights()
-    local hwin = self:history_win()
-    local pwin = self:prompt_win()
-    if not hwin or not pwin then
-        return
-    end
-    -- Capture the attachments height before wincmd _ shrinks it.
-    local awin = self:attachments_win()
-    local target_attachments_height = awin and vim.api.nvim_win_get_height(awin) or 0
-    vim.api.nvim_win_call(hwin, function()
-        vim.cmd("wincmd _")
-    end)
-    vim.api.nvim_win_set_height(pwin, self._prompt:content_height())
-    if awin and target_attachments_height > 0 then
-        vim.api.nvim_win_set_height(awin, target_attachments_height)
-    end
 end
 
 ---@param after_win integer
@@ -281,6 +203,9 @@ function Layout:_open_attachments_in_side_layout(after_win)
     vim.wo[self._attachments_win].relativenumber = false
     vim.wo[self._attachments_win].cursorline = false
 
+    if self._tab then
+        Workspace.set_attachments(self._tab, self._attachments_win)
+    end
     vim.api.nvim_set_current_win(prev_win)
 end
 
@@ -320,9 +245,15 @@ function Layout:_open_attachments_in_float_layout(col, row, width, border)
 end
 
 function Layout:_close_history_win()
-    local hwin = self:history_win()
-    if hwin then
-        vim.api.nvim_win_close(hwin, false)
+    -- The workspace owns the chat column: it closes the column it split out, or
+    -- restores the tab's own window in full-tab mode.
+    if self._tab and Workspace.chat(self._tab) then
+        Workspace.release_chat(self._tab)
+    else
+        local hwin = self:history_win()
+        if hwin then
+            pcall(vim.api.nvim_win_close, hwin, false)
+        end
     end
     self._history_win = nil
     self._history:set_win(nil)
@@ -353,6 +284,9 @@ function Layout:_close_attachments_win()
     end
     vim.api.nvim_win_close(awin, false)
     self._attachments_win = nil
+    if self._tab then
+        Workspace.set_attachments(self._tab, nil)
+    end
 end
 
 --- Reposition (and optionally resize) the float window stack.
@@ -463,10 +397,7 @@ function Layout:_refresh_attachments()
             if is_float then
                 self:_reposition_float_stack()
             else
-                vim.api.nvim_win_call(self._history_win, function()
-                    vim.cmd("wincmd _")
-                end)
-                vim.api.nvim_win_set_height(self._prompt_win, self._prompt:content_height())
+                Workspace.apply(self._tab)
             end
         end
         return
@@ -491,16 +422,8 @@ function Layout:_refresh_attachments()
             end
             vim.api.nvim_win_set_height(awin, aheight)
         end
-        -- Maximize history, then re-fix prompt and attachments heights.
-        -- Capture attachment height before wincmd _ steals its space.
-        local target_attachments_height = awin and vim.api.nvim_win_get_height(awin) or 0
-        vim.api.nvim_win_call(self._history_win, function()
-            vim.cmd("wincmd _")
-        end)
-        vim.api.nvim_win_set_height(self._prompt_win, self._prompt:content_height())
-        if awin then
-            vim.api.nvim_win_set_height(awin, target_attachments_height)
-        end
+        -- One geometry pass rebalances history / prompt / attachments.
+        Workspace.apply(self._tab)
     end
 end
 
@@ -523,40 +446,6 @@ local function resolve_side_width()
     return resolve_dimension(side_cfg.width, vim.o.columns)
 end
 
---- Window the side column is carved out of, plus the split prefix that keeps
---- the new column adjacent to it.
----
---- Side panels (sessions list, todo, tasks) are tab-level and outlive a
---- session: after a cross-checkout `:PiResume` — or any hide/show of the chat
---- while a panel is focused — the chat reopens while the previous session's
---- panels still hold the configured edge. `:topleft`/`:botright` then put the
---- new column at the *outer* edge of the tab (outside the panel column,
---- flipping the layout), and splitting a narrow panel window squeezes that
---- column to a single cell. Inserting next to the outermost regular window
---- with `:leftabove`/`:rightbelow` keeps the column inside the panel edge;
---- with no panel open that is the same outer position as before.
----@param position "left"|"right"
----@return integer? win window to split (nil: keep the current window)
----@return string prefix split command prefix
-local function resolve_side_split(position)
-    local Sidebar = require("pi.ui.sidebar")
-    local fallback = position == "left" and "topleft" or "botright"
-    local best, best_col = nil, nil
-    for _, win in ipairs(vim.api.nvim_tabpage_list_wins(0)) do
-        -- Floats are not part of the frame tree and panels hold their own edge.
-        if vim.api.nvim_win_get_config(win).relative == "" and not Sidebar.is_panel(win) then
-            local col = vim.fn.win_screenpos(win)[2]
-            if not best_col or (position == "left" and col < best_col) or (position == "right" and col > best_col) then
-                best, best_col = win, col
-            end
-        end
-    end
-    if not best then
-        return nil, fallback
-    end
-    return best, (position == "left" and "leftabove" or "rightbelow")
-end
-
 --- Resolve float dimensions in pixels from config.
 ---@param float_cfg? pi.FloatLayout Pre-resolved config; resolved internally if omitted.
 ---@return integer width, integer total_height
@@ -568,20 +457,17 @@ local function resolve_float_size(float_cfg)
 end
 
 function Layout:_open_in_side_layout()
+    local tab = self._tab or vim.api.nvim_get_current_tabpage()
     local side_cfg = Config.resolve_side_layout()
     local panels = side_cfg.panels
-    local w = resolve_side_width()
-    local position = side_cfg.position == "left" and "left" or "right"
-    local target, split_prefix = resolve_side_split(position)
-    if target and vim.api.nvim_get_current_win() ~= target then
-        vim.api.nvim_set_current_win(target)
-    end
-    vim.cmd(split_prefix .. " " .. w .. "vsplit")
+    -- The workspace owns the frame placement: it carves the chat column out of
+    -- the tab in split mode, or hands back the tab's own window in full-tab
+    -- mode (the window the layout then renders the history into).
+    local center = Workspace.acquire_center(tab, side_cfg)
 
-    self._history_win = vim.api.nvim_get_current_win()
+    self._history_win = center.win
     vim.api.nvim_win_set_buf(self._history_win, self._history:buf())
     set_win_opts(self._history_win, function(win)
-        vim.wo[win].winfixwidth = true
         -- Builtin engine: conceallevel=0 because treesitter markdown can't
         -- conceal brackets/bold in tool output.  render-markdown engine needs
         -- conceallevel=2 (set by set_win_opts) to hide syntax markers.
@@ -596,11 +482,11 @@ function Layout:_open_in_side_layout()
 
     local prompt_winbar = panels.prompt.winbar
     local prompt_h = Prompt.HEIGHT + (prompt_winbar and 1 or 0)
+    vim.api.nvim_set_current_win(self._history_win)
     vim.cmd("belowright " .. prompt_h .. "split")
     self._prompt_win = vim.api.nvim_get_current_win()
     vim.api.nvim_win_set_buf(self._prompt_win, self._prompt:buf())
     set_win_opts(self._prompt_win, function(win)
-        vim.wo[win].winfixwidth = true
         vim.wo[win].winfixheight = true
         vim.wo[win].virtualedit = "onemore"
     end)
@@ -609,6 +495,14 @@ function Layout:_open_in_side_layout()
     end
     self._prompt:set_layout("side")
     self._prompt:set_win(self._prompt_win)
+
+    Workspace.register_chat(tab, {
+        history = self._history_win,
+        prompt = self._prompt_win,
+        prompt_height = function()
+            return self._prompt:content_height()
+        end,
+    })
 end
 
 function Layout:_open_in_float_layout()
@@ -682,9 +576,14 @@ function Layout:on_resize()
         local width, total_height = resolve_float_size(float_cfg)
         self:_reposition_float_stack(width, total_height, float_cfg)
     else
-        if self._history_win and vim.api.nvim_win_is_valid(self._history_win) then
+        local tab = self._tab or vim.api.nvim_get_current_tabpage()
+        -- Split mode keeps the configured chat width (the leftover editor
+        -- window absorbs the rest); full-tab mode leaves the chat column
+        -- flexible, so the workspace pass owns the geometry either way.
+        if Workspace.mode(tab) ~= "full" and self._history_win and vim.api.nvim_win_is_valid(self._history_win) then
             vim.api.nvim_win_set_width(self._history_win, resolve_side_width())
         end
+        Workspace.on_resize(tab)
     end
 end
 

@@ -28,7 +28,7 @@ local M = {}
 local Config = require("pi.config")
 local Ft = require("pi.filetypes")
 local Highlights = require("pi.ui.highlights")
-local Sidebar = require("pi.ui.sidebar")
+local Workspace = require("pi.ui.workspace")
 local Tasks = require("pi.tasks")
 
 local ns = vim.api.nvim_create_namespace("pi-tasks-list")
@@ -1199,47 +1199,43 @@ end
 --- panels). Focus semantics match the historical behavior: the new panel
 --- window keeps focus.
 ---@param b integer
----@return integer
+---@return integer?
 local function open_side_win(b)
     local cfg = panel_cfg()
     local position = cfg.position or "left"
     local tab = current_tab()
-    local edge = Sidebar.effective_edge(tab, position)
-    local vertical = edge == "left" or edge == "right"
-    local panels = Sidebar.panels(tab, edge)
+    if position == "left" or position == "right" then
+        -- The workspace owns frame placement (column creation, stacking in
+        -- ORDER position, width pinning); the panel only supplies the buffer.
+        return Workspace.claim_panel(tab, "tasks", b, {
+            edge = position,
+            width = cfg.width,
+            weight = 1,
+            configure = function(win)
+                set_list_win_opts(win)
+                vim.wo[win].winfixwidth = true
+            end,
+        })
+    end
+    -- Legacy horizontal rows (top/bottom): not part of the three-column
+    -- workspace, so they keep the historical split and registry claim.
+    local Sidebar = require("pi.ui.sidebar")
+    local panels = Sidebar.panels(tab, position)
     local win
     if #panels > 0 then
-        -- Stack into the existing column/row instead of opening a new one:
-        -- split the last panel's window so the new window inherits its
-        -- width (vertical edge) or height (horizontal edge).
         vim.api.nvim_set_current_win(panels[#panels].win)
-        vim.cmd(vertical and "split" or "vsplit")
+        vim.cmd("vsplit")
         win = vim.api.nvim_get_current_win()
     else
-        local cmd
-        if position == "right" then
-            cmd = "botright " .. cfg.width .. "vsplit"
-        elseif position == "top" then
-            cmd = "topleft " .. cfg.height .. "split"
-        elseif position == "bottom" then
-            cmd = "botright " .. cfg.height .. "split"
-        else
-            cmd = "topleft " .. cfg.width .. "vsplit"
-        end
+        local cmd = position == "top" and ("topleft " .. cfg.height .. "split")
+            or ("botright " .. cfg.height .. "split")
         vim.cmd(cmd)
         win = vim.api.nvim_get_current_win()
     end
     vim.api.nvim_win_set_buf(win, b)
     set_list_win_opts(win)
-    if position == "top" or position == "bottom" then
-        vim.wo[win].winfixheight = true
-    else
-        vim.wo[win].winfixwidth = true
-    end
-    -- Column/row size along the edge stays owned by the opener (above);
-    -- the claim pins the perpendicular dimension via restack. Float
-    -- windows never reach this function, so they never claim.
-    Sidebar.claim(tab, edge, "tasks", win, { weight = 1 })
+    vim.wo[win].winfixheight = true
+    Sidebar.claim(tab, position, "tasks", win, { weight = 1 })
     return win
 end
 
@@ -1347,15 +1343,10 @@ end
 --- sidebar claim so the remaining edge panels expand.
 ---@param tab integer
 function M.close_tab(tab)
-    local win = win_for(tab)
-    if not win then
-        return
-    end
     wins[tab] = nil
-    if vim.api.nvim_win_is_valid(win) then
-        pcall(vim.api.nvim_win_close, win, false)
-    end
-    Sidebar.release(tab, "tasks")
+    -- Window first, then the claim release + geometry pass (both inside the
+    -- workspace, so the remaining edge panels and the chat column re-expand).
+    Workspace.release_panel(tab, "tasks")
 end
 
 --- Close the tasks panel window in the current tab (no-op when absent).
