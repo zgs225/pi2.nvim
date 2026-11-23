@@ -396,7 +396,7 @@ describe("session cwd / worktree plumbing", function()
             end,
         }
         local dir = mkdir(vim.fn.tempname() .. "-bind")
-        local info = { name = "wt3", path = dir }
+        local info = { kind = "linked", name = "wt3", path = dir }
         local session = Sessions.create_detached(1, { cwd = dir, worktree = info })
         assert.is_not_nil(session)
         -- Earlier specs in this describe leave scheduled get_state callbacks
@@ -416,6 +416,44 @@ describe("session cwd / worktree plumbing", function()
         local call = own_call()
         assert.equals("sess-1", call.fields.session_id)
         assert.equals("/tmp/pi-worktree-spec/session.jsonl", call.fields.session_file)
+        package.loaded["pi.worktree"] = nil
+    end)
+
+    it("never binds or locks the main checkout (kind == main is not a worktree)", function()
+        -- `Worktree.detect` answers for the repository's main work tree with a
+        -- valid path and `kind == "main"`. Treating it as worktree metadata
+        -- wrote pi2 metadata into the main `.git` and then ran `git worktree
+        -- lock <main>`, which git refuses (exit 128: "The main working tree
+        -- cannot be locked or unlocked").
+        local bind_calls, lock_calls = 0, 0
+        package.loaded["pi.worktree"] = {
+            bind = function()
+                bind_calls = bind_calls + 1
+                return true
+            end,
+            lock = function(_, _, cb)
+                lock_calls = lock_calls + 1
+                cb(true)
+            end,
+        }
+        local real_jobpid = vim.fn.jobpid
+        -- The relock needs an agent pid; fake one so the lock attempt would
+        -- really happen if the guard were missing.
+        vim.fn.jobpid = function()
+            return 4242
+        end
+        local dir = mkdir(vim.fn.tempname() .. "-main-kind")
+        local info = { kind = "main", name = "repo", path = dir, repo_root = dir, git_dir = dir .. "/.git" }
+        local ok, session = pcall(Sessions.create_detached, 1, { cwd = dir, worktree = info })
+        vim.wait(200, function()
+            return bind_calls > 0 or lock_calls > 0
+        end, 10)
+        vim.fn.jobpid = real_jobpid
+        assert.is_true(ok)
+        assert.is_not_nil(session)
+        assert.equals(0, bind_calls)
+        assert.equals(0, lock_calls)
+        assert.is_nil(find_note("worktree lock failed"))
         package.loaded["pi.worktree"] = nil
     end)
 
@@ -824,7 +862,7 @@ describe("worktree release hooks", function()
 
     it("close_session releases once after the process stopped", function()
         local dir = mkdir(vim.fn.tempname() .. "-close")
-        local info = { name = "c1", path = dir }
+        local info = { kind = "linked", name = "c1", path = dir }
         local session = Sessions.create_detached(1, { cwd = dir, worktree = info })
         assert.is_not_nil(session)
         Sessions.close_session(session)
@@ -841,7 +879,7 @@ describe("worktree release hooks", function()
 
     it("M.stop releases the current tab's worktree", function()
         local dir = mkdir(vim.fn.tempname() .. "-stop")
-        local info = { name = "c2", path = dir }
+        local info = { kind = "linked", name = "c2", path = dir }
         local session = Sessions.get_or_create({ cwd = dir, worktree = info })
         assert.is_not_nil(session)
         Sessions.stop()
@@ -853,7 +891,7 @@ describe("worktree release hooks", function()
 
     it("an unexpected process exit releases the worktree", function()
         local dir = mkdir(vim.fn.tempname() .. "-exit")
-        local info = { name = "c3", path = dir }
+        local info = { kind = "linked", name = "c3", path = dir }
         local session = Sessions.create_detached(1, { cwd = dir, worktree = info })
         assert.is_not_nil(session)
         Sessions.handle_event(session, { type = "_process_exit", code = 1 })

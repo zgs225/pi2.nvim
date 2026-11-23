@@ -1293,6 +1293,41 @@ describe("worktree recovery for cross-worktree resume", function()
         assert.equals("wt-missing", recovered.worktree.name)
         assert.is_not_nil(find_note("Recovered worktree", vim.log.levels.INFO))
     end)
+
+    it("reports no worktree metadata for the main checkout", function()
+        -- `Worktree.detect` answers for the repository's main work tree too.
+        -- That table is a fine `cwd` but never worktree metadata: attaching it
+        -- made the resumed session bind pi2 metadata into the main `.git` and
+        -- then fail to lock it — git refuses the main working tree
+        -- (`fatal: The main working tree cannot be locked or unlocked`).
+        local main = mkdir(vim.fn.tempname() .. "-main")
+        wt.detect = function()
+            return { kind = "main", name = "repo", path = main, repo_root = main, git_dir = main .. "/.git" }
+        end
+
+        local target
+        WorktreeSession.prepare_resume_target({ cwd = main, session_id = "s7" }, function(ctx)
+            target = ctx
+        end)
+        assert.is_not_nil(target)
+        assert.equals(main, target.cwd)
+        assert.is_nil(target.worktree)
+    end)
+
+    it("reports no worktree metadata for a directory outside a repository", function()
+        local plain = mkdir(vim.fn.tempname() .. "-plain")
+        wt.detect = function()
+            return nil
+        end
+
+        local target
+        WorktreeSession.prepare_resume_target({ cwd = plain }, function(ctx)
+            target = ctx
+        end)
+        assert.is_not_nil(target)
+        assert.equals(plain, target.cwd)
+        assert.is_nil(target.worktree)
+    end)
 end)
 
 describe("real recover_worktree after release/removal", function()

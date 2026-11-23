@@ -45,7 +45,7 @@
 ---@field system_errors pi.SystemErrorEntry[]
 ---@field cwd string Working directory the session runs in (anchor for changed_files paths, prompt history and diffs). A worktree session's cwd is its worktree path.
 ---@field _process_cwd? string Working directory the process was *deliberately* started in (explicit `opts.cwd`: worktree or sub-session). Distinct from `cwd`, which a resume may adopt from the session file when the process cwd is not fixed.
----@field worktree? { name: string, path: string, repo_root?: string, base_sha?: string, mode?: string, forked_from?: table, [string]: any } Worktree metadata when this session runs in an isolated git worktree (managed by `pi.worktree`).
+---@field worktree? { kind: "linked", name: string, path: string, repo_root?: string, base_sha?: string, mode?: string, forked_from?: table, [string]: any } Metadata of the linked git worktree this session runs in (managed by `pi.worktree`). Never the repository's main work tree (`kind == "main"`): that is an ordinary session whose `cwd` happens to be the main checkout.
 ---@field assigned_worktree? { kind: "linked", path: string, name?: string, repo_root?: string, git_dir?: string, common_dir?: string, base_sha?: string } Pre-existing linked worktree explicitly assigned to this child by its parent. Never owned by this session: no release, no bind, no resume rebind.
 ---@field forked_from? { session_id?: string, session_file?: string, worktree?: string } Source conversation for a worktree fork; surfaced by the sessions UI.
 ---@field _worktree_released? boolean True once release was dispatched for this session's worktree (guards close_session + process-exit double release).
@@ -233,6 +233,25 @@ local function resumed_session_cwd(session, session_path)
     return nil
 end
 
+--- A session owns a checkout only when its metadata describes a **linked**
+--- worktree, so every side effect below (bind, `git worktree lock`, release)
+--- goes through this gate.
+---
+--- `Worktree.detect` also answers for the repository's **main** work tree
+--- (`kind == "main"`), and that table has a valid `path` but is not a worktree:
+--- binding it writes pi2 metadata into the main `.git`, and `git worktree lock`
+--- refuses the main working tree outright (`fatal: The main working tree cannot
+--- be locked or unlocked`, exit 128). A nil/unknown `kind` is not a worktree
+--- either — there is nothing to lock, release or bind.
+---@param worktree any
+---@return table? linked
+local function linked_worktree(worktree)
+    if type(worktree) ~= "table" or worktree.kind ~= "linked" then
+        return nil
+    end
+    return worktree
+end
+
 --- Re-attach worktree metadata after a resume.
 ---
 --- A session object loses its process-only metadata when its conversation is
@@ -318,8 +337,8 @@ local function bind_session_worktree(session)
     if type(session.assigned_worktree) == "table" then
         return
     end
-    local worktree = session.worktree
-    if type(worktree) ~= "table" then
+    local worktree = linked_worktree(session.worktree)
+    if not worktree then
         return
     end
     local id = session.id
@@ -410,8 +429,8 @@ local function release_session_worktree(session)
     if type(session.assigned_worktree) == "table" then
         return
     end
-    local worktree = session.worktree
-    if type(worktree) ~= "table" then
+    local worktree = linked_worktree(session.worktree)
+    if not worktree then
         return
     end
     if session._worktree_released then

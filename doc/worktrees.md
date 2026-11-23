@@ -397,6 +397,8 @@ A listed checkout can be gone by the time you pick it (retention removed it, or 
 
 `:PiContinue` stays scoped to Neovim's cwd — it is "the most recent session here", not a cross-worktree picker.
 
+Resuming a session that ran in the repository's **main** checkout — or in a directory outside any repository — opens an **ordinary** session in that directory: the target is its `cwd` only, never worktree metadata, so nothing is badged, bound or locked for it (git refuses `worktree lock` on the main work tree, so attaching it could only fail).
+
 ## Where you see it
 
 - **Chat history title** — a session running in a linked worktree shows `󰙅 <name>` next to the panel title (in the side-layout winbar and the float border), with a trailing `*` while the checkout is dirty or has commits ahead of its base commit. The glyph is the whole signal, so a worktree badge is **not** additionally prefixed when the session's cwd differs from Neovim's — that is the normal state (starting a worktree session does not `:cd` the editor), and a warning that is always on says nothing while taking the worktree color and the `*` with it. `⚠` is reserved for the two cases where the badge could not otherwise show the divergence, both in the warning color because paths you open from your own buffers and paths the agent touches then resolve against different roots: a session in the repository's **main** checkout while Neovim's cwd is elsewhere (`⚠ <repo>`), and a session in a directory that is not a work tree at all (`⚠ <dir>`). A session in the repository's main worktree with Neovim's cwd shows no badge.
