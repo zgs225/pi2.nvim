@@ -1091,7 +1091,6 @@ end
 --- no hint row, no second press.
 function Chat:_handle_abort_esc()
     if self._compacting and (Config.options.abort or {}).enabled ~= false then
-        ---@diagnostic disable-next-line: undefined-field -- pi.compact_abort (P0-4) lands with the compaction public API
         require("pi").compact_abort()
         return
     end
@@ -2177,7 +2176,6 @@ end
 ---@param tokens_before integer
 ---@param meta table?
 function Chat:append_compaction_summary(summary, tokens_before, meta)
-    ---@diagnostic disable-next-line: redundant-parameter -- History:append_compaction_summary gains `meta` with the compaction panel
     self._history:append_compaction_summary(summary, tokens_before, meta)
 end
 
@@ -2189,7 +2187,6 @@ end
 ---@return boolean jumped
 function Chat:jump_to_compaction(summary, tokens_before)
     local history = self._history
-    ---@diagnostic disable-next-line: undefined-field -- History:jump_to_compaction lands with the compaction panel
     local jump = history and history.jump_to_compaction
     if type(jump) ~= "function" then
         return false
