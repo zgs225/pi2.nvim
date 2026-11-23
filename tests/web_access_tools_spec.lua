@@ -126,6 +126,19 @@ describe("pi-web-access tool renderers (issue #51)", function()
             pump(60)
             assert.is_true(#rows_with(h:buf(), "xyz · https://c.example") == 1)
         end)
+
+        it("drops a stringified null selector", function()
+            -- The optional filters are what a model stringifies when it means
+            -- "no filter"; echoing them would read as a real selector.
+            local h = History.new(1001)
+            h:on_tool_start("get_search_content", "t1", { responseId = "abc123", query = "null", url = "Null" })
+            pump(60)
+            assert.is_true(
+                #rows_with(h:buf(), "abc123") == 1,
+                table.concat(vim.api.nvim_buf_get_lines(h:buf(), 0, -1, false), "\n")
+            )
+            assert.is_true(#rows_with(h:buf(), "null") == 0)
+        end)
     end)
 
     describe("auto-collapse", function()

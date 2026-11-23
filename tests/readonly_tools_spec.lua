@@ -98,6 +98,20 @@ describe("built-in read-only tool renderers (issue #105)", function()
             pump(60)
             assert.is_true(#rows_with(h:buf(), "/FIXME/ in src (*.ts) limit 25") == 1)
         end)
+
+        it("reads a stringified null as an omitted path and glob", function()
+            -- A model that means "the default path" but writes `"path": "null"`
+            -- must not produce `/pat/ in null (undefined)`.
+            local h = History.new(1065)
+            h:on_tool_start("grep", "t1", { pattern = "hello", path = "null", glob = "undefined" })
+            pump(60)
+            assert.is_true(
+                #rows_with(h:buf(), "/hello/ in .") == 1,
+                table.concat(vim.api.nvim_buf_get_lines(h:buf(), 0, -1, false), "\n")
+            )
+            assert.is_true(#rows_with(h:buf(), "null") == 0)
+            assert.is_true(#rows_with(h:buf(), "undefined") == 0)
+        end)
     end)
 
     describe("find input summary", function()
