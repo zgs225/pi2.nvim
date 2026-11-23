@@ -154,6 +154,14 @@ local MAX_WAKE_BUDGET = 10
 local DEFAULT_WAKE_CACHE_WINDOW_MS = 300000
 local MAX_WAKE_CACHE_WINDOW_MS = 86400000
 
+--- Every policy the extension accepts (`WAKE_POLICIES` in
+--- `extensions/bg-tasks.ts`). The list must stay a superset of that one: the
+--- backend refuses a policy it does not know and falls back to its own default,
+--- so a value missing here is silently downgraded to `never` — which is exactly
+--- what `budgeted` used to be, while the check spelled out three names by hand.
+---@type table<string, boolean>
+local WAKE_POLICIES = { never = true, budgeted = true, failure = true, always = true }
+
 --- Runtime file conveying the configured completion-wake policy to
 --- already-spawned RPC processes, as JSON:
 --- `{wake_on_completion:string, wake_budget:number, wake_cache_window_ms:number, present:boolean}`.
@@ -235,7 +243,7 @@ function M.publish(cfg)
     local c = published_cfg or {}
     ---@diagnostic disable-next-line: undefined-field -- deprecated alias, kept for one update
     local policy = c.wake_on_completion or c.wake_on_idle
-    if policy ~= "always" and policy ~= "failure" and policy ~= "never" then
+    if type(policy) ~= "string" or not WAKE_POLICIES[policy] then
         policy = DEFAULT_WAKE_POLICY
     end
     local ok, payload = pcall(vim.json.encode, {

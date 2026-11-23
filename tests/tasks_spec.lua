@@ -5,6 +5,17 @@
 
 local Tasks = require("pi.tasks")
 
+--- Read the bundled bg-tasks extension, the source of truth for what the backend
+--- accepts. The published policy is only as good as this contract.
+---@return string
+local function read_extension()
+    local root = vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":h:h")
+    local f = assert(io.open(root .. "/extensions/bg-tasks.ts", "r"))
+    local src = f:read("*a")
+    f:close()
+    return src
+end
+
 --- Build a pi2_bg_task event envelope the way the session pipeline forwards it.
 ---@param kind string
 ---@param fields table?
@@ -811,6 +822,24 @@ describe("pi.tasks completion-wake policy file", function()
         -- a usable policy when only that one is set.
         Tasks.publish({ wake_on_idle = "always" })
         assert.are.equal("always", Tasks.published().wake_on_completion)
+    end)
+
+    it("publishes every policy the extension accepts", function()
+        local list = assert(
+            read_extension():match("const WAKE_POLICIES = %[([^%]]*)%]"),
+            "the extension must declare its policy list"
+        )
+        local seen = 0
+        for policy in list:gmatch('"([^"]+)"') do
+            seen = seen + 1
+            Tasks.publish({ wake_on_completion = policy })
+            assert.are.equal(
+                policy,
+                Tasks.published().wake_on_completion,
+                "policy " .. policy .. " must survive the Lua publisher, not be downgraded to never"
+            )
+        end
+        assert.are.equal(4, seen, "every documented policy must be covered")
     end)
 
     it("keeps the last config when republishing for a focus change", function()
