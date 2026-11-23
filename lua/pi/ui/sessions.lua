@@ -2821,18 +2821,21 @@ function M.open()
 end
 
 --- Close the sessions list window in the current tab (no-op when absent).
-function M.close()
-    show_hidden_children = false
-    parent_hidden = {}
-    local tab = current_tab()
-    local win = win_for(tab)
-    if not win then
-        return
-    end
+--- Close `tab`'s session-list window (no-op when absent). Safe for a tab the
+--- user is not looking at: releasing a panel claim and closing a window never
+--- change the current tabpage.
+---@param tab pi.TabId
+function M.close_tab(tab)
     wins[tab] = nil
     -- Window first, then the claim release + geometry pass (both inside the
     -- workspace, so the remaining panels and the chat column re-expand).
     Workspace.release_panel(tab, "sessions")
+end
+
+function M.close()
+    show_hidden_children = false
+    parent_hidden = {}
+    M.close_tab(current_tab())
 end
 
 --- True when the current window is a `:PiSessions` list.

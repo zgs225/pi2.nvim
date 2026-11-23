@@ -66,7 +66,7 @@ And mid-session management:
 | `:PiSessions` | `pi.sessions()` | Toggle the live overview of all active sessions (name + busy/idle/attention). See [Sessions overview](#sessions-overview-pisessions). |
 | `:PiSessionsSync` | — | Reorder the π tabs into `:PiSessions` list order, so every checkout's tabs form one block (same as `S` in the list). Explicit only: Neovim reports no event for a user `:tabmove`, so an automatic pass could not tell a deliberate reorder from drift. See [Sessions overview](#sessions-overview-pisessions). |
 | `:PiSessionName [name]` | `pi.set_session_name(name?)` | Set a human-readable display name for the current session. Without an argument, opens an input dialog prefilled with the current name. Names appear in the `:PiResume` picker so you can identify long-running conversations at a glance. |
-| `:PiStop` | `pi.stop()` | Tear down the current session entirely, killing the backing `pi --mode rpc` process. Different from `:PiToggleChat`, which just hides the windows while the session keeps running. |
+| `:PiStop` | `pi.stop()` | Tear down the current session entirely, killing the backing `pi --mode rpc` process. Different from `:PiToggleChat`, which just hides the tab's π windows (chat and side panels) while the session keeps running. |
 | `:PiSubNew` | `pi.sub_new()` | Spawn a background sub-session with a task prompt (inherits model/thinking by default). |
 | `:PiSubSwitch` | `pi.sub_switch()` | Picker to switch the current tab's chat to a child sub-session (including dormant). |
 | `:PiSubParent` | `pi.sub_parent()` | Return from a child sub-session view to the parent. |

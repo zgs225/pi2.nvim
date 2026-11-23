@@ -29,6 +29,7 @@
 ---@field _last_turn_stop_reason "aborted"|"error"|nil
 ---@field _attachments pi.ChatAttachments
 ---@field _zen pi.Zen
+---@field _hidden_panels? pi.ChatUiPanels Panels open when :PiToggleChat last hid the whole UI
 ---@field _bash_running boolean
 ---@field _bash_req_id string?
 ---@field _bash_req_counter integer
@@ -107,6 +108,7 @@ function Chat.new(tab, mode, agent)
     self._worktree_status = nil
     self._worktree_timer = nil
     self._last_applied_prompt = nil
+    self._hidden_panels = nil
     self._bash_running = false
     self._bash_req_id = nil
     self._bash_req_counter = 0
@@ -787,11 +789,93 @@ function Chat:focus_attachments()
     end
 end
 
+---@class pi.ChatUiPanels
+---@field sessions boolean
+---@field tasks boolean
+---@field todo boolean
+
+--- Which tab-level panels are open for this chat's tab.
+---@return pi.ChatUiPanels
+function Chat:ui_snapshot()
+    local tab = self._tab or vim.api.nvim_get_current_tabpage()
+    return {
+        sessions = require("pi.ui.sessions").win(tab) ~= nil,
+        tasks = require("pi.ui.tasks").win(tab) ~= nil,
+        todo = require("pi.todo").win(tab) ~= nil,
+    }
+end
+
+---@param snap pi.ChatUiPanels
+---@return boolean
+local function any_panel(snap)
+    return snap.sessions or snap.tasks or snap.todo
+end
+
+--- Whether any part of this tab's π UI is on screen: the chat windows or one
+--- of the side panels.
+---@return boolean
+function Chat:ui_visible()
+    if self:is_visible() then
+        return true
+    end
+    return any_panel(self:ui_snapshot())
+end
+
+--- Reopen the panels recorded by the last hide_ui (if any). Cleared once
+--- restored, so a later show of the chat alone does not resurrect them.
+function Chat:_restore_ui_panels()
+    local snap = self._hidden_panels
+    self._hidden_panels = nil
+    if not snap or not any_panel(snap) then
+        return
+    end
+    -- Panel open() functions focus their window; the caller focuses the prompt
+    -- afterwards, so the remembered layout is restored without stealing the
+    -- cursor from the chat.
+    if snap.sessions then
+        require("pi.ui.sessions").open()
+    end
+    if snap.tasks then
+        require("pi.ui.tasks").open()
+    end
+    if snap.todo then
+        require("pi.todo").open()
+    end
+end
+
+--- Show the whole π UI for this chat: the chat windows plus the panels that
+--- were open when the UI was last toggled off.
+function Chat:show_ui()
+    self:show()
+    self:_restore_ui_panels()
+    self:focus_prompt()
+end
+
+--- Hide the whole π UI: remember which side panels are open, close them, then
+--- hide the chat (the workspace hands the tab's own window back in full-tab
+--- mode). `pi.toggle` / `:Pi` and `pi.toggle_chat` / `:PiToggleChat` both route
+--- here; `Chat:hide()` stays the narrow "close my windows" path used by
+--- layout switches and teardown.
+function Chat:hide_ui()
+    local snap = self:ui_snapshot()
+    if any_panel(snap) then
+        self._hidden_panels = snap
+    end
+    local tab = self._tab or vim.api.nvim_get_current_tabpage()
+    require("pi.ui.sessions").close_tab(tab)
+    -- The task-output splits belong to the panel (`o` / `a`), so they go with
+    -- it; the panel's preview floats close through their own WinClosed watch.
+    require("pi.ui.tasks").close_outputs(tab)
+    require("pi.ui.tasks").close_tab(tab)
+    require("pi.todo").close_tab(tab)
+    self:hide()
+end
+
 function Chat:toggle()
-    if self._layout:is_visible() then
-        self._layout:hide()
+    if self:ui_visible() then
+        self:hide_ui()
     else
-        self:ensure_shown_and_focus_prompt()
+        self:show_ui()
     end
 end
 
@@ -2182,6 +2266,7 @@ function Chat:clear()
     self._last_turn_stop_reason = nil
     self._history:clear()
     self._prompt:statusline():reset_usage()
+    self._hidden_panels = nil
 end
 
 --- Scroll the history window by a number of lines.

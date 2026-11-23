@@ -481,6 +481,13 @@ local function close_for_tab(tab)
     Workspace.release_panel(tab, "todo")
 end
 
+--- Close `tab`'s panel window (no-op when absent). Safe for a tab the user is
+--- not looking at.
+---@param tab pi.TabId
+function M.close_tab(tab)
+    close_for_tab(tab)
+end
+
 --- Close the panel window in the current tab (no-op when absent).
 function M.close()
     close_for_tab(current_tab())

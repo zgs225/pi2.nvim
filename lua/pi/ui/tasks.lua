@@ -1338,6 +1338,25 @@ function M.open()
     end
 end
 
+--- Close the task-output splits opened from `tab`'s panel (`o` / `a`). They
+--- are ordinary splits, not floats, so hiding the whole π UI would otherwise
+--- leave them next to an empty editor. Preview floats close with their list
+--- window through `watch_list_win`, which `close_tab` triggers. Safe for a
+--- background tab.
+---@param tab integer
+function M.close_outputs(tab)
+    if not vim.api.nvim_tabpage_is_valid(tab) then
+        return
+    end
+    for _, win in ipairs(vim.api.nvim_tabpage_list_wins(tab)) do
+        local buf = vim.api.nvim_win_get_buf(win)
+        local name = vim.api.nvim_buf_get_name(buf)
+        if vim.bo[buf].filetype == "pi-task-output" and vim.startswith(name, "pi://task-output/") then
+            pcall(vim.api.nvim_win_close, win, false)
+        end
+    end
+end
+
 --- Close the tasks panel window in `tab` (no-op when absent). Safe to call
 --- for a tab the user is not looking at: closing a window never touches the
 --- current tabpage or focus. Close the window first, then release the

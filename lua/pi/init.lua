@@ -76,17 +76,21 @@ function M.toggle(opts)
     end
 
     local requested_layout = opts and opts.layout or nil
-    if existing.chat:is_visible() then
+    if existing.chat:ui_visible() then
         if requested_layout and existing.chat:layout() ~= requested_layout then
             existing.chat:set_layout(requested_layout)
             existing.chat:focus_prompt()
         else
-            existing.chat:hide()
+            existing.chat:hide_ui()
         end
         return
     end
 
-    show_chat(existing.chat, requested_layout)
+    -- Restore the panels that were open when the UI was last toggled off.
+    if requested_layout and existing.chat:layout() ~= requested_layout then
+        existing.chat:set_layout(requested_layout)
+    end
+    existing.chat:show_ui()
 end
 
 --- Continue the most recent session for the current cwd.
@@ -101,10 +105,23 @@ function M.resume_session(opts)
     require("pi.sessions.manager").resume_session(opts)
 end
 
---- Toggle chat visibility. No-op if no session exists.
+--- Toggle the whole π UI of the current tab: the chat windows plus the side
+--- panels (`:PiSessions`, `:PiTasks`, `:PiTodo`). The panels that were open when
+--- it hid are reopened on the next toggle. With no session in the tab the
+--- panels are still π UI, so the toggle closes them (a sessions dashboard).
 function M.toggle_chat()
     local session = require("pi.sessions.manager").get()
     if not session then
+        local tab = vim.api.nvim_get_current_tabpage()
+        local Sessions = require("pi.ui.sessions")
+        local Tasks = require("pi.ui.tasks")
+        local Todo = require("pi.todo")
+        if not (Sessions.win(tab) or Tasks.win(tab) or Todo.win(tab)) then
+            return
+        end
+        Sessions.close_tab(tab)
+        Tasks.close_tab(tab)
+        Todo.close_tab(tab)
         return
     end
     session.chat:toggle()

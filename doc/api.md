@@ -11,7 +11,7 @@ pi.setup(opts?)
 -- Chat lifecycle
 pi.show(opts?)                -- open the chat; opts: { layout = "side"|"float" }
 pi.toggle(opts?)              -- open or hide the chat
-pi.toggle_chat()              -- hide/show the chat windows for the current tab
+pi.toggle_chat()              -- hide/show the whole π UI of the current tab (chat + side panels)
 pi.toggle_layout(cb?)         -- swap side ↔ float; cb runs after the swap completes
 pi.is_visible()               -- boolean: is the chat shown in the current tab?
 pi.layout()                   -- "side" | "float" | nil

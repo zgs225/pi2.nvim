@@ -249,7 +249,7 @@ require("pi").setup({
 | `:PiNewTab [worktree=<name>]` | Open a fresh session in a new tabpage (optionally in a worktree — created when the name does not exist) |
 | `:PiContinue [layout=side\|float]` | Continue the most recent session for the current working directory |
 | `:PiResume [layout=side\|float]` | Pick and resume a past session for the current working directory, grouped per checkout — with Telescope: `<CR>`/`o` here, `t`/`<C-t>` in a new tab |
-| `:PiToggleChat` | Toggle chat visibility |
+| `:PiToggleChat` | Toggle the tab's π UI: the chat and the side panels |
 | `:PiToggleLayout` | Switch between side and float layout |
 | `:PiAbort` | Abort the current agent operation |
 | `:PiAbortBash` | Abort the running direct bash (`!`) command |
