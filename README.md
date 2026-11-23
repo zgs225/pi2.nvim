@@ -343,6 +343,7 @@ Everything below is present in `pi2.nvim` and **not** in upstream `alex35mil/pi.
 **Navigation & layout**
 
 - [Open file under cursor (`gf`)](doc/usage.md#open-file-under-cursor) — resolves bare paths, `@mention#L<line>`, and `path:line` from history lines.
+- [Turn navigation (`[[` / `]]`)](doc/usage.md#turn-navigation) — jump the history from one user message to the next/previous one, count-aware, from the history buffer or the prompt; `]]` past the last turn returns to the live bottom and resumes following.
 - [Search results in the quickfix list](doc/usage.md#quickfix) — `grep`/`find` results loaded for `:cnext` / `:cprev`.
 - [Left side panel](doc/usage.md#chat--layouts) — `layout.side.position` accepts `"left"`.
 

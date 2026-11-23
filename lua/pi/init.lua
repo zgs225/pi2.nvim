@@ -933,6 +933,24 @@ function M.scroll_chat_history_to_last_agent_response()
     end
 end
 
+--- Jump the chat history to the next or previous turn (a turn starts at its
+--- user message).
+---
+--- The history window's cursor and viewport move; focus stays where it is, so
+--- this is callable from the prompt buffer while typing. Past the last turn
+--- `"next"` lands at the bottom and resumes following the stream. Default
+--- bindings are `]]` / `[[` in the history *and* prompt buffers (normal mode).
+---@param direction "next"|"prev" `"next"` moves forward, `"prev"` backward
+---@param count? integer turns to move (default 1)
+---@return boolean moved whether the cursor was moved
+function M.goto_turn(direction, count)
+    local session = require("pi.sessions.manager").get()
+    if session then
+        return session.chat:goto_turn(direction, count)
+    end
+    return false
+end
+
 --- Focus the chat history window.
 function M.focus_chat_history()
     local session = require("pi.sessions.manager").get()

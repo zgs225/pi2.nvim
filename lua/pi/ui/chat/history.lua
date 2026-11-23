@@ -50,6 +50,7 @@
 ---@field _agent_text_start_row integer?
 ---@field _current_turn_first_agent_response_extmark_id integer?
 ---@field _current_turn_last_agent_response_extmark_id integer?
+---@field _turn_anchors integer[] extmark ids of the user label rows, one per turn, in render order
 ---@field _text_batches string[][] sealed/open text-delta batches, one per structural boundary
 ---@field _structural_inflight integer structural dispatches whose callback has not run yet
 ---@field _pending_thinking table<integer, string[]> coalesced thinking deltas awaiting flush, keyed by block generation
@@ -154,6 +155,12 @@ local Render = require("pi.ui.render")
 local Text = require("pi.ui.chat.text")
 
 local ns = vim.api.nvim_create_namespace("pi-chat")
+
+-- Turn anchors get their own namespace on purpose: `ns` is cleared by row range
+-- throughout the render code (tool-block expand/collapse, live updates, footer
+-- redraws), and an anchor swallowed by such a clear would silently drop a turn
+-- from `[[` / `]]` navigation. Nothing else writes here.
+local turn_ns = vim.api.nvim_create_namespace("pi-chat-turn")
 
 local STARTUP_HL_PRIORITY = 200
 
@@ -557,6 +564,7 @@ function History.new(tab)
     self._agent_text_start_row = nil
     self._current_turn_first_agent_response_extmark_id = nil
     self._current_turn_last_agent_response_extmark_id = nil
+    self._turn_anchors = {}
     self._text_batches = { {} } -- invariant: always ends with one open batch
     self._structural_inflight = 0
     self._pending_thinking = {}
@@ -748,6 +756,34 @@ function History:scroll_to_bottom()
     self:_scroll_to_bottom()
 end
 
+--- Move the history window's cursor to a buffer row and put it at the top.
+---
+--- Focus stays where it is (`nvim_win_call` never changes the current window), so
+--- this works while the user is typing in the prompt. The jump is a navigation
+--- move, not following: it detaches from the stream until the cursor comes back
+--- to the bottom, and records the landing spot so `_on_cursor_moved` can tell our
+--- move apart from the user's.
+---@param row integer 0-indexed target row
+function History:_jump_to_row(row)
+    if not self._win or not vim.api.nvim_win_is_valid(self._win) then
+        return
+    end
+    if not self._buf or not vim.api.nvim_buf_is_valid(self._buf) then
+        return
+    end
+    local last = vim.api.nvim_buf_line_count(self._buf) - 1
+    row = math.max(0, math.min(row, last))
+    vim.api.nvim_win_call(self._win, function()
+        -- `m'` puts the pre-jump position on the jumplist, so <C-o> / <C-i>
+        -- walk back through turn jumps the way they do through any other jump.
+        vim.cmd("normal! m'")
+        vim.api.nvim_win_set_cursor(self._win, { row + 1, 0 })
+        vim.cmd("normal! zt")
+    end)
+    self._auto_follow = false
+    self._pending_cursor = vim.api.nvim_win_get_cursor(self._win)
+end
+
 ---@param extmark_id integer?
 function History:_scroll_to_agent_response(extmark_id)
     if not self._win or not vim.api.nvim_win_is_valid(self._win) then
@@ -762,14 +798,7 @@ function History:_scroll_to_agent_response(extmark_id)
         return
     end
 
-    vim.api.nvim_win_call(self._win, function()
-        vim.api.nvim_win_set_cursor(self._win, { pos[1] + 1, 0 })
-        vim.cmd("normal! zt")
-    end)
-    -- Navigation jump: the user is reading a specific response — detach from
-    -- the stream until they return to the bottom.
-    self._auto_follow = false
-    self._pending_cursor = vim.api.nvim_win_get_cursor(self._win)
+    self:_jump_to_row(pos[1])
 end
 
 --- Scroll the history window to the first agent response in the current user turn.
@@ -780,6 +809,111 @@ end
 --- Scroll the history window to the last agent response in the current user turn.
 function History:scroll_to_last_agent_response()
     self:_scroll_to_agent_response(self._current_turn_last_agent_response_extmark_id)
+end
+
+--- Rows (0-indexed) of every live turn anchor, ascending.
+---
+--- Anchors are extmarks on the user label rows, so they follow every buffer
+--- edit instead of being tracked as row numbers. Ids that no longer resolve (a
+--- wiped buffer, an anchor namespace clear) are dropped here rather than
+--- skipped forever.
+---@return integer[]
+function History:_live_turn_rows()
+    local rows = {}
+    local kept = {}
+    if self._buf and vim.api.nvim_buf_is_valid(self._buf) then
+        for _, id in ipairs(self._turn_anchors) do
+            local pos = vim.api.nvim_buf_get_extmark_by_id(self._buf, turn_ns, id, {})
+            if pos and #pos > 0 then
+                rows[#rows + 1] = pos[1]
+                kept[#kept + 1] = id
+            end
+        end
+        if #kept ~= #self._turn_anchors then
+            self._turn_anchors = kept
+        end
+        -- Render order is append order; sorting keeps navigation sane even if a
+        -- replayed session ever lands out of order.
+        table.sort(rows)
+    end
+    return rows
+end
+
+--- Resolve a turn motion against the anchor rows.
+---
+--- Pure (no buffer, no window) so the motion can be unit-tested directly.
+--- `next` / `prev` move strictly past the cursor — no "jump to the start of my
+--- own turn first" special case — so repeated presses always make progress. A
+--- count that runs past the end of the list clamps to the last reachable turn;
+--- only a motion with nothing ahead returns nil.
+---@param rows integer[] ascending 0-indexed turn-start rows
+---@param cursor_row integer 0-indexed cursor row
+---@param direction "next"|"prev"
+---@param count integer
+---@return integer? index index into `rows`, nil when there is no target in that direction
+function History.turn_target_index(rows, cursor_row, direction, count)
+    count = math.max(1, count or 1)
+    if direction == "prev" then
+        local found
+        for i = #rows, 1, -1 do
+            if rows[i] < cursor_row then
+                found = i
+                break
+            end
+        end
+        if not found then
+            return nil
+        end
+        return math.max(1, found - (count - 1))
+    end
+    local found
+    for i = 1, #rows do
+        if rows[i] > cursor_row then
+            found = i
+            break
+        end
+    end
+    if not found then
+        return nil
+    end
+    return math.min(#rows, found + (count - 1))
+end
+
+--- Jump the history window to the next or previous turn.
+---
+--- A turn starts at its user message label: `next` lands on the following
+--- turn's label, `prev` on the one above the cursor. Running past the last turn
+--- lands at the buffer bottom and re-attaches the stream (the same place `G`
+--- leaves you), so `]]` from anywhere reaches the live output.
+---@param direction "next"|"prev"
+---@param count? integer turns to move (default 1)
+---@return boolean moved whether the cursor was moved
+function History:goto_turn(direction, count)
+    if not self._win or not vim.api.nvim_win_is_valid(self._win) then
+        return false
+    end
+    if not self._buf or not vim.api.nvim_buf_is_valid(self._buf) then
+        return false
+    end
+    local rows = self:_live_turn_rows()
+    if #rows == 0 then
+        -- Nothing rendered yet (or the anchors are gone): there is no turn to
+        -- navigate, and claiming a move would be a lie to callers.
+        return false
+    end
+    local cursor_row = vim.api.nvim_win_get_cursor(self._win)[1] - 1
+    local index = History.turn_target_index(rows, cursor_row, direction, count or 1)
+    if not index then
+        if direction ~= "next" then
+            return false
+        end
+        -- Past the last turn: nothing left to land on, so go to the live end
+        -- and follow it again — the reading session is over.
+        self:_scroll_to_bottom()
+        return true
+    end
+    self:_jump_to_row(rows[index])
+    return true
 end
 
 function History:_pick_spinner()
@@ -1777,6 +1911,11 @@ function History:add_user_message(msg, timestamp, image_count, queue_type)
         end
         local start = self:_append_lines(lines)
         local label_row = start + (turn_gap and 2 or 1)
+        -- Turn anchor: the user label row is where `[[` / `]]` land. An extmark
+        -- (not a row number) so streaming appends, tool-block expand/collapse
+        -- and startup-block toggles all move it correctly.
+        local anchor = vim.api.nvim_buf_set_extmark(self._buf, turn_ns, label_row, 0, { right_gravity = true })
+        self._turn_anchors[#self._turn_anchors + 1] = anchor
         vim.api.nvim_buf_set_extmark(self._buf, ns, label_row, 0, {
             end_col = #icon,
             hl_group = "PiUserMessageLabel",
@@ -4493,7 +4632,9 @@ function History:clear()
     self._agent_text_chunks = nil
     self._current_turn_first_agent_response_extmark_id = nil
     self._current_turn_last_agent_response_extmark_id = nil
+    self._turn_anchors = {}
     vim.api.nvim_buf_clear_namespace(self._buf, ns, 0, -1)
+    vim.api.nvim_buf_clear_namespace(self._buf, turn_ns, 0, -1)
     self:_with_modifiable(function()
         vim.api.nvim_buf_set_lines(self._buf, 0, -1, false, { "" })
     end)

@@ -133,6 +133,7 @@ pi.scroll_chat_history(direction, lines?)          -- direction: "up" | "down"; 
 pi.scroll_chat_history_to_bottom()
 pi.scroll_chat_history_to_first_agent_response()
 pi.scroll_chat_history_to_last_agent_response()
+pi.goto_turn(direction, count?)                  -- direction: "next" | "prev"; count defaults to 1
 pi.goto_file_under_cursor()   -- open the file referenced on the history line under the cursor
 
 -- Debug
