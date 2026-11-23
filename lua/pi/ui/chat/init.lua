@@ -1763,7 +1763,10 @@ function Chat:clear_for_compaction_rebuild()
     self._compaction_queue = compaction_queue
 end
 
-function Chat:on_agent_end()
+---@param rate? pi.TurnRateSummary Output tokens and decode seconds summed over the
+---       run's assistant messages; nil when nothing was measured (replay, an
+---       aborted stream, a provider that reports no usage).
+function Chat:on_agent_end(rate)
     self._streaming = false
     self:_disarm_abort_esc()
     self._assistant_block_open = false
@@ -1796,7 +1799,11 @@ function Chat:on_agent_end()
     self._done_verb = nil
     self._last_turn_stop_reason = nil
 
-    self._history:on_agent_end(completion_text, { force_completion = force_completion, stop_reason = stop_reason })
+    self._history:on_agent_end(completion_text, {
+        force_completion = force_completion,
+        stop_reason = stop_reason,
+        rate = rate,
+    })
     self:set_status(nil)
 
     -- The turn is over: files are final, so refresh the badge now and drop any

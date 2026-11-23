@@ -37,6 +37,7 @@
 ---@field _detached_retrying? boolean Auto-retry backoff (detached or captured on unbind).
 ---@field _busy_started_at? integer Run clock (`vim.uv.hrtime()/1e9`); first `agent_start` of the run.
 ---@field _busy_verb? string Active-verb snapshot for view-switch restore.
+---@field _turn_rate? pi.TurnRate Generation-speed meter of the current run (see `pi.turn_rate`), reset on every `agent_start`.
 ---@field _last_stop_reason? string Stop reason of the last assistant turn (`message_end`), reset on `agent_start`. The sub-session settle path reads it as the file-less fallback for a failed run.
 ---@field _last_error_message? string `errorMessage` of that turn when `_last_stop_reason` is `"error"`.
 ---@field session_file? string Backend-reported session file path (from get_state responses). Lets the resume picker detect "still open in another tab" without extra RPC round-trips.
@@ -72,6 +73,7 @@ local Rpc = require("pi.rpc")
 local Chat = require("pi.ui.chat")
 local Config = require("pi.config")
 local Startup = require("pi.startup")
+local TurnRate = require("pi.turn_rate")
 local Notify = require("pi.notify")
 local Attention = require("pi.attention")
 local Dialog = require("pi.ui.dialog")
@@ -511,6 +513,23 @@ local function mark_run_start(session)
         session._busy_started_at = math.floor(vim.uv.hrtime() / 1e9)
     end
     session._detached_busy = true
+end
+
+--- Monotonic clock in seconds. The generation rate needs the sub-second
+--- precision `mark_run_start`'s integer seconds deliberately drop.
+---@return number
+local function now_secs()
+    return vim.uv.hrtime() / 1e9
+end
+
+--- The run's generation-speed meter, created on first use.
+---@param session pi.Session
+---@return pi.TurnRate
+local function get_turn_rate(session)
+    if not session._turn_rate then
+        session._turn_rate = TurnRate.new()
+    end
+    return session._turn_rate
 end
 
 --- Authoritative end of the session-level run (`agent_settled` / process exit).
@@ -1241,6 +1260,9 @@ function M.handle_event(session, msg)
         session._last_stop_reason = nil
         session._last_error_message = nil
         session._detached_retrying = false
+        -- A retry / post-compaction start begins a fresh speed measurement: the
+        -- completion marker of the previous run was already written.
+        get_turn_rate(session):reset()
         require("pi.ui.sessions").on_agent_start(session)
         if chat then
             chat:on_agent_start(nil, session._busy_started_at)
@@ -1251,7 +1273,8 @@ function M.handle_event(session, msg)
         CommandsCache.refresh(session.rpc)
         M.refresh_state(session)
         if chat then
-            chat:on_agent_end()
+            local rate = session._turn_rate and session._turn_rate:summary() or nil
+            chat:on_agent_end(rate)
         end
     elseif t == "agent_settled" then
         -- Authoritative end of the session-level run: pi emits this only after
@@ -1270,6 +1293,13 @@ function M.handle_event(session, msg)
     elseif t == "message_update" then
         local event = msg.assistantMessageEvent
         if event then
+            -- The run's generation rate is measured client-side (pi reports no
+            -- throughput): the first streamed update of this message opens its
+            -- decode window, `message_end` closes it. Every `message_update`
+            -- counts as output — text, thinking and tool-call deltas all emit
+            -- tokens — and the agent loop turns the provider's `start`/`done`
+            -- into `message_start`/`message_end` instead of an update.
+            get_turn_rate(session):on_update(now_secs())
             if event.type == "toolcall_end" then
                 local tool_call = event.toolCall
                 if type(tool_call) == "table" then
@@ -1528,8 +1558,14 @@ function M.handle_event(session, msg)
                 handle_bg_task_message(message, session.id, session.attached_tab)
             end
             render_bg_task_note(message, chat)
-        elseif chat then
-            chat:on_message_start(msg)
+        else
+            if type(message) == "table" and message.role == "assistant" then
+                -- The decode window opens on this message's first delta.
+                get_turn_rate(session):on_message_start()
+            end
+            if chat then
+                chat:on_message_start(msg)
+            end
         end
     elseif t == "message_end" then
         require("pi.ui.sessions").on_message_end(session)
@@ -1539,6 +1575,9 @@ function M.handle_event(session, msg)
             -- chat to hold it, and the sub-session settle path needs it even
             -- when the child runs without a session file.
             session._last_stop_reason = type(message.stopReason) == "string" and message.stopReason or nil
+            -- Bank this message's output tokens against its decode window.
+            -- Skipped for aborted/errored messages (see pi.turn_rate).
+            get_turn_rate(session):on_message_end(message.usage, message.stopReason, now_secs())
             session._last_error_message = type(message.errorMessage) == "string"
                     and message.errorMessage ~= ""
                     and message.errorMessage
