@@ -1,18 +1,29 @@
 /**
  * Compaction control for pi.nvim (Gitea #127).
  *
- * One bundled extension, four layers. This file implements L1 and L2 and
- * carries the skeleton for the rest, so a follow-up task extends ONE file
- * instead of inventing a second:
+ * One bundled extension, four layers. This file implements L1, L2 and L3 plus
+ * the owner/conflict detection and carries the skeleton for the rest, so a
+ * follow-up task extends ONE file instead of inventing a second:
  *
  *  - L1 `cleaner` (default on, this file): bound the file lists pi appends to a
  *    summary, and keep the summarisation INPUT clean.
  *  - L2 `checkpoint` (opt-in, this file): return our own structured, deduped
  *    checkpoint from `session_before_compact`, with evidence tags, protected
  *    literals and the same file lists L1 bounds.
- *  - L3 `state`: inject a compact session state note before each request
- *    (follow-up task).
+ *  - L3 `state` (default on, this file): after a successful compaction, persist
+ *    one deterministic state snapshot (todos, background tasks, sub-agents, git,
+ *    compaction facts) and replay it into the NEXT request exactly once through
+ *    the `context` hook.
  *  - L4 `prune`: opt-in tool-result pruning (follow-up task).
+ *
+ * ## Owner / conflict detection
+ *
+ * Compaction handlers chain last-wins: another loaded extension may replace our
+ * summary. When a successful compaction reports `fromExtension` with
+ * `details.engine !== "pi2"`, a DIFFERENT extension supplied it. pi.nvim then
+ * warns once per session and L2/L4 stand down for the rest of the session; L1
+ * cleaning and the L3 snapshot stay active (they cost nothing and keep the
+ * state note correct).
  *
  * ## Why L1 exists
  *
@@ -56,8 +67,8 @@
  * frozen at spawn, the file is re-read on every compaction event, so a live
  * `setup()` applies without respawning pi (same pattern as extensions/todo.ts).
  * Outside pi.nvim the file is absent and the defaults below apply. This file
- * reads the `enabled`, `cleaner` and `checkpoint` sections; L3/L4 read their own
- * keys when they land.
+ * reads the `enabled`, `cleaner`, `checkpoint`, `state` and `owner` sections; L4
+ * reads its own keys when it lands.
  */
 
 import type {
@@ -68,8 +79,10 @@ import type {
 	SessionCompactFailedEvent,
 } from "@earendil-works/pi-coding-agent";
 import { convertToLlm, serializeConversation } from "@earendil-works/pi-coding-agent";
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 
 const ENV_FILE = "PI_NVIM_COMPACTION_FILE";
 /** Custom entry that records what the cleaner did for one compaction. */
@@ -77,6 +90,8 @@ const ENTRY_TYPE = "pi2-compaction-cleaner";
 const DEFAULT_MAX_READ = 50;
 const DEFAULT_MAX_MODIFIED = 100;
 const DEFAULT_MAX_WORDS = 1500;
+/** Default character budget of the L3 snapshot, in tokens (`max_tokens * 4` chars). */
+const DEFAULT_STATE_MAX_TOKENS = 1000;
 /** Output limit used when the summarisation model does not report `maxTokens`. */
 const DEFAULT_CHECKPOINT_MAX_TOKENS = 8192;
 /** Never ask for less than this, even when the window is nearly full. */
@@ -158,11 +173,24 @@ interface CheckpointSettings {
 	max_words: number;
 }
 
+/** The L3 post-compaction snapshot options, as published by pi.nvim. */
+interface StateSettings {
+	enabled: boolean;
+	max_tokens: number;
+}
+
+/** The owner/conflict detection switch, as published by pi.nvim. */
+interface OwnerSettings {
+	detect: boolean;
+}
+
 /** The part of the published runtime config these layers read. */
 interface CompactionRuntimeConfig {
 	enabled: boolean;
 	cleaner: CleanerSettings;
 	checkpoint: CheckpointSettings;
+	state: StateSettings;
+	owner: OwnerSettings;
 }
 
 /** Fresh defaults per call: a caller may mutate what `readConfig` returns. */
@@ -183,6 +211,13 @@ function defaultConfig(): CompactionRuntimeConfig {
 			thinking_level: null,
 			language: "auto",
 			max_words: DEFAULT_MAX_WORDS,
+		},
+		state: {
+			enabled: true,
+			max_tokens: DEFAULT_STATE_MAX_TOKENS,
+		},
+		owner: {
+			detect: true,
 		},
 	};
 }
@@ -275,6 +310,17 @@ function readConfig(): CompactionRuntimeConfig {
 		target.thinking_level = optionalString(checkpoint.thinking_level);
 		target.language = checkpointLanguage(checkpoint.language, target.language);
 		target.max_words = clampInteger(checkpoint.max_words, target.max_words, 200, 6000);
+	}
+	const rawState = parsed.state;
+	if (rawState !== null && typeof rawState === "object") {
+		const state = rawState as Record<string, unknown>;
+		config.state.enabled = booleanOr(state.enabled, config.state.enabled);
+		config.state.max_tokens = clampInteger(state.max_tokens, config.state.max_tokens, 100, 4000);
+	}
+	const rawOwner = parsed.owner;
+	if (rawOwner !== null && typeof rawOwner === "object") {
+		const owner = rawOwner as Record<string, unknown>;
+		config.owner.detect = booleanOr(owner.detect, config.owner.detect);
 	}
 	return config;
 }
@@ -991,6 +1037,557 @@ function untouchedReport(preparation: SessionBeforeCompactEvent["preparation"], 
 	};
 }
 
+// ---------------------------------------------------------------------------
+// L3: post-compaction state snapshot (default on through `state.enabled`)
+// ---------------------------------------------------------------------------
+
+/** Custom entry that records one snapshot: its text, facts and content hash. */
+const STATE_ENTRY_TYPE = "pi2-compaction-state";
+
+/**
+ * First line of every snapshot. Byte-constant on purpose: it says what the
+ * block is (facts, not a summary) and what to do with it, so the model never
+ * mistakes it for the summary it was injected next to. The e2e asserts it.
+ */
+const STATE_HEADER =
+	"[pi2 state] Post-compaction state snapshot (facts, NOT a summary). Re-read files you still need; this replaces nothing.";
+
+/** Per-section caps (the budget below is the hard limit, these keep it readable). */
+const STATE_MAX_TODOS = 10;
+const STATE_MAX_BG_TASKS = 5;
+const STATE_MAX_SUBAGENTS = 5;
+const STATE_MAX_GIT_LINES = 20;
+const STATE_COMMAND_COLS = 60;
+const STATE_TASK_COLS = 60;
+/** A hung `git` must never block a compaction that already succeeded. */
+const GIT_TIMEOUT_MS = 2000;
+
+/** `extensions/todo.ts`: the tool result and the checkpoint entry it persists. */
+const TODO_TOOL_NAME = "todo_write";
+const TODO_CHECKPOINT_TYPE = "pi2-todo";
+/** `extensions/bg-tasks.ts`: the custom (message) entries it pushes. */
+const BG_TASK_TYPE = "pi2_bg_task";
+/** pi.nvim's sub-session manifest, next to the session files. */
+const SUBSESSION_MANIFEST = ".pi2-subsessions.json";
+
+/**
+ * The `fromExtension` / `details.engine` classification of one compaction:
+ * `pi2` = ours, `foreign` = another extension, `native` = pi's own summariser.
+ */
+export type CompactionOwner = "pi2" | "foreign" | "native";
+
+/**
+ * Who supplied a successful compaction. `session_before_compact` handlers chain
+ * last-wins, so a later explicit `--extension` (or a third-party summariser)
+ * can replace ours; only `details.engine` tells the two apart.
+ */
+export function classifyCompactionOwner(fromExtension: unknown, details: unknown): CompactionOwner {
+	if (fromExtension !== true) {
+		return "native";
+	}
+	if (details === null || typeof details !== "object") {
+		return "foreign";
+	}
+	return (details as { engine?: unknown }).engine === "pi2" ? "pi2" : "foreign";
+}
+
+/** Shown once per session when another extension owns the summary. */
+const OWNER_CONFLICT_MESSAGE =
+	"pi2-compaction: another compaction extension supplied this summary; the pi2 checkpoint/prune layers stand down for this session";
+
+/** True once a foreign summariser was seen: L2 and L4 stand down (L1/L3 stay). */
+let ownerConflict = false;
+/** Session id already warned about a foreign summariser, so the notice is per session. */
+let ownerWarnedFor: string | undefined;
+
+/**
+ * One snapshot, kept in module state so the `context` hook can replay it. The
+ * `timestamp` is carried here on purpose: the injected message needs a stable
+ * one, and the snapshot TEXT must stay timestamp-free (byte-stable hashing).
+ */
+interface StateSnapshot {
+	text: string;
+	hash: string;
+	/** Fixed epoch ms for the injected message envelope. */
+	timestamp: number;
+	reason: string;
+	tokensBefore: number;
+	tokensAfter: number;
+	/** Hash the last request already carried; equal to `hash` means "injected". */
+	injectedHash?: string;
+}
+
+/** The most recent snapshot ("pending" until one request has carried it). */
+let pendingState: StateSnapshot | undefined;
+
+/** The subset of a session entry the snapshot folds (see session-format.md). */
+interface SessionEntryLike {
+	type?: string;
+	customType?: string;
+	data?: unknown;
+	details?: unknown;
+	message?: {
+		role?: string;
+		toolName?: string;
+		details?: unknown;
+	};
+}
+
+/** FNV-1a (32 bit) as 8 hex chars: cheap, stable across runs, no crypto import. */
+function fnv1aHex(text: string): string {
+	let hash = 0x811c9dc5;
+	for (let index = 0; index < text.length; index += 1) {
+		hash ^= text.charCodeAt(index);
+		// `Math.imul` keeps the multiply in 32-bit space.
+		hash = Math.imul(hash, 0x01000193) >>> 0;
+	}
+	return hash.toString(16).padStart(8, "0");
+}
+
+/** All whitespace runs collapsed to one space (a command or task on one line). */
+function flatten(text: string): string {
+	return text.replace(/\s+/g, " ").trim();
+}
+
+/** `flatten` plus a hard column cut (deterministic: the marker is always `...`). */
+function cut(text: string, max: number): string {
+	const flat = flatten(text);
+	return flat.length > max ? `${flat.slice(0, Math.max(0, max - 3))}...` : flat;
+}
+
+/** One folded todo item (only `content` and `status` matter here). */
+interface FoldedTodo {
+	content: string;
+	status: string;
+}
+
+/**
+ * The array shape `todo_write` stores in `details.todos`. Anything malformed is
+ * rejected as a whole (a half-read list would be worse than none).
+ */
+function validTodos(value: unknown): FoldedTodo[] | undefined {
+	if (!Array.isArray(value)) {
+		return undefined;
+	}
+	const todos: FoldedTodo[] = [];
+	for (const item of value) {
+		if (item === null || typeof item !== "object") {
+			return undefined;
+		}
+		const content = (item as { content?: unknown }).content;
+		const status = (item as { status?: unknown }).status;
+		if (typeof content !== "string" || typeof status !== "string") {
+			return undefined;
+		}
+		todos.push({ content, status });
+	}
+	return todos;
+}
+
+/**
+ * Fold the session's todo state like `extensions/todo.ts` rebuilds it, except
+ * that the newest source wins across BOTH: a compaction drops the tool results
+ * whose `details` carried the list, while the `pi2-todo` checkpoint survives.
+ */
+function foldTodos(entries: SessionEntryLike[]): FoldedTodo[] {
+	let latest: FoldedTodo[] = [];
+	for (const entry of entries) {
+		if (entry.type === "message") {
+			const message = entry.message;
+			if (message?.role !== "toolResult" || message.toolName !== TODO_TOOL_NAME) {
+				continue;
+			}
+			const details = message.details as { error?: unknown; todos?: unknown } | undefined;
+			if (!details || details.error) {
+				continue;
+			}
+			const todos = validTodos(details.todos);
+			if (todos) {
+				latest = todos;
+			}
+		} else if (entry.type === "custom" && entry.customType === TODO_CHECKPOINT_TYPE) {
+			const todos = validTodos((entry.data as { todos?: unknown } | undefined)?.todos);
+			if (todos) {
+				latest = todos;
+			}
+		}
+	}
+	return latest;
+}
+
+/** `## Todos` with the unfinished items only (completed work is in the summary). */
+function renderTodos(todos: FoldedTodo[]): string {
+	const open = todos.filter((todo) => todo.status !== "completed");
+	if (open.length === 0) {
+		return "";
+	}
+	const lines = [`## Todos (${open.length} unfinished)`];
+	for (const todo of open.slice(0, STATE_MAX_TODOS)) {
+		const content = todo.status === "in_progress" ? `${flatten(todo.content)} (in progress)` : flatten(todo.content);
+		lines.push(`- [ ] ${content}`);
+	}
+	if (open.length > STATE_MAX_TODOS) {
+		lines.push(`- ... ${open.length - STATE_MAX_TODOS} more unfinished`);
+	}
+	return lines.join("\n");
+}
+
+/** One background task record after the newest-wins fold. */
+interface FoldedBgTask {
+	id: string;
+	state: string;
+	command: string;
+}
+
+/** `bg-tasks.ts` kinds projected onto the state the snapshot reports. */
+function bgTaskState(kind: unknown): string | undefined {
+	if (kind === "started") {
+		return "running";
+	}
+	if (kind === "completed") {
+		return "completed";
+	}
+	if (kind === "failed") {
+		return "failed";
+	}
+	if (kind === "stopped") {
+		return "stopped";
+	}
+	if (kind === "unknown") {
+		return "unknown";
+	}
+	return undefined;
+}
+
+/**
+ * Fold `pi2_bg_task` records, newest per `taskId`. They are `custom_message`
+ * entries in practice (they also enter LLM context) and `custom` entries when an
+ * extension appends them directly, so both entry shapes are read.
+ */
+function foldBgTasks(entries: SessionEntryLike[]): FoldedBgTask[] {
+	const byId = new Map<string, FoldedBgTask>();
+	for (const entry of entries) {
+		if (entry.customType !== BG_TASK_TYPE) {
+			continue;
+		}
+		if (entry.type !== "custom" && entry.type !== "custom_message") {
+			continue;
+		}
+		const details =
+			entry.type === "custom"
+				? (entry.data as Record<string, unknown> | undefined)
+				: (entry.details as Record<string, unknown> | undefined);
+		if (!details || typeof details.taskId !== "string" || details.taskId === "") {
+			continue;
+		}
+		const state = bgTaskState(details.kind);
+		if (!state) {
+			continue;
+		}
+		byId.set(details.taskId, {
+			id: details.taskId,
+			state,
+			command: typeof details.command === "string" ? details.command : "",
+		});
+	}
+	return [...byId.values()].sort((left, right) => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0));
+}
+
+/** `## Background tasks`: running / failed / unknown only (a clean exit is done). */
+function renderBgTasks(tasks: FoldedBgTask[]): string {
+	const open = tasks.filter(
+		(task) => task.state === "running" || task.state === "failed" || task.state === "unknown",
+	);
+	if (open.length === 0) {
+		return "";
+	}
+	const lines = ["## Background tasks"];
+	for (const task of open.slice(0, STATE_MAX_BG_TASKS)) {
+		lines.push(`- ${task.id} ${task.state} "${cut(task.command, STATE_COMMAND_COLS)}"`);
+	}
+	if (open.length > STATE_MAX_BG_TASKS) {
+		lines.push(`- ... ${open.length - STATE_MAX_BG_TASKS} more`);
+	}
+	return lines.join("\n");
+}
+
+/** One sub-agent row the parent still has to hear from. */
+interface SubagentRow {
+	name: string;
+	status: string;
+	task: string;
+}
+
+/**
+ * Rows of `.pi2-subsessions.json` next to the session file (the manifest pi.nvim
+ * keeps per workspace): active children, plus completed/failed ones whose report
+ * the parent has not collected yet. A missing/unreadable manifest is just "no
+ * sub-agents" — never an error.
+ */
+function readSubagents(sessionFile: string | undefined): SubagentRow[] {
+	if (typeof sessionFile !== "string" || sessionFile === "") {
+		return [];
+	}
+	let parsed: Record<string, unknown>;
+	try {
+		const path = join(dirname(sessionFile), SUBSESSION_MANIFEST);
+		parsed = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+	} catch {
+		return [];
+	}
+	if (parsed === null || typeof parsed !== "object") {
+		return [];
+	}
+	const rows: SubagentRow[] = [];
+	for (const [id, raw] of Object.entries(parsed)) {
+		// `__lineage__` and any future metadata key is not a child row.
+		if (id.startsWith("__") || raw === null || typeof raw !== "object") {
+			continue;
+		}
+		const row = raw as Record<string, unknown>;
+		const status = typeof row.status === "string" ? row.status : "";
+		const pending = (status === "completed" || status === "failed") && row.reported !== true;
+		if (status !== "active" && !pending) {
+			continue;
+		}
+		const name = typeof row.name === "string" && row.name !== "" ? row.name : id;
+		const task =
+			typeof row.task_prompt === "string" && row.task_prompt !== ""
+				? row.task_prompt
+				: typeof row.task === "string"
+					? row.task
+					: "";
+		rows.push({ name, status, task });
+	}
+	rows.sort((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
+	return rows;
+}
+
+/** `## Sub-agents`, one line per child the parent may still have to reconcile. */
+function renderSubagents(rows: SubagentRow[]): string {
+	if (rows.length === 0) {
+		return "";
+	}
+	const lines = ["## Sub-agents"];
+	for (const row of rows.slice(0, STATE_MAX_SUBAGENTS)) {
+		const task = cut(row.task, STATE_TASK_COLS);
+		lines.push(task === "" ? `- ${row.name} ${row.status}` : `- ${row.name} ${row.status} ${task}`);
+	}
+	if (rows.length > STATE_MAX_SUBAGENTS) {
+		lines.push(`- ... ${rows.length - STATE_MAX_SUBAGENTS} more`);
+	}
+	return lines.join("\n");
+}
+
+/** What `git` says about the working tree, already capped for the snapshot. */
+interface GitState {
+	branch?: string;
+	root?: string;
+	status: string[];
+	more: number;
+}
+
+/** `execFileSync` wrapper: any failure (no git, not a repo, timeout) is `undefined`. */
+function runGit(cwd: string, args: string[]): string | undefined {
+	try {
+		return execFileSync("git", args, {
+			cwd,
+			timeout: GIT_TIMEOUT_MS,
+			encoding: "utf8",
+			// Never inherit stdout/stderr: git's own chatter must not reach the RPC stream.
+			stdio: ["ignore", "pipe", "ignore"],
+		}).trim();
+	} catch {
+		return undefined;
+	}
+}
+
+/** Branch, root and a capped `status --short`; `undefined` when git is unusable. */
+function readGit(cwd: string): GitState | undefined {
+	if (typeof cwd !== "string" || cwd === "") {
+		return undefined;
+	}
+	// `--no-optional-locks`: reading state must not take the index lock.
+	const branch = runGit(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]);
+	const root = runGit(cwd, ["rev-parse", "--show-toplevel"]);
+	const status = runGit(cwd, ["--no-optional-locks", "status", "--short"]);
+	if (branch === undefined && root === undefined && status === undefined) {
+		return undefined;
+	}
+	const lines = status === undefined || status === "" ? [] : status.split("\n").filter((line) => line.trim() !== "");
+	return {
+		branch: branch === undefined || branch === "" ? undefined : branch,
+		root: root === undefined || root === "" ? undefined : root,
+		status: lines.slice(0, STATE_MAX_GIT_LINES),
+		more: Math.max(0, lines.length - STATE_MAX_GIT_LINES),
+	};
+}
+
+/** `## Git`: branch, root and the (capped) short status. */
+function renderGit(git: GitState | undefined): string {
+	if (!git) {
+		return "";
+	}
+	const lines = ["## Git"];
+	if (git.branch !== undefined) {
+		lines.push(`- branch: ${git.branch}`);
+	}
+	if (git.root !== undefined) {
+		lines.push(`- root: ${git.root}`);
+	}
+	if (git.status.length > 0) {
+		const count = git.more > 0 ? `${git.status.length} of ${git.status.length + git.more}` : `${git.status.length}`;
+		lines.push(`- status (${count}):`);
+		lines.push(...git.status);
+	}
+	return lines.join("\n");
+}
+
+/** The `## Compaction` facts: what was compacted, and what L1 kept of it. */
+function renderFacts(args: {
+	reason: string;
+	tokensBefore: number;
+	tokensAfter: number;
+	report: PendingReport | undefined;
+}): string {
+	const lines = ["## Compaction", `- reason: ${args.reason}`];
+	lines.push(`- tokens: ${args.tokensBefore} -> ${args.tokensAfter} (after: estimated)`);
+	const report = args.report;
+	if (report) {
+		lines.push(
+			`- files: read ${report.readKept} kept / ${report.readOmitted} omitted; modified ${report.modifiedKept} kept / ${report.modifiedOmitted} omitted`,
+		);
+	}
+	return lines.join("\n");
+}
+
+/**
+ * Assemble the snapshot within `max_tokens * 4` characters. Sections render in a
+ * fixed order (compaction, todos, background tasks, sub-agents, git), and the
+ * budget is met by dropping git first, then sub-agents; anything else that still
+ * does not fit is cut and marked `[truncated]`.
+ *
+ * `digest` is the same render WITHOUT the `## Compaction` facts, and it is what
+ * the content hash covers: the facts carry this compaction's token counts, so
+ * hashing them would make every snapshot look new and re-inject an unchanged
+ * state after each compaction. The hash answers "is the folded state the same?",
+ * which is the question the re-injection gate asks.
+ */
+function renderSnapshotText(
+	parts: { facts: string; todos: string; bgTasks: string; subagents: string; git: string },
+	maxTokens: number,
+): { text: string; digest: string } {
+	const budget = Math.max(1, Math.floor(maxTokens)) * 4;
+	const sections = [
+		{ name: "facts", text: parts.facts },
+		{ name: "todos", text: parts.todos },
+		{ name: "bg", text: parts.bgTasks },
+		{ name: "subagents", text: parts.subagents },
+		{ name: "git", text: parts.git },
+	].filter((section) => section.text !== "");
+	const dropped = new Set<string>();
+	let truncated = false;
+	const render = (): { text: string; digest: string } => {
+		const kept = sections.filter((section) => !dropped.has(section.name));
+		const trailer = truncated ? ["[truncated]"] : [];
+		const body = kept.map((section) => section.text);
+		const digestBody = kept.filter((section) => section.name !== "facts").map((section) => section.text);
+		return {
+			text: [STATE_HEADER, ...body, ...trailer].join("\n\n"),
+			digest: [STATE_HEADER, ...digestBody, ...trailer].join("\n\n"),
+		};
+	};
+	let rendered = render();
+	for (const name of ["git", "subagents"]) {
+		if (rendered.text.length <= budget) {
+			break;
+		}
+		if (!sections.some((section) => section.name === name)) {
+			continue;
+		}
+		dropped.add(name);
+		truncated = true;
+		rendered = render();
+	}
+	if (rendered.text.length > budget) {
+		const tail = "\n\n[truncated]";
+		const text = `${rendered.text.slice(0, Math.max(0, budget - tail.length)).trimEnd()}${tail}`;
+		return { text, digest: text };
+	}
+	return rendered;
+}
+
+/** Warn once per session that another extension owns the summary. */
+function warnOwnerConflictOnce(ctx: ExtensionContext): void {
+	const sessionId = readSessionId(ctx) ?? "";
+	if (ownerWarnedFor === sessionId) {
+		return;
+	}
+	ownerWarnedFor = sessionId;
+	try {
+		ctx.ui.notify(OWNER_CONFLICT_MESSAGE, "warning");
+	} catch {
+		// A notify that cannot be delivered must not fail a successful compaction.
+	}
+}
+
+/**
+ * L3: build, persist and schedule one state snapshot for a successful
+ * compaction. Never throws: the snapshot is an enhancement, not part of the
+ * compaction contract.
+ */
+function publishStateSnapshot(
+	pi: ExtensionAPI,
+	event: SessionCompactEvent,
+	ctx: ExtensionContext,
+	config: CompactionRuntimeConfig,
+	report: PendingReport | undefined,
+): void {
+	try {
+		const entry = event.compactionEntry;
+		const summary = typeof entry?.summary === "string" ? entry.summary : "";
+		const tokensBefore = typeof entry?.tokensBefore === "number" ? entry.tokensBefore : 0;
+		// pi's own chars/4 heuristic: the entry carries no "after" count.
+		const tokensAfter = Math.ceil(summary.length / 4);
+		const entries = ctx.sessionManager.getEntries() as unknown as SessionEntryLike[];
+		const sessionFile = ctx.sessionManager.getSessionFile();
+		const { text, digest } = renderSnapshotText(
+			{
+				facts: renderFacts({ reason: event.reason, tokensBefore, tokensAfter, report }),
+				todos: renderTodos(foldTodos(entries)),
+				bgTasks: renderBgTasks(foldBgTasks(entries)),
+				subagents: renderSubagents(readSubagents(sessionFile)),
+				git: renderGit(readGit(ctx.cwd)),
+			},
+			config.state.max_tokens,
+		);
+		const hash = fnv1aHex(digest);
+		const timestamp = Date.now();
+		// A snapshot with the SAME state hash stays "already injected": the bytes
+		// the last request carried are unchanged, so a second copy is pure waste.
+		const alreadyInjected = pendingState?.injectedHash === hash ? hash : undefined;
+		pendingState = {
+			text,
+			hash,
+			timestamp,
+			reason: event.reason,
+			tokensBefore,
+			tokensAfter,
+			injectedHash: alreadyInjected,
+		};
+		pi.appendEntry(STATE_ENTRY_TYPE, {
+			text,
+			reason: event.reason,
+			tokensBefore,
+			tokensBeforeAfter: tokensAfter,
+			hash,
+		});
+	} catch {
+		// Telemetry only: a failed snapshot must not undo a successful compaction.
+		pendingState = undefined;
+	}
+}
+
 export default function compaction(pi: ExtensionAPI): void {
 	pi.on("session_before_compact", async (event, ctx) => {
 		const config = readConfig();
@@ -1017,8 +1614,9 @@ export default function compaction(pi: ExtensionAPI): void {
 			checkpoint: false,
 		};
 		pendingReport = report;
-		if (!config.checkpoint.enabled) {
+		if (!config.checkpoint.enabled || ownerConflict) {
 			// `undefined` = "no custom summary": pi keeps driving the compaction.
+			// A session another extension owns also stands L2 down for good.
 			return undefined;
 		}
 		try {
@@ -1066,36 +1664,54 @@ export default function compaction(pi: ExtensionAPI): void {
 		}
 	});
 
-	pi.on("session_compact", async (event: SessionCompactEvent) => {
+	pi.on("session_compact", async (event: SessionCompactEvent, ctx: ExtensionContext) => {
+		const config = readConfig();
 		const report = pendingReport;
 		pendingReport = undefined;
-		if (!report) {
-			return;
-		}
-		try {
-			const entry = event.compactionEntry;
-			const data: Record<string, unknown> = {
-				reason: report.reason,
-				tokensBefore: entry?.tokensBefore,
-				firstKeptEntryId: entry?.firstKeptEntryId,
-				readKept: report.readKept,
-				readOmitted: report.readOmitted,
-				modifiedKept: report.modifiedKept,
-				modifiedOmitted: report.modifiedOmitted,
-				strippedPrevious: report.strippedPrevious,
-				engine: report.engine,
-				checkpoint: report.checkpoint,
-			};
-			if (report.checkpoint) {
-				data.model = report.model;
-				data.thinkingLevel = report.thinkingLevel ?? null;
-				data.durationMs = report.durationMs;
-				data.language = report.language;
-				data.summaryChars = report.summaryChars;
+
+		// Owner detection comes first: it must work even when this extension did
+		// not supply the summary (a later handler overwrote ours, or we never
+		// ran because the competing extension cancelled first).
+		if (config.owner.detect) {
+			const owner = classifyCompactionOwner(event.fromExtension, event.compactionEntry?.details);
+			if (owner === "foreign") {
+				ownerConflict = true;
+				warnOwnerConflictOnce(ctx);
 			}
-			pi.appendEntry(ENTRY_TYPE, data);
-		} catch {
-			// The record is telemetry: losing it must not fail a successful compaction.
+		}
+
+		if (report) {
+			try {
+				const entry = event.compactionEntry;
+				const data: Record<string, unknown> = {
+					reason: report.reason,
+					tokensBefore: entry?.tokensBefore,
+					firstKeptEntryId: entry?.firstKeptEntryId,
+					readKept: report.readKept,
+					readOmitted: report.readOmitted,
+					modifiedKept: report.modifiedKept,
+					modifiedOmitted: report.modifiedOmitted,
+					strippedPrevious: report.strippedPrevious,
+					engine: report.engine,
+					checkpoint: report.checkpoint,
+				};
+				if (report.checkpoint) {
+					data.model = report.model;
+					data.thinkingLevel = report.thinkingLevel ?? null;
+					data.durationMs = report.durationMs;
+					data.language = report.language;
+					data.summaryChars = report.summaryChars;
+				}
+				pi.appendEntry(ENTRY_TYPE, data);
+			} catch {
+				// The record is telemetry: losing it must not fail a successful compaction.
+			}
+		}
+
+		// L3 stays active even when another extension owns the summary: the state
+		// note is about the session (todos, tasks, git), not about the summary.
+		if (config.enabled && config.state.enabled) {
+			publishStateSnapshot(pi, event, ctx, config, report);
 		}
 	});
 
@@ -1103,8 +1719,32 @@ export default function compaction(pi: ExtensionAPI): void {
 		pendingReport = undefined;
 	});
 
-	// L3 state: implemented in a follow-up (a `context` handler that injects one
-	// compact session-state note before each request).
+	// L3 injection: exactly ONE request after a compaction carries the snapshot,
+	// and only when its content changed since the last injected one (same hash =
+	// byte-stable, no second copy; never per turn). `event.messages` is a deep copy
+	// and the returned array is a new one, so nothing is persisted to the session.
+	pi.on("context", async (event) => {
+		const snapshot = pendingState;
+		if (!snapshot || snapshot.injectedHash === snapshot.hash) {
+			return undefined;
+		}
+		const config = readConfig();
+		if (!config.enabled || !config.state.enabled) {
+			return undefined;
+		}
+		const messages = [
+			{
+				role: "user" as const,
+				content: [{ type: "text" as const, text: snapshot.text }],
+				// Fixed per snapshot: the injected envelope never drifts within a run.
+				timestamp: snapshot.timestamp,
+			},
+			...event.messages,
+		];
+		snapshot.injectedHash = snapshot.hash;
+		return { messages };
+	});
+
 	// L4 prune: implemented in a follow-up (opt-in tool-result pruning before a
 	// summarisation starts, driven by `prune.high_water` / `prune.min_turns`).
 }
