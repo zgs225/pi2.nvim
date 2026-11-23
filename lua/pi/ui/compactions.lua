@@ -913,6 +913,15 @@ function M._records()
     return records
 end
 
+--- The panel window open in `tab` (nil when none). Public like the other
+--- panels' `win(tab)`, because `Chat:ui_snapshot()` asks every panel whose
+--- tab UI it manages.
+---@param tab pi.TabId
+---@return integer?
+function M.win(tab)
+    return win_for(tab)
+end
+
 --- Test hook: the panel window open in `tab` (nil when none).
 ---@param tab pi.TabId
 ---@return integer?

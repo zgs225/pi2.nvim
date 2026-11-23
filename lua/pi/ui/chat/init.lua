@@ -793,6 +793,7 @@ end
 ---@field sessions boolean
 ---@field tasks boolean
 ---@field todo boolean
+---@field compactions boolean
 
 --- Which tab-level panels are open for this chat's tab.
 ---@return pi.ChatUiPanels
@@ -802,13 +803,14 @@ function Chat:ui_snapshot()
         sessions = require("pi.ui.sessions").win(tab) ~= nil,
         tasks = require("pi.ui.tasks").win(tab) ~= nil,
         todo = require("pi.todo").win(tab) ~= nil,
+        compactions = require("pi.ui.compactions").win(tab) ~= nil,
     }
 end
 
 ---@param snap pi.ChatUiPanels
 ---@return boolean
 local function any_panel(snap)
-    return snap.sessions or snap.tasks or snap.todo
+    return snap.sessions or snap.tasks or snap.todo or snap.compactions
 end
 
 --- Whether any part of this tab's π UI is on screen: the chat windows or one
@@ -841,6 +843,9 @@ function Chat:_restore_ui_panels()
     if snap.todo then
         require("pi.todo").open()
     end
+    if snap.compactions then
+        require("pi.ui.compactions").open()
+    end
 end
 
 --- Show the whole π UI for this chat: the chat windows plus the panels that
@@ -868,6 +873,7 @@ function Chat:hide_ui()
     require("pi.ui.tasks").close_outputs(tab)
     require("pi.ui.tasks").close_tab(tab)
     require("pi.todo").close_tab(tab)
+    require("pi.ui.compactions").close_tab(tab)
     self:hide()
 end
 
