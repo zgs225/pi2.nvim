@@ -128,6 +128,7 @@ History._stream_flush_ms = 30
 ---@field anchor integer
 ---@field line_count integer
 ---@field expanded boolean
+---@field meta? pi.CompactionRecord Rich record from the compaction event; absent on replayed/legacy sessions
 
 ---@class pi.PendingQueueEntry
 ---@field queue_type "steer"|"follow_up"
@@ -151,6 +152,7 @@ local Config = require("pi.config")
 local TurnRate = require("pi.turn_rate")
 local Path = require("pi.path")
 local Tools = require("pi.ui.chat.tools")
+local Stats = require("pi.stats")
 local Ansi = require("pi.ui.chat.ansi")
 local Render = require("pi.ui.render")
 local Text = require("pi.ui.chat.text")
@@ -1642,7 +1644,7 @@ function History:win()
     return nil
 end
 
----@alias pi.Status { type: "agent", text: string } | { type: "compaction" } | { type: "summary", text: string }
+---@alias pi.Status { type: "agent", text: string } | { type: "compaction", text?: string } | { type: "summary", text: string }
 
 ---@param status pi.Status?
 ---@param start_time? number Existing run clock (`vim.uv.hrtime()/1e9`); idle→busy uses this instead of now.
@@ -1658,7 +1660,9 @@ function History:set_status(status, start_time)
                 local s = spinner.compaction
                 self._spinner_frames = s.frames
                 self._spinner_rate = s.refresh_rate
-                text = "Compacting…"
+                -- A summarisation retry carries its own text (`summary retry
+                -- 2/3 (429)`); the plain compaction start does not.
+                text = (type(status.text) == "string" and status.text ~= "") and status.text or "Compacting…"
             else
                 self:_pick_spinner()
                 text = status.text
@@ -2563,13 +2567,135 @@ function History:_set_startup_block_expanded(expanded)
     return true
 end
 
+--- Compact wall time for the compaction header: `12s`, `1m 03s`. Sub-second
+--- compactions get no segment at all — a 300 ms summary is not worth the noise.
+---@param ms number?
+---@return string?
+local function format_compaction_duration(ms)
+    if type(ms) ~= "number" or ms < 1000 then
+        return nil
+    end
+    local secs = math.floor(ms / 1000)
+    if secs >= 60 then
+        return string.format("%dm %02ds", math.floor(secs / 60), secs % 60)
+    end
+    return string.format("%ds", secs)
+end
+
+--- Collapse an error message to one line of at most 120 characters, so a
+--- multi-line provider error (HTML body, stack trace) cannot flood the block.
+---@param message string
+---@return string
+local function flatten_compaction_error(message)
+    local text = vim.trim((tostring(message):gsub("%s+", " ")))
+    if vim.fn.strchars(text) > 120 then
+        text = vim.fn.strcharpart(text, 0, 117) .. "..."
+    end
+    return text
+end
+
+--- `summary: 8.2k in / 1.1k out · $0.003` — every segment optional, because pi
+--- omits parts of `usage` depending on the provider.
+---@param usage table
+---@return string?
+local function format_summary_usage(usage)
+    local parts = {} ---@type string[]
+    if type(usage.input) == "number" then
+        parts[#parts + 1] = Stats.format_tokens(usage.input) .. " in"
+    end
+    if type(usage.output) == "number" then
+        parts[#parts + 1] = Stats.format_tokens(usage.output) .. " out"
+    end
+    local text = table.concat(parts, " / ")
+    local cost = type(usage.cost) == "table" and usage.cost.total or nil
+    if type(cost) == "number" then
+        local amount = string.format("$%.3f", cost)
+        text = text == "" and amount or (text .. " · " .. amount)
+    end
+    if text == "" then
+        return nil
+    end
+    return "summary: " .. text
+end
+
+--- Header row of a compaction block (row 1; row 0 is the blank margin).
+---
+--- Without a record this is exactly the line older sessions always rendered.
+--- With one it reports what pi did: the tokens released, why, and how long it
+--- took. `tokens_after` comes from pi's heuristic estimate, hence `(est.)`.
+---@param block pi.CompactionBlock
+---@return string
+local function build_compaction_header(block)
+    local icon = Config.options.labels.compaction
+    local dashes = "──────"
+    local segments = { "compacted" } ---@type string[]
+    local meta = block.meta
+    if not meta then
+        segments[#segments + 1] = format_number(block.tokens_before) .. " tokens"
+    else
+        if type(meta.tokens_after) == "number" then
+            local text = Stats.format_tokens(block.tokens_before) .. " → " .. Stats.format_tokens(meta.tokens_after)
+            if meta.estimated then
+                text = text .. " (est.)"
+            end
+            segments[#segments + 1] = text
+        else
+            segments[#segments + 1] = Stats.format_tokens(block.tokens_before) .. " tokens"
+        end
+        if type(meta.reason) == "string" and meta.reason ~= "" then
+            segments[#segments + 1] = meta.reason
+        end
+        local duration = format_compaction_duration(meta.duration_ms)
+        if duration then
+            segments[#segments + 1] = duration
+        end
+    end
+    return dashes .. " " .. icon .. " " .. table.concat(segments, " · ") .. " " .. dashes
+end
+
+---@class pi.CompactionMetaRow
+---@field text string row text without the two-space indent
+---@field hl string highlight group for the whole row
+
+--- Metadata rows of the expanded block, in report order. Rows that report a
+--- failure (retry / abort / error) are warnings, the rest are de-emphasised.
+---@param meta pi.CompactionRecord
+---@return pi.CompactionMetaRow[]
+local function build_compaction_meta_rows(meta)
+    local rows = {} ---@type pi.CompactionMetaRow[]
+    if type(meta.first_kept_entry_id) == "string" and meta.first_kept_entry_id ~= "" then
+        rows[#rows + 1] = { text = "kept from: " .. meta.first_kept_entry_id, hl = "PiCompactionMeta" }
+    end
+    if type(meta.read_files) == "number" or type(meta.modified_files) == "number" then
+        local text = string.format("files: %d read · %d modified", meta.read_files or 0, meta.modified_files or 0)
+        local omitted = (meta.read_files_omitted or 0) + (meta.modified_files_omitted or 0)
+        if omitted > 0 then
+            text = text .. string.format(" · %d omitted", omitted)
+        end
+        rows[#rows + 1] = { text = text, hl = "PiCompactionMeta" }
+    end
+    if type(meta.usage) == "table" then
+        local usage = format_summary_usage(meta.usage)
+        if usage then
+            rows[#rows + 1] = { text = usage, hl = "PiCompactionMeta" }
+        end
+    end
+    if meta.will_retry then
+        rows[#rows + 1] = { text = "will retry after compaction", hl = "PiCompactionWarn" }
+    end
+    if meta.aborted then
+        rows[#rows + 1] = { text = "aborted", hl = "PiCompactionWarn" }
+    end
+    if type(meta.error) == "string" and vim.trim(meta.error) ~= "" then
+        rows[#rows + 1] = { text = "error: " .. flatten_compaction_error(meta.error), hl = "PiCompactionWarn" }
+    end
+    return rows
+end
+
 ---@param block pi.CompactionBlock
 ---@return string[], pi.HighlightMark[]
 function History:_build_compaction_lines(block)
-    local tokens = format_number(block.tokens_before)
-    local icon = Config.options.labels.compaction
-    local dashes = "──────"
-    local header = dashes .. " " .. icon .. " compacted · " .. tokens .. " tokens " .. dashes
+    local header = build_compaction_header(block)
     local lines = { "", header } ---@type string[]
     local marks = {
         { row = 1, col_start = 0, col_end = #header, hl = "PiCompactionText" },
@@ -2580,6 +2706,21 @@ function History:_build_compaction_lines(block)
         for _, line in ipairs(summary_lines) do
             lines[#lines + 1] = "  " .. line
             marks[#marks + 1] = { row = #lines - 1, col_start = 0, col_end = #lines[#lines], hl = "PiCompactionText" }
+        end
+        if block.meta then
+            local rows = build_compaction_meta_rows(block.meta)
+            if #rows > 0 then
+                lines[#lines + 1] = ""
+                for _, row in ipairs(rows) do
+                    lines[#lines + 1] = "  " .. row.text
+                    marks[#marks + 1] = {
+                        row = #lines - 1,
+                        col_start = 0,
+                        col_end = #lines[#lines],
+                        hl = row.hl,
+                    }
+                end
+            end
         end
     else
         local hint = "  Tab to expand"
@@ -2624,7 +2765,8 @@ end
 
 ---@param summary string
 ---@param tokens_before integer
-function History:_append_compaction_summary(summary, tokens_before)
+---@param meta? pi.CompactionRecord
+function History:_append_compaction_summary(summary, tokens_before, meta)
     if not self._buf or not vim.api.nvim_buf_is_valid(self._buf) then
         return
     end
@@ -2635,6 +2777,7 @@ function History:_append_compaction_summary(summary, tokens_before)
         anchor = 0,
         line_count = 0,
         expanded = self._blocks_expanded,
+        meta = meta,
     }
     local lines, marks = self:_build_compaction_lines(block)
     local start = self:_append_lines(lines)
@@ -2647,11 +2790,12 @@ end
 
 ---@param summary string
 ---@param tokens_before integer
-function History:append_compaction_summary(summary, tokens_before)
+---@param meta? pi.CompactionRecord
+function History:append_compaction_summary(summary, tokens_before, meta)
     self:_seal_stream_text()
     vim.schedule(function()
         self:_pop_text_batch()
-        self:_append_compaction_summary(summary, tokens_before)
+        self:_append_compaction_summary(summary, tokens_before, meta)
     end)
 end
 
@@ -2682,6 +2826,53 @@ function History:toggle_compaction_block()
         end
     end
     return false
+end
+
+--- Every compaction block in render order. The block tables are live (a panel
+--- reading `expanded` / `meta` sees the current state), so treat them as
+--- read-only rather than as a snapshot.
+---@return pi.CompactionBlock[]
+function History:compaction_blocks()
+    return self._compaction_blocks
+end
+
+--- The block a replayed compaction belongs to: pi replays a compaction summary
+--- with only `summary` + `tokensBefore`, so those two identify it.
+---@param summary string
+---@param tokens_before integer
+---@return pi.CompactionBlock?
+function History:find_compaction_block(summary, tokens_before)
+    for _, block in ipairs(self._compaction_blocks) do
+        if block.summary == summary and block.tokens_before == tokens_before then
+            return block
+        end
+    end
+    return nil
+end
+
+--- Scroll the history window to a compaction block's header (the row below the
+--- blank margin), the same way a turn jump moves the cursor. Never steals
+--- focus: `_jump_to_row` only calls the window, so the caller keeps its window.
+---@param summary string
+---@param tokens_before integer
+---@return boolean jumped false when the block is unknown or its anchor is dead
+function History:jump_to_compaction(summary, tokens_before)
+    local block = self:find_compaction_block(summary, tokens_before)
+    if not block or not self._buf or not vim.api.nvim_buf_is_valid(self._buf) then
+        return false
+    end
+    if not self:win() then
+        return false
+    end
+    local pos = vim.api.nvim_buf_get_extmark_by_id(self._buf, ns, block.anchor, {})
+    local start_row = pos[1]
+    if not start_row then
+        return false
+    end
+    -- The anchor sits on the block's blank margin row; land on the header row
+    -- below it, so a jump shows the summary's header, not an empty line.
+    self:_jump_to_row(start_row + 1)
+    return true
 end
 
 ---@param error_message string

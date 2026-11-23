@@ -85,6 +85,13 @@ local function set_defaults()
     )
     vim.api.nvim_set_hl(0, "PiCompactionText", { default = true, fg = comment.fg, italic = true, nocombine = true })
     vim.api.nvim_set_hl(0, "PiCompactionHint", { default = true, fg = comment.fg, italic = true, nocombine = true })
+    -- Metadata rows of an expanded compaction block (kept-from id, files, usage):
+    -- de-emphasised like the hint, because they annotate the summary rather than
+    -- belong to the conversation.
+    vim.api.nvim_set_hl(0, "PiCompactionMeta", { default = true, fg = comment.fg, italic = true, nocombine = true })
+    -- Rows reporting a failed or repeated compaction (aborted / error / will
+    -- retry): the same warning colour the statusline uses.
+    vim.api.nvim_set_hl(0, "PiCompactionWarn", { default = true, fg = warning.fg, nocombine = true })
     -- One dim line per background-task report the model already received: a
     -- system remark, not conversation content, so it links to Comment.
     vim.api.nvim_set_hl(0, "PiSystemNote", { default = true, link = "Comment" })
