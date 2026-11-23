@@ -54,6 +54,23 @@
 --       and the custom entry reports `strippedPrevious == true`
 --   A6  no `extension_error` event, both `compact` responses are `success:true`
 --
+-- Phase 3 (L2, opt-in checkpoint) flips `checkpoint.enabled` on in the runtime
+-- file and prompts with two backticked literals:
+--   A7  the summarisation request is OURS: it carries the structured prompt
+--       (every heading, the `pi2-compaction` marker, the sentinel literal) and
+--       the previous summary inside `<previous-summary>` WITHOUT a file list
+--   A8  the stored compaction is the extension's (`fromHook == true`), its
+--       `details.engine == "pi2"`, `details.model` is the pinned model and the
+--       summary has all nine headings + the sentinel + a `<read-files>` block
+--   A9  a literal the model dropped comes back under `## Retained Identifiers`
+--   A10 the summary is within the 2x`max_words` hard stop and the custom entry
+--       reports `engine == "checkpoint"`, `checkpoint == true`, the model
+--
+-- Phase 4 (fail open) is a fresh session where the fake provider answers the
+-- checkpoint request with an EMPTY completion:
+--   A11 pi's native compaction is stored (`fromHook` falsy, no `details.engine`),
+--       the custom entry reports `checkpoint == false`, and pi exits cleanly
+--
 -- Needs the pi binary, nothing else (the provider is fake), so it can run in CI:
 --
 --   make e2e-compaction
@@ -77,6 +94,26 @@ local N_TEMP = 60
 local N_PROJECT = 60
 local MAX_READ_DEFAULT = 50
 local MAX_READ_PHASE2 = 5
+
+-- Phase 3 (L2 checkpoint). The literals are backticked in the user prompt, so
+-- they are extracted as protected literals; the fake summary keeps ONE of them
+-- and drops the other, which is what exercises `## Retained Identifiers`.
+local CHECKPOINT_MAX_WORDS = 300
+local SENTINEL = "SENTINEL-LITERAL-42"
+local DROPPED_LITERAL = "OTHER-LITERAL-7"
+
+-- The nine H2 sections the checkpoint prompt asks for.
+local CHECKPOINT_HEADINGS = {
+    "## Goal",
+    "## Constraints & Preferences",
+    "## Progress",
+    "## Key Decisions",
+    "## Artifact Trail",
+    "## Next Steps",
+    "## Critical Context",
+    "## Open Questions",
+    "## Rejected Approaches",
+}
 
 -- The summary text the fake "model" returns; must not contain a file list.
 local SUMMARY_TEXT = table.concat({
@@ -244,17 +281,94 @@ end
 
 ---@class CompactionE2EProvider
 ---@field server? uv.uv_tcp_t
----@field turn integer conversation requests answered so far
----@field summarizations string[] flattened text of every summarisation request
+---@field mode "l1"|"checkpoint"|"fallback" which scripted conversation is active
+---@field turn integer conversation requests answered so far (per phase)
+---@field summarizations string[] flattened text of every native summarisation request
+---@field checkpoint_requests string[] flattened text of every L2 checkpoint request
 ---@field temp_paths string[]
 ---@field project_paths string[]
 ---@field big_path string
+
+--- The L2 checkpoint request carries a section only OUR prompt asks for.
+---@param text string
+---@return boolean
+local function is_checkpoint_request(text)
+    return text:find("## Artifact Trail", 1, true) ~= nil
+end
+
+--- The checkpoint summary the fake "model" returns. It echoes the sentinel it
+--- found in the request (so a prompt that lost the conversation fails the
+--- assertions) and deliberately omits `DROPPED_LITERAL`, which the extension
+--- must restore under `## Retained Identifiers`.
+---@param request_text string
+---@return string
+local function checkpoint_summary(request_text)
+    local sentinel = request_text:match("`([%w]+%-LITERAL%-%d+)`") or SENTINEL
+    return table.concat({
+        "## Goal",
+        ("Finish the checkpoint e2e run. Keep `%s` verbatim."):format(sentinel),
+        "",
+        "## Constraints & Preferences",
+        "- [USER] never lose a literal",
+        "",
+        "## Progress",
+        "### Done",
+        "- [VERIFIED] read the large project file",
+        "",
+        "### In Progress",
+        "- [VERIFIED] assert the stored checkpoint",
+        "",
+        "### Blocked",
+        "- (none)",
+        "",
+        "## Key Decisions",
+        "- **[Decision]**: [REPORTED] use the checkpoint engine",
+        "",
+        "## Artifact Trail",
+        "- [VERIFIED] big-project-file.txt",
+        "",
+        "## Next Steps",
+        "1. [VERIFIED] stop after the assertions",
+        "",
+        "## Critical Context",
+        ("- [VERIFIED] sentinel %s"):format(sentinel),
+        "",
+        "## Open Questions",
+        "- (none)",
+        "",
+        "## Rejected Approaches",
+        "- [VERIFIED] pi's native summary format",
+    }, "\n")
+end
+
+---@param text string
+---@return integer
+local function word_count(text)
+    local count = 0
+    for _ in text:gmatch("%S+") do
+        count = count + 1
+    end
+    return count
+end
 
 ---@param provider CompactionE2EProvider
 ---@return string
 local function respond(provider)
     provider.turn = provider.turn + 1
     local turn = provider.turn
+
+    if provider.mode == "checkpoint" then
+        if turn == 1 then
+            return tool_turn({ { "read", { path = provider.big_path } } })
+        end
+        return text_turn("Read the large project file again.")
+    end
+    if provider.mode == "fallback" then
+        if turn == 1 then
+            return tool_turn({ { "read", { path = provider.big_path } } })
+        end
+        return text_turn("Read the large project file.")
+    end
 
     if turn == 1 then
         -- One assistant message with 120 read calls: 60 scratch paths and 60
@@ -289,6 +403,15 @@ end
 ---@return string
 local function handle_request(provider, body)
     local text = body_text(body)
+    if is_checkpoint_request(text) then
+        provider.checkpoint_requests[#provider.checkpoint_requests + 1] = text
+        if provider.mode == "fallback" then
+            -- An EMPTY completion: the extension must fail open and let pi's
+            -- native summariser run.
+            return text_turn("")
+        end
+        return text_turn(checkpoint_summary(text))
+    end
     if is_summarization(text) then
         provider.summarizations[#provider.summarizations + 1] = text
         return text_turn(SUMMARY_TEXT)
@@ -377,6 +500,15 @@ local function write_agent_dir(dir, port)
     local s = assert(io.open(dir .. "/settings.json", "w"))
     s:write('{"compaction":{"reserveTokens":16384,"keepRecentTokens":2000}}')
     s:close()
+end
+
+--- Write the runtime config file the extension re-reads on every compaction.
+---@param path string
+---@param cfg table
+local function write_runtime_config(path, cfg)
+    local f = assert(io.open(path, "w"))
+    f:write(vim.json.encode(cfg))
+    f:close()
 end
 
 ---@param path string
@@ -670,8 +802,10 @@ local function main()
     local temp_paths, project_paths, big_path = create_fixture_files()
     ---@type CompactionE2EProvider
     local provider = {
+        mode = "l1",
         turn = 0,
         summarizations = {},
+        checkpoint_requests = {},
         temp_paths = temp_paths,
         project_paths = project_paths,
         big_path = big_path,
@@ -764,9 +898,10 @@ local function main()
 
     -- Phase 2: publish max_read=5, then two more turns (a big one and a small
     -- one) so the next compaction has a real user-message span to summarize.
-    local f = assert(io.open(config_path, "w"))
-    f:write('{"enabled":true,"cleaner":{"max_read":' .. tostring(MAX_READ_PHASE2) .. "}}")
-    f:close()
+    write_runtime_config(config_path, {
+        enabled = true,
+        cleaner = { max_read = MAX_READ_PHASE2 },
+    })
     run_turn(backend, "Acknowledge this prompt.", 180000)
     run_turn(backend, "Read the large project file.", 180000)
     -- 2 phase-1 turns + 1 text turn + (read turn -> text turn) = 5.
@@ -856,6 +991,143 @@ local function main()
         "the first summary keeps its native file block (the extension only bounds it)"
     )
 
+    -- -----------------------------------------------------------------------
+    -- Phase 3: L2 checkpoint. Flip `checkpoint.enabled` on in the runtime file
+    -- (the extension re-reads it per event, so no respawn is needed) and prompt
+    -- with two backticked literals; the fake summary keeps one and drops the
+    -- other, which is what exercises `## Retained Identifiers`.
+    -- -----------------------------------------------------------------------
+    write_runtime_config(config_path, {
+        enabled = true,
+        cleaner = { max_read = MAX_READ_PHASE2 },
+        checkpoint = {
+            enabled = true,
+            model = PROVIDER .. "/" .. MODEL_ID,
+            language = "auto",
+            max_words = CHECKPOINT_MAX_WORDS,
+        },
+    })
+    provider.mode = "checkpoint"
+    provider.turn = 0
+    run_turn(
+        backend,
+        ("Remember the literals `%s` and `%s`, then read the large project file."):format(SENTINEL, DROPPED_LITERAL),
+        180000
+    )
+    check(provider.turn == 2, "the checkpoint phase ran both scripted turns", { turn = provider.turn })
+    step("phase 3: checkpoint enabled, prompt with two literals answered by a big read")
+
+    response = run_compact(backend, "compact #3 (checkpoint)")
+    check(response ~= nil, "compaction #3 returned an RPC response")
+    step("compaction #3 finished")
+
+    entries = session_entries(backend.session_dir)
+    compactions = by_type(entries, "compaction")
+    cleaners = custom_entries(entries, "pi2-compaction-cleaner")
+    check(#compactions == 3, "three compaction entries after compaction #3", { count = #compactions })
+    check(#cleaners == 3, "the extension wrote a third custom entry", { count = #cleaners })
+
+    -- A7: the request that ran was OURS, not pi's native prompt.
+    check(#provider.checkpoint_requests >= 1, "the checkpoint summariser issued a request", {
+        count = #provider.checkpoint_requests,
+    })
+    local request = provider.checkpoint_requests[1]
+    check(request:find("pi2-compaction", 1, true) ~= nil, "the request carries our system prompt")
+    check(request:find(SENTINEL, 1, true) ~= nil, "the request carries the conversation (sentinel literal)")
+    for _, heading in ipairs(CHECKPOINT_HEADINGS) do
+        check(request:find(heading, 1, true) ~= nil, "the request asks for every section", { heading = heading })
+    end
+    check(
+        request:find("<previous-summary>", 1, true) ~= nil,
+        "phase 3 takes the update path (<previous-summary> present)"
+    )
+    check(
+        request:find("<read-files>", 1, true) == nil,
+        "the previous summary reaches the checkpoint prompt without a file list"
+    )
+    check(
+        request:find("</modified-files>", 1, true) == nil,
+        "no modified-files block reaches the checkpoint prompt either"
+    )
+    step("A7 checkpoint request carries every heading + the stripped previous summary")
+
+    -- A8/A9/A10: what pi stored.
+    local third = compactions[3]
+    local third_details = third.details or {}
+    check(third.fromHook == true, "the stored compaction is the extension's (fromHook true)", {
+        fromHook = third.fromHook,
+    })
+    check(third_details.engine == "pi2", "the stored details are tagged engine=pi2", { details = third_details })
+    check(
+        third_details.model == PROVIDER .. "/" .. MODEL_ID,
+        "the stored details name the pinned model",
+        { model = third_details.model }
+    )
+    local third_summary = third.summary
+    check(type(third_summary) == "string", "the checkpoint summary is a string")
+    check(
+        third_summary:sub(1, #"## Goal") == "## Goal",
+        "the checkpoint starts at ## Goal (not pi's native preamble)",
+        { head = third_summary:sub(1, 40) }
+    )
+    for _, heading in ipairs(CHECKPOINT_HEADINGS) do
+        check(third_summary:find(heading, 1, true) ~= nil, "the checkpoint has every section", { heading = heading })
+    end
+    check(third_summary:find(SENTINEL, 1, true) ~= nil, "the checkpoint keeps the sentinel literal")
+    check(third_summary:find(DROPPED_LITERAL, 1, true) ~= nil, "a literal the model dropped is restored verbatim")
+    check(
+        third_summary:find("## Retained Identifiers", 1, true) ~= nil,
+        "the restored literal is listed under ## Retained Identifiers"
+    )
+    local third_block = read_files_block(third_summary)
+    check(third_block ~= nil, "the checkpoint carries the appended <read-files> block")
+    local third_paths = block_paths(third_block)
+    check(contains(third_paths, provider.big_path), "the appended block lists the freshly read file", {
+        paths = third_paths,
+    })
+    check(type(third_details.readFiles) == "table", "the stored details carry the read list")
+    check(
+        #third_paths == #third_details.readFiles,
+        "the appended block is the same list details record",
+        { block = #third_paths, details = #third_details.readFiles }
+    )
+    check(type(third_details.readFilesOmitted) == "number", "the stored details carry readFilesOmitted")
+    check(third_details.previousSummaryStripped == true, "L1 stripped the previous lists before L2 ran")
+    local third_body = (third_summary:gsub("<read%-files>.-</read%-files>", "")):gsub(
+        "<modified%-files>.-</modified%-files>",
+        ""
+    )
+    local third_words = word_count(third_body)
+    check(
+        third_words <= CHECKPOINT_MAX_WORDS * 2,
+        ("the checkpoint stays inside the 2x hard stop (%d <= %d)"):format(third_words, CHECKPOINT_MAX_WORDS * 2),
+        { words = third_words }
+    )
+    step(
+        ("A8/A9 checkpoint: fromHook, engine=pi2, model=%s, %d headings, %d words, %d files"):format(
+            third_details.model,
+            #CHECKPOINT_HEADINGS,
+            third_words,
+            #third_paths
+        )
+    )
+
+    local third_report = cleaners[3].data or {}
+    check(third_report.engine == "checkpoint", "the custom entry reports engine=checkpoint", {
+        report = third_report,
+    })
+    check(third_report.checkpoint == true, "the custom entry reports checkpoint=true", { report = third_report })
+    check(
+        third_report.model == PROVIDER .. "/" .. MODEL_ID,
+        "the custom entry names the model",
+        { report = third_report }
+    )
+    check(type(third_report.durationMs) == "number", "the custom entry records the duration", {
+        report = third_report,
+    })
+    check(third_report.strippedPrevious == true, "the custom entry records the strip", { report = third_report })
+    step("A10 custom entry: engine=checkpoint, checkpoint=true, model + duration recorded")
+
     -- A6: nothing failed.
     local errors = {}
     for _, ev in ipairs(backend.events) do
@@ -871,9 +1143,71 @@ local function main()
     end
     step("A6 no extension_error events, every compact response succeeded")
 
+    -- -----------------------------------------------------------------------
+    -- Phase 4 (A11): fail open. A fresh session with the SAME checkpoint config;
+    -- the fake provider answers the checkpoint request with an EMPTY completion,
+    -- so the extension must return undefined and pi's native summariser runs.
+    -- -----------------------------------------------------------------------
+    provider.mode = "fallback"
+    provider.turn = 0
+    local fallback_backend = start_backend(RUN_ROOT .. "/sessions-fallback", PROJECT_ROOT .. "/project")
+    send(fallback_backend, { type = "set_model", provider = PROVIDER, modelId = MODEL_ID })
+    local fallback_pinned = wait_event(fallback_backend, function(ev)
+        return ev.type == "response" and ev.command == "set_model"
+    end, 30000, "set_model (fallback)")
+    check(fallback_pinned ~= nil and fallback_pinned.success ~= false, "the fallback model is selected", {
+        stderr = fallback_backend.stderr,
+    })
+    run_turn(fallback_backend, "Read the large project file before compacting.", 180000)
+    check(provider.turn == 2, "the fallback phase ran both scripted turns", { turn = provider.turn })
+    local checkpoint_requests_before = #provider.checkpoint_requests
+    response = run_compact(fallback_backend, "compact (fallback)")
+    check(response ~= nil, "the fallback compaction returned an RPC response")
+    check(
+        #provider.checkpoint_requests == checkpoint_requests_before + 1,
+        "the checkpoint summariser ran and was answered with an empty completion",
+        { before = checkpoint_requests_before, now = #provider.checkpoint_requests }
+    )
+
+    local fallback_entries = session_entries(fallback_backend.session_dir)
+    local fallback_compactions = by_type(fallback_entries, "compaction")
+    check(#fallback_compactions == 1, "pi stored exactly one compaction in the fallback session", {
+        count = #fallback_compactions,
+    })
+    local fallback = fallback_compactions[1]
+    check(fallback.fromHook ~= true, "the fallback stored pi's native compaction (fromHook falsy)", {
+        fromHook = fallback.fromHook,
+    })
+    check(type(fallback.details) == "table", "the fallback carries pi's native details")
+    check(fallback.details.engine == nil, "the fallback details are native (no engine tag)", {
+        details = fallback.details,
+    })
+    check(type(fallback.details.readFiles) == "table", "the fallback details carry native file lists")
+    local fallback_cleaners = custom_entries(fallback_entries, "pi2-compaction-cleaner")
+    check(#fallback_cleaners == 1, "the extension still records the fallback compaction", {
+        count = #fallback_cleaners,
+    })
+    local fallback_report = fallback_cleaners[1].data or {}
+    check(fallback_report.engine == "checkpoint", "the fallback entry reports the enabled mode", {
+        report = fallback_report,
+    })
+    check(fallback_report.checkpoint == false, "the fallback entry reports checkpoint=false", {
+        report = fallback_report,
+    })
+    check(fallback_report.model == nil, "no model is recorded when L2 did not run", { report = fallback_report })
+    local fallback_errors = {}
+    for _, ev in ipairs(fallback_backend.events) do
+        if ev.type == "extension_error" then
+            fallback_errors[#fallback_errors + 1] = ev
+        end
+    end
+    check(#fallback_errors == 0, "the empty completion raised no extension_error", { errors = fallback_errors })
+    stop_backend(fallback_backend)
+    step("A11 empty completion: native compaction stored, checkpoint=false recorded, pi exited cleanly")
+
     stop_backend(backend)
     print(
-        ("ALL compaction cleaner cases passed (scratch paths dropped, read list capped, previous lists stripped) in %.2fs"):format(
+        ("ALL compaction cases passed (cleaner bounds + strips, checkpoint summaries structured/deduped, fail open) in %.2fs"):format(
             (uv.hrtime() - run_started) / 1e9
         )
     )
