@@ -1079,7 +1079,16 @@ end
 --- (same as :PiAbort / pi.abort()). A timer disarms automatically once the
 --- window elapses. Outside of streaming/retrying, or when the feature is
 --- disabled, this is a no-op so <Esc> keeps its normal behavior.
+---
+--- A compaction is the one exception: it is not a model turn the user might
+--- want to let finish, so a single <Esc> aborts it outright — no armed state,
+--- no hint row, no second press.
 function Chat:_handle_abort_esc()
+    if self._compacting and (Config.options.abort or {}).enabled ~= false then
+        ---@diagnostic disable-next-line: undefined-field -- pi.compact_abort (P0-4) lands with the compaction public API
+        require("pi").compact_abort()
+        return
+    end
     if not (self._streaming or self._retrying) then
         -- A single <Esc> cancels a running direct bash command (TUI behavior).
         if self._bash_running then
@@ -2072,6 +2081,17 @@ function Chat:update_state(data)
     end
 end
 
+--- Push the compaction budget (the distance to pi's automatic compaction
+--- threshold, see `pi.CompactionBudget`) to the status line; `nil` clears it.
+---@param budget pi.CompactionBudget?
+function Chat:set_compaction_budget(budget)
+    local statusline = self._prompt and self._prompt:statusline()
+    if not statusline then
+        return
+    end
+    statusline:set_compaction_budget(budget)
+end
+
 --- Push the provider disambiguation suffix to the statusline model component.
 --- Keyed by provider/id: a suffix computed for a model that is no longer
 --- active is dropped by the statusline. Called by the session manager after
@@ -2143,10 +2163,32 @@ function Chat:append_system_note(chunks)
     self._history:append_system_note(chunks)
 end
 
+--- Append a compaction summary block to the chat history.
+--- `meta` carries the richer record the history renders (reason, token
+--- counts, files, retry/invalid markers); a history that does not know it yet
+--- simply ignores the extra argument.
 ---@param summary string
 ---@param tokens_before integer
-function Chat:append_compaction_summary(summary, tokens_before)
-    self._history:append_compaction_summary(summary, tokens_before)
+---@param meta table?
+function Chat:append_compaction_summary(summary, tokens_before, meta)
+    ---@diagnostic disable-next-line: redundant-parameter -- History:append_compaction_summary gains `meta` with the compaction panel
+    self._history:append_compaction_summary(summary, tokens_before, meta)
+end
+
+--- Jump to the compaction block that produced `summary`/`tokens_before`.
+--- Returns false when there is no history (or a history without the lookup
+--- yet) or the block is not on screen.
+---@param summary string
+---@param tokens_before integer
+---@return boolean jumped
+function Chat:jump_to_compaction(summary, tokens_before)
+    local history = self._history
+    ---@diagnostic disable-next-line: undefined-field -- History:jump_to_compaction lands with the compaction panel
+    local jump = history and history.jump_to_compaction
+    if type(jump) ~= "function" then
+        return false
+    end
+    return jump(history, summary, tokens_before) == true
 end
 
 --- Re-render the prompt status line.
