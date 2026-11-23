@@ -195,46 +195,59 @@ describe("todo panel", function()
     end)
 
     describe("sidebar claim", function()
-        --- Registered panels of the current tab's left edge (the default
-        --- sessions_list.position, so the edge the panel claims).
+        --- Registered panels of the given edge of the current tab (the right
+        --- edge is the default `todo.panel.position` since the three-column
+        --- layout landed).
+        ---@param edge? pi.SidebarEdge
         ---@return table[]
-        local function panels()
-            return Sidebar.panels(vim.api.nvim_get_current_tabpage(), "left")
+        local function panels(edge)
+            return Sidebar.panels(vim.api.nvim_get_current_tabpage(), edge or "right")
         end
 
-        it("standalone open claims the edge with the default weight and order", function()
+        it("standalone open claims the right column with the default weight and order", function()
             Todo.open()
             local ps = panels()
             assert.are.equal(1, #ps)
             assert.are.equal("todo", ps[1].key)
             assert.are.equal(Todo.win(vim.api.nvim_get_current_tabpage()), ps[1].win)
             -- height 0.5 (default) maps to weight 1 (f/(1-f), the even
-            -- split); position "below" falls through to the ORDER map
-            -- entry (todo = 2).
+            -- split); "right" falls through to the ORDER map entry
+            -- (sessions 1, tasks 2, todo 3).
             assert.are.equal(1, ps[1].weight)
-            assert.are.equal(2, ps[1].order)
+            assert.are.equal(3, ps[1].order)
+            assert.are.equal(40, ps[1].width, "opens the column with todo.panel.width")
+            assert.are.equal(0, #panels("left"), "nothing on the left edge")
         end)
 
         it("fractional height maps to weight f/(1-f)", function()
             Config.options.todo =
-                { panel = { auto_open = false, height = 0.25, position = "below", hide_when_empty = true } }
+                { panel = { auto_open = false, height = 0.25, position = "right", hide_when_empty = true } }
             Todo.open()
             assert.are.equal(0.25 / 0.75, panels()[1].weight)
         end)
 
         it("absolute height maps to a weight normalized against the column budget", function()
             Config.options.todo =
-                { panel = { auto_open = false, height = 6, position = "below", hide_when_empty = true } }
+                { panel = { auto_open = false, height = 6, position = "right", hide_when_empty = true } }
             Todo.open()
             local budget = vim.o.lines - vim.o.cmdheight - 2
             assert.are.equal(6 / (budget - 6), panels()[1].weight)
         end)
 
-        it("position=above claims order 0.5 (stacked before sessions)", function()
+        it("position=above keeps following the sessions edge (order 0.5)", function()
             Config.options.todo =
                 { panel = { auto_open = false, height = 0.5, position = "above", hide_when_empty = true } }
             Todo.open()
-            assert.are.equal(0.5, panels()[1].order)
+            assert.are.equal(0.5, panels("left")[1].order)
+        end)
+
+        it("position=left joins the sessions column instead of the right one", function()
+            Config.options.todo =
+                { panel = { auto_open = false, height = 0.5, position = "left", hide_when_empty = true } }
+            Todo.open()
+            assert.are.equal(0, #panels("right"))
+            assert.are.equal(1, #panels("left"))
+            assert.are.equal("todo", panels("left")[1].key)
         end)
 
         it("closing releases the claim", function()
@@ -376,6 +389,8 @@ describe("todo panel", function()
         end)
 
         it("stacks below the sessions window and claims the sidebar registry", function()
+            Config.options.todo =
+                { panel = { auto_open = false, height = 0.5, position = "below", hide_when_empty = true } }
             local sess = open_fake_sessions()
             update(details({ { content = "a", status = "pending" } }))
             Todo.open()
@@ -440,6 +455,8 @@ describe("todo panel", function()
         end)
 
         it("content taller than the panel does not grow it (scrolls instead)", function()
+            Config.options.todo =
+                { panel = { auto_open = false, height = 0.5, position = "below", hide_when_empty = true } }
             local sess = open_fake_sessions()
             update(details({
                 { content = "a", status = "pending" },
@@ -479,6 +496,8 @@ describe("todo panel", function()
         end)
 
         it("sidebar restack re-asserts the weight split after layout churn", function()
+            Config.options.todo =
+                { panel = { auto_open = false, height = 0.5, position = "below", hide_when_empty = true } }
             local sess = open_fake_sessions()
             update(details({ { content = "a", status = "pending" } }))
             Todo.open()
@@ -498,6 +517,8 @@ describe("todo panel", function()
         end)
 
         it("sidebar restack re-asserts the split after the sessions window is resized", function()
+            Config.options.todo =
+                { panel = { auto_open = false, height = 0.5, position = "below", hide_when_empty = true } }
             local sess = open_fake_sessions()
             update(details({ { content = "a", status = "pending" } }))
             Todo.open()

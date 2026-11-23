@@ -153,22 +153,22 @@ describe("pi.ui.workspace", function()
 
         it("stacks a panel at its ORDER position whatever the open order", function()
             local tab = current_tab()
-            -- Tasks (order 3) opens the column first, todo (order 2) joins it:
-            -- the new window must land above the tasks panel, not below it.
-            local tasks = assert(Workspace.claim_panel(tab, "tasks", scratch_buf(), {
+            -- Todo (order 3) opens the column first, tasks (order 2) joins it:
+            -- the new window must land above the todo panel, not below it.
+            local todo = assert(Workspace.claim_panel(tab, "todo", scratch_buf(), {
                 edge = "right",
                 width = 40,
             }))
             assert.are.equal(1, #Sidebar.panels(tab, "right"))
-            local todo = assert(Workspace.claim_panel(tab, "todo", scratch_buf(), {
+            local tasks = assert(Workspace.claim_panel(tab, "tasks", scratch_buf(), {
                 edge = "right",
                 width = 40,
             }))
             local panels = Sidebar.panels(tab, "right")
             assert.are.equal(2, #panels)
-            assert.are.equal("todo", panels[1].key)
-            assert.are.equal("tasks", panels[2].key)
-            assert.is_true(row(todo) < row(tasks), "todo stacked above tasks")
+            assert.are.equal("tasks", panels[1].key)
+            assert.are.equal("todo", panels[2].key)
+            assert.is_true(row(tasks) < row(todo), "tasks stacked above todo")
             assert.are.equal(
                 vim.api.nvim_win_get_width(todo),
                 vim.api.nvim_win_get_width(tasks),

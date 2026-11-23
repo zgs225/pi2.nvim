@@ -212,8 +212,8 @@
 ---@class pi.TodoPanelConfig
 ---@field auto_open? boolean Open the todo side panel automatically when a session has unfinished items (default false)
 ---@field height? number Stacked panel height: fraction of the shared column when < 1 (default 0.5, an even split), absolute lines when >= 1
----@field position? "above"|"below" Stacking position relative to the :PiSessions side panel (default "below")
----@field width? number Column width when the panel opens a side column on its own: columns (>=1) or a fraction of the editor width (<1, default: the sessions-list width)
+---@field position? "left"|"right"|"above"|"below" Side column (left/right) the panel lives in (default "right"); the legacy "above"/"below" stack it around the :PiSessions panel instead
+---@field width? number Column width when the panel opens a side column on its own: columns (>=1) or a fraction of the editor width (<1, default 40)
 ---@field hide_when_empty? boolean Hide the panel while the todo list is empty (default true)
 
 ---@class pi.TodoConfig
@@ -241,7 +241,7 @@
 
 ---@class pi.TasksPanelConfig
 ---@field mode "follow"|"side"|"float" How the panel opens: "side" or "float" explicitly, or "follow" the current tab's chat layout (default "follow")
----@field position "left"|"right"|"top"|"bottom" Window placement in the side layout (default "left")
+---@field position "left"|"right"|"top"|"bottom" Side column (left/right) the panel lives in; "top"/"bottom" keep the legacy horizontal row (default "right")
 ---@field width integer Window width for left/right placement in the side layout (default 40)
 ---@field height integer Window height for top/bottom placement in the side layout (default 12)
 ---@field auto_open? boolean Open the tasks panel when a background task starts in the current tab (default false)
@@ -605,7 +605,8 @@ local defaults = {
         panel = {
             auto_open = false,
             height = 0.5,
-            position = "below",
+            position = "right",
+            width = 40,
             hide_when_empty = true,
         },
     },
@@ -627,7 +628,7 @@ local defaults = {
     },
     tasks_panel = {
         mode = "follow",
-        position = "left",
+        position = "right",
         width = 40,
         height = 12,
         auto_open = false,

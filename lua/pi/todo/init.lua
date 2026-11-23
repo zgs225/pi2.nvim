@@ -64,7 +64,8 @@ local Workspace = require("pi.ui.workspace")
 ---@class pi.TodoPanelResolvedConfig
 ---@field auto_open boolean
 ---@field height number
----@field position "below"|"above"
+---@field position "left"|"right"|"above"|"below"
+---@field width number
 ---@field hide_when_empty boolean
 
 --- How the panel window in a tab came to be open.
@@ -107,6 +108,16 @@ local function current_tab()
     return vim.api.nvim_get_current_tabpage()
 end
 
+--- Normalize `todo.panel.position` to one of the supported placements.
+---@param value any
+---@return "left"|"right"|"above"|"below"
+local function normalize_position(value)
+    if value == "left" or value == "right" or value == "above" or value == "below" then
+        return value
+    end
+    return "right"
+end
+
 --- Read the panel config with the documented defaults applied defensively.
 ---@return pi.TodoPanelResolvedConfig
 local function panel_config()
@@ -115,7 +126,8 @@ local function panel_config()
     return {
         auto_open = panel.auto_open == true,
         height = (type(panel.height) == "number" and panel.height > 0) and panel.height or 0.5,
-        position = panel.position == "above" and "above" or "below",
+        position = normalize_position(panel.position),
+        width = (type(panel.width) == "number" and panel.width > 0) and panel.width or 40,
         hide_when_empty = panel.hide_when_empty ~= false,
     }
 end
@@ -285,12 +297,19 @@ local function set_win_opts(win, stacked)
     end
 end
 
---- The sidebar edge the panel opens at. The todo panel has no position
---- config of its own and follows `sessions_list.position` (effective_edge
---- validates it and falls back to "left").
+--- The side column the panel opens at: `todo.panel.position = "left"|"right"`
+--- names it directly; the legacy "above"/"below" keeps following the
+--- sessions list's edge and stacks around that panel instead.
 ---@param tab pi.TabId
 ---@return pi.SidebarEdge
 local function panel_edge(tab)
+    local position = panel_config().position
+    if position == "left" then
+        return "left"
+    end
+    if position == "right" then
+        return "right"
+    end
     local sl = Config.options.sessions_list or {}
     return Sidebar.effective_edge(tab, sl.position)
 end
@@ -301,8 +320,8 @@ end
 --- f/(1-f) (f = 0.5 → weight 1, the even split); `height >= 1` (absolute
 --- lines L) becomes weight L/(budget-L) with the column budget
 --- (lines - cmdheight - 2), so restack approximates the pinned share.
---- Order: "above" tops the stack (before the sessions panel); otherwise
---- the default ORDER map entry applies (after sessions, before tasks).
+--- Order: the legacy "above" tops the stack (before the sessions panel);
+--- otherwise the default ORDER map entry applies (below sessions/tasks).
 ---@param cfg pi.TodoPanelResolvedConfig
 ---@return { weight: number, order?: number }
 local function claim_opts(cfg)
@@ -364,22 +383,6 @@ local function open_standalone(tab, b)
     return win
 end
 
---- Column width for the todo panel when it opens a side column on its own.
---- Prefers a dedicated `todo.panel.width`; falls back to the sessions-list
---- width (the historical standalone column size) and then to 40.
----@return number
-local function column_width()
-    local panel = (Config.options.todo or {}).panel or {}
-    if type(panel.width) == "number" and panel.width > 0 then
-        return panel.width
-    end
-    local sl = Config.options.sessions_list or {}
-    if type(sl.width) == "number" and sl.width > 0 then
-        return sl.width
-    end
-    return 40
-end
-
 --- Whether the panel window is open in the current tab.
 ---@return boolean
 function M.is_open()
@@ -427,9 +430,9 @@ function M.open(how)
     end
     local cfg = panel_config()
     local edge = panel_edge(tab)
-    local column = edge == "right" and "right" or "left"
+    local column = Workspace.column_for(tab, edge)
     local win
-    if edge == "left" or edge == "right" then
+    if column then
         -- Left/right columns are owned by the workspace: it creates the
         -- column, stacks the panel at its ORDER position (below the tasks
         -- panel by default), and pins the width/height. The weight keeps the
@@ -437,7 +440,7 @@ function M.open(how)
         local claim = claim_opts(cfg)
         win = Workspace.claim_panel(tab, "todo", b, {
             edge = column,
-            width = column_width(),
+            width = cfg.width,
             weight = claim.weight,
             order = claim.order,
             configure = function(w)

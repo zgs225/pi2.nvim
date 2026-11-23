@@ -112,10 +112,11 @@ end
 
 --- Resolve a configured column width (fraction when < 1) to columns.
 ---@param spec number
+---@param available integer
 ---@return integer
-local function resolve_width(spec)
+local function resolve_width(spec, available)
     if spec < 1 then
-        return math.max(1, math.floor(vim.o.columns * spec))
+        return math.max(1, math.floor(available * spec))
     end
     return math.max(1, math.floor(spec))
 end
@@ -134,44 +135,63 @@ local function owns_window(st, win)
     return false
 end
 
---- Resolve the width of every open side column, clamped to the chat floor.
+--- Resolve the side-column widths and the flexible remainder for a given
+--- editor width. Pure (no window access), so `:checkhealth pi` can report what
+--- the current config produces without opening anything.
+---
+--- Each side column is capped at 40% of the editor; in full-tab mode the chat
+--- column is the only flexible one, so two wide columns are shrunk
+--- proportionally to keep at least `min_chat` columns for the chat. In split
+--- mode the leftover editor window is the flexible one, exactly as always.
+---@param left number? width spec of the left column (fraction when < 1)
+---@param right number? width spec of the right column
+---@param available integer editor width in columns
+---@param mode pi.WorkspaceMode
+---@return { left?: integer, right?: integer, flex: integer, min_chat: integer }
+function M.resolve_columns(left, right, available, mode)
+    local out = { flex = available, min_chat = math.min(MIN_CHAT_WIDTH, available) }
+    local ncols = 0
+    local cap = math.max(1, math.floor(available * MAX_COLUMN_FRACTION))
+    if left then
+        out.left = math.min(resolve_width(left, available), cap)
+        ncols = ncols + 1
+    end
+    if right then
+        out.right = math.min(resolve_width(right, available), cap)
+        ncols = ncols + 1
+    end
+    if ncols > 0 then
+        if mode == "full" and out.left and out.right then
+            local room = available - ncols -- one separator per side column
+            local budget = room - MIN_CHAT_WIDTH
+            if budget < 2 then
+                budget = 2
+            end
+            local sum = out.left + out.right
+            if sum > budget then
+                out.left = math.max(1, math.floor(budget * out.left / sum))
+                out.right = math.max(1, budget - out.left)
+            end
+        end
+        out.flex = available - ncols - (out.left or 0) - (out.right or 0)
+    end
+    return out
+end
+
+--- Width of every open side column in `tab`, clamped to the chat floor.
 --- Only `left`/`right` keys are ever present.
 ---@param tab pi.TabId
 ---@param st pi.WorkspaceState
 ---@return table<string, integer>
 local function column_widths(tab, st)
-    local avail = vim.o.columns
+    local resolved =
+        M.resolve_columns(Sidebar.width_spec(tab, "left"), Sidebar.width_spec(tab, "right"), vim.o.columns, st.mode)
     local out = {}
-    local specs = {}
-    local ncols = 0
-    for _, edge in ipairs({ "left", "right" }) do
-        local spec = Sidebar.width_spec(tab, edge)
-        if spec then
-            specs[edge] = spec
-            ncols = ncols + 1
-        end
+    if resolved.left then
+        out.left = resolved.left
     end
-    if ncols == 0 then
-        return out
-    end
-    local cap = math.max(1, math.floor(avail * MAX_COLUMN_FRACTION))
-    for edge, spec in pairs(specs) do
-        out[edge] = math.min(resolve_width(spec), cap)
-    end
-    -- In full-tab mode the chat column is the only flexible one: two wide side
-    -- columns must not starve it. In split mode the leftover editor window is
-    -- the flexible one, exactly as it always was.
-    if st.mode == "full" and out.left and out.right then
-        local room = avail - ncols -- one separator per side column
-        local budget = room - MIN_CHAT_WIDTH
-        if budget < 2 then
-            budget = 2
-        end
-        local sum = out.left + out.right
-        if sum > budget then
-            out.left = math.max(1, math.floor(budget * out.left / sum))
-            out.right = math.max(1, budget - out.left)
-        end
+    if resolved.right then
+        out.right = resolved.right
     end
     return out
 end
@@ -458,7 +478,7 @@ function M.acquire_center(tab, side_cfg)
     if target and vim.api.nvim_get_current_win() ~= target then
         vim.api.nvim_set_current_win(target)
     end
-    local width = resolve_width(side_cfg and side_cfg.width or 80)
+    local width = resolve_width(side_cfg and side_cfg.width or 80, vim.o.columns)
     vim.cmd(prefix .. " " .. width .. "vsplit")
     return { win = vim.api.nvim_get_current_win(), borrowed = false, created = true }
 end
@@ -558,7 +578,7 @@ end
 ---@param width number width spec
 ---@return integer
 local function open_column(edge, width)
-    local w = resolve_width(width or DEFAULT_COLUMN_WIDTH)
+    local w = resolve_width(width or DEFAULT_COLUMN_WIDTH, vim.o.columns)
     vim.cmd((edge == "left" and "topleft " or "botright ") .. w .. "vsplit")
     return vim.api.nvim_get_current_win()
 end
@@ -574,6 +594,27 @@ local function chat_anchor(tab)
         return chat.history
     end
     return nil
+end
+
+--- Map a panel's configured placement to a side column.
+---
+--- `left`/`right` pass through. A legacy `top`/`bottom` row is only honored in
+--- split mode: a full-tab layout is built from left/right columns, so such a
+--- panel falls back to the left column there instead of breaking the layout.
+---@param tab pi.TabId
+---@param position string?
+---@return "left"|"right"|nil column; nil keeps the legacy row placement
+function M.column_for(tab, position)
+    if position == "left" or position == "right" then
+        return position
+    end
+    if position == "top" or position == "bottom" then
+        if M.mode(tab) == "full" then
+            return "left"
+        end
+        return nil
+    end
+    return "left"
 end
 
 --- Open a panel window in its side column and register it.

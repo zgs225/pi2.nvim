@@ -358,8 +358,9 @@ require("pi").setup({
         max_items = 20, -- maximum items per todo list; exceeding it rejects the call so the model keeps the list focused
         panel = {
             auto_open = false, -- open the :PiTodo panel automatically when the session's todo list becomes non-empty
-            height = 0.5, -- stacked panel height: fraction (<1) of the shared :PiSessions column (0.5 = even split), or absolute lines (>=1)
-            position = "below", -- stacking position relative to the :PiSessions panel: "below" | "above"
+            height = 0.5, -- share of the panel's column: fraction (<1), or absolute lines (>=1)
+            position = "right", -- side column: "left" | "right"; "above"/"below" keep stacking around the :PiSessions panel
+            width = 40, -- column width when the todo panel opens the column on its own (fraction <1 = share of the editor width)
             hide_when_empty = true, -- hide the panel while the todo list is empty
         },
     },
@@ -376,11 +377,11 @@ require("pi").setup({
         auto_open = false,
         -- Collapse sub-sessions under parent rows by default (default: false).
         collapse_subsessions = false,
-        -- Window placement in the side layout: "left" | "right" | "top" | "bottom".
+        -- Side column: "left" | "right" ("top"/"bottom" keep the legacy horizontal row).
         position = "left",
-        -- Window width for left/right placement (side layout).
+        -- Column width for left/right placement (columns, or a fraction of the editor width when < 1).
         width = 40,
-        -- Window height for top/bottom placement (side layout).
+        -- Window height for top/bottom placement (legacy rows).
         height = 12,
         -- Float sizing when the current tab uses the float layout.
         float = {
@@ -405,11 +406,11 @@ require("pi").setup({
         -- How the window opens: "side" | "float" explicitly, or "follow" the
         -- current tab's chat layout (default).
         mode = "follow",
-        -- Window placement in the side layout: "left" | "right" | "top" | "bottom".
-        position = "left",
-        -- Window width for left/right placement (side layout).
+        -- Side column: "left" | "right" ("top"/"bottom" keep the legacy horizontal row).
+        position = "right",
+        -- Column width for left/right placement (columns, or a fraction of the editor width when < 1).
         width = 40,
-        -- Window height for top/bottom placement (side layout).
+        -- Window height for top/bottom placement (legacy rows).
         height = 12,
         -- Open the panel automatically when a background task starts in the
         -- current tab (default false).
@@ -552,6 +553,7 @@ require("pi").setup({
 
 Notes on a few fields:
 
+- The side layout is **three columns**: the chat column in the middle, a left column and a right column for the panels. `sessions_list.position` / `tasks_panel.position` / `todo.panel.position` choose the column, and the first panel of a column (stacking order: sessions → tasks → todo) owns that column's `width` — so `sessions_list.width` sizes the left column and `tasks_panel.width` the right one. A column exists only while a panel holds it; the chat column absorbs whatever they leave (and is the only flexible column when the tab is taken over, see [Chat & layouts](usage.md#chat--layouts)).
 - `layout.default`, `layout.side`, and `layout.float` each also accept a **function** returning the value, so you can compute sizes from `vim.o.columns` / `vim.o.lines` at open time. A function-return for `side`/`float` is deep-merged over the defaults, so returning a partial table is fine.
 - `panels.<panel>.name` takes a `fun(tab_id): string` that computes the underlying buffer name per tab — useful for distinguishing multiple π conversations in `:buffers`, statuslines, or tab bars.
 - Several fields (`diff.keys`, `dialog.keys`, `zen.keys`) accept **key specs** — plain strings, `{ key, modes = ... }` tables, or lists of those. See [Keymaps](keymaps.md#key-specs).

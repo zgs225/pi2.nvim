@@ -100,7 +100,7 @@ end
 ---@return { mode: "follow"|"side"|"float", position: string, width: integer, height: integer }
 local function panel_cfg()
     ---@type table
-    local defaults = { mode = "follow", position = "left", width = 40, height = 12 }
+    local defaults = { mode = "follow", position = "right", width = 40, height = 12 }
     return vim.tbl_deep_extend("keep", Config.options.tasks_panel or {}, defaults)
 end
 
@@ -1204,11 +1204,12 @@ local function open_side_win(b)
     local cfg = panel_cfg()
     local position = cfg.position or "left"
     local tab = current_tab()
-    if position == "left" or position == "right" then
+    local column = Workspace.column_for(tab, position)
+    if column then
         -- The workspace owns frame placement (column creation, stacking in
         -- ORDER position, width pinning); the panel only supplies the buffer.
         return Workspace.claim_panel(tab, "tasks", b, {
-            edge = position,
+            edge = column,
             width = cfg.width,
             weight = 1,
             configure = function(win)

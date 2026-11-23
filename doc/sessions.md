@@ -223,9 +223,9 @@ require("pi").setup({
         mode = "follow",   -- "follow" | "side" | "float"
         auto_open = false, -- open the list together with the chat
         collapse_subsessions = false, -- collapse sub-sessions by default
-        position = "left", -- side layout: "left" | "right" | "top" | "bottom"
-        width = 40,        -- side layout width for left/right
-        height = 12,       -- side layout height for top/bottom
+        position = "left", -- side column: "left" | "right" ("top"/"bottom" = legacy rows)
+        width = 40,        -- width of the left column this panel owns (fraction <1 = share of the editor)
+        height = 12,       -- legacy row height for top/bottom
         float = { width = 0.5, height = 0.4, border = "rounded" },
         -- `x` in the list: ask before closing a sub-session's process, a
         -- session's π tab, or every π tab of a worktree group (default: true).

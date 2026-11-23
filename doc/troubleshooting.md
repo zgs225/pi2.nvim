@@ -19,6 +19,7 @@ The health check verifies:
 - **Optional plugins** — `img-clip.nvim` (clipboard image paste), `render-markdown.nvim` (warned when it's the configured engine but missing), `blink.cmp` (info-only).
 - **The bundled tree extension** — `extensions/tree.ts` exists when `tree.enabled` is on (`:PiTree` depends on it).
 - **Image compression tools** — when `prompt.image_compress` is enabled, at least one of `sips` / `magick` / `ffmpeg` is found (warns if you pinned a specific `tool` that's missing).
+- **Three-column layout** — `layout.side.full_tab` holds a supported value (`never` / `auto` / `always`), the side columns leave the chat column at least 40 columns at the current editor width (the warning names the width and the knobs: `sessions_list.width` / `tasks_panel.width` / `todo.panel.width`), `layout.side.position = "bottom"` is reported as unsupported (the chat column opens on the right instead), and a panel configured as `top`/`bottom` is reported when the tab is taken over (it moves into the left column then).
 
 Run it any time you suspect something is off with the install:
 

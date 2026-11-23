@@ -31,7 +31,9 @@ local M = {}
 ---@field width? number width spec the column was opened with (fraction when < 1)
 
 --- Fixed stacking order within an edge; unknown keys sort last, by claim order.
-local ORDER = { sessions = 1, todo = 2, tasks = 3 }
+--- Sessions top the left column; on the right the tasks panel sits above the
+--- todo checklist. Unknown keys sort last, by claim order.
+local ORDER = { sessions = 1, tasks = 2, todo = 3 }
 
 local VALID_EDGES = { left = true, right = true, top = true, bottom = true }
 

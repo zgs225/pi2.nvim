@@ -2702,8 +2702,8 @@ local function open_side_win(b)
     local cfg = Config.options.sessions_list
     local position = cfg.position or "left"
     local tab = current_tab()
-    local column = position == "right" and "right" or "left"
-    if position == "left" or position == "right" then
+    local column = Workspace.column_for(tab, position)
+    if column then
         -- The workspace owns frame placement: it creates the side column at
         -- the tab's edge (or joins one that already exists), pins the width to
         -- the session list's config and keeps the chat column inboard of it.
