@@ -120,6 +120,23 @@ local function valid_info(info)
     return type(info) == "table" and type(info.path) == "string" and info.path ~= ""
 end
 
+--- Metadata of a *linked* checkout, or nil.
+---
+--- Attaching worktree metadata is a claim of ownership (bind, `git worktree
+--- lock`, release, badge, `pi.worktree_*` target), so only a linked checkout
+--- may be one. `Worktree.detect` returns a perfectly valid table for the
+--- repository's **main** work tree (`kind == "main"`) and nothing at all for a
+--- plain directory — neither is a worktree, and git refuses to lock the main
+--- one (`fatal: The main working tree cannot be locked or unlocked`).
+---@param info any
+---@return table? linked
+local function linked_info(info)
+    if type(info) ~= "table" or info.kind ~= "linked" then
+        return nil
+    end
+    return valid_info(info) and info or nil
+end
+
 --- Two paths point at the same directory. Normalizes symlinks and trailing
 --- separators so a worktree reached via a symlinked/`~/` path still matches its
 --- canonical form (a live session must never be missed because of that).
@@ -1935,9 +1952,11 @@ end
 --- Ensure a resume target's checkout exists before the session is opened.
 ---
 --- An existing directory is used as-is (worktree metadata refreshed via
---- `Worktree.detect` when missing). A missing managed worktree is recovered
---- through `recover_worktree` (integration metadata / snapshot), never by
---- silently opening the session in the main checkout.
+--- `Worktree.detect` when missing, but only a **linked** checkout is reported
+--- back as `worktree` — the main checkout and a plain directory resume as
+--- ordinary sessions). A missing managed worktree is recovered through
+--- `recover_worktree` (integration metadata / snapshot), never by silently
+--- opening the session in the main checkout.
 ---@param target pi.ResumeTarget
 ---@param cb fun(target: pi.ResumeTarget?)
 function M.prepare_resume_target(target, cb)
@@ -1970,7 +1989,9 @@ function M.prepare_resume_target(target, cb)
         end
         cb({
             cwd = resolved_cwd,
-            worktree = type(resolved) == "table" and resolved or nil,
+            -- The main checkout (or a directory outside any repository) is
+            -- resumed as an ordinary session: its `cwd` is the whole target.
+            worktree = linked_info(resolved),
             session_id = target.session_id,
         })
     end
@@ -1981,7 +2002,7 @@ function M.prepare_resume_target(target, cb)
         if type(info) ~= "table" and Worktree and type(Worktree.detect) == "function" then
             info = Worktree.detect(existing)
         end
-        finish(info or { path = existing })
+        finish(info)
         return
     end
 
