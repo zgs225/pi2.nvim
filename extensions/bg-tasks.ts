@@ -14,8 +14,8 @@
  * policy:
  *
  *  - `run_in_background: true` — return immediately with the task id.
- *  - foreground (default) — stay attached for the attach window (`timeout`,
- *    default DEFAULT_ATTACH_MS). If the process exits inside the window the
+ *  - foreground (default) — stay attached for the attach window (`timeout` in
+ *    seconds, default 2 minutes). If the process exits inside the window the
  *    call returns its output like a normal bash call. If it outlives the
  *    window it is NOT killed (P0-2): it keeps running as a background task and
  *    the call returns "[still running]" plus the task id. This is the one
@@ -27,7 +27,9 @@
  *  - the tool result of a call that was attached when the process exited
  *    (a foreground call that finished inside its window, or `wait_task`), or
  *  - the wake report — a `pi2_bg_task` custom message carrying the exit status,
- *    sent when the process exits with nobody attached.
+ *    delivered when the process exits with nobody attached. Whether it may BUY a
+ *    provider request is the completion-wake policy below; a report that rides a
+ *    turn which is going to continue anyway is always delivered for free.
  *
  * Delivery ladder (why it is four stages instead of one `sendMessage`). A
  * steering message is discarded when the run is aborted, so a report sent that
@@ -36,13 +38,17 @@
  * `none -> sent -> confirmed`, and only `confirmed` stops further delivery:
  *
  *  1. idle at exit -> `sendMessage(..., { triggerTurn: true })` starts a turn
- *     immediately (the completion is the only thing left to do). The wake is
- *     COALESCED: a short timer merges every completion of one burst (and of a
- *     settle that is about to flush anyway) into ONE message and ONE turn,
- *     instead of one wake per task, each paying a full context read;
+ *     immediately, but only when `completionWakeHold` allows a paid turn (the
+ *     default policy `never` does not). The wake is COALESCED: a short timer
+ *     merges every completion of one burst (and of a settle that is about to
+ *     flush anyway) into ONE message and ONE turn, instead of one wake per task,
+ *     each paying a full context read;
  *  2. a run is active -> the next actionable boundary (`turn_end`, then
- *     `agent_before_settle`) appends ONE aggregated `custom_message` entry and
- *     asks for `continue: true`, so the model acts on it in this run. Entries
+ *     `agent_before_settle`) appends ONE aggregated `custom_message` entry. A
+ *     boundary that still has tool results is going to make a provider request
+ *     anyway, so the entry rides it for free; a boundary with nothing left —
+ *     the model just produced its final answer — is a PAID turn, decided by the
+ *     same gate, and at most ONE such continuation is bought per run. Entries
  *     are committed even when the turn ends in an abort (verified), unlike a
  *     steering queue, and `continue` is suppressed for an aborted turn so an
  *     abort still ends the run;
@@ -85,12 +91,12 @@
  * block or forge a second element.
  *
  * The wake report is why `sleep` must never be the model's waiting primitive:
- * it is delivered mid-run at the next turn boundary, so a model that has other
- * work to do loses nothing by continuing, and a model with nothing left to do
- * only has to end its turn. `wait_task` covers the third case — the model wants
- * the result before it can say anything else — by blocking server-side until
- * the process exits or its own deadline hits. Both are advertised in the bash
- * tool description and in every result that starts or hands off a task.
+ * a report that rides a continuing turn costs nothing, and a report that would
+ * buy a turn stays pending for the next user turn. `wait_task` covers the case
+ * where the model wants the result before it can say anything else — it blocks
+ * server-side until the process exits or its own deadline hits. Both are
+ * advertised in the bash tool description and in every result that starts or
+ * hands off a task.
  *
  * `wait_task` can also wait for a LINE instead of an exit (`until`). A match
  * settles the call but does NOT consume the completion: the lease is released
@@ -145,19 +151,25 @@
  * carries no `details` (so it cannot fabricate a panel row), marks no delivery
  * state and is best-effort.
  *
- * The IDLE WAKE is the expensive path, so it is gated (`idleWakeHold`). A
- * completion that lands while nothing is running starts a turn of its own, and
- * that turn is priced by the whole conversation, not by the report — harshest
- * where it is least useful: nobody at the editor, prompt cache expired (a wake
- * minutes later re-reads everything at full input price instead of the cache
- * read), or a task that predates the newest user message, i.e. old news. So the
- * idle branch consults a policy the frontend publishes (`PREFS_ENV`, re-read per
- * decision): `always`, `budgeted` (default: `wake_budget` wakes per user prompt,
- * then hold), or `never`. A held report is NOT dropped and gets no new channel:
- * it stays `none`, so the next boundary — the user's next turn — or the
- * `context` fallback carries it exactly as before. What the hold adds is the
- * REASON (`policy` / `absent` / `cache` / `stale` / `budget`), shown by `:PiTasks`
- * and `list_tasks`, because a hold nobody can explain reads as a lost report.
+ * The COMPLETION WAKE is the expensive path, so it is gated
+ * (`completionWakeHold`). A completion is delivered for free when the turn it
+ * joins has natural tool work; a completion that would BUY a provider request —
+ * an idle wake, or the final answer's boundary — is priced by the whole
+ * conversation, not by the report, and is harshest where it is least useful:
+ * nobody at the editor, prompt cache expired (a wake minutes later re-reads
+ * everything at full input price instead of the cache read), a task that
+ * predates the newest user message (old news), or a report whose run already
+ * bought its one continuation. So the paid branch consults a policy the frontend
+ * publishes (`PREFS_ENV`, re-read per decision): `never` (default: no paid turn),
+ * `budgeted` (`wake_budget` paid turns per user prompt, then hold), `failure`
+ * (only a burst with a non-zero exit, signal, spawn error or unknown exit may
+ * buy one), or `always` (the pre-policy behaviour; bypasses every rule). A held
+ * report is NOT dropped and gets no new channel: it stays `none`, so the next
+ * boundary with natural work, the user's next turn, or the `context` fallback
+ * carries it exactly as before. What the hold adds is the REASON (`policy` /
+ * `absent` / `cache` / `stale` / `failure` / `continuation` / `budget`), shown by
+ * `:PiTasks` and `list_tasks`, because a hold nobody can explain reads as a lost
+ * report.
  *
  * The task table OUTLIVES the process that built it, and the SESSION TRANSCRIPT
  * is the only place it is written. Every state transition already reaches it as
@@ -196,9 +208,13 @@
  * Panel reporting is separate from the wake path and never triggers a turn:
  * the frontend (`:PiTasks`) needs the exit status even when a tool call already
  * consumed the result, so `started` / terminal events are pushed as
- * `display: false` custom messages with no options. They are only pushed for
- * tasks that actually become background tasks — a foreground command that
- * finishes inside its window never touches the panel.
+ * `display: false` custom messages. They are only pushed for tasks that actually
+ * become background tasks — a foreground command that finishes inside its window
+ * never touches the panel. Every panel send passes `{ triggerTurn: false }`
+ * EXPLICITLY: without options `pi.sendMessage` defaults to `deliverAs: "steer"`
+ * while a run is active, and a steering message is queued as new input and opens
+ * a turn of its own. A status ping that buys a turn is indistinguishable from
+ * autonomous work, which is exactly the bug this contract exists to prevent.
  *
  * A load-time `context` handler is the fallback injector for wake reports whose
  * send threw (stale extension ctx); it reads the module-level task table and
@@ -322,17 +338,23 @@ const LOG_TTL_ENV = "PI_BG_TASK_LOG_TTL_MS";
 /** The only files the sweep may touch: the logs THIS extension writes. */
 const LOG_FILE_PATTERN = /^pi-bash-(b[0-9a-f]{6})\.log$/;
 /**
- * Where the frontend publishes its idle-wake policy (JSON:
- * `{wake_on_idle, wake_budget, wake_cache_window_ms, present}`), re-read at every
- * decision so a live `setup()` call or a focus change applies without respawning
- * the process. Absent file = defaults (see `readWakePrefs`).
+ * Where the frontend publishes its completion-wake policy (JSON:
+ * `{wake_on_completion, wake_budget, wake_cache_window_ms, present}`), re-read at
+ * every decision so a live `setup()` call or a focus change applies without
+ * respawning the process. Absent file = defaults (see `readWakePrefs`).
  */
 const PREFS_ENV = "PI_NVIM_BG_TASKS_FILE";
-/** Idle-wake policies, most to least eager. */
-const WAKE_POLICIES = ["always", "budgeted", "never"] as const;
+/**
+ * What a completion may buy: nothing (`never`, the default), a bounded number of
+ * paid turns (`budgeted`), a paid turn only when the burst contains a failure
+ * (`failure`), or a turn on every completion (`always`). "Paid" means a provider
+ * request that would not otherwise happen; a report that rides a boundary with
+ * natural tool work is always delivered for free.
+ */
+const WAKE_POLICIES = ["never", "budgeted", "failure", "always"] as const;
 type WakePolicy = (typeof WAKE_POLICIES)[number];
-const DEFAULT_WAKE_POLICY: WakePolicy = "budgeted";
-/** Idle wakes allowed per user prompt under `budgeted`. */
+const DEFAULT_WAKE_POLICY: WakePolicy = "never";
+/** Paid wakes allowed per user prompt under `budgeted` and `failure`. */
 const DEFAULT_WAKE_BUDGET = 2;
 const MAX_WAKE_BUDGET = 10;
 /**
@@ -372,13 +394,13 @@ const MAX_REARMS = 3;
 /** How far a completion report has got on its way into model context. */
 type DeliveryState = "none" | "sent" | "confirmed";
 /**
- * Why an idle wake was HELD instead of sent. Recorded on the task so the panel
- * and `list_tasks` can explain it — a hold nobody can see is indistinguishable
- * from a report that was lost.
+ * Why a completion report was HELD instead of spent. Recorded on the task so the
+ * panel and `list_tasks` can explain it — a hold nobody can see is
+ * indistinguishable from a report that was lost.
  */
-type HoldReason = "policy" | "absent" | "cache" | "stale" | "budget";
+type HoldReason = "policy" | "absent" | "cache" | "stale" | "failure" | "continuation" | "budget";
 
-/** The frontend-published idle-wake policy (see `PREFS_ENV`). */
+/** The frontend-published completion-wake policy (see `PREFS_ENV`). */
 interface WakePrefs {
 	policy: WakePolicy;
 	budget: number;
@@ -460,7 +482,7 @@ interface BgTaskState {
 	/** Which channel carried `sentText`. */
 	sentVia?: DeliveryChannel;
 	/**
-	 * Why the idle wake for this report is being held (see `idleWakeHold`). Cleared
+	 * Why the paid completion for this report was held (see `completionWakeHold`). Cleared
 	 * as soon as a channel carries the report, so the panel never shows a stale
 	 * reason for a report that has since been delivered.
 	 */
@@ -774,11 +796,14 @@ let busy = false;
  * API): a task that started BEFORE it is reporting old news. `lastRequestAt` is
  * when a request was last handed over, which is the closest proxy for "the
  * prompt cache is warm". `wakesThisTurn` is the per-prompt allowance, reset by
- * the next user input rather than by a clock.
+ * the next user input rather than by a clock. `continuedThisRun` caps the
+ * boundary channel at ONE paid continuation per run: the next request it buys in
+ * the same run would be a turn the model did not ask for.
  */
 let lastUserAt = 0;
 let lastRequestAt: number | undefined;
 let wakesThisTurn = 0;
+let continuedThisRun = false;
 /** Last read of the frontend policy file, keyed by mtime+size. */
 let prefsCache: { key: string; value: WakePrefs } | undefined;
 
@@ -1311,11 +1336,19 @@ function formatBytes(bytes: number): string {
 	return bytes >= 1024 * 1024 ? `${(bytes / (1024 * 1024)).toFixed(1)}MB` : `${(bytes / 1024).toFixed(1)}KB`;
 }
 
-function clampAttachWindow(timeout: number | undefined): number {
-	if (typeof timeout !== "number" || !Number.isFinite(timeout) || timeout <= 0) {
+/**
+ * The foreground attach window, in MILLISECONDS. The model-facing `timeout`
+ * parameter is in SECONDS (pi's bash schema), so `clampAttachWindow` converts it
+ * here — treating a raw seconds value as milliseconds made every `timeout: 30`
+ * detach after 1 s (the old minimum), which turned ordinary commands into
+ * background tasks and made completions wake the model far more often than the
+ * extension ever intended.
+ */
+function clampAttachWindow(timeoutSeconds: number | undefined): number {
+	if (typeof timeoutSeconds !== "number" || !Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0) {
 		return DEFAULT_ATTACH_MS;
 	}
-	return Math.min(MAX_ATTACH_MS, Math.max(MIN_ATTACH_MS, Math.floor(timeout)));
+	return Math.min(MAX_ATTACH_MS, Math.max(MIN_ATTACH_MS, Math.round(timeoutSeconds * 1000)));
 }
 
 function clampWaitWindow(timeout: number | undefined): number {
@@ -1762,7 +1795,10 @@ export default function bgTasks(pi: ExtensionAPI) {
 				"This is an automated startup report, not a message from the user. A task listed as running in THIS session was started before this process: wait_task, stop_task, task_input and list_tasks work on it exactly as on a task you start now, and its exit is reported when its pid disappears. A record that belongs to another session (a fork or clone of this one) or to another pi process is listed for reference only — it cannot be waited on, fed or stopped from here. Do not start a second copy of something listed above as still running.",
 		};
 		try {
-			pi.sendMessage({ customType: CUSTOM_TYPE, content: startupNote.text, display: false }, undefined);
+			// `triggerTurn: false` is explicit on purpose: without options the
+			// message defaults to `steer` while a run is active, and a steering
+			// message opens a turn by itself.
+			pi.sendMessage({ customType: CUSTOM_TYPE, content: startupNote.text, display: false }, { triggerTurn: false });
 		} catch {
 			// Not deliverable yet: the `context` handler injects it before the first
 			// request instead (the same fallback the wake reports use).
@@ -1914,12 +1950,14 @@ export default function bgTasks(pi: ExtensionAPI) {
 	// report can join the conversation (after the turn's tool calls, before the
 	// next provider request) and the only one that fires for an aborted turn;
 	// `agent_before_settle` is the final chance of a normal run. Both append ONE
-	// aggregated `custom_message` entry — durable, unlike a steering message —
-	// and ask for one continuation so the model can act on it in this run.
+	// aggregated `custom_message` entry — durable, unlike a steering message — and
+	// ask for a continuation only when the completion-wake gate allows it. A
+	// boundary with natural tool work is free; a boundary with nothing left is a
+	// paid turn and is gated exactly like the idle wake.
 	// ------------------------------------------------------------------
 	// ------------------------------------------------------------------
 	// User presence. A real input (typed, or sent through the API) opens a new wake
-	// budget and makes every task that predates it old news (`idleWakeHold`'s
+	// budget and makes every task that predates it old news (`completionWakeHold`'s
 	// `stale` rule). Messages another extension sends through `sendUserMessage` are
 	// not user presence and must reset neither.
 	// ------------------------------------------------------------------
@@ -1929,11 +1967,14 @@ export default function bgTasks(pi: ExtensionAPI) {
 		}
 		lastUserAt = Date.now();
 		wakesThisTurn = 0;
+		continuedThisRun = false;
 		return undefined;
 	});
 
 	pi.on("agent_start", () => {
 		busy = true;
+		// One paid continuation per run: a new run starts with a fresh allowance.
+		continuedThisRun = false;
 		return undefined;
 	});
 
@@ -2269,27 +2310,64 @@ export default function bgTasks(pi: ExtensionAPI) {
 	}
 
 	/**
+	 * Whether a terminal report describes a failure worth spending a turn on: a
+	 * non-zero exit, a signal, a spawn error, or an exit nobody observed. A clean
+	 * exit is exactly what `wake_on_completion = "failure"` leaves for the next
+	 * user turn.
+	 */
+	function reportFailed(task: BgTaskState): boolean {
+		if (task.spawnError !== undefined || task.exitUnknown) {
+			return true;
+		}
+		if (task.signal !== null) {
+			return true;
+		}
+		return task.exitCode !== null && task.exitCode !== 0;
+	}
+
+	/**
 	 * Append the outstanding reports to a boundary proposal.
 	 *
-	 * `continue: true` guarantees one follow-up provider request, so a model that
-	 * ended its turn while a task was still running does not go quiet holding the
-	 * result. A turn that is ending because it was aborted keeps the entry (it is
-	 * committed with the turn — verified) but asks for no continuation, so the
-	 * abort still stops the run; the report is read on the next turn instead.
+	 * A boundary that still has tool results to hand back is going to make a
+	 * provider request anyway, so the report rides it for free (`continue` is not
+	 * requested). A boundary with nothing left — the model just produced its final
+	 * answer — is the expensive one: whether it may buy a turn is decided by
+	 * `completionWakeHold`, the same gate the idle channel uses. A held report
+	 * stays `none` and is injected by `context` on the next user turn.
+	 *
+	 * An aborted turn keeps a committed entry but never asks for a continuation,
+	 * so Esc still stops the run.
 	 */
 	function deliverAtBoundary(event: {
 		entries: unknown[];
 		outcome?: string;
+		toolResults?: unknown[];
 	}): { entries: unknown[]; continue?: boolean } | undefined {
 		const pending = pendingReports().filter((task) => task.delivery === "none" && task.observers === 0);
 		if (pending.length === 0) {
 			return undefined;
 		}
+		const aborted = event.outcome === "aborted";
+		const naturalWork = (event.toolResults?.length ?? 0) > 0;
+		const prefs = readWakePrefs();
+		if (!aborted && !naturalWork) {
+			const hold = completionWakeHold(pending, prefs, "boundary");
+			if (hold !== undefined) {
+				markHeld(pending, hold);
+				return undefined;
+			}
+		}
 		const text = buildBatchNote(pending);
 		for (const task of pending) {
 			markSent(task, "boundary", text);
 		}
-		const aborted = event.outcome === "aborted";
+		const continueRun = !aborted && !naturalWork;
+		if (continueRun) {
+			wakesThisTurn += 1;
+			if (prefs.policy !== "always") {
+				continuedThisRun = true;
+			}
+		}
 		return {
 			entries: [
 				...event.entries,
@@ -2304,7 +2382,7 @@ export default function bgTasks(pi: ExtensionAPI) {
 					...batchDetails(pending),
 				},
 			],
-			...(aborted ? {} : { continue: true }),
+			...(continueRun ? { continue: true } : {}),
 		};
 	}
 
@@ -2332,7 +2410,7 @@ export default function bgTasks(pi: ExtensionAPI) {
 					display: false,
 					...batchDetails(pending),
 				},
-				options.wake ? { triggerTurn: true } : undefined,
+				options.wake ? { triggerTurn: true } : { triggerTurn: false },
 			);
 		} catch {
 			// Stale ctx after reload etc.: leave the reports pending; the `context`
@@ -2345,9 +2423,11 @@ export default function bgTasks(pi: ExtensionAPI) {
 	}
 
 	/**
-	 * The frontend-published idle-wake policy, with defaults that keep a plain pi
-	 * (TUI, SDK, no pi.nvim) behaving as it did before: `budgeted`, two wakes per
-	 * prompt, and `present: true` because there is no focus to observe.
+	 * The frontend-published completion-wake policy. A plain pi (TUI, SDK, no
+	 * pi.nvim) gets the same default as pi.nvim — `never` — and `present: true`
+	 * because there is no focus to observe. `wake_on_idle` is the old key and is
+	 * still read as a fallback, so a frontend and a backend from different updates
+	 * agree on what the user asked for.
 	 *
 	 * The read is cached by mtime+size so the per-completion decision costs one
 	 * `stat`; a live `setup()` or a focus change rewrites the file and the next
@@ -2371,9 +2451,10 @@ export default function bgTasks(pi: ExtensionAPI) {
 				return prefsCache.value;
 			}
 			const parsed = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+			const rawPolicy = parsed.wake_on_completion ?? parsed.wake_on_idle;
 			const policy =
-				typeof parsed.wake_on_idle === "string" && (WAKE_POLICIES as readonly string[]).includes(parsed.wake_on_idle)
-					? (parsed.wake_on_idle as WakePolicy)
+				typeof rawPolicy === "string" && (WAKE_POLICIES as readonly string[]).includes(rawPolicy)
+					? (rawPolicy as WakePolicy)
 					: fallback.policy;
 			const budget =
 				typeof parsed.wake_budget === "number" && Number.isFinite(parsed.wake_budget)
@@ -2399,25 +2480,35 @@ export default function bgTasks(pi: ExtensionAPI) {
 	}
 
 	/**
-	 * Decide whether this burst of completions may start a turn of its own.
+	 * Decide whether this burst of completions may BUY a provider request.
 	 *
-	 * A wake is one full provider request whose price is the CONVERSATION, not the
-	 * report — and that price is highest exactly when a wake is least useful: nobody
-	 * is looking (`absent`), the prompt cache has expired so the whole conversation
-	 * is re-read at full input price (`cache`), the task predates the newest user
-	 * message so its result is old news (`stale`), or the prompt's allowance is
-	 * spent (`budget`). Holding is never a drop: the report stays `none` and rides
-	 * the next boundary or the `context` fallback, i.e. the user's next turn.
+	 * A paid turn is one full request whose price is the CONVERSATION, not the
+	 * report — and that price is highest exactly where it is least useful: nobody
+	 * is looking (`absent`), the prompt cache expired so the whole conversation is
+	 * re-read at full input price (`cache`), the task predates the newest user
+	 * message so its result is old news (`stale`), the burst has no failure under
+	 * `failure`, this run already bought its one continuation (`continuation`), or
+	 * the prompt's allowance is spent (`budget`). Holding is never dropping: the
+	 * report stays `none` and rides the next boundary with natural work or the
+	 * `context` fallback, i.e. the user's next turn.
 	 *
-	 * Order matters. `never` explains every hold it causes; presence is the user's
-	 * own signal; then the cache window (the most expensive mistake); then
-	 * staleness; and the budget last, so a report held for a cheaper reason keeps
-	 * that reason instead of degrading to `budget`.
+	 * Order matters. The policy explains every hold it causes; presence is the
+	 * user's own signal; then the cache window (the most expensive mistake); then
+	 * staleness; then the failure filter; then the per-run continuation cap; and
+	 * the budget last, so a report held for a cheaper reason keeps that reason
+	 * instead of degrading to `budget`. `always` bypasses every rule, including
+	 * the cap — it is the explicit "old behaviour" escape hatch.
 	 */
-	function idleWakeHold(reports: BgTaskState[]): HoldReason | undefined {
-		const prefs = readWakePrefs();
+	function completionWakeHold(
+		reports: BgTaskState[],
+		prefs: WakePrefs,
+		channel: "boundary" | "idle",
+	): HoldReason | undefined {
 		if (prefs.policy === "never") {
 			return "policy";
+		}
+		if (prefs.policy === "always") {
+			return undefined;
 		}
 		if (!prefs.present) {
 			return "absent";
@@ -2428,7 +2519,13 @@ export default function bgTasks(pi: ExtensionAPI) {
 		if (lastUserAt > 0 && reports.every((task) => task.startedAt < lastUserAt)) {
 			return "stale";
 		}
-		if (prefs.policy === "budgeted" && wakesThisTurn >= prefs.budget) {
+		if (prefs.policy === "failure" && !reports.some(reportFailed)) {
+			return "failure";
+		}
+		if (channel === "boundary" && continuedThisRun) {
+			return "continuation";
+		}
+		if (wakesThisTurn >= prefs.budget) {
 			return "budget";
 		}
 		return undefined;
@@ -2459,7 +2556,7 @@ export default function bgTasks(pi: ExtensionAPI) {
 			if (pending.length === 0) {
 				return;
 			}
-			const hold = idleWakeHold(pending);
+			const hold = completionWakeHold(pending, readWakePrefs(), "idle");
 			if (hold !== undefined) {
 				// Held, not dropped: the report stays `none`, so the next boundary or
 				// the `context` fallback carries it on the user's next turn.
@@ -2488,11 +2585,13 @@ export default function bgTasks(pi: ExtensionAPI) {
 		}
 		const text = buildCheckInNote(task, kind);
 		try {
-			// A check-in is worth a turn only when nothing else is happening; while a
-			// run is active it is appended for the next boundary instead.
+			// A check-in is worth a turn only when nothing else is happening and the
+			// policy allows one: `never` stores it without a turn, so it rides the
+			// next user request instead of paying for an advisory note.
+			const mayWake = !busy && readWakePrefs().policy !== "never";
 			pi.sendMessage(
 				{ customType: CUSTOM_TYPE, content: text, display: false },
-				busy ? undefined : { triggerTurn: true },
+				mayWake ? { triggerTurn: true } : { triggerTurn: false },
 			);
 		} catch {
 			// Stale ctx after reload: a check-in is advisory, and the exit report is
@@ -2578,12 +2677,20 @@ export default function bgTasks(pi: ExtensionAPI) {
 			sessionId: task.sessionId ?? currentSessionId,
 		} satisfies BgTaskDetails;
 		try {
-			pi.sendMessage({
-				customType: CUSTOM_TYPE,
-				content: `[Background task ${task.taskId} ${kind}]`,
-				display: false,
-				details,
-			});
+			// The panel ping is TUI-only in intent, but it is still a custom
+			// message; without `triggerTurn: false` the streaming default is
+			// `steer`, which opens a turn and made a mere status update look like
+			// autonomous work. (The model-visible delivery reports are a separate
+			// channel, see `deliverAtBoundary`/`flushPending`.)
+			pi.sendMessage(
+				{
+					customType: CUSTOM_TYPE,
+					content: `[Background task ${task.taskId} ${kind}]`,
+					display: false,
+					details,
+				},
+				{ triggerTurn: false },
+			);
 		} catch {
 			// Stale ctx after reload: the task still runs; only the panel misses it.
 		}
@@ -2635,7 +2742,7 @@ export default function bgTasks(pi: ExtensionAPI) {
 		run_in_background: Type.Optional(
 			Type.Boolean({
 				description:
-					"Run the command as a background task instead of staying attached. Use for long-running commands such as dev servers, watchers, long builds, or test suites that take minutes. The command starts immediately, output streams to a log file whose path is returned, and you are notified with the result when it finishes. Do not poll the output file and do not append '&' to background commands. The timeout parameter does not apply to background tasks.",
+					"Run the command as a background task instead of staying attached. Use for long-running commands such as dev servers, watchers, long builds, or test suites that take minutes. The command starts immediately, output streams to a log file whose path is returned, and its result is delivered on a later turn (call wait_task to read it now). Do not poll the output file and do not append '&' to background commands. The timeout parameter does not apply to background tasks.",
 			}),
 		),
 		deadline_ms: Type.Optional(
@@ -2676,8 +2783,8 @@ export default function bgTasks(pi: ExtensionAPI) {
 	 */
 	const BG_GUIDE =
 		" Long-running commands can be backgrounded two ways: pass run_in_background: true (for a dev server, watcher or anything you do not need now) or just run it and let it outlive the attach window (timeout, default 2 minutes) — an outlived command is NOT killed, it keeps running as a background task and the call returns its task id." +
-		" Never wait with `sleep` and never poll a task's output file: you are told the task id, and when the process exits with nobody attached you are woken with its status and output tail." +
-		" If you have other work, do it. If the task's result is all that is left, either end your turn (that is the correct action, not giving up — the wake report starts a new turn) or call wait_task, which blocks until the task exits or its timeout hits and returns the output." +
+		" Never wait with `sleep` and never poll a task's output file: you are told the task id, and when the process exits its status and output tail are delivered on a later turn (or read the log, or call wait_task)." +
+		" If you have other work, do it. If the task's result is all that is left, ending your turn is correct (the result arrives on a later turn; a turn is not bought for it by default), or call wait_task, which blocks until the task exits or its timeout hits and returns the output." +
 		" A wait_task result of \"still running\" is not a failure." +
 		" A task you no longer need — a dev server holding a port, a watcher for a file you already fixed — is stopped with stop_task(task_id), which signals its whole process group; list_tasks shows what is still running." +
 		" A background task keeps its stdin open: if it is waiting on input (a confirmation, a name, a REPL line), answer it with task_input(task_id, data) instead of killing and restarting it." +
@@ -2713,7 +2820,7 @@ export default function bgTasks(pi: ExtensionAPI) {
 					content: [
 						{
 							type: "text" as const,
-							text: `Task ${task.taskId} running in background: ${command}\nOutput: ${task.outputFile}\nYou are woken with the result when it exits. Do not \`sleep\` or poll the file. If you have nothing else to do, ending your turn is the correct move; if you need the result before continuing, call wait_task(task_id: "${task.taskId}").`,
+							text: `Task ${task.taskId} running in background: ${command}\nOutput: ${task.outputFile}\nIts result is delivered on a later turn. Do not \`sleep\` or poll the file. If you need the result before continuing, call wait_task(task_id: "${task.taskId}").`,
 						},
 					],
 					details: {
@@ -2818,7 +2925,7 @@ export default function bgTasks(pi: ExtensionAPI) {
 				content: [
 					{
 						type: "text" as const,
-						text: `[still running] ${command}\nThe command outlived its ${formatSeconds(window)} attach window and keeps running as background task ${task.taskId} (not killed).\nOutput: ${task.outputFile}${soFar}\nCall wait_task(task_id: "${task.taskId}") to block until it exits, or end your turn and you will be woken with the result. Do not \`sleep\`.`,
+						text: `[still running] ${command}\nThe command outlived its ${formatSeconds(window)} attach window and keeps running as background task ${task.taskId} (not killed).\nOutput: ${task.outputFile}${soFar}\nCall wait_task(task_id: "${task.taskId}") to block until it exits; ending your turn is safe, its result arrives on a later turn. Do not \`sleep\`.`,
 					},
 				],
 				details: {
@@ -2865,7 +2972,7 @@ export default function bgTasks(pi: ExtensionAPI) {
 		timeout_ms: Type.Optional(
 			Type.Number({
 				description:
-					"How long to stay attached, in milliseconds (default 120000, max 1800000). Reaching it does NOT kill the task and is NOT a failure: call again, or end your turn and let the wake report deliver the result.",
+					"How long to stay attached, in milliseconds (default 120000, max 1800000). Reaching it does NOT kill the task and is NOT a failure: call again, or end your turn; the report is delivered on a later turn.",
 			}),
 		),
 		until: Type.Optional(
@@ -2896,12 +3003,12 @@ export default function bgTasks(pi: ExtensionAPI) {
 		name: "wait_task",
 		label: "Wait for background task",
 		description:
-			"Stay attached to a background bash task until it exits or the timeout hits, then return its output. Use this instead of `sleep` whenever you need a task's result before you can continue. Reaching the timeout is not a failure: the process keeps running and you can wait again (or end your turn and be woken when it exits). Pass `until` to wait for a LINE instead (a server's ready line, a port binding, a build stage): the call returns as soon as the text appears, the process keeps running, and its exit is still reported exactly once.",
+			"Stay attached to a background bash task until it exits or the timeout hits, then return its output. Use this instead of `sleep` whenever you need a task's result before you can continue. Reaching the timeout is not a failure: the process keeps running and you can wait again (or end your turn; the report is delivered on a later turn). Pass `until` to wait for a LINE instead (a server's ready line, a port binding, a build stage): the call returns as soon as the text appears, the process keeps running, and its exit is still reported exactly once.",
 		promptSnippet:
 			"Block until a background task exits, prints a line you pass as `until`, or the timeout hits, and return its output",
 		promptGuidelines: [
 			"Use wait_task (not `sleep`) when you need a background task's result before continuing: it returns as soon as the process exits, and a \"still running\" result is not a failure.",
-			"If a task's result is all that is left and you have nothing else to do, ending your turn is correct — wait_task's sibling wake report will deliver the result and start a new turn.",
+			"If a task's result is all that is left and you have nothing else to do, ending your turn is correct — the report is delivered on a later turn; call wait_task if you need it now.",
 			"To wait for a task to reach a state (a server's ready line, a port binding line, a build stage), pass `until` with the literal text to look for instead of `sleep`-polling its output file; a match does NOT stop the task, and its exit is still reported once.",
 		],
 		parameters: waitTaskParameters,
@@ -3049,7 +3156,7 @@ export default function bgTasks(pi: ExtensionAPI) {
 				content: [
 					{
 						type: "text" as const,
-						text: `[still running] Task ${task.taskId} has not exited after ${formatSeconds(window)} attached (running for ${elapsed}). This is not a failure — the process is still alive and was not killed.${neverPrinted}${soFar}\nCall wait_task again with a larger timeout_ms, or end your turn and you will be woken with the result. Do not \`sleep\`.`,
+						text: `[still running] Task ${task.taskId} has not exited after ${formatSeconds(window)} attached (running for ${elapsed}). This is not a failure — the process is still alive and was not killed.${neverPrinted}${soFar}\nCall wait_task again with a larger timeout_ms, or end your turn; the report is delivered on a later turn. Do not \`sleep\`.`,
 					},
 				],
 				details: {

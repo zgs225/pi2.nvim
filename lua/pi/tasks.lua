@@ -21,9 +21,9 @@ local M = {}
 ---@field pid integer|nil
 ---@field session_id string?  owning session id (passed in at event routing; nil = unknown ownership)
 ---@field tab integer?        owning tabpage handle (passed in at event routing; panel display)
----@field held_reason string? why an idle wake for this task's report is being
----                          held for the next user turn (see the bg-tasks
----                          extension's idle-wake gate); nil once delivered
+---@field held_reason string? why the paid turn for this task's report is held
+---                          for the next user turn (see the bg-tasks
+---                          extension's completion-wake gate); nil once delivered
 ---@field log_removed? boolean true once the panel deleted this task's log
 
 ---@class pi.TasksRow
@@ -148,14 +148,15 @@ local presence_group = nil
 
 -- Mirror the extension's clamping (extensions/bg-tasks.ts) so a published value
 -- means exactly what the backend will do with it.
+local DEFAULT_WAKE_POLICY = "never"
 local DEFAULT_WAKE_BUDGET = 2
 local MAX_WAKE_BUDGET = 10
 local DEFAULT_WAKE_CACHE_WINDOW_MS = 300000
 local MAX_WAKE_CACHE_WINDOW_MS = 86400000
 
---- Runtime file conveying the configured idle-wake policy to already-spawned
---- RPC processes, as JSON:
---- `{wake_on_idle:string, wake_budget:number, wake_cache_window_ms:number, present:boolean}`.
+--- Runtime file conveying the configured completion-wake policy to
+--- already-spawned RPC processes, as JSON:
+--- `{wake_on_completion:string, wake_budget:number, wake_cache_window_ms:number, present:boolean}`.
 --- The PID is part of the name because stdpath("run") is per-user, not
 --- per-process: without it two concurrently running nvim instances would clobber
 --- each other's policy.
@@ -222,9 +223,9 @@ local function watch_presence()
     end
 end
 
---- Publish the idle-wake policy for the extension. Always writes the file, so a
---- live setup() change (or an explicit `wake_on_idle = "never"`) reaches a
---- backend that was spawned earlier.
+--- Publish the completion-wake policy for the extension. Always writes the file,
+--- so a live setup() change (or an explicit `wake_on_completion = "never"`)
+--- reaches a backend that was spawned earlier.
 ---@param cfg pi.BackgroundTasksConfig?
 function M.publish(cfg)
     if cfg ~= nil then
@@ -232,12 +233,13 @@ function M.publish(cfg)
     end
     watch_presence()
     local c = published_cfg or {}
-    local policy = c.wake_on_idle
-    if policy ~= "always" and policy ~= "never" then
-        policy = "budgeted"
+    ---@diagnostic disable-next-line: undefined-field -- deprecated alias, kept for one update
+    local policy = c.wake_on_completion or c.wake_on_idle
+    if policy ~= "always" and policy ~= "failure" and policy ~= "never" then
+        policy = DEFAULT_WAKE_POLICY
     end
     local ok, payload = pcall(vim.json.encode, {
-        wake_on_idle = policy,
+        wake_on_completion = policy,
         wake_budget = clamp_int(c.wake_budget, DEFAULT_WAKE_BUDGET, MAX_WAKE_BUDGET),
         wake_cache_window_ms = clamp_int(
             c.wake_cache_window_ms,

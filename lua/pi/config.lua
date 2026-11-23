@@ -245,9 +245,10 @@
 ---@field auto_open? boolean Open the tasks panel when a background task starts in the current tab (default false)
 
 ---@class pi.BackgroundTasksConfig
----@field wake_on_idle? "always"|"budgeted"|"never" May a completion that lands while the agent is idle start a turn of its own? "budgeted" (default) allows `wake_budget` wakes per user prompt and then holds the rest for the next prompt; "always" wakes on every completion; "never" only ever delivers at a turn boundary or on the next user prompt (see doc/extensions.md#the-idle-wake-gate)
----@field wake_budget? integer Idle wakes allowed per user prompt under "budgeted" (default 2, 0…10). Replenished by the next user input, not by a clock
----@field wake_cache_window_ms? integer How old the last request may be before an idle wake is held instead of spent: a wake past the prompt-cache lifetime re-reads the whole conversation at full input price (default 300000 = the 5-minute cache TTL; 0 disables the window)
+---@field wake_on_idle? "always"|"budgeted"|"never" Deprecated alias for `wake_on_completion`, read only when the new key is absent
+---@field wake_on_completion? "never"|"budgeted"|"failure"|"always" May a completion buy a provider request? "never" (default) delivers it on a later turn without starting one; "budgeted" allows `wake_budget` paid turns per user prompt; "failure" only when the burst contains a non-zero exit, a signal, a spawn error or an unknown exit; "always" buys one on every completion (the pre-policy behaviour). A completion that rides a turn with natural tool work is always free. The old `wake_on_idle` key is still read as a fallback (see doc/extensions.md#the-completion-wake-gate)
+---@field wake_budget? integer Paid turns allowed per user prompt under "budgeted" and "failure" (default 2, 0…10). Replenished by the next user input, not by a clock
+---@field wake_cache_window_ms? integer How old the last request may be before a paid turn is held instead of spent: a wake past the prompt-cache lifetime re-reads the whole conversation at full input price (default 300000 = the 5-minute cache TTL; 0 disables the window)
 
 ---@class pi.DiffReviewListConfig
 ---@field position? "left"|"right" Side window placement (default "left")
@@ -391,7 +392,7 @@
 ---@field todo pi.TodoConfig
 ---@field sessions_list pi.SessionsListConfig
 ---@field tasks_panel pi.TasksPanelConfig
----@field background_tasks pi.BackgroundTasksConfig Idle-wake policy for the bundled background-bash extension (see doc/extensions.md#the-idle-wake-gate)
+---@field background_tasks pi.BackgroundTasksConfig Completion-wake policy for the bundled background-bash extension (see doc/extensions.md#the-completion-wake-gate)
 ---@field diff_review pi.DiffReviewConfig
 ---@field zen pi.ZenConfig
 ---@field prompt pi.PromptConfig
@@ -630,7 +631,7 @@ local defaults = {
         auto_open = false,
     },
     background_tasks = {
-        wake_on_idle = "budgeted",
+        wake_on_completion = "never",
         wake_budget = 2,
         wake_cache_window_ms = 300000,
     },
@@ -761,8 +762,8 @@ function M.setup(opts)
     -- every context event; same live-reload rationale as title/vision.
     require("pi.todo.tool_ui").publish(M.options.todo)
 
-    -- The bundled bg-tasks extension re-reads its idle-wake policy from a
-    -- runtime file at every wake decision; same live-reload rationale. The
+    -- The bundled bg-tasks extension re-reads its completion-wake policy from a
+    -- runtime file at every paid-turn decision; same live-reload rationale. The
     -- file also carries `present`, which the module refreshes on focus changes.
     require("pi.tasks").publish(M.options.background_tasks)
 end

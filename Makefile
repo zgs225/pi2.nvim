@@ -158,10 +158,11 @@ e2e-bg-fallback:
 e2e-bg-wake:
 	$(NVIM_BIN) --headless -u $(MIN_INIT) -l scripts/e2e/bg_tasks_wake.lua
 
-# Real-pi e2e for the idle-wake COST GATE: a completion that would otherwise
-# start its own turn is held (`never`, or a spent budget), the hold is announced
-# with its reason, the report is not persisted or woken, and it rides the next
-# user prompt exactly once. Needs the pi binary only — runs in CI.
+# Real-pi e2e for the completion-wake COST GATE: a completion that would
+# otherwise buy a turn — while idle, or at the final answer's boundary — is held
+# (`never`, a spent budget, or the per-run continuation cap), the hold is
+# announced with its reason, and the report rides the next user prompt exactly
+# once. Needs the pi binary only — runs in CI.
 e2e-bg-wake-gate:
 	$(NVIM_BIN) --headless -u $(MIN_INIT) -l scripts/e2e/bg_tasks_wake_gate.lua
 

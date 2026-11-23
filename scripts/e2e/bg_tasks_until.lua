@@ -507,12 +507,16 @@ local function main()
     -- The child pi inherits this env; nothing touches the user's real config.
     vim.env.PI_CODING_AGENT_DIR = agent_dir
     vim.env.PI_OFFLINE = "1"
-    -- Drop the frontend's idle-wake policy file. This script IS run from pi.nvim
-    -- sometimes (a developer's shell inherits it), and the published policy says
-    -- `present: false` whenever the editor is unfocused, which holds the exit
-    -- report instead of waking — the very report case U1.3/U2.2 assert. Unset, the
-    -- extension falls back to `present: true`, i.e. what a plain pi does.
-    vim.env.PI_NVIM_BG_TASKS_FILE = nil
+    -- Write our own policy file instead of inheriting the editor's: this script
+    -- IS run from pi.nvim sometimes, and the published policy says `present:
+    -- false` whenever the editor is unfocused (which holds the exit report) and
+    -- now defaults to `never` anyway. The cases assert the exit report, so opt
+    -- into paid wakes explicitly.
+    local prefs_path = RUN_ROOT .. "/bg-tasks.json"
+    local prefs = assert(io.open(prefs_path, "w"))
+    prefs:write(vim.json.encode({ wake_on_completion = "always", present = true }))
+    prefs:close()
+    vim.env.PI_NVIM_BG_TASKS_FILE = prefs_path
 
     local provider = start_fake_provider()
     local addr = provider.server:getsockname()

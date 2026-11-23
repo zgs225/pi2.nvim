@@ -588,7 +588,7 @@ describe("bg-tasks extension contract", function()
     it("never tells the model to sleep, and authorizes ending the turn", function()
         local src = read_extension()
         assert.is_truthy(src:find("Never wait with `sleep`", 1, true))
-        assert.is_truthy(src:find("ending your turn is the correct", 1, true))
+        assert.is_truthy(src:find("ending your turn is correct", 1, true))
         assert.is_truthy(src:find("is not a failure", 1, true))
     end)
 
@@ -1047,8 +1047,12 @@ describe("bg-tasks extension contract", function()
         assert.is_truthy(sender:find("display: false", 1, true), "the check-in is display:false")
         assert.is_nil(sender:find("details:", 1, true), "and carries NO details: no phantom panel row")
         assert.is_truthy(
-            sender:find("busy ? undefined : { triggerTurn: true }", 1, true),
-            "a wake only when the session is idle"
+            sender:find('const mayWake = !busy && readWakePrefs().policy !== "never"', 1, true),
+            "a wake only when the session is idle and the paid-turn policy allows one"
+        )
+        assert.is_truthy(
+            sender:find("mayWake ? { triggerTurn: true } : { triggerTurn: false }", 1, true),
+            "an idle check-in wakes; a busy/held one is stored without steering"
         )
         assert.is_truthy(sender:find("catch", 1, true), "a stale extension ctx must not throw into a timer")
         assert.is_nil(sender:find("markSent", 1, true), "a check-in is outside the delivery ladder")
@@ -1409,39 +1413,51 @@ describe("resumed session (history replay)", function()
     end)
 end)
 
-describe("bg-tasks idle-wake gate contract", function()
-    it("gates the idle wake behind an explicit policy lookup", function()
+describe("bg-tasks completion-wake gate contract", function()
+    it("gates both paid channels behind one explicit decision", function()
         local src = read_extension()
-        assert.is_truthy(src:find("function idleWakeHold", 1, true))
+        assert.is_truthy(src:find("function completionWakeHold(", 1, true))
         assert.is_truthy(src:find('const PREFS_ENV = "PI_NVIM_BG_TASKS_FILE"', 1, true))
-        -- The decision runs inside the coalescing timer, i.e. only on the idle
-        -- path: a boundary delivery is already paid for by the run it joins.
-        local decision = src:find("const hold = idleWakeHold(pending)", 1, true)
-        assert.is_truthy(decision)
-        local held = src:find("markHeld(pending, hold)", 1, true)
-        assert.is_truthy(held)
-        assert.is_true(decision < held)
-        -- The counter moves only on the path that actually sends a wake.
-        local bump = src:find("wakesThisTurn += 1", 1, true)
-        assert.is_truthy(bump)
-        assert.is_true(held < bump)
+        -- A boundary with nothing left and an idle completion both buy a turn,
+        -- so both ask the same gate. A boundary with natural tool work does not.
+        assert.is_truthy(src:find('completionWakeHold(pending, prefs, "boundary")', 1, true))
+        assert.is_truthy(src:find('completionWakeHold(pending, readWakePrefs(), "idle")', 1, true))
+        -- One paid continuation per run, reset when the run starts.
+        assert.is_truthy(src:find('if (channel === "boundary" && continuedThisRun)', 1, true))
+        assert.is_truthy(src:find("continuedThisRun = false", 1, true))
     end)
 
-    it("names every reason a wake can be held", function()
+    it("names every reason a paid turn can be held", function()
         local src = read_extension()
         assert.is_truthy(
-            src:find('type HoldReason = "policy" | "absent" | "cache" | "stale" | "budget"', 1, true),
+            src:find(
+                'type HoldReason = "policy" | "absent" | "cache" | "stale" | "failure" | "continuation" | "budget"',
+                1,
+                true
+            ),
             "each rule must be nameable in the panel and in list_tasks"
         )
     end)
 
-    it("defaults to a budgeted policy that keeps plain pi working", function()
+    it("defaults to never, with budgeted/failure/always available", function()
         local src = read_extension()
-        assert.is_truthy(src:find('const DEFAULT_WAKE_POLICY: WakePolicy = "budgeted"', 1, true))
+        assert.is_truthy(src:find('const DEFAULT_WAKE_POLICY: WakePolicy = "never"', 1, true))
+        assert.is_truthy(src:find('const WAKE_POLICIES = ["never", "budgeted", "failure", "always"] as const', 1, true))
         assert.is_truthy(src:find("const DEFAULT_WAKE_BUDGET = 2", 1, true))
         assert.is_truthy(src:find("const DEFAULT_WAKE_CACHE_WINDOW_MS = 5 * 60 * 1000", 1, true))
         -- No frontend file (plain TUI / SDK) must mean "someone may be reading".
         assert.is_truthy(src:find("present: true,", 1, true))
+    end)
+
+    it("treats the bash timeout as seconds, not milliseconds", function()
+        local src = read_extension()
+        -- pi's bash schema is seconds; clamping the raw value as ms turned
+        -- `timeout: 120` into a 1 s attach window and made every call detach.
+        local start = assert(src:find("function clampAttachWindow", 1, true))
+        local stop = assert(src:find("function clampWaitWindow", start, true))
+        local fn = src:sub(start, stop)
+        assert.is_truthy(fn:find("Math.round(timeoutSeconds * 1000)", 1, true), "seconds are converted to ms")
+        assert.is_nil(fn:find("Math.floor(timeout)", 1, true), "the raw seconds value must not be clamped as ms")
     end)
 
     it("replenishes the budget and refreshes the cache clock from real activity", function()

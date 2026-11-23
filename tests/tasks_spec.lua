@@ -755,7 +755,7 @@ describe("pi.tasks _reset", function()
     end)
 end)
 
-describe("pi.tasks idle-wake policy file", function()
+describe("pi.tasks completion-wake policy file", function()
     local path
 
     before_each(function()
@@ -781,7 +781,7 @@ describe("pi.tasks idle-wake policy file", function()
     it("publishes the defaults the extension falls back to", function()
         Tasks.publish(nil)
         local published = Tasks.published()
-        assert.are.equal("budgeted", published.wake_on_idle)
+        assert.are.equal("never", published.wake_on_completion)
         assert.are.equal(2, published.wake_budget)
         assert.are.equal(300000, published.wake_cache_window_ms)
         -- Headless (`-l`, `:embed`) has no UI a human could be present at.
@@ -790,24 +790,34 @@ describe("pi.tasks idle-wake policy file", function()
     end)
 
     it("clamps what it publishes, so the file means what the backend will do", function()
-        Tasks.publish({ wake_on_idle = "never", wake_budget = 99, wake_cache_window_ms = -5 })
+        Tasks.publish({ wake_on_completion = "never", wake_budget = 99, wake_cache_window_ms = -5 })
         local published = Tasks.published()
-        assert.are.equal("never", published.wake_on_idle)
+        assert.are.equal("never", published.wake_on_completion)
         assert.are.equal(10, published.wake_budget)
         assert.are.equal(0, published.wake_cache_window_ms)
 
-        Tasks.publish({ wake_on_idle = "sometimes", wake_budget = 1.6, wake_cache_window_ms = 999999999999 })
+        Tasks.publish({ wake_on_completion = "sometimes", wake_budget = 1.6, wake_cache_window_ms = 999999999999 })
         published = Tasks.published()
-        assert.are.equal("budgeted", published.wake_on_idle, "an unknown policy falls back, never guesses")
+        assert.are.equal("never", published.wake_on_completion, "an unknown policy falls back, never guesses")
         assert.are.equal(1, published.wake_budget)
         assert.are.equal(86400000, published.wake_cache_window_ms)
     end)
 
+    it("accepts the failure policy and the legacy wake_on_idle key", function()
+        Tasks.publish({ wake_on_completion = "failure" })
+        assert.are.equal("failure", Tasks.published().wake_on_completion)
+
+        -- A backend from an older update still reads the old key; keep publishing
+        -- a usable policy when only that one is set.
+        Tasks.publish({ wake_on_idle = "always" })
+        assert.are.equal("always", Tasks.published().wake_on_completion)
+    end)
+
     it("keeps the last config when republishing for a focus change", function()
-        Tasks.publish({ wake_on_idle = "never", wake_budget = 0, wake_cache_window_ms = 0 })
+        Tasks.publish({ wake_on_completion = "never", wake_budget = 0, wake_cache_window_ms = 0 })
         Tasks.publish() -- a focus change publishes `present` alone
         local published = Tasks.published()
-        assert.are.equal("never", published.wake_on_idle)
+        assert.are.equal("never", published.wake_on_completion)
         assert.are.equal(0, published.wake_budget)
     end)
 

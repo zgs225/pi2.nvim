@@ -11,7 +11,7 @@
 --   T1  bash(run_in_background: true, `IFS= read -r line; printf ... > out`)
 --   T2  task_input(<id from T1>, "hello")
 --   T3  wait_task(<id>)
---   T4  bash(`sleep 900`, timeout 1000)        — foreground, detaches
+--   T4  bash(`sleep 900`, timeout 1)            — foreground, detaches after 1 s
 --   T5  task_input(<id from T4>)               — must refuse: no stdin pipe
 --   T6  stop_task(<id from T4>)
 --   T7  "done"
@@ -175,7 +175,7 @@ local function respond(provider)
     end
 
     if turn == 4 then
-        return tool_turn("bash", { command = "sleep 900", timeout = 1000 })
+        return tool_turn("bash", { command = "sleep 900", timeout = 1 })
     end
 
     if turn == 5 then
@@ -401,6 +401,15 @@ local function main()
 
     vim.env.PI_CODING_AGENT_DIR = agent_dir
     vim.env.PI_OFFLINE = "1"
+
+    -- These cases exercise the delivery ladder, not the cost gate: opt into a
+    -- paid wake explicitly. The default policy is `never`, which would (rightly)
+    -- hold the report for the next user prompt.
+    local prefs_path = RUN_ROOT .. "/bg-tasks.json"
+    local prefs = assert(io.open(prefs_path, "w"))
+    prefs:write(vim.json.encode({ wake_on_completion = "always", present = true }))
+    prefs:close()
+    vim.env.PI_NVIM_BG_TASKS_FILE = prefs_path
 
     local provider = start_fake_provider(out_path)
     local addr = provider.server:getsockname()
