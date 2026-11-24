@@ -747,6 +747,11 @@ function M.compact(custom_instructions, session)
         return
     end
 
+    -- Remember the focus for the record this compaction will produce: the
+    -- session carries it into `compaction_end`, and the focus dialog offers it
+    -- again next time. Blank input clears it.
+    Sessions.set_compaction_focus(session, custom_instructions)
+
     session.chat:set_compacting(true)
     session.chat:set_status({ type = "compaction" })
 
@@ -769,6 +774,63 @@ function M.compact(custom_instructions, session)
         session.chat:set_compacting(false)
         session.chat:set_status(nil)
     end
+end
+
+--- Abort the compaction that is running.
+---
+--- Sent as the generic `abort` request: pi cancels the summarisation in flight
+--- and reports the compaction as aborted, which the history block renders and
+--- `pi.compact_retry` can replay.
+---@return boolean aborted True when the abort request was handed to the process
+function M.compact_abort()
+    local Notify = require("pi.notify")
+    local session = require("pi.sessions.manager").get()
+    if not session or not session.chat:is_compacting() then
+        Notify.warn("No compaction is running")
+        return false
+    end
+    if not session.rpc:is_running() then
+        Notify.warn("No active session")
+        return false
+    end
+    if not session.rpc:send({ type = "abort" }) then
+        Notify.warn("Could not reach the π process")
+        return false
+    end
+    Notify.info("Compaction abort requested")
+    return true
+end
+
+--- Retry the last compaction when it failed or was aborted, with the same
+--- focus text.
+---
+--- "Same focus" is the session's most recent focus: the failed attempt recorded
+--- it, so a retry repeats exactly what the user asked for instead of dropping
+--- back to a generic summary. A retry is refused while another compaction runs,
+--- and when the last record succeeded (there is nothing to repair then).
+---@return boolean retried True when a replacement compaction was started
+function M.compact_retry()
+    local Notify = require("pi.notify")
+    local Sessions = require("pi.sessions.manager")
+    local session = Sessions.get()
+    if not session then
+        Notify.warn("No active session")
+        return false
+    end
+    if session.chat:is_compacting() then
+        Notify.warn("A compaction is already running")
+        return false
+    end
+
+    local state = Sessions.get_compaction_state(session)
+    local last = state and state.records[#state.records] or nil
+    if not last or not (last.aborted or last.error) then
+        Notify.warn("Nothing to retry: the last compaction did not fail")
+        return false
+    end
+
+    M.compact(state and state.last_focus or nil)
+    return true
 end
 
 --- Toggle automatic context compaction.

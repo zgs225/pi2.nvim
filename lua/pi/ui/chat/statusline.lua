@@ -39,6 +39,7 @@
 ---@field abort_hint string? Transient "press <Esc> again to abort" hint
 ---@field aborted_notice string? Transient "Aborted" confirmation
 ---@field queue_count integer Number of pending (steer/follow-up) queue entries
+---@field compaction_budget pi.CompactionBudget? Distance to pi's automatic compaction threshold (nil = unknown). Shape: `{ window, reserve, keep, threshold, pathological, enabled, invalid? }` — only threshold/enabled/pathological/invalid change the countdown
 
 ---@class pi.StatusLine
 ---@field _buf integer
@@ -47,6 +48,7 @@
 ---@field _extmark_id integer?
 ---@field _virt_line_count integer
 ---@field _state pi.StatusLineState
+---@field _compaction_budget_key string Cheap identity of the last budget pushed (skip a re-render when unchanged)
 local StatusLine = {}
 StatusLine.__index = StatusLine
 
@@ -79,6 +81,63 @@ local function component_config(name)
     local components = ((Config.options.statusline or {}).components or {})
     local cfg = components[name]
     return type(cfg) == "table" and cfg or {}
+end
+
+--- Identity of the budget fields the context countdown renders.
+--- The push happens on every get_state response and after every compaction,
+--- so an unchanged budget must not re-render the status line.
+---@param budget pi.CompactionBudget?
+---@return string
+local function budget_key(budget)
+    if type(budget) ~= "table" then
+        return ""
+    end
+    return table.concat({
+        tostring(budget.threshold),
+        tostring(budget.keep),
+        tostring(budget.enabled),
+        tostring(budget.pathological),
+        tostring(budget.invalid),
+    }, "|")
+end
+
+--- Distance to pi's automatic compaction threshold, as a suffix of the context
+--- component (" · 37k to compact").
+--- Returns nil when the countdown is disabled, pi's compaction is off, or no
+--- budget was pushed. `threshold <= tokens` means pi compacts at the next
+--- turn boundary, so no negative number is ever shown.
+---@param cfg table Context component config
+---@param state pi.StatusLineState
+---@param tokens integer Current context occupancy
+---@return string? suffix
+---@return string? hl
+local function countdown_suffix(cfg, state, tokens)
+    if cfg.countdown == false then
+        return nil
+    end
+    local budget = state.compaction_budget
+    if type(budget) ~= "table" or budget.enabled == false then
+        return nil
+    end
+    if budget.pathological then
+        -- keep >= threshold: nothing is cuttable, so the countdown would read
+        -- as a number that never shrinks (pi #12076).
+        return " · keep ≥ budget", "PiStatusLineError"
+    end
+    if budget.invalid then
+        -- The manager warns with the offending path; the status line only
+        -- marks that the number below it is not trustworthy.
+        return " · ?", "PiStatusLineError"
+    end
+    local threshold = tonumber(budget.threshold)
+    if not threshold then
+        return nil
+    end
+    local remaining = threshold - tokens
+    if remaining <= 0 then
+        return " · at compaction threshold"
+    end
+    return " · " .. format_tokens(remaining) .. " to compact"
 end
 
 --- Normalize a component return value into chunks.
@@ -162,7 +221,9 @@ function builtin.cost(state)
     return text
 end
 
---- 63.9%/200k or -/200k when context is unknown
+--- 63.9%/200k or -/200k when context is unknown, followed by the distance to
+--- pi's automatic compaction threshold (" · 37k to compact") when a budget is
+--- known and the component's `countdown` is not disabled.
 function builtin.context(state)
     if not state.model_context_window or state.model_context_window <= 0 then
         return nil
@@ -174,12 +235,26 @@ function builtin.context(state)
     end
     local pct = (state.context_tokens / state.model_context_window) * 100
     local text = string.format("%.1f%%/%s", pct, total)
+    local hl
     if cfg.error and pct > cfg.error then
-        return text, "PiStatusLineError"
+        hl = "PiStatusLineError"
     elseif cfg.warn and pct > cfg.warn then
-        return text, "PiStatusLineWarning"
+        hl = "PiStatusLineWarning"
     end
-    return text
+
+    local suffix, suffix_hl = countdown_suffix(cfg, state, state.context_tokens)
+    if not suffix then
+        return text, hl
+    end
+    -- An unusable budget (pathological/invalid) reads as an error on the whole
+    -- component, but a percentage that already has something to say keeps its
+    -- own warn/error highlight.
+    if suffix_hl == "PiStatusLineError" and not hl then
+        hl = "PiStatusLineError"
+    end
+    -- Separate chunk: the percentage keeps its own highlight, and a narrow
+    -- window truncates the suffix (which comes last) instead of the percentage.
+    return { { text, hl }, { suffix, suffix_hl } }
 end
 
 --- 󰏗 — auto-compaction enabled (hidden when disabled).
@@ -367,6 +442,7 @@ local function new_state()
         abort_hint = nil,
         aborted_notice = nil,
         queue_count = 0,
+        compaction_budget = nil,
     }
 end
 
@@ -382,6 +458,7 @@ function StatusLine.new(buf, tab, win_fn)
     self._extmark_id = nil
     self._virt_line_count = 0
     self._state = new_state()
+    self._compaction_budget_key = ""
     self:render()
     return self
 end
@@ -529,6 +606,20 @@ end
 ---@param count integer
 function StatusLine:set_queue_count(count)
     self._state.queue_count = count
+    self:render()
+end
+
+--- Set (or clear) the distance to pi's automatic compaction threshold.
+--- Pushed on every get_state response and after every compaction, so an
+--- unchanged budget must not re-render the status line.
+---@param budget pi.CompactionBudget?
+function StatusLine:set_compaction_budget(budget)
+    self._state.compaction_budget = budget
+    local key = budget_key(budget)
+    if key == self._compaction_budget_key then
+        return
+    end
+    self._compaction_budget_key = key
     self:render()
 end
 

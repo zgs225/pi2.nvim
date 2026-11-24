@@ -793,6 +793,7 @@ end
 ---@field sessions boolean
 ---@field tasks boolean
 ---@field todo boolean
+---@field compactions boolean
 
 --- Which tab-level panels are open for this chat's tab.
 ---@return pi.ChatUiPanels
@@ -802,13 +803,14 @@ function Chat:ui_snapshot()
         sessions = require("pi.ui.sessions").win(tab) ~= nil,
         tasks = require("pi.ui.tasks").win(tab) ~= nil,
         todo = require("pi.todo").win(tab) ~= nil,
+        compactions = require("pi.ui.compactions").win(tab) ~= nil,
     }
 end
 
 ---@param snap pi.ChatUiPanels
 ---@return boolean
 local function any_panel(snap)
-    return snap.sessions or snap.tasks or snap.todo
+    return snap.sessions or snap.tasks or snap.todo or snap.compactions
 end
 
 --- Whether any part of this tab's π UI is on screen: the chat windows or one
@@ -841,6 +843,9 @@ function Chat:_restore_ui_panels()
     if snap.todo then
         require("pi.todo").open()
     end
+    if snap.compactions then
+        require("pi.ui.compactions").open()
+    end
 end
 
 --- Show the whole π UI for this chat: the chat windows plus the panels that
@@ -868,6 +873,7 @@ function Chat:hide_ui()
     require("pi.ui.tasks").close_outputs(tab)
     require("pi.ui.tasks").close_tab(tab)
     require("pi.todo").close_tab(tab)
+    require("pi.ui.compactions").close_tab(tab)
     self:hide()
 end
 
@@ -1079,7 +1085,15 @@ end
 --- (same as :PiAbort / pi.abort()). A timer disarms automatically once the
 --- window elapses. Outside of streaming/retrying, or when the feature is
 --- disabled, this is a no-op so <Esc> keeps its normal behavior.
+---
+--- A compaction is the one exception: it is not a model turn the user might
+--- want to let finish, so a single <Esc> aborts it outright — no armed state,
+--- no hint row, no second press.
 function Chat:_handle_abort_esc()
+    if self._compacting and (Config.options.abort or {}).enabled ~= false then
+        require("pi").compact_abort()
+        return
+    end
     if not (self._streaming or self._retrying) then
         -- A single <Esc> cancels a running direct bash command (TUI behavior).
         if self._bash_running then
@@ -2072,6 +2086,17 @@ function Chat:update_state(data)
     end
 end
 
+--- Push the compaction budget (the distance to pi's automatic compaction
+--- threshold, see `pi.CompactionBudget`) to the status line; `nil` clears it.
+---@param budget pi.CompactionBudget?
+function Chat:set_compaction_budget(budget)
+    local statusline = self._prompt and self._prompt:statusline()
+    if not statusline then
+        return
+    end
+    statusline:set_compaction_budget(budget)
+end
+
 --- Push the provider disambiguation suffix to the statusline model component.
 --- Keyed by provider/id: a suffix computed for a model that is no longer
 --- active is dropped by the statusline. Called by the session manager after
@@ -2143,10 +2168,30 @@ function Chat:append_system_note(chunks)
     self._history:append_system_note(chunks)
 end
 
+--- Append a compaction summary block to the chat history.
+--- `meta` carries the richer record the history renders (reason, token
+--- counts, files, retry/invalid markers); a history that does not know it yet
+--- simply ignores the extra argument.
 ---@param summary string
 ---@param tokens_before integer
-function Chat:append_compaction_summary(summary, tokens_before)
-    self._history:append_compaction_summary(summary, tokens_before)
+---@param meta table?
+function Chat:append_compaction_summary(summary, tokens_before, meta)
+    self._history:append_compaction_summary(summary, tokens_before, meta)
+end
+
+--- Jump to the compaction block that produced `summary`/`tokens_before`.
+--- Returns false when there is no history (or a history without the lookup
+--- yet) or the block is not on screen.
+---@param summary string
+---@param tokens_before integer
+---@return boolean jumped
+function Chat:jump_to_compaction(summary, tokens_before)
+    local history = self._history
+    local jump = history and history.jump_to_compaction
+    if type(jump) ~= "function" then
+        return false
+    end
+    return jump(history, summary, tokens_before) == true
 end
 
 --- Re-render the prompt status line.

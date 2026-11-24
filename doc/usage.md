@@ -54,7 +54,7 @@ Each chat contains three panels:
 
 The filetype names are stable — you can target them from your own `FileType` autocmds (see [Keymaps](keymaps.md) for an example). Input and info dialog buffers use the stable `pi-dialog` filetype, so completion plugins can be disabled there without affecting the prompt.
 
-Use `:PiToggleLayout` to swap `side` ↔ `float` without losing the conversation, and `:PiToggleChat` to hide and re-show the whole π UI of the tab — the chat windows plus the side panels (`:PiSessions`, `:PiTasks`, `:PiTodo`). The panels that were open when it hid are reopened on the next toggle, while a panel you had already closed stays closed; with no session in the tab the toggle still closes the panels it can see. Neither command stops the agent. To actually shut down the underlying `pi --mode rpc` process for the current tab, use `:PiStop`.
+Use `:PiToggleLayout` to swap `side` ↔ `float` without losing the conversation, and `:PiToggleChat` to hide and re-show the whole π UI of the tab — the chat windows plus the side panels (`:PiSessions`, `:PiTasks`, `:PiTodo`, `:PiCompactions`). The panels that were open when it hid are reopened on the next toggle, while a panel you had already closed stays closed; with no session in the tab the toggle still closes the panels it can see. Neither command stops the agent. To actually shut down the underlying `pi --mode rpc` process for the current tab, use `:PiStop`.
 
 Each panel has a winbar with a title controlled by `panels.<panel>.title` (a string; defaults: `π`, `prompt`, `attached`). In side layout, the winbar can be disabled per-panel with `layout.side.panels.<panel>.winbar = false`. Separately, `panels.<panel>.name = function(tab_id) return ... end` lets you compute the underlying buffer name per tab — useful for distinguishing multiple π conversations in `:buffers`, statuslines, or tab bars. The prompt panel has an extra `panels.prompt.bash_title`: while the prompt text starts with `!` (direct bash mode, see below), the prompt title switches to this string and is drawn with the `PiChatPromptWinbarBashTitle` / `PiChatPromptFloatBashTitle` highlight groups (a distinct foreground color, derived from `WarningMsg` by default) so it's obvious you're about to run a shell command rather than message the agent.
 
@@ -546,7 +546,7 @@ The **center** group is centered in the window and has placement priority: when 
 | `tokens` | `↑3.8k ↓58k` | Total input/output tokens used this session |
 | `cache` | `R7.2M W416k` | Total prompt-cache read/write |
 | `cost` | `$7.665` | Session cost is greater than zero |
-| `context` | `63.9%/200k` | Current context window usage — percentage + total |
+| `context` | `63.9%/200k` | Current context window usage — percentage + total. With a known compaction budget it appends the distance to pi's automatic compaction threshold (`63.9%/200k · 37k to compact`) |
 | `compaction` | 󰏗 | Auto-compaction is enabled — the same icon as the compaction summary label |
 | `attention` | `󰵚` / `󰵚 2` | There's at least one pending attention request |
 | `model` | `claude-opus-4-6` / `claude-opus-4-6  [anthropic]` | A model is active. The `[provider]` suffix appears when the same model id is served by several providers (or by one provider through several base URLs) — see the `provider` option below |
@@ -577,7 +577,9 @@ statusline = {
         -- `context` supports warning / error thresholds as percentages
         -- of the model's context window. When crossed, the value is
         -- rendered in `PiStatusLineWarning` / `PiStatusLineError`.
-        context = { icon = "", warn = 70, error = 90 },
+        -- `countdown = true` (default) appends the distance to pi's
+        -- automatic compaction threshold; see Statusline below.
+        context = { icon = "", warn = 70, error = 90, countdown = true },
 
         -- `cost` supports the same thresholds as raw numbers.
         -- cost = { icon = "", warn = 5, error = 10 },
@@ -699,6 +701,56 @@ Sections:
 - **Context** — current context-window usage with a threshold-colored bar (yellow above 70%, red above 90%, like the statusline `context` component); shows `?` until the first response after a compaction.
 
 The command is a silent no-op without an active session. `q`/`<Esc>`/`<CR>` close the panel; closing any of the panel's windows closes the rest.
+
+### Compaction countdown
+
+The `context` component answers "how much of the window is used"; with `components.context.countdown = true` (the default) it also answers "how long until pi compacts on its own":
+
+```
+63.9%/200k · 37k to compact
+```
+
+The suffix is `window - reserveTokens` (pi's `compaction.reserveTokens`, default 16384) minus the live occupancy, resolved from pi's own settings files (`~/.pi/agent/settings.json` and the session checkout's `.pi/settings.json`, including `compaction.modelOverrides` for the current `provider/modelId`). The files are read lazily and cached by their size+mtime stamp, so the countdown never touches the session-start path and an edit is picked up on the next refresh.
+
+Two configurations the countdown makes visible instead of hiding:
+
+- `keep ≥ budget` — `keepRecentTokens` is at or above `window - reserveTokens`, so pi cannot find a cut point at all (upstream #12076). The component turns red and the manager warns once with the numbers. Lower `compaction.keepRecentTokens` in pi settings or use a larger window.
+- `· ?` — a compaction setting is invalid (wrong type, zero, negative, or the file does not parse). The next valid layer answers for the value, and the warning names the dotted path. Set `countdown = false` to drop the suffix entirely; with `compaction.enabled = false` it is omitted too, because there is no threshold to count down to.
+
+Auto-compaction itself stays pi's: `:PiToggleAutoCompaction` / `pi.toggle_auto_compaction()` flips it, and the `compaction` icon shows the state.
+
+## Compaction timeline (`:PiCompactions`)
+
+`:PiCompactions` opens a read-only timeline of every compaction this session ran, newest first. It is the after-the-fact view the chat block cannot give you: one row per compaction, with the numbers pi reported and the actions that make them useful.
+
+```
+#3  14:32  threshold  150k → 32k  12s  $0.003  12/4 files  "Auth refactor…"  󰏗pi2
+#2  13:05  manual      98k → 28k   8s  $0.002   9/2 files  "Focus on tests"
+#1  11:20  overflow   210k → 40k  21s  $0.006  20/6 files  "Recovered from 400"
+```
+
+- `#N` / `14:32` — the compaction's ordinal in the session and its local time.
+- `reason` — `manual` (`:PiCompact`), `threshold` (pi's auto-compaction) or `overflow` (recovery from a provider context-overflow error).
+- `before → after` — the occupancy pi reported and its heuristic estimate of the rebuilt context. A resumed session whose entry predates the estimate shows `?`.
+- duration, summary cost and `read/modified` file counts — only the parts pi reported.
+- the summary's first line, flattened and elided; the trailing `󰏗pi2` marks a summary produced by the bundled pi2-compaction checkpoint layer.
+- `aborted` / `failed` for a cancelled or failed compaction, in the warning colour.
+
+Keys (buffer-local, list only):
+
+| Key | Action |
+| --- | --- |
+| `<CR>` | Jump to this compaction's block in the chat history |
+| `gp` | Show the full summary in a float |
+| `d` | Diff this summary against the previous compaction (unified) |
+| `y` | Copy the summary to the clipboard |
+| `r` | Request a new compaction with this one's focus instructions |
+| `q` | Close the panel |
+| `?` | Toggle a help overlay listing these keys |
+
+Rows come from the live RPC events (`compaction_end` carries the reason, both token counts, the usage and the file lists). For a resumed session the panel also reads the persisted compaction entries once per session file, so the timeline is complete without replaying the conversation; without a session or before the first compaction it shows an empty list instead of an error.
+
+The panel is a float by default; `compaction.panel.mode = "side"` puts it in the tab's right column (the same geometry plumbing as `:PiTasks`), and `compaction.panel.width` / `height` size it.
 
 ## Navigation
 

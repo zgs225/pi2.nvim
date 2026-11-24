@@ -139,6 +139,7 @@
 ---@field icon? string|false Prefix icon rendered before the component text. Use false to disable.
 ---@field warn? number Percentage threshold for warning highlight (default 70)
 ---@field error? number Percentage threshold for error highlight (default 90)
+---@field countdown? boolean Append the distance to pi's automatic compaction threshold ("· 37k to compact"), computed from the effective pi settings (default true)
 
 ---@class pi.StatusLineCostConfig
 ---@field icon? string|false Prefix icon rendered before the component text. Use false to disable.
@@ -244,6 +245,50 @@
 ---@field width integer Window width for left/right placement in the side layout (default 40)
 ---@field height integer Window height for top/bottom placement in the side layout (default 12)
 ---@field auto_open? boolean Open the tasks panel when a background task starts in the current tab (default false)
+
+---@class pi.CompactionCleanerConfig Bounded, deterministic file lists for pi's default compaction (no LLM)
+---@field enabled? boolean Bound the file lists before pi summarises (default true)
+---@field max_read? integer Keep at most this many read paths (default 50)
+---@field max_modified? integer Keep at most this many modified paths (default 100)
+---@field drop_temp? boolean Drop OS temp dirs, pi subagent artifacts and editor run files (default true)
+---@field drop_build? boolean Drop build output, caches, lockfiles and dependency directories (default true)
+---@field strip_previous_lists? boolean Strip `<read-files>` / `<modified-files>` from previousSummary before the update prompt (default true)
+
+---@class pi.CompactionCheckpointConfig Take over summary generation with the bundled pi2-compaction extension (opt-in)
+---@field enabled? boolean Generate the summary ourselves (default false: keep pi's native summariser and only clean its input)
+---@field model? string Summary model as `provider/modelId` (default nil: the session model)
+---@field thinking_level? string Summary thinking level (default nil: the session level)
+---@field language? "auto"|"english"|"conversation" Summary language: body follows the conversation language, or always English (default "auto")
+---@field max_words? integer Target summary length in words (default 1500, 200…6000)
+
+---@class pi.CompactionStateConfig Inject a compact state snapshot after a compaction
+---@field enabled? boolean Inject the `[pi2 state]` snapshot into the first request after a compaction (default true)
+---@field max_tokens? integer Hard size budget for the snapshot (default 1000, 100…4000)
+
+---@class pi.CompactionPruneConfig Replace old tool results with pointers at a turn boundary (opt-in)
+---@field enabled? boolean Prune old tool results when the context passes the watermark (default false)
+---@field high_water? number Context fraction that arms pruning (default 0.7, 0.3…0.95)
+---@field min_turns? integer Keep the tool results of at least this many recent turns (default 8, 1…100)
+
+---@class pi.CompactionOwnerConfig
+---@field detect? boolean Detect a third-party compaction extension taking over and say so once (default true)
+
+---@class pi.CompactionExtensionConfig The bundled pi2-compaction extension (extensions/compaction.ts)
+---@field enabled? boolean Inject the extension into every pi process (default true)
+---@field cleaner? pi.CompactionCleanerConfig
+---@field checkpoint? pi.CompactionCheckpointConfig
+---@field state? pi.CompactionStateConfig
+---@field prune? pi.CompactionPruneConfig
+---@field owner? pi.CompactionOwnerConfig
+
+---@class pi.CompactionPanelConfig Timeline panel opened by `:PiCompactions`
+---@field mode? "float"|"side" Open as a float or in the tab's side column (default "float")
+---@field width? integer Window width in columns (float) or side width (default 100 / 50)
+---@field height? integer Window height in rows (default 22)
+
+---@class pi.CompactionConfig Compaction observability and the bundled compaction extensions
+---@field panel? pi.CompactionPanelConfig :PiCompactions timeline panel
+---@field extension? pi.CompactionExtensionConfig The bundled pi2-compaction extension
 
 ---@class pi.BackgroundTasksConfig
 ---@field wake_on_idle? "always"|"budgeted"|"never" Deprecated alias for `wake_on_completion`, read only when the new key is absent
@@ -394,6 +439,7 @@
 ---@field sessions_list pi.SessionsListConfig
 ---@field tasks_panel pi.TasksPanelConfig
 ---@field background_tasks pi.BackgroundTasksConfig Completion-wake policy for the bundled background-bash extension (see doc/extensions.md#the-completion-wake-gate)
+---@field compaction? pi.CompactionConfig Compaction observability (the :PiCompactions timeline, the statusline countdown) and the bundled pi2-compaction extension
 ---@field diff_review pi.DiffReviewConfig
 ---@field zen pi.ZenConfig
 ---@field prompt pi.PromptConfig
@@ -481,7 +527,7 @@ local defaults = {
             cache = { icon = "󰆼" },
             cost = { icon = "" },
             compaction = { icon = false },
-            context = { icon = "", warn = 70, error = 90 },
+            context = { icon = "", warn = 70, error = 90, countdown = true },
             attention = { icon = "󰵚", counter = false },
             model = { icon = "󰚩", provider = "ambiguous" },
             thinking = {
@@ -638,6 +684,43 @@ local defaults = {
         wake_budget = 2,
         wake_cache_window_ms = 300000,
     },
+    compaction = {
+        panel = {
+            mode = "float",
+            width = 100,
+            height = 22,
+        },
+        extension = {
+            enabled = true,
+            cleaner = {
+                enabled = true,
+                max_read = 50,
+                max_modified = 100,
+                drop_temp = true,
+                drop_build = true,
+                strip_previous_lists = true,
+            },
+            checkpoint = {
+                enabled = false,
+                model = nil,
+                thinking_level = nil,
+                language = "auto",
+                max_words = 1500,
+            },
+            state = {
+                enabled = true,
+                max_tokens = 1000,
+            },
+            prune = {
+                enabled = false,
+                high_water = 0.7,
+                min_turns = 8,
+            },
+            owner = {
+                detect = true,
+            },
+        },
+    },
     diff_review = {
         width = 0.8,
         height = 0.8,
@@ -769,6 +852,12 @@ function M.setup(opts)
     -- runtime file at every paid-turn decision; same live-reload rationale. The
     -- file also carries `present`, which the module refreshes on focus changes.
     require("pi.tasks").publish(M.options.background_tasks)
+
+    -- The bundled pi2-compaction extension re-reads its whole option tree
+    -- (cleaner / checkpoint / state / prune / owner) from a runtime file on
+    -- every compaction event, so live setup() calls apply without respawning
+    -- the RPC process (same rationale as vision/title/todo/bg-tasks).
+    require("pi.compaction.extension").publish(M.options.compaction and M.options.compaction.extension)
 end
 
 --- Resolve a config value that may be a function, merging the result with

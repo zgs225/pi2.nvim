@@ -402,6 +402,12 @@ function Rpc:start(opts)
     -- any setup() call must still see the resolved policy, and the module also
     -- republishes `present` on focus changes.
     require("pi.tasks").publish(Config.options.background_tasks)
+    -- The bundled pi2-compaction extension re-reads its whole option tree
+    -- (cleaner / checkpoint / state / prune / owner) from this runtime file on
+    -- every compaction event, and config.setup() republishes it on every live
+    -- setup() call — so option changes apply without respawning the RPC
+    -- process (same rationale as todo/bg-tasks).
+    require("pi.compaction.extension").publish(Config.options.compaction and Config.options.compaction.extension)
     local env = {
         PI_NVIM_VISION_FILE = require("pi.vision").state_path(),
         PI_NVIM_TITLE_FILE = require("pi.title").state_path(),
@@ -410,6 +416,9 @@ function Rpc:start(opts)
         -- The bg-tasks extension re-reads its completion-wake policy (and whether a
         -- human is at the editor) from this file at every paid-turn decision.
         PI_NVIM_BG_TASKS_FILE = require("pi.tasks").state_path(),
+        -- The pi2-compaction extension re-reads its cleaner/checkpoint/state/
+        -- prune options from this file on every compaction event.
+        PI_NVIM_COMPACTION_FILE = require("pi.compaction.extension").state_path(),
     }
     -- Extensions (e.g. subagent.ts) must know this process runs inside an
     -- isolated git worktree. The spawn-time env is the only channel that

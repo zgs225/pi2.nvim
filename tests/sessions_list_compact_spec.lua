@@ -81,6 +81,9 @@ local function with_manager(sessions, fn)
         get = function()
             return nil
         end,
+        -- `pi.compact` records the focus on the session it targets; this stub
+        -- has no compaction state to record into.
+        set_compaction_focus = function() end,
     }
     local ok, err = pcall(fn)
     package.loaded["pi.sessions.manager"] = real_manager

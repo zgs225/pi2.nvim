@@ -282,7 +282,10 @@ require("pi").setup({
 | `:PiSendMention` | Mention the current file; in visual mode or with a range, mention the selection lines |
 | `:PiAttachImage {path}` | Attach an image file to the prompt |
 | `:PiPasteImage` | Attach an image from the clipboard |
-| `:PiCompact [instructions]` | Ask π to compact the current conversation context |
+| `:PiCompact [instructions]` | Ask π to compact the current conversation context. With no argument it opens a focus dialog (presets + free text + recent focuses); `:PiCompact!` compacts immediately without the dialog; passing instructions compacts with that focus |
+| `:PiCompactAbort` | Abort the compaction that is running (same as a single `<Esc>` while compacting) |
+| `:PiCompactRetry` | Retry the last failed or aborted compaction with the same focus instructions |
+| `:PiCompactions` | Toggle the compaction timeline: one row per compaction (reason, before → after, duration, cost, files) with jump / diff / copy / re-run actions (see [doc/usage.md](doc/usage.md#compaction-timeline-picompactions)) |
 | `:PiToggleAutoCompaction` | Toggle automatic context compaction (statusline shows the auto-compaction icon while on) |
 | `:PiSessionName [name]` | Set or show the session display name |
 | `:PiToggleDebug` | Toggle RPC debug logging |
@@ -295,7 +298,7 @@ Detailed guides live in [`doc/`](doc/):
 
 | Doc | What's inside |
 | --- | --- |
-| [doc/usage.md](doc/usage.md) | Chat & layouts, prompt (submit/queue/abort), direct bash mode (`!`), background tasks (`:PiTasks`), prompt history & drafts, `@mentions`, slash commands, completion, attachments, zen mode, statusline, navigation, quickfix, tool blocks, todo list, models, thinking, markdown rendering, buffer reload, startup block |
+| [doc/usage.md](doc/usage.md) | Chat & layouts, prompt (submit/queue/abort), direct bash mode (`!`), background tasks (`:PiTasks`), compaction focus & timeline (`:PiCompact` / `:PiCompactions`), prompt history & drafts, `@mentions`, slash commands, completion, attachments, zen mode, statusline, navigation, quickfix, tool blocks, todo list, models, thinking, markdown rendering, buffer reload, startup block |
 | [doc/sessions.md](doc/sessions.md) | One session per tab, storage & cwd scoping, continue/resume, sub-sessions (`:PiSub*`), session tree (`:PiTree`), fork/clone (`:PiFork`/`:PiClone`), sessions overview (`:PiSessions`), compaction |
 | [doc/worktrees.md](doc/worktrees.md) | Git worktree isolation: creating and opening a checkout (`:PiNewTab worktree=<name>`, `pi.worktree_new`/`_fork`), `.worktreeinclude`, `setup_cmd`, detached HEAD, cleanup & snapshots, cross-worktree resume |
 | [doc/diff-review.md](doc/diff-review.md) | Two-way diff review of agent edits, review notes, permission-extension protocol reference, session diff review (`:PiDiff`) |

@@ -267,12 +267,24 @@ Requires **pi 0.44.0+** (the `turn_end` extension event and `setSessionName` wer
 Long sessions eventually run into the model's context window limit. pi delegates this to a **compaction** step: the backend summarizes older parts of the conversation and replaces them with the summary, freeing up tokens for new turns. pi supports both automatic and manual compaction.
 
 - **Automatic compaction** is enabled at the backend level. When the conversation approaches the context threshold, pi compacts on its own and the `compaction` statusline component lights up (see [Statusline](usage.md#statusline)) — it renders the same 󰏗 icon as the compaction summary label while auto-compaction is on. `:PiToggleAutoCompaction` / `pi.toggle_auto_compaction()` flips the setting on/off for the current session — the icon appears/disappears immediately and the backend session file records the change. With no active session the command is a silent no-op.
-- **Manual compaction** — `:PiCompact [instructions]` / `pi.compact(instructions?)` — triggers compaction immediately. If you pass custom instructions, they're forwarded to the summarizer to guide what gets kept:
-
-```vim
-:PiCompact focus on architectural decisions and the reasoning behind them; drop intermediate tool outputs
-```
+- **Manual compaction** — `:PiCompact [instructions]` / `pi.compact(instructions?)` — triggers compaction immediately. With no argument the command opens a **focus dialog**: the five presets (`Preserve architectural decisions`, `Drop intermediate tool outputs`, `Preserve test failures and exact errors`, `Preserve user constraints and rejected approaches`, `Keep next steps and open questions`), the focuses you used before in this session, `Custom focus…` (a text input), and `No focus`. Passing instructions directly (`:PiCompact focus on …`) compacts with that focus without a dialog, and `:PiCompact!` always compacts immediately with whatever arguments it got — useful in a mapping or a script.
 
 Compaction can't run while the agent is streaming — wait for the current turn to finish (or abort it) first. Message submits during compaction are queued and sent after compaction finishes.
 
-After successful compaction, pi2.nvim renders a collapsed summary block in chat history. Focus the block and press `<Tab>` to expand the backend-generated summary.
+After successful compaction, pi2.nvim renders a collapsed summary block in chat history:
+
+```
+────── 󰏗 compacted · 150k → 42k (est.) · threshold · 12s ──────
+```
+
+`150k → 42k` are pi's measured occupancy and its estimate of the rebuilt context (`(est.)` marks the estimate; an older pi without `estimatedTokensAfter` keeps the before-only form), followed by the reason (`manual` / `threshold` / `overflow`) and how long the summary took. Focus the block and press `<Tab>` to expand the backend-generated summary. The expanded block ends with the metadata pi reported for that compaction: the entry id the kept tail starts at (`kept from:`), the bounded file lists (`files: 12 read · 4 modified · 18 omitted`), the summary request's own cost (`summary: 8.2k in / 1.1k out · $0.003`), and — when it applies — `will retry after compaction`, `aborted`, or the failure message. Blocks replayed from a resumed session render the same header when the record is available, and the before-only form when it is not.
+
+Three more surfaces keep a long compaction-heavy session legible:
+
+- **Countdown** — the statusline's `context` component appends `· 37k to compact`, the distance to pi's auto-compaction threshold computed from pi's own `reserveTokens` / `keepRecentTokens` (`compaction.modelOverrides` included). A `keep ≥ budget` combination — nothing is cuttable, upstream #12076 — turns it red with a one-time warning. See [Statusline](usage.md#compaction-countdown).
+- **Abort and retry** — a single `<Esc>` while the compaction status is showing aborts it (`:PiCompactAbort` / `pi.compact_abort()` do the same), and `:PiCompactRetry` / `pi.compact_retry()` re-runs the last aborted or failed compaction with the same focus. A summarization retry shows up in the spinner as `summary retry 2/3 (429)` instead of a silent spin.
+- **Timeline** — `:PiCompactions` lists every compaction with its numbers and offers jump / diff / copy / re-run actions. See [Compaction timeline](usage.md#compaction-timeline-picompactions).
+
+A session that keeps compacting without freeing context (three compactions within ten turns, or a `tokensBefore` that never drops) triggers one warning naming the recent occupancies: a giant tool output or file read is refilling the window, and the fix is a focused compaction or reading in smaller chunks, not another blind retry.
+
+The bundled `pi2-compaction` extension cleans up what pi's default summarizer sends and receives: it bounds the file lists (temp paths, build output and lockfiles dropped; recent 50 read / 100 modified kept), strips the previous summary's file blocks before the update prompt, can take over summarization with a structured, deduplicated checkpoint (opt-in), injects a compact `[pi2 state]` snapshot after each compaction (todo, background tasks, sub-agents, git), and can prune old tool results (opt-in). See [Extensions](extensions.md#bundled-compaction-extension-extensionscompactionts).

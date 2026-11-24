@@ -314,6 +314,14 @@ function M.subagent_child_extension_path()
     return plugin_root() .. "/extensions/subagent-child.ts"
 end
 
+--- Absolute path to the bundled compaction extension: bounded file lists in
+--- pi's default summarizer (L1), optional structured summaries (L2), the
+--- post-compaction state snapshot (L3) and optional tool-result pruning (L4).
+---@return string
+function M.compaction_extension_path()
+    return plugin_root() .. "/extensions/compaction.ts"
+end
+
 --- The two tools that make every `codemode` / `deferred` exposure tool reachable
 --- (see pi's docs/mcp.md, "Control tool exposure").
 ---@type string[]
@@ -461,16 +469,30 @@ function M.command(opts)
         cmd[#cmd + 1] = "--extension"
         cmd[#cmd + 1] = bg_ext
     end
-    -- Sub-agent extensions, mutually exclusive per process role: parents
-    -- get subagent.ts (orchestration tools + system-prompt note), children
-    -- get subagent-child.ts (worker system-prompt note only — no tools, no
-    -- nesting). subagent.enabled = false injects neither.
+    -- Inject the sub-agent extension tree: parents get subagent.ts (orchestration
+    -- tools + system-prompt note), children get subagent-child.ts (worker
+    -- system-prompt note only — no tools, no nesting). subagent.enabled = false
+    -- injects neither.
     local subagent = Config.options.subagent or {}
     if subagent.enabled ~= false then
         local sub_ext = opts.subagent ~= false and M.subagent_extension_path() or M.subagent_child_extension_path()
         if vim.fn.filereadable(sub_ext) == 1 then
             cmd[#cmd + 1] = "--extension"
             cmd[#cmd + 1] = sub_ext
+        end
+    end
+    -- Inject the compaction extension unless it is disabled. Injected for BOTH
+    -- parent and child processes: a sub-session compacts its own context, and
+    -- the extension is inert until a compaction event fires. Its options travel
+    -- via a runtime file re-read on every compaction event
+    -- (PI_NVIM_COMPACTION_FILE, see rpc.lua), so live setup() calls apply
+    -- without respawning the RPC process.
+    local compaction = Config.options.compaction or {}
+    if (compaction.extension or {}).enabled ~= false then
+        local compaction_ext = M.compaction_extension_path()
+        if vim.fn.filereadable(compaction_ext) == 1 then
+            cmd[#cmd + 1] = "--extension"
+            cmd[#cmd + 1] = compaction_ext
         end
     end
     -- A child tool allowlist replaces the whole tool selection on the pi side,

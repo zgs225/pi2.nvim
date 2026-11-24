@@ -20,6 +20,8 @@ All highlight groups are defined with `default = true`, so they can be overridde
 | `PiCompactionLabel` | Icon label for compaction summaries |
 | `PiCompactionText` | Body text inside compaction summaries |
 | `PiCompactionHint` | Expand/collapse hint inside collapsed compaction summaries |
+| `PiCompactionMeta` | Metadata rows inside an expanded compaction summary (kept boundary, file counts, summary usage) |
+| `PiCompactionWarn` | Failure rows inside an expanded compaction summary (aborted, retry pending, error) |
 | `PiMessageDateTime` | Timestamp next to messages |
 | `PiSteerDelivered` | Delivered steer tag (`labels.steer_message`) next to a message that entered the conversation as a steer |
 | `PiFollowUpDelivered` | Delivered follow-up tag (`labels.follow_up_message`) next to a message that entered the conversation as a follow-up |
