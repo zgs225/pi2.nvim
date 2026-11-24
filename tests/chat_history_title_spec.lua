@@ -429,3 +429,269 @@ describe("chat history worktree badge", function()
         end)
     end)
 end)
+
+-- The git branch badge rides the same title path, so it is exercised here too:
+-- the display matrix, the `HEAD` watcher that makes a `git checkout` show up
+-- without waiting for the turn to end, the per-turn fallback, and the non-git
+-- case (nothing rendered at all — no placeholder).
+describe("chat history branch badge", function()
+    local BRANCH_GLYPH = "󰘬"
+    local real_worktree_module
+    local real_branch_module
+
+    before_each(function()
+        Config.setup({})
+        real_worktree_module = package.loaded["pi.worktree"]
+        real_branch_module = package.loaded["pi.git_branch"]
+        package.loaded["pi.git_branch"] = nil
+    end)
+
+    after_each(function()
+        package.loaded["pi.worktree"] = real_worktree_module
+        package.loaded["pi.git_branch"] = real_branch_module
+        local ok, Branch = pcall(require, "pi.git_branch")
+        if ok and type(Branch._reset) == "function" then
+            Branch._reset()
+        end
+    end)
+
+    --- Install a `pi.git_branch` stub: `read` answers `info` for any directory,
+    --- `watch` records the callback so a spec can simulate a checkout.
+    ---@param info pi.GitBranch?
+    ---@return { info: pi.GitBranch?, on_change: fun(info: pi.GitBranch?)?, unsubscribed: integer }
+    local function stub_branch(info)
+        local stub = { info = info, on_change = nil, unsubscribed = 0 }
+        package.loaded["pi.git_branch"] = {
+            read = function()
+                return stub.info
+            end,
+            label = function(rec)
+                if type(rec) ~= "table" then
+                    return nil
+                end
+                return rec.name or rec.detached
+            end,
+            watch = function(_cwd, cb)
+                stub.on_change = cb
+                return function()
+                    stub.unsubscribed = stub.unsubscribed + 1
+                end
+            end,
+        }
+        return stub
+    end
+
+    --- A fabricated main checkout: `.git/HEAD` is all the reader needs.
+    ---@param head string raw HEAD content
+    ---@return string root
+    local function fake_repo(head)
+        local root = vim.uv.fs_realpath(vim.fn.tempname()) or vim.fn.tempname()
+        vim.fn.mkdir(root .. "/.git", "p")
+        vim.fn.writefile({ head }, root .. "/.git/HEAD")
+        return root
+    end
+
+    describe("display matrix (pure)", function()
+        it("renders the branch name", function()
+            assert.are.same(
+                { { BRANCH_GLYPH .. " feat/login-ui", "PiChatHistoryBranch" } },
+                Chat.branch_badge({ name = "feat/login-ui", git_dir = "/repo/.git" })
+            )
+        end)
+
+        it("renders the short sha of a detached checkout", function()
+            -- `pi.worktree_new()` detaches, so this is the common state: hiding
+            -- it would leave the badge empty exactly when it matters.
+            assert.are.same(
+                { { BRANCH_GLYPH .. " 3db087b", "PiChatHistoryBranch" } },
+                Chat.branch_badge({ detached = "3db087b", git_dir = "/repo/.git" })
+            )
+        end)
+
+        it("renders nothing outside a repository", function()
+            assert.is_nil(Chat.branch_badge(nil))
+            assert.is_nil(Chat.branch_badge({}))
+            assert.is_nil(Chat.branch_badge({ name = "", git_dir = "/repo/.git" }))
+            assert.is_nil(Chat.branch_badge({ name = "", detached = "" }))
+            assert.is_nil(Chat.branch_badge("feat/x"))
+        end)
+    end)
+
+    describe("side layout winbar", function()
+        it("appends the branch after the worktree badge", function()
+            local chat = setup_chat("side")
+            stub_worktree({ kind = "linked", name = "wt", path = "/tmp/wt", repo_root = "/tmp/main" })
+            stub_branch({ name = "feat/x", git_dir = "/tmp/main/.git/worktrees/wt" })
+
+            chat:set_cwd(vim.fn.getcwd())
+
+            local winbar = history_winbar(chat)
+            assert.is_truthy(winbar:find(GLYPH .. " wt", 1, true))
+            assert.is_truthy(winbar:find(BRANCH_GLYPH .. " feat/x", 1, true))
+            assert.is_truthy(winbar:find("PiChatHistoryBranch", 1, true))
+            -- The worktree badge stays in front of the branch.
+            assert.is_true(winbar:find(GLYPH, 1, true) < winbar:find(BRANCH_GLYPH, 1, true))
+            teardown_chat(chat)
+        end)
+
+        it("shows the branch in a plain checkout with a matching cwd", function()
+            -- The branch is the one identity chunk a main checkout gets: the
+            -- worktree badge is deliberately blank there.
+            local chat = setup_chat("side")
+            local cwd = vim.fn.getcwd()
+            stub_worktree({ kind = "main", name = "repo", path = cwd, repo_root = cwd })
+            stub_branch({ name = "main", git_dir = cwd .. "/.git" })
+
+            chat:set_cwd(cwd)
+
+            local winbar = history_winbar(chat)
+            assert.is_nil(winbar:find(GLYPH, 1, true))
+            assert.is_truthy(winbar:find(BRANCH_GLYPH .. " main", 1, true))
+            teardown_chat(chat)
+        end)
+
+        it("keeps the plain title outside a repository and arms no watcher", function()
+            local chat = setup_chat("side")
+            stub_worktree(nil)
+            local stub = stub_branch(nil)
+
+            chat:set_cwd(vim.fn.getcwd())
+
+            local winbar = history_winbar(chat)
+            assert.is_nil(winbar:find(BRANCH_GLYPH, 1, true))
+            assert.is_nil(winbar:find("PiChatHistoryBranch", 1, true))
+            assert.is_nil(stub.on_change)
+            teardown_chat(chat)
+        end)
+
+        it("escapes % in a branch name so the winbar still evaluates", function()
+            local chat = setup_chat("side")
+            stub_worktree(nil)
+            stub_branch({ name = "feat/50%off", git_dir = "/repo/.git" })
+
+            chat:set_cwd(vim.fn.getcwd())
+
+            local winbar = history_winbar(chat)
+            assert.is_truthy(winbar:find("50%%off", 1, true))
+            local evaluated = vim.api.nvim_eval_statusline(winbar, { winid = chat._layout:history_win() })
+            assert.is_truthy(evaluated.str:find("50%off", 1, true))
+            teardown_chat(chat)
+        end)
+
+        it("lets the sub-session breadcrumb win over the branch", function()
+            local chat = setup_chat("side")
+            stub_worktree(nil)
+            stub_branch({ name = "feat/x", git_dir = "/repo/.git" })
+
+            chat:set_cwd(vim.fn.getcwd())
+            assert.is_truthy(history_winbar(chat):find(BRANCH_GLYPH, 1, true))
+
+            chat:set_subsession_breadcrumb("parent", "parent-id")
+            assert.is_nil(history_winbar(chat):find(BRANCH_GLYPH, 1, true))
+
+            chat:clear_subsession_breadcrumb()
+            assert.is_truthy(history_winbar(chat):find(BRANCH_GLYPH, 1, true))
+            teardown_chat(chat)
+        end)
+    end)
+
+    describe("refresh", function()
+        it("updates the title when the watcher reports a checkout", function()
+            local chat = setup_chat("side")
+            stub_worktree(nil)
+            local stub = stub_branch({ name = "main", git_dir = "/repo/.git" })
+            chat:set_cwd(vim.fn.getcwd())
+            assert.is_truthy(history_winbar(chat):find(BRANCH_GLYPH .. " main", 1, true))
+
+            assert.are.equal("function", type(stub.on_change))
+            stub.on_change({ name = "feat/switched", git_dir = "/repo/.git" })
+            assert.is_truthy(history_winbar(chat):find(BRANCH_GLYPH .. " feat/switched", 1, true))
+
+            -- Unchanged (same ref rewritten) reports must not re-render.
+            local before = history_winbar(chat)
+            stub.on_change({ name = "feat/switched", git_dir = "/repo/.git" })
+            assert.are.equal(before, history_winbar(chat))
+            teardown_chat(chat)
+        end)
+
+        it("re-reads the branch on agent end (a checkout run by the turn's tools)", function()
+            local chat = setup_chat("side")
+            stub_worktree(nil)
+            local stub = stub_branch({ name = "main", git_dir = "/repo/.git" })
+            chat:set_cwd(vim.fn.getcwd())
+
+            -- The turn's tool checked out another branch: the fallback read sees
+            -- it even on a filesystem whose watcher never fired.
+            stub.info = { name = "feat/from-bash", git_dir = "/repo/.git" }
+            chat:on_agent_end()
+
+            assert.is_truthy(history_winbar(chat):find(BRANCH_GLYPH .. " feat/from-bash", 1, true))
+            teardown_chat(chat)
+        end)
+
+        it("re-arms the watcher when the session cwd moves to another checkout", function()
+            local chat = setup_chat("side")
+            stub_worktree(nil)
+            local stub = stub_branch({ name = "main", git_dir = "/repo-a/.git" })
+            chat:set_cwd(vim.fn.getcwd())
+            assert.are.equal(0, stub.unsubscribed)
+
+            stub.info = { name = "feat/b", git_dir = "/repo-b/.git" }
+            chat:set_cwd(vim.fn.getcwd() .. "-elsewhere")
+
+            assert.is_truthy(history_winbar(chat):find(BRANCH_GLYPH .. " feat/b", 1, true))
+            teardown_chat(chat)
+        end)
+
+        it("releases the watcher when the chat is disposed", function()
+            local chat = setup_chat("side")
+            stub_worktree(nil)
+            local stub = stub_branch({ name = "main", git_dir = "/repo/.git" })
+            chat:set_cwd(vim.fn.getcwd())
+            assert.are.equal(0, stub.unsubscribed)
+
+            chat:dispose()
+            assert.are.equal(1, stub.unsubscribed)
+            -- Disposing twice must not call the unsubscribe again.
+            chat:dispose()
+            assert.are.equal(1, stub.unsubscribed)
+            teardown_chat(chat)
+        end)
+    end)
+
+    describe("real checkout", function()
+        it("follows a HEAD rewrite without polling", function()
+            -- End to end over the real modules: `pi.worktree` resolves the git
+            -- dir from the filesystem, `pi.git_branch` reads `HEAD` and watches
+            -- it. No git process, no timer.
+            package.loaded["pi.worktree"] = nil
+            package.loaded["pi.git_branch"] = nil
+            local Branch = require("pi.git_branch")
+            local root = fake_repo("ref: refs/heads/feat/live")
+            local chat = setup_chat("side")
+
+            chat:set_cwd(root)
+            assert.is_truthy(history_winbar(chat):find(BRANCH_GLYPH .. " feat/live", 1, true))
+            assert.are.equal(1, Branch._active_watches())
+
+            vim.fn.writefile({ "ref: refs/heads/feat/next" }, root .. "/.git/HEAD")
+            assert.is_true(
+                vim.wait(3000, function()
+                    return history_winbar(chat):find(BRANCH_GLYPH .. " feat/next", 1, true) ~= nil
+                end, 20),
+                "the HEAD rewrite never reached the winbar"
+            )
+
+            -- Non-git cwd: the chunk disappears and the watcher with it.
+            local plain = vim.uv.fs_realpath(vim.fn.tempname()) or vim.fn.tempname()
+            vim.fn.mkdir(plain, "p")
+            chat:set_cwd(plain)
+            assert.is_nil(history_winbar(chat):find(BRANCH_GLYPH, 1, true))
+            assert.are.equal(0, Branch._active_watches())
+
+            vim.fn.delete(root, "rf")
+            vim.fn.delete(plain, "rf")
+            teardown_chat(chat)
+        end)
+    end)
+end)

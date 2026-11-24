@@ -170,6 +170,12 @@ local function set_defaults()
     -- worktree is badged; the ⚠ case (session cwd elsewhere, no glyph to show
     -- it) renders plain text in PiStatusLineWarning (no separate group).
     vim.api.nvim_set_hl(0, "PiChatHistoryWorktree", { default = true, fg = title.fg, bold = true, italic = true })
+    -- Git branch badge in the history title (`π 󰙅 name  feat/x`), the sibling of
+    -- the worktree badge. Dimmer on purpose: the worktree names the checkout (and
+    -- stays put), the branch is what moves under you — a `git checkout` inside a
+    -- bash tool, or one run in a terminal next to the editor. A detached `HEAD`
+    -- shows the short sha, never the word "detached".
+    vim.api.nvim_set_hl(0, "PiChatHistoryBranch", { default = true, fg = comment.fg })
     vim.api.nvim_set_hl(0, "PiChatPromptWinbar", { default = true, bg = normal.bg })
     vim.api.nvim_set_hl(0, "PiChatPromptWinbarTitle", { default = true, fg = comment.fg, bg = normal.bg, bold = true })
     vim.api.nvim_set_hl(

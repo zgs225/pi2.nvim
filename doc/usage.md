@@ -58,6 +58,17 @@ Use `:PiToggleLayout` to swap `side` ↔ `float` without losing the conversation
 
 Each panel has a winbar with a title controlled by `panels.<panel>.title` (a string; defaults: `π`, `prompt`, `attached`). In side layout, the winbar can be disabled per-panel with `layout.side.panels.<panel>.winbar = false`. Separately, `panels.<panel>.name = function(tab_id) return ... end` lets you compute the underlying buffer name per tab — useful for distinguishing multiple π conversations in `:buffers`, statuslines, or tab bars. The prompt panel has an extra `panels.prompt.bash_title`: while the prompt text starts with `!` (direct bash mode, see below), the prompt title switches to this string and is drawn with the `PiChatPromptWinbarBashTitle` / `PiChatPromptFloatBashTitle` highlight groups (a distinct foreground color, derived from `WarningMsg` by default) so it's obvious you're about to run a shell command rather than message the agent.
 
+### Git branch in the title
+
+The history title names the checkout the session runs in (`󰙅 <worktree>`, see [Worktrees](worktrees.md#where-you-see-it)) and the **git branch** that checkout is on: `π 󰙅 fix-auth 󰘬 feat/login-ui`. The branch is the one identity chunk a plain session gets too — `π 󰘬 main` — because the worktree badge is deliberately blank in the repository's main checkout. A detached `HEAD` shows the **short sha** (`󰘬 3db087b`) instead of a branch name: `pi.worktree_new()` detaches by default, so that is what a fresh worktree session shows until `pi.worktree_branch()` puts it on a branch.
+
+Nothing is drawn outside a git repository — no placeholder, exactly as every other frontend treats that case. The branch belongs to the **session's** checkout, so two tabs in two worktrees each show their own, and a sub-session opened in another checkout shows that one.
+
+The value is derived, never stored: π reads `<git_dir>/HEAD` (one small file read through the same cached, subprocess-free detection the worktree badge uses), which is why it costs nothing on the render path. It follows a `git checkout` — the agent's own, from a bash tool, or one you run in a terminal next to the editor — through a filesystem watch on that `HEAD`, with one re-read at each turn end as the fallback for filesystems that cannot be watched (network mounts, some WSL setups). There is no polling and no `git` process.
+
+Draw the two chunks with `PiChatHistoryWorktree` and `PiChatHistoryBranch`; the `⚠` divergence case keeps `PiStatusLineWarning`.
+
+
 ### Turn completion marker
 
 When a turn ends, π leaves **one** marker as inline virtual text at the end of the last response line instead of opening a new line — the run's duration, `· 12s` (or `· 1m 04s` past a minute), in the muted `PiBusyTime` color. A run whose stream lasted under a second gets no marker at all — unless it has a rate worth printing, which justifies the marker on its own (`· <1s · 250 tok/s`): a fast answer with real content is exactly the case where the duration says nothing and the speed says everything.

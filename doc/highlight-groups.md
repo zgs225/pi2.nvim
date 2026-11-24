@@ -100,6 +100,7 @@ Inspect what a block actually uses with `:Inspect` over the coloured text, or li
 | `PiChatHistoryWinbar` | Winbar background for the history panel (side layout) |
 | `PiChatHistoryWinbarTitle` | Winbar title for the history panel (side layout) |
 | `PiChatHistoryWorktree` | Git worktree badge (`󰙅 <name>`, with `*` when dirty/ahead) in the history title — winbar and float title. Only a linked worktree is badged; the `⚠` case (session cwd elsewhere and no glyph to show it — main checkout or a non-worktree directory) renders `PiStatusLineWarning` instead. |
+| `PiChatHistoryBranch` | Git branch of the session's checkout in the history title, after the worktree badge — `󰘬 <branch>`, or `󰘬 <short sha>` for a detached `HEAD`. Never drawn outside a git repository. Dimmer than the worktree badge on purpose: the checkout stays put, the branch moves. |
 | `PiChatPromptWinbar` | Winbar background for the prompt panel (side layout) |
 | `PiChatPromptWinbarTitle` | Winbar title for the prompt panel (side layout) |
 | `PiChatPromptWinbarAttentionTitle` | Winbar title for the prompt panel when attention is pending |
