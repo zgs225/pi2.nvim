@@ -9,7 +9,8 @@
 -- module instead of hardcoding them (a hardcoded "56k" would silently rot).
 --
 -- The second suite covers the chat wrappers that push a budget, forward a
--- compaction summary and abort a running compaction with a single <Esc>.
+-- compaction summary and cancel a running compaction with the double-<Esc>
+-- gesture.
 
 local Chat = require("pi.ui.chat")
 local Config = require("pi.config")
@@ -436,14 +437,37 @@ describe("chat compaction wrappers", function()
         assert.is_false(Chat.jump_to_compaction(bare_chat({}), "the summary", 1))
     end)
 
-    it("a single <Esc> during a compaction aborts it and arms no gesture", function()
+    it("a compaction needs a second <Esc>: the first only arms and shows the hint", function()
         local calls = stub_pi()
         chat:set_compacting(true)
         chat:_handle_abort_esc()
-        assert.are.same({ "compact_abort" }, calls)
-        assert.is_nil(chat._abort_esc_at, "compaction abort must not arm the double-<Esc> gesture")
-        assert.is_nil(chat._abort_esc_timer, "compaction abort must not start the disarm timer")
+        vim.wait(100, function()
+            return chat._prompt:statusline()._state.abort_hint ~= nil
+        end)
+        assert.are.same({}, calls, "the first <Esc> must not cancel the compaction")
+        assert.is_not_nil(chat._abort_esc_at, "the first <Esc> must arm while compacting")
+        assert.is_not_nil(chat._abort_esc_timer, "the first <Esc> must start the disarm timer")
+        assert.are.equal("Press <Esc> again to abort", chat._prompt:statusline()._state.abort_hint)
         assert.is_true(chat:is_compacting())
+    end)
+
+    it("the second <Esc> within the window cancels the compaction exactly once", function()
+        local calls = stub_pi()
+        chat:set_compacting(true)
+        chat:_handle_abort_esc()
+        assert.are.same({}, calls)
+        chat:_handle_abort_esc()
+        vim.wait(100, function()
+            return #calls > 0
+        end)
+        -- The abort runs off the keypress path (vim.schedule), and the gesture
+        -- is disarmed before it so a third press cannot re-fire.
+        assert.are.same({ "compact_abort" }, calls)
+        assert.is_nil(chat._abort_esc_at)
+        assert.is_nil(chat._abort_esc_timer)
+        chat:_handle_abort_esc()
+        assert.are.same({ "compact_abort" }, calls, "a third <Esc> only re-arms")
+        assert.is_not_nil(chat._abort_esc_at)
     end)
 
     it("<Esc> during a compaction is inert when abort is disabled", function()
@@ -451,8 +475,26 @@ describe("chat compaction wrappers", function()
         Config.options.abort.enabled = false
         chat:set_compacting(true)
         chat:_handle_abort_esc()
+        chat:_handle_abort_esc()
+        vim.wait(50)
         assert.are.same({}, calls)
         assert.is_nil(chat._abort_esc_at)
+        assert.is_nil(chat._abort_esc_timer)
+    end)
+
+    it("the compaction ending disarms a half-pressed gesture", function()
+        local calls = stub_pi()
+        chat:set_compacting(true)
+        chat:_handle_abort_esc()
+        assert.is_not_nil(chat._abort_esc_at)
+        chat:set_compacting(false)
+        assert.is_nil(chat._abort_esc_at, "leaving the compaction must disarm the gesture")
+        assert.is_nil(chat._abort_esc_timer)
+        vim.wait(100, function()
+            return chat._prompt:statusline()._state.abort_hint == nil
+        end)
+        assert.is_nil(chat._prompt:statusline()._state.abort_hint, "the hint must be cleared too")
+        assert.are.same({}, calls)
     end)
 
     it("streaming without a compaction keeps the double-<Esc> gesture", function()

@@ -67,8 +67,11 @@ pi.compact(instructions?, session?) -- manually compact a session (optional guid
                               -- is recorded, so the compaction block and :PiCompactions
                               -- show what was asked for, and a retry repeats it
 pi.compact_abort()            -- abort the compaction that is running (:PiCompactAbort, or a
-                              -- single <Esc> while compacting). Returns false and warns
-                              -- when no compaction is in flight
+                              -- double <Esc> while compacting). Returns false and warns
+                              -- when no compaction is in flight. The cancellation is not
+                              -- a failure: no error notification, and the history shows a
+                              -- neutral `Compaction cancelled` notice
+                              -- (the record still carries `aborted = true`)
 pi.compact_retry()            -- re-run the last aborted/failed compaction with the same
                               -- focus; refused while another compaction runs or when the
                               -- last one succeeded

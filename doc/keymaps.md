@@ -5,7 +5,7 @@
 What the plugin does bind on its own:
 
 - Submission keys in the prompt buffer (`<CR>`, `<A-CR>`, `<S-CR>` — see [Usage → Prompt](usage.md#prompt)).
-- `<Esc>` / double-`<Esc>` abort gestures (see [Usage → Aborting](usage.md#aborting-with-double-esc)). A single `<Esc>` while a compaction is running aborts that compaction instead of arming the double-`<Esc>` gesture.
+- `<Esc>` / double-`<Esc>` abort gestures (see [Usage → Aborting](usage.md#aborting-with-double-esc)). The gesture covers a running compaction too, and a cancelled compaction is reported as a cancellation, not a failure.
 - `<C-p>` / `<C-n>` / `<Up>` / `<Down>` prompt-history recall (see [Usage → Prompt history](usage.md#prompt-history)).
 - `<Tab>` block expand/collapse, `gf` open-file-under-cursor, `dd` delete-queued-message and `yy` copy-message in the history buffer.
 - `yy` on a message copies its **source** text (see [Usage → Copying messages](usage.md#copying-messages)); `[count]yy` copies that many consecutive messages. The `y` operator itself stays native, so `y{motion}` and `V`+`y` keep yanking what is on screen, and [`:` `'<,'>PiCopy`](usage.md#copying-messages) does the source-text copy for a visual range.

@@ -37,6 +37,7 @@
 ---@field compaction pi.CompactionState Every compaction this session ran, with the numbers the panel reports (see `pi.compaction.state`).
 ---@field model_state? table Last `get_state` payload (model + context window), so a `compaction_end` can derive the budget without another round trip.
 ---@field _compaction_focus? string Focus text handed to the next `:PiCompact`, recorded on the compaction it lands in.
+---@field _compaction_request? { cancelled: boolean } The `compact` request in flight: its callback consumes `cancelled` (an aborted request answers `success:false`), so a cancellation is never reported as a failure.
 ---@field _compaction_warned? table<string, boolean> Warn-once latches per session (`pathological`), so a refresh loop cannot spam the user.
 ---@field _detached_retrying? boolean Auto-retry backoff (detached or captured on unbind).
 ---@field _busy_started_at? integer Run clock (`vim.uv.hrtime()/1e9`); first `agent_start` of the run.
@@ -1575,9 +1576,21 @@ function M.handle_event(session, msg)
         end
         if chat then
             if msg.aborted then
+                -- Authoritative cancellation signal: pi reports the compaction
+                -- as aborted before it answers the `compact` request, which
+                -- comes back as `success:false` ("Compaction cancelled"). The
+                -- request's callback consumes it, so an abort that did not go
+                -- through `pi.compact_abort()` / `pi.abort()` is still not
+                -- reported as a failure.
+                if session._compaction_request then
+                    session._compaction_request.cancelled = true
+                end
                 chat:set_compacting(false)
                 restore_active_agent_status(session)
-                chat:on_error("Compaction cancelled", { pad_top = true, pad_bottom = true })
+                -- A cancellation is not a failure: the user pressed the
+                -- double-<Esc> gesture (or ran :PiCompactAbort), so the notice
+                -- stays neutral instead of raising the error alarm.
+                chat:on_error("Compaction cancelled", { pad_top = true, pad_bottom = true, notice = true })
                 chat:flush_compaction_queue(msg.willRetry == true)
             elseif type(msg.errorMessage) == "string" and msg.errorMessage ~= "" then
                 chat:set_compacting(false)

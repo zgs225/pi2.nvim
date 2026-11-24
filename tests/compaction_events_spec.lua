@@ -125,6 +125,58 @@ describe("compaction events", function()
         return table.concat(lines, "\n")
     end
 
+    --- 0-indexed buffer rows whose text contains `needle`.
+    ---@param needle string
+    ---@return integer[]
+    local function rows_with(needle)
+        local rows = {}
+        for index, line in ipairs(vim.api.nvim_buf_get_lines(chat._history._buf, 0, -1, false)) do
+            if line:find(needle, 1, true) then
+                rows[#rows + 1] = index - 1
+            end
+        end
+        return rows
+    end
+
+    --- The highlights painted on a 0-indexed row: `hl_group`s plus the
+    --- highlight groups of its inline virtual text (the alarm rail).
+    ---@param row integer
+    ---@return string[]
+    local function row_highlights(row)
+        local found = {}
+        local marks = vim.api.nvim_buf_get_extmarks(
+            chat._history._buf,
+            chat._history:ns(),
+            { row, 0 },
+            { row, -1 },
+            { details = true }
+        )
+        for _, mark in ipairs(marks) do
+            local details = mark[4] or {}
+            if details.hl_group then
+                found[#found + 1] = details.hl_group
+            end
+            for _, chunk in ipairs(details.virt_text or {}) do
+                if chunk[2] then
+                    found[#found + 1] = chunk[2]
+                end
+            end
+        end
+        return found
+    end
+
+    ---@param list string[]
+    ---@param value string
+    ---@return boolean
+    local function has(list, value)
+        for _, item in ipairs(list) do
+            if item == value then
+                return true
+            end
+        end
+        return false
+    end
+
     --- One compaction round-trip, waiting for the post-compaction rebuild.
     ---@param tokens_before integer
     local function compact(tokens_before)
@@ -233,6 +285,18 @@ describe("compaction events", function()
         wait_for(function()
             return history_text():find("Compaction cancelled", 1, true) ~= nil
         end, "the cancelled notice must still render")
+        do
+            -- A cancellation the user chose is not a failure: no error alarm
+            -- (red text + `▌` rail), just the neutral compaction notice.
+            local row = rows_with("Compaction cancelled")[1]
+            assert.is_not_nil(row, "the notice row must exist")
+            local line = vim.api.nvim_buf_get_lines(chat._history._buf, row, row + 1, false)[1]
+            assert.are.equal(Config.options.labels.compaction .. " Compaction cancelled", line)
+            local highlights = row_highlights(row)
+            assert.is_true(has(highlights, "PiCompactionHint"), "the notice uses the hint highlight")
+            assert.is_false(has(highlights, "PiError"), "a cancellation must not paint the error colour")
+            assert.is_false(has(highlights, "PiErrorRail"), "a cancellation must not raise the alarm rail")
+        end
 
         feed(session, { type = "compaction_start", reason = "overflow" })
         feed(session, { type = "compaction_end", reason = "overflow", errorMessage = "boom", result = {} })
@@ -246,6 +310,15 @@ describe("compaction events", function()
         wait_for(function()
             return history_text():find("boom", 1, true) ~= nil
         end, "the failure notice must still render")
+        do
+            -- A real failure keeps the alarm: same layout, error highlight and rail.
+            local row = rows_with("boom")[1]
+            assert.is_not_nil(row, "the failure row must exist")
+            local highlights = row_highlights(row)
+            assert.is_true(has(highlights, "PiError"), "a failure paints the error colour")
+            assert.is_true(has(highlights, "PiErrorRail"), "a failure raises the alarm rail")
+            assert.is_false(has(highlights, "PiCompactionHint"), "a failure is not a neutral notice")
+        end
     end)
 
     it("hands the replay the record it matches by summary and occupancy", function()

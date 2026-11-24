@@ -1270,7 +1270,7 @@ end
 --- arm/disarm sequences never leave a stale hint behind.
 function Chat:_sync_abort_hint()
     vim.schedule(function()
-        if self._abort_esc_at and (self._streaming or self._retrying) then
+        if self._abort_esc_at and (self._streaming or self._retrying or self._compacting) then
             local cfg = Config.options.abort or {}
             if cfg.enabled ~= false then
                 self._prompt:statusline():set_abort_hint(cfg.message or "Press <Esc> again to abort")
@@ -1296,22 +1296,20 @@ end
 
 --- Handle one <Esc> press of the double-<Esc> abort gesture.
 ---
---- While the agent is streaming **or auto-retrying** (statusline shows
---- "Retrying…"), the first press arms the gesture and shows a hint row in the
---- bottom status overlay; a second press within `abort.timeout` ms aborts
---- (same as :PiAbort / pi.abort()). A timer disarms automatically once the
---- window elapses. Outside of streaming/retrying, or when the feature is
---- disabled, this is a no-op so <Esc> keeps its normal behavior.
+--- While the agent is streaming, **auto-retrying** (statusline shows
+--- "Retrying…"), **or compacting**, the first press arms the gesture and shows
+--- a hint row in the bottom status overlay; a second press within
+--- `abort.timeout` ms aborts (same as :PiAbort / pi.abort() — a running
+--- compaction is cancelled instead, same as :PiCompactAbort). A timer disarms
+--- automatically once the window elapses. Outside of those states, or when the
+--- feature is disabled, this is a no-op so <Esc> keeps its normal behavior.
 ---
---- A compaction is the one exception: it is not a model turn the user might
---- want to let finish, so a single <Esc> aborts it outright — no armed state,
---- no hint row, no second press.
+--- A compaction needs the second press like every other abortable operation:
+--- it is a paid summarisation call, and a stray <Esc> in normal mode used to
+--- throw it away (`abort` is a single key, so this is the gesture that gets
+--- fat-fingered).
 function Chat:_handle_abort_esc()
-    if self._compacting and (Config.options.abort or {}).enabled ~= false then
-        require("pi").compact_abort()
-        return
-    end
-    if not (self._streaming or self._retrying) then
+    if not (self._streaming or self._retrying or self._compacting) then
         -- A single <Esc> cancels a running direct bash command (TUI behavior).
         if self._bash_running then
             require("pi").abort_bash()
@@ -1327,13 +1325,19 @@ function Chat:_handle_abort_esc()
     -- Second press while armed -> abort. During the retry backoff there is no
     -- agent run to abort, so the precise abort_retry command is sent instead
     -- (it only cancels the backoff sleep, matching the TUI's retry escape
-    -- handler). Decide synchronously: by the time the scheduled callback runs
-    -- the retry may already have transitioned into streaming.
+    -- handler), and a running compaction is cancelled through compact_abort.
+    -- Decide synchronously: by the time the scheduled callback runs the retry
+    -- may already have transitioned into streaming.
     if self._abort_esc_at then
         self:_disarm_abort_esc()
-        local abort_retry = self._retrying and not self._streaming
+        local target = self._compacting and "compaction" or nil
+        if not target then
+            target = (self._retrying and not self._streaming) and "retry" or "agent"
+        end
         vim.schedule(function()
-            if abort_retry then
+            if target == "compaction" then
+                require("pi").compact_abort()
+            elseif target == "retry" then
                 require("pi").abort_retry()
             else
                 require("pi").abort()
@@ -1389,9 +1393,17 @@ function Chat:is_compacting()
     return self._compacting
 end
 
+--- Leaving the compaction state disarms the gesture, so a half-pressed
+--- gesture cannot bleed into whatever runs next (same rule as `set_retrying`).
 ---@param compacting boolean
 function Chat:set_compacting(compacting)
+    if self._compacting == compacting then
+        return
+    end
     self._compacting = compacting
+    if not compacting then
+        self:_disarm_abort_esc()
+    end
 end
 
 ---@param text string

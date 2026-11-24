@@ -141,6 +141,7 @@ History._stream_flush_ms = 30
 ---@class pi.ChatErrorOpts
 ---@field pad_top? boolean
 ---@field pad_bottom? boolean
+---@field notice? boolean Render a neutral notice instead of an error: the compaction label as the prefix, the `PiCompactionHint` highlight and no alarm rail. For outcomes the user chose (a cancelled compaction), which are not failures.
 
 --- One rendered message, kept so `yy` / `:PiCopy` can return the SOURCE text
 --- instead of the rendered rows (markdown tables are drawn as box art, user
@@ -2191,7 +2192,9 @@ function History:on_error(error_message, opts)
             return
         end
         self:_pop_text_batch()
-        local icon = Config.options.labels.error
+        local notice = opts ~= nil and opts.notice == true
+        local icon = notice and Config.options.labels.compaction or Config.options.labels.error
+        local hl_group = notice and "PiCompactionHint" or "PiError"
         local prefix_w = vim.fn.strdisplaywidth(icon) + 1
         local indent = string.rep(" ", prefix_w)
         -- Hard-wrap to the window width so every screen line is a buffer
@@ -2224,14 +2227,16 @@ function History:on_error(error_message, opts)
             local row = start + first_error_row + i - 2
             vim.api.nvim_buf_set_extmark(self._buf, ns, row, 0, {
                 end_col = #line,
-                hl_group = "PiError",
+                hl_group = hl_group,
             })
-            -- Error alarm rail
-            vim.api.nvim_buf_set_extmark(self._buf, ns, row, 0, {
-                virt_text = { { "▌ ", "PiErrorRail" } },
-                virt_text_pos = "inline",
-                hl_mode = "replace",
-            })
+            if not notice then
+                -- Error alarm rail
+                vim.api.nvim_buf_set_extmark(self._buf, ns, row, 0, {
+                    virt_text = { { "▌ ", "PiErrorRail" } },
+                    virt_text_pos = "inline",
+                    hl_mode = "replace",
+                })
+            end
         end
         self:_maybe_scroll()
     end)
