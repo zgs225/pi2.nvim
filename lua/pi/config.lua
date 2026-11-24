@@ -196,7 +196,7 @@
 ---@field glob? boolean Alias of `find` for older pi versions that named the tool `glob` (default: false)
 
 ---@class pi.AbortConfig
----@field enabled? boolean Enable double-<Esc> to abort the running agent (default: true)
+---@field enabled? boolean Enable double-<Esc> to abort the running agent or a running compaction (default: true)
 ---@field timeout? integer Window in milliseconds for the second <Esc> to count (default: 1500)
 ---@field message? string Hint shown in the statusline center on the first <Esc> (default: "Press <Esc> again to abort")
 

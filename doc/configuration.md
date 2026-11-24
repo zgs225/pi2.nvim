@@ -198,7 +198,8 @@ require("pi").setup({
         glob = false, -- alias of `find` for older pi versions that named the tool `glob`
     },
 
-    -- Double-<Esc> aborts the running agent (same as :PiAbort).
+    -- Double-<Esc> aborts the running agent (same as :PiAbort) or a running
+    -- compaction (same as :PiCompactAbort).
     abort = {
         -- Enable the double-<Esc> abort gesture.
         enabled = true,

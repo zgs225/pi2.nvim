@@ -344,10 +344,79 @@ describe("compaction focus dialog and commands", function()
 
     it("requests an abort while a compaction runs", function()
         session.chat.compacting = true
+        session._compaction_request = { cancelled = false }
         assert.is_true(Pi.compact_abort())
         assert.is_not_nil(first_sent("abort"))
+        assert.is_true(session._compaction_request.cancelled, "the abort must be recorded on the request")
         assert.are.equal(vim.log.levels.INFO, last_note().level)
         assert.is_not_nil(last_note().msg:find("Compaction abort requested", 1, true))
+    end)
+
+    it("does not mark a request cancelled when the abort could not be sent", function()
+        session.chat.compacting = true
+        session._compaction_request = { cancelled = false }
+        session.rpc.running = false
+        assert.is_false(Pi.compact_abort())
+        assert.is_false(session._compaction_request.cancelled, "a refused abort must not suppress a real failure")
+    end)
+
+    --- Make the fake rpc answer the next `compact` with a failure, the way a
+    --- real pi answers a compaction it aborted mid-summarisation
+    --- (`success:false`, `error = "Compaction cancelled"`).
+    ---@param error string
+    local function compact_fails_with(error)
+        session.rpc.send = function(self, cmd, callback)
+            sent[#sent + 1] = vim.deepcopy(cmd)
+            if callback and cmd.type == "compact" then
+                vim.schedule(function()
+                    callback({ success = false, command = "compact", error = error })
+                end)
+            end
+            return self.running
+        end
+    end
+
+    it("a cancelled compaction is not reported as a failure", function()
+        -- Exactly what a real pi does: the abort is requested first, then the
+        -- `compact` request answers success:false / "Compaction cancelled"
+        -- (verified against `pi --mode rpc` with the summariser in flight).
+        compact_fails_with("Compaction cancelled")
+        Pi.compact(nil)
+        assert.is_true(session.chat:is_compacting(), "the request must be running before the abort")
+        assert.is_true(Pi.compact_abort())
+        local before = #notes
+        vim.wait(300, function()
+            return session._compaction_request == nil
+        end)
+        for index = before + 1, #notes do
+            assert.is_true(
+                notes[index].level < vim.log.levels.WARN,
+                "a cancellation must not warn or error: " .. notes[index].msg
+            )
+        end
+        assert.is_nil(session._compaction_request, "the request is consumed by its answer")
+    end)
+
+    it("a compaction that really failed still raises an ERROR", function()
+        compact_fails_with("summarizer exploded")
+        Pi.compact(nil)
+        vim.wait(200, function()
+            return last_note() ~= nil and last_note().msg:find("Compaction failed", 1, true) ~= nil
+        end)
+        assert.are.equal(vim.log.levels.ERROR, last_note().level)
+        assert.is_not_nil(last_note().msg:find("Compaction failed: summarizer exploded", 1, true))
+    end)
+
+    it("a new compaction gets its own cancellation, no stale one", function()
+        -- The previous request was cancelled; the next one owns its outcome, so
+        -- a genuine failure must still surface.
+        session._compaction_request = { cancelled = true }
+        compact_fails_with("summarizer exploded")
+        Pi.compact(nil)
+        vim.wait(200, function()
+            return last_note() ~= nil and last_note().msg:find("Compaction failed", 1, true) ~= nil
+        end)
+        assert.are.equal(vim.log.levels.ERROR, last_note().level)
     end)
 
     it("warns and sends nothing when no compaction is running", function()

@@ -223,6 +223,12 @@ function M.abort()
             end
         end
         if target.rpc and target.rpc:is_running() then
+            -- An abort that lands on a running compaction cancels it: record it
+            -- on that compaction's request, so its `success:false` answer is not
+            -- reported as a failure (see `pi.compact`).
+            if target.chat and target.chat:is_compacting() and target._compaction_request then
+                target._compaction_request.cancelled = true
+            end
             target.rpc:send({ type = "abort" })
         end
         pcall(function()
@@ -751,6 +757,10 @@ function M.compact(custom_instructions, session)
     -- session carries it into `compaction_end`, and the focus dialog offers it
     -- again next time. Blank input clears it.
     Sessions.set_compaction_focus(session, custom_instructions)
+    -- This request owns its outcome: an abort belongs to the request it was
+    -- sent for, so a stale one can never silence a later genuine failure.
+    local request = { cancelled = false }
+    session._compaction_request = request
 
     session.chat:set_compacting(true)
     session.chat:set_status({ type = "compaction" })
@@ -763,14 +773,30 @@ function M.compact(custom_instructions, session)
 
     local sent = session.rpc:send(cmd, function(res)
         vim.schedule(function()
-            if not res.success then
-                session.chat:set_compacting(false)
-                session.chat:set_status(nil)
-                Notify.error("Compaction failed: " .. (res.error or "unknown error"))
+            if session._compaction_request == request then
+                session._compaction_request = nil
             end
+            if res.success then
+                return
+            end
+            -- An aborted `compact` answers success:false / "Compaction
+            -- cancelled" (verified against a real `pi --mode rpc` with the
+            -- summarisation call in flight): a cancellation, not a failure.
+            -- The outcome is already reported by the `compaction_end` handler
+            -- (its notice, the record's `aborted` flag), so turning it into an
+            -- ERROR notification would tell the user their own <Esc> was a bug.
+            session.chat:set_compacting(false)
+            session.chat:set_status(nil)
+            if request.cancelled then
+                return
+            end
+            Notify.error("Compaction failed: " .. (res.error or "unknown error"))
         end)
     end)
     if not sent then
+        if session._compaction_request == request then
+            session._compaction_request = nil
+        end
         session.chat:set_compacting(false)
         session.chat:set_status(nil)
     end
@@ -779,8 +805,10 @@ end
 --- Abort the compaction that is running.
 ---
 --- Sent as the generic `abort` request: pi cancels the summarisation in flight
---- and reports the compaction as aborted, which the history block renders and
---- `pi.compact_retry` can replay.
+--- and reports the compaction as aborted, which the history notice renders and
+--- `pi.compact_retry` can replay. The abort is recorded on the compaction
+--- request it cancels, so the `success:false` answer that comes back is
+--- recognized as a cancellation rather than a failure (see `pi.compact`).
 ---@return boolean aborted True when the abort request was handed to the process
 function M.compact_abort()
     local Notify = require("pi.notify")
@@ -796,6 +824,11 @@ function M.compact_abort()
     if not session.rpc:send({ type = "abort" }) then
         Notify.warn("Could not reach the π process")
         return false
+    end
+    -- Only after the abort was accepted: a failed send must leave the request
+    -- reporting its own real outcome.
+    if session._compaction_request then
+        session._compaction_request.cancelled = true
     end
     Notify.info("Compaction abort requested")
     return true
