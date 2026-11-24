@@ -7,7 +7,8 @@ What the plugin does bind on its own:
 - Submission keys in the prompt buffer (`<CR>`, `<A-CR>`, `<S-CR>` — see [Usage → Prompt](usage.md#prompt)).
 - `<Esc>` / double-`<Esc>` abort gestures (see [Usage → Aborting](usage.md#aborting-with-double-esc)). A single `<Esc>` while a compaction is running aborts that compaction instead of arming the double-`<Esc>` gesture.
 - `<C-p>` / `<C-n>` / `<Up>` / `<Down>` prompt-history recall (see [Usage → Prompt history](usage.md#prompt-history)).
-- `<Tab>` block expand/collapse, `gf` open-file-under-cursor, and `dd` delete-queued-message in the history buffer.
+- `<Tab>` block expand/collapse, `gf` open-file-under-cursor, `dd` delete-queued-message and `yy` copy-message in the history buffer.
+- `yy` on a message copies its **source** text (see [Usage → Copying messages](usage.md#copying-messages)); `[count]yy` copies that many consecutive messages. The `y` operator itself stays native, so `y{motion}` and `V`+`y` keep yanking what is on screen, and [`:` `'<,'>PiCopy`](usage.md#copying-messages) does the source-text copy for a visual range.
 - `[[` / `]]` turn navigation in the history buffer and in the prompt buffer (normal mode): previous / next turn, count-aware (`3]]`), and `]]` past the last turn returns to the live bottom and resumes following (see [Usage → Turn navigation](usage.md#turn-navigation)).
 - `dd` on a queued steer/follow-up message in the history buffer deletes just that message (from pi's queue too) and yanks its text into the unnamed register (see [Usage → Deleting queued messages](usage.md#deleting-queued-messages)).
 - `gp` return to parent session when viewing a sub-session (see [Sessions → Sub-sessions](sessions.md#sub-sessions)).

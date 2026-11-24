@@ -557,6 +557,15 @@ function Chat:_set_keymaps()
         self:delete_pending_at_cursor()
     end, { buffer = hbuf, desc = "π: delete queued message under cursor" })
 
+    -- `yy` copies the message or block under the cursor as SOURCE text (raw
+    -- markdown, not the rendered rows). The "y" operator is deliberately left
+    -- alone: `y{motion}`, `V`+`y` and `"ay` keep their vim semantics, and
+    -- `:PiCopy` is the source-text path for an arbitrary visual range.
+    -- `[count]yy` copies that many consecutive messages.
+    vim.keymap.set("n", "yy", function()
+        self:copy_entry(vim.v.count1)
+    end, { buffer = hbuf, desc = "π: copy message under cursor" })
+
     -- Turn navigation, vim's section-motion pair: `]]` next turn (user
     -- message), `[[` previous one, counts included (`3]]`). Bound on the prompt
     -- too (normal mode only — `[[` in insert mode is a literal bracket), and the
@@ -915,6 +924,84 @@ function Chat:submit_follow_up()
         return
     end
     self:_send_message(self._streaming and "follow_up" or nil)
+end
+
+---@param target pi.CopyTarget
+---@return string
+local function copy_label(target)
+    if target.kind == "messages" then
+        return ("%d messages"):format(target.count or 1)
+    elseif target.kind == "tool" then
+        return "Tool output"
+    elseif target.kind == "bash" then
+        return "Bash output"
+    elseif target.kind == "thinking" then
+        return "Thinking"
+    elseif target.kind == "compaction" then
+        return "Compaction summary"
+    elseif target.kind == "user" then
+        return "User message"
+    end
+    return "Assistant message"
+end
+
+--- Copy the message or block under the cursor as source text (`yy`).
+---
+--- "Source" matters: the history buffer shows markdown tables as box art, the
+--- user body indented and a collapsed tool block as its tail, so re-reading the
+--- buffer would not reproduce what was written. The history keeps the original
+--- strings for exactly this call.
+---@param count? integer consecutive messages to copy (default 1)
+---@return boolean copied
+function Chat:copy_entry(count)
+    local target = self._history:copy_target_under_cursor(count)
+    if not target then
+        Notify.warn("Nothing to copy here")
+        return false
+    end
+    if target.text == "" then
+        Notify.warn("Nothing to copy: this message has no text yet")
+        return false
+    end
+    local Copy = require("pi.copy")
+    local register = Copy.write(target.text)
+    Notify.info(("%s copied to %s"):format(copy_label(target), Copy.describe(register)))
+    return true
+end
+
+--- Copy a 1-indexed line range of the history buffer (`:PiCopy`, normally
+--- `:'<,'>PiCopy` from a visual selection). A range that covers whole messages
+--- yields their source text; a partial selection yields the rendered lines.
+---@param line1 integer
+---@param line2 integer
+---@param opts? { clipboard?: boolean } `:PiCopy!` writes `+` as well
+---@return boolean copied
+function Chat:copy_range(line1, line2, opts)
+    local hbuf = self._history:buf()
+    if not hbuf or vim.api.nvim_get_current_buf() ~= hbuf then
+        Notify.warn(":PiCopy works in the π chat history buffer")
+        return false
+    end
+    local result = self._history:copy_range_text(line1, line2)
+    if result.text == "" then
+        Notify.warn("Nothing to copy in this range")
+        return false
+    end
+    local Copy = require("pi.copy")
+    local register = Copy.write(result.text, { clipboard = opts and opts.clipboard })
+    if result.whole then
+        local what = result.messages > 0 and ("%d message(s)"):format(result.messages)
+            or ("%d line(s)"):format(result.lines)
+        Notify.info(("%s copied to %s"):format(what, Copy.describe(register)))
+    else
+        Notify.info(
+            ("%d rendered line(s) copied to %s — select whole messages for the source text"):format(
+                result.lines,
+                Copy.describe(register)
+            )
+        )
+    end
+    return true
 end
 
 --- Delete the pending queued message under the cursor in the history buffer.

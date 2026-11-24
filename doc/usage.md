@@ -103,6 +103,22 @@ Queued messages render as real lines at the bottom of the history buffer (below 
 
 With the cursor on a queued message in the history buffer, press `dd`. π removes just that message — from pi's queue too (via `clear_queue`, then re-enqueueing the survivors in their original order and type, with attachments intact). The deleted text lands in the unnamed register, so you can paste it back with `p`; it's also in the prompt history, so `<Up>`/`<C-p>` in the prompt recalls it for editing and resubmission. Messages held locally during compaction (not yet sent to pi) are removed locally only. Deleting a queued message requires **pi 1.1.0**; older pi warns and leaves the queue untouched (`:checkhealth pi` reports the version).
 
+### Copying messages
+
+`yy` in the history buffer copies the **source** text of what the cursor is on: a user or assistant message, a tool block's body, a direct `!` bash block, a thinking block, or a compaction summary. `[count]yy` copies that many consecutive messages (`3yy`).
+
+It copies the source, not the buffer rows, because the rows are a rendering: markdown tables are drawn as box art, a user body carries a two-space indent, an unclosed fence is auto-closed and a **collapsed** tool block keeps only its tail. A tool block is the more specific target — with the cursor on one, `yy` copies its body (the complete saved body even while collapsed) instead of the assistant prose around it.
+
+The write behaves like a Vim yank, so the usual habits work: `"` and `0` are both filled (`"0p` after a later yank still pastes the message), a register prefix is honoured (`"ayy`), and `*`/`+` are mirrored when `'clipboard'` contains `unnamed`/`unnamedplus`.
+
+The `y` operator is deliberately **not** remapped: `y{motion}`, `V`+`y` and `"ay` keep their normal meaning and yank exactly the lines that are on screen. For an arbitrary range use `:PiCopy`, which needs no mapping of its own:
+
+- select lines in the history buffer and run `:'<,'>PiCopy` (or `v` then `:` — Vim fills the range for you);
+- a range that lines up with message boundaries copies the **source** text of those messages, joined by a blank line;
+- anything else copies the rendered lines and says so in the notification, because a partial selection has no source equivalent (a box-drawn table row, a folded tool tail).
+
+`:PiCopy!` writes the clipboard register (`+`) as well as `"`/`0`, the same escaping hatch as the compaction panel's `y` for a build without a clipboard provider. Like `dd`, both paths require an active session and the history buffer as the current buffer.
+
 ### Queue delivery modes
 
 By default pi delivers one queued steer per turn boundary (`one-at-a-time`) — a burst of steers is folded in one at a time. `:PiSteeringMode [mode]` (Lua: `pi.set_steering_mode(mode)`) switches steering delivery to `all` (every queued steer is delivered together after the current tool calls finish) or back to `one-at-a-time`. `:PiFollowUpMode [mode]` (Lua: `pi.set_follow_up_mode(mode)`) does the same for follow-up messages. With no argument, both commands cycle to the other mode; with an argument they set that mode. The mode is per-session backend state — it applies to the current tab's session and does not cascade to sub-sessions. See [Queue modes](api.md#queue-modes) for details.

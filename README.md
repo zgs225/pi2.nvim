@@ -282,6 +282,7 @@ require("pi").setup({
 | `:PiSendMention` | Mention the current file; in visual mode or with a range, mention the selection lines |
 | `:PiAttachImage {path}` | Attach an image file to the prompt |
 | `:PiPasteImage` | Attach an image from the clipboard |
+| `:PiCopy` | Copy chat history lines: the **source** text when the range covers whole messages, the rendered lines otherwise (see [doc/usage.md](doc/usage.md#copying-messages)) |
 | `:PiCompact [instructions]` | Ask π to compact the current conversation context. With no argument it opens a focus dialog (presets + free text + recent focuses); `:PiCompact!` compacts immediately without the dialog; passing instructions compacts with that focus |
 | `:PiCompactAbort` | Abort the compaction that is running (same as a single `<Esc>` while compacting) |
 | `:PiCompactRetry` | Retry the last failed or aborted compaction with the same focus instructions |

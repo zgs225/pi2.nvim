@@ -351,6 +351,20 @@ function M.setup()
         require("pi.ui.compactions").toggle()
     end, { desc = "Show the compaction timeline for the current session" })
 
+    vim.api.nvim_create_user_command("PiCopy", function(cmd)
+        local session = require("pi.sessions.manager").get()
+        local chat = session and session.chat or nil
+        if not chat then
+            require("pi.notify").warn("No active π session to copy from")
+            return
+        end
+        chat:copy_range(cmd.line1, cmd.line2, { clipboard = cmd.bang })
+    end, {
+        range = true,
+        bang = true,
+        desc = "Copy chat history lines (source text when whole messages are selected)",
+    })
+
     vim.api.nvim_create_user_command("PiToggleAutoCompaction", function()
         Pi.toggle_auto_compaction()
     end, { desc = "Toggle π automatic context compaction" })
