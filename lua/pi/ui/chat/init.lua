@@ -37,6 +37,11 @@
 ---@field _worktree_same_cwd boolean session cwd equals Neovim's cwd
 ---@field _worktree_status? { dirty?: boolean, ahead?: integer } async `git status` summary for the badge
 ---@field _worktree_timer? uv.uv_timer_t debounced badge refresh (tool completion)
+---@field _branch? pi.GitBranch git branch of the session checkout (nil: not a repository)
+---@field _branch_key? string identity of the rendered branch chunk (skip no-op re-renders)
+---@field _branch_watch? fun() unsubscribe for the `HEAD` watcher
+---@field _branch_watch_cwd? string cwd the watcher was armed for
+---@field _branch_watch_git_dir? string git dir the watcher was armed for (nil: not a repository)
 local Chat = {}
 Chat.__index = Chat
 
@@ -107,6 +112,11 @@ function Chat.new(tab, mode, agent)
     self._worktree_same_cwd = true
     self._worktree_status = nil
     self._worktree_timer = nil
+    self._branch = nil
+    self._branch_key = nil
+    self._branch_watch = nil
+    self._branch_watch_cwd = nil
+    self._branch_watch_git_dir = nil
     self._last_applied_prompt = nil
     self._hidden_panels = nil
     self._bash_running = false
@@ -142,6 +152,10 @@ end
 --- enough to keep the dirty/ahead marker current.
 local WORKTREE_REFRESH_DEBOUNCE_MS = 300
 
+--- Glyph for the git branch badge in the history title (` feat/x`), the sibling
+--- of the worktree badge's `󰙅`.
+local BRANCH_GLYPH = "󰘬"
+
 --- The worktree module when available. `detect` is synchronous and
 --- filesystem-only; dirty/ahead comes from an async `status` call, so nothing
 --- on the render path ever runs git.
@@ -149,6 +163,18 @@ local WORKTREE_REFRESH_DEBOUNCE_MS = 300
 local function worktree_module()
     local ok, mod = pcall(require, "pi.worktree")
     if ok and type(mod) == "table" and type(mod.detect) == "function" then
+        return mod
+    end
+    return nil
+end
+
+--- The git branch module when available. `read` is a cached detection plus one
+--- `HEAD` file read — no subprocess — and `watch` observes that same file, so
+--- the history title can show a checkout without ever shelling out to git.
+---@return table?
+local function branch_module()
+    local ok, mod = pcall(require, "pi.git_branch")
+    if ok and type(mod) == "table" and type(mod.read) == "function" and type(mod.label) == "function" then
         return mod
     end
     return nil
@@ -212,6 +238,26 @@ function Chat.worktree_badge(info, same_cwd, status, cwd)
     return { { "⚠ " .. label, "PiStatusLineWarning" } }
 end
 
+--- Title chunks for the git branch badge, so the display matrix is unit
+--- testable without a repository:
+---   on a branch         → ` feat/x`
+---   detached `HEAD`     → ` 3db087b` (the sha is the whole story)
+---   no repository       → nil, no placeholder
+---
+--- Nothing is rendered outside a checkout, matching every frontend the feature
+--- was modelled on (pi TUI, Gemini CLI, Codex CLI, Crush): a directory that is
+--- not a repository never advertises an empty branch.
+---@param info pi.GitBranch?
+---@return pi.ChatHistoryTitleChunk[]?
+function Chat.branch_badge(info)
+    local mod = branch_module()
+    local label = mod and mod.label(info) or nil
+    if type(label) ~= "string" or label == "" then
+        return nil
+    end
+    return { { BRANCH_GLYPH .. " " .. label, "PiChatHistoryBranch" } }
+end
+
 --- Show a breadcrumb when viewing a sub-session (`◂ 父：…`).
 ---@param label string
 ---@param parent_id string
@@ -240,6 +286,12 @@ function Chat:_update_history_title()
             Chat.worktree_badge(self._worktree, self._worktree_same_cwd, self._worktree_status, self:_session_cwd())
         if badge then
             for _, chunk in ipairs(badge) do
+                chunks[#chunks + 1] = chunk
+            end
+        end
+        local branch = Chat.branch_badge(self._branch)
+        if branch then
+            for _, chunk in ipairs(branch) do
                 chunks[#chunks + 1] = chunk
             end
         end
@@ -324,6 +376,83 @@ function Chat:refresh_worktree()
             self:_update_history_title()
         end)
     end)
+end
+
+--- Resolve the session checkout's branch and arm its `HEAD` watcher.
+---
+--- One cached `pi.worktree.detect` (marker-stamped, no subprocess) plus one small
+--- file read, so this is cheap enough for the show path and for a per-turn
+--- fallback. The watcher is re-armed only when the cwd or the git dir changed;
+--- it is what makes a `git checkout` run by the agent — or in a terminal next to
+--- the editor — visible without waiting for the turn to end.
+function Chat:refresh_branch()
+    local mod = branch_module()
+    if not mod then
+        return
+    end
+    local cwd = self:_session_cwd()
+    local ok, info = pcall(mod.read, cwd)
+    if not ok then
+        info = nil
+    end
+    self:_apply_branch(info)
+    local git_dir = type(info) == "table" and info.git_dir or nil
+    if self._branch_watch_cwd ~= cwd or self._branch_watch_git_dir ~= git_dir then
+        self:_rearm_branch_watch(cwd, git_dir)
+    end
+end
+
+--- Drop the current watcher and arm one for the checkout the session now runs
+--- in (none for a directory that is not a repository).
+---@param cwd string
+---@param git_dir string?
+function Chat:_rearm_branch_watch(cwd, git_dir)
+    if self._branch_watch then
+        pcall(self._branch_watch)
+        self._branch_watch = nil
+    end
+    self._branch_watch_cwd = cwd
+    self._branch_watch_git_dir = git_dir
+    local mod = branch_module()
+    if not mod or type(git_dir) ~= "string" or git_dir == "" then
+        return
+    end
+    local ok, unsubscribe = pcall(mod.watch, cwd, function(info)
+        self:_apply_branch(info)
+    end)
+    if ok and type(unsubscribe) == "function" then
+        self._branch_watch = unsubscribe
+    end
+end
+
+--- Store a branch record, re-rendering the title only when the rendered label
+--- (or the checkout it came from) actually changed.
+---@param info pi.GitBranch?
+function Chat:_apply_branch(info)
+    local mod = branch_module()
+    local label = mod and mod.label(info) or nil
+    local git_dir = type(info) == "table" and info.git_dir or nil
+    local key = (git_dir or "") .. "\0" .. (label or "")
+    if key == self._branch_key then
+        return
+    end
+    self._branch_key = key
+    self._branch = info
+    self:_update_history_title()
+end
+
+--- Release the checkout watcher. The uv handle keeps its callback (and this
+--- chat) alive, so a detached tab that skipped this would leave one watcher
+--- behind per tab it ever showed.
+function Chat:dispose()
+    if self._branch_watch then
+        pcall(self._branch_watch)
+        self._branch_watch = nil
+    end
+    self._branch_watch_cwd = nil
+    self._branch_watch_git_dir = nil
+    cancel_timer(self._worktree_timer)
+    self._worktree_timer = nil
 end
 
 --- Coalesce an event-driven badge refresh: one finished turn can contain many
@@ -608,6 +737,7 @@ function Chat:show(opts)
     -- the worktree state (files may have changed while the chat was hidden),
     -- rather than replaying a cached badge.
     self:refresh_worktree()
+    self:refresh_branch()
     if opts and opts.loading then
         self:show_loading()
     else
@@ -1314,6 +1444,7 @@ function Chat:set_cwd(cwd)
     self._prompt_history = nil
     self._prompt_nav = nil
     self:refresh_worktree()
+    self:refresh_branch()
 end
 
 --- Get the prompt-history store for this chat, honoring config. History is
@@ -1909,6 +2040,9 @@ function Chat:on_agent_end(rate)
     cancel_timer(self._worktree_timer)
     self._worktree_timer = nil
     self:refresh_worktree()
+    -- Branch fallback: a filesystem that cannot watch `HEAD` (network mount,
+    -- some WSL setups) still catches a checkout run by the turn's tools here.
+    self:refresh_branch()
 
     -- Clear, eye-catching confirmation that the turn was aborted.
     if stop_reason == "aborted" then

@@ -727,6 +727,9 @@ local function detach_tab(tab)
     if chat then
         chat:hide()
         chat:clear()
+        -- Release the checkout watcher (`HEAD` fs_event) with the tab: the uv
+        -- handle would otherwise outlive the chat it belongs to.
+        pcall(chat.dispose, chat)
         tab_chats[tab] = nil
     end
     -- The tab no longer views any session: an open todo panel in it
@@ -3939,6 +3942,7 @@ function M._reset()
         registry[id] = nil
     end
     for tab in pairs(tab_chats) do
+        pcall(tab_chats[tab].dispose, tab_chats[tab])
         tab_chats[tab] = nil
     end
     for tab in pairs(tab_session_id) do
