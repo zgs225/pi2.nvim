@@ -234,6 +234,20 @@ end)
 describe("copy: register semantics", function()
     local orig_clipboard
 
+    --- Content the `+` register is expected to hold, or nil where there is no
+    --- provider to hold it: a build without one accepts `setreg("+")` and keeps
+    --- nothing (the reason `pi.copy` treats the `+` write as best-effort), so
+    --- the target assertion below stays unconditional but the content one
+    --- cannot be. CI runners have no clipboard provider.
+    ---@param text string
+    ---@return string?
+    local function clipboard_content(text)
+        if vim.fn.has("clipboard") == 0 then
+            return nil
+        end
+        return text
+    end
+
     before_each(function()
         orig_clipboard = vim.o.clipboard
         vim.o.clipboard = ""
@@ -267,13 +281,22 @@ describe("copy: register semantics", function()
         vim.o.clipboard = "unnamedplus"
         local target = Copy.write("hello")
         assert.are.equal("+", target)
-        assert.are.equal("hello\n", vim.fn.getreg("+"))
+        local content = clipboard_content("hello\n")
+        if content then
+            assert.are.equal(content, vim.fn.getreg("+"))
+        end
+        -- The unnamed register is written either way, so a provider-less build
+        -- still gets the text.
+        assert.are.equal("hello\n", vim.fn.getreg('"'))
     end)
 
     it("writes + for an explicit clipboard request", function()
         local target = Copy.write("hello", { clipboard = true })
         assert.are.equal("+", target)
-        assert.are.equal("hello\n", vim.fn.getreg("+"))
+        local content = clipboard_content("hello\n")
+        if content then
+            assert.are.equal(content, vim.fn.getreg("+"))
+        end
         -- Still recoverable without a clipboard provider.
         assert.are.equal("hello\n", vim.fn.getreg('"'))
     end)
@@ -373,7 +396,12 @@ describe("copy: yy and :PiCopy wiring", function()
 
         vim.cmd(("1,%dPiCopy!"):format(total))
 
-        assert.are.equal("clip me\n", vim.fn.getreg("+"))
+        if vim.fn.has("clipboard") == 1 then
+            assert.are.equal("clip me\n", vim.fn.getreg("+"))
+        end
+        -- The named/unnamed registers are always written, which is what makes
+        -- `:PiCopy!` useful on a build without a clipboard provider.
+        assert.are.equal("clip me\n", vim.fn.getreg('"'))
     end)
 
     it(":PiCopy refuses a buffer that is not the chat history", function()
