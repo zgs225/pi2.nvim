@@ -573,8 +573,8 @@ The **center** group is centered in the window and has placement priority: when 
 | `tokens` | `↑3.8k ↓58k` | Total input/output tokens used this session |
 | `cache` | `R7.2M W416k` | Total prompt-cache read/write |
 | `cost` | `$7.665` | Session cost is greater than zero |
-| `context` | `63.9%/200k` | Current context window usage — percentage + total. With a known compaction budget it appends the distance to pi's automatic compaction threshold (`63.9%/200k · 37k to compact`) |
-| `compaction` | 󰏗 | Auto-compaction is enabled — the same icon as the compaction summary label |
+| `context` | `63.9%/200k` | Current context window usage — percentage + total. Deliberately text-free: the compaction distance lives on the `compaction` marker |
+| `compaction` | `󰏗` / `󰏗 37k` | Auto-compaction is enabled — the same icon as the compaction summary label. With `countdown` on it also carries the distance to pi's automatic compaction threshold — see [Compaction countdown](#compaction-countdown) |
 | `attention` | `󰵚` / `󰵚 2` | There's at least one pending attention request |
 | `model` | `claude-opus-4-6` / `claude-opus-4-6  [anthropic]` | A model is active. The `[provider]` suffix appears when the same model id is served by several providers (or by one provider through several base URLs) — see the `provider` option below |
 | `thinking` | `󰌵 H` / `󰹏` | The current model supports reasoning |
@@ -591,7 +591,12 @@ Per-component options live under `statusline.components.<name>`:
 statusline = {
     components = {
         -- Every built-in takes an `icon` prefix. Set to `false` to disable.
-        compaction = { icon = false },
+        -- `compaction` is the auto-compaction marker. `countdown` hangs the
+        -- distance to pi's automatic compaction threshold off it:
+        -- `false` (default) keeps the marker alone, `true` always shows the
+        -- distance, `"near"` shows it only once the context reaches `near`
+        -- percent of that threshold.
+        compaction = { icon = false, countdown = false, near = 80 },
 
         -- `model` can disambiguate providers: with the default
         -- `provider = "ambiguous"`, a "[provider]" suffix (e.g. "[openrouter]"
@@ -604,9 +609,7 @@ statusline = {
         -- `context` supports warning / error thresholds as percentages
         -- of the model's context window. When crossed, the value is
         -- rendered in `PiStatusLineWarning` / `PiStatusLineError`.
-        -- `countdown = true` (default) appends the distance to pi's
-        -- automatic compaction threshold; see Statusline below.
-        context = { icon = "", warn = 70, error = 90, countdown = true },
+        context = { icon = "", warn = 70, error = 90 },
 
         -- `cost` supports the same thresholds as raw numbers.
         -- cost = { icon = "", warn = 5, error = 10 },
@@ -731,18 +734,38 @@ The command is a silent no-op without an active session. `q`/`<Esc>`/`<CR>` clos
 
 ### Compaction countdown
 
-The `context` component answers "how much of the window is used"; with `components.context.countdown = true` (the default) it also answers "how long until pi compacts on its own":
+The `context` component answers "how much of the window is used" and nothing else — it never grows a suffix. "How long until pi compacts on its own" is a separate reading on a separate component, the auto-compaction marker (`statusline.components.compaction.countdown`):
+
+```lua
+statusline = {
+    components = {
+        -- false (default): 󰏗      — the marker alone, the pre-countdown display
+        -- true:            󰏗 37k   — the distance, always
+        -- "near":          󰏗 37k   — the distance only once the context reaches
+        --                     `near` percent of the threshold (default 80)
+        compaction = { icon = false, countdown = false, near = 80 },
+    },
+}
+```
 
 ```
-63.9%/200k · 37k to compact
+󰏗 37k          the context has 37k tokens of room before pi compacts on its own
+󰏗 now          at or past the threshold: pi compacts at the next turn boundary
+󰏗 !            keep ≥ budget — see the warnings below
+󰏗 ?            a compaction setting is invalid — see the warnings below
+󰏗              auto-compaction is off, or no budget is known (nothing to count)
 ```
 
-The suffix is `window - reserveTokens` (pi's `compaction.reserveTokens`, default 16384) minus the live occupancy, resolved from pi's own settings files (`~/.pi/agent/settings.json` and the session checkout's `.pi/settings.json`, including `compaction.modelOverrides` for the current `provider/modelId`). The files are read lazily and cached by their size+mtime stamp, so the countdown never touches the session-start path and an edit is picked up on the next refresh.
+`countdown = "near"` is the middle ground: the number appears only when it is about to matter, so a comfortable session keeps the one-glyph statusline. A narrow window truncates the number before anything else of the left group is cut, and the marker disappears together with the rest of the left group when nothing fits.
 
-Two configurations the countdown makes visible instead of hiding:
+The distance is `window - reserveTokens` (pi's `compaction.reserveTokens`, default 16384) minus the live occupancy, resolved from pi's own settings files (`~/.pi/agent/settings.json` and the session checkout's `.pi/settings.json`, including `compaction.modelOverrides` for the current `provider/modelId`). The files are read lazily and cached by their size+mtime stamp, so the countdown never touches the session-start path and an edit is picked up on the next refresh.
 
-- `keep ≥ budget` — `keepRecentTokens` is at or above `window - reserveTokens`, so pi cannot find a cut point at all (upstream #12076). The component turns red and the manager warns once with the numbers. Lower `compaction.keepRecentTokens` in pi settings or use a larger window.
-- `· ?` — a compaction setting is invalid (wrong type, zero, negative, or the file does not parse). The next valid layer answers for the value, and the warning names the dotted path. Set `countdown = false` to drop the suffix entirely; with `compaction.enabled = false` it is omitted too, because there is no threshold to count down to.
+Unusable settings are never hidden, not even by `"near"` — they are the reason the number is missing:
+
+- `!` — `keepRecentTokens` is at or above `window - reserveTokens`, so pi cannot find a cut point at all (upstream #12076). The manager warns once with both numbers. Lower `compaction.keepRecentTokens` in pi settings or use a larger window.
+- `?` — a compaction setting is invalid (wrong type, zero, negative, or the file does not parse). The next valid layer answers for the value, and the warning names the dotted path.
+
+Both markers are one-off diagnostics: with `countdown = false` the statusline stays clean, but the same problems are still reported (once) by the notification.
 
 Auto-compaction itself stays pi's: `:PiToggleAutoCompaction` / `pi.toggle_auto_compaction()` flips it, and the `compaction` icon shows the state.
 
