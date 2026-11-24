@@ -51,6 +51,7 @@
 ---@field _current_turn_first_agent_response_extmark_id integer?
 ---@field _current_turn_last_agent_response_extmark_id integer?
 ---@field _turn_anchors integer[] extmark ids of the user label rows, one per turn, in render order
+---@field _entries pi.HistoryEntry[] rendered messages in append order (copy source)
 ---@field _text_batches string[][] sealed/open text-delta batches, one per structural boundary
 ---@field _structural_inflight integer structural dispatches whose callback has not run yet
 ---@field _pending_thinking table<integer, string[]> coalesced thinking deltas awaiting flush, keyed by block generation
@@ -141,6 +142,24 @@ History._stream_flush_ms = 30
 ---@field pad_top? boolean
 ---@field pad_bottom? boolean
 
+--- One rendered message, kept so `yy` / `:PiCopy` can return the SOURCE text
+--- instead of the rendered rows (markdown tables are drawn as box art, user
+--- bodies are indented two spaces, collapsed tool blocks keep only a tail).
+--- The anchor is an extmark in `entry_ns`, so it survives streaming inserts,
+--- block expand/collapse and compaction-block rewrites.
+---@class pi.HistoryEntry
+---@field kind "user"|"assistant"
+---@field anchor integer
+---@field text? string nil while an assistant message is still streaming
+
+--- What the cursor (or a `:PiCopy` range) resolves to.
+---@class pi.CopyTarget
+---@field kind "user"|"assistant"|"tool"|"thinking"|"compaction"|"messages"
+---@field text string source text (markdown for messages, body for a tool block)
+---@field start_row integer 0-indexed first buffer row of the target
+---@field end_row integer 0-indexed last buffer row of the target (inclusive)
+---@field count? integer messages covered (only for kind = "messages")
+
 ---@class pi.HighlightMark
 ---@field row integer
 ---@field col_start integer
@@ -164,6 +183,13 @@ local ns = vim.api.nvim_create_namespace("pi-chat")
 -- redraws), and an anchor swallowed by such a clear would silently drop a turn
 -- from `[[` / `]]` navigation. Nothing else writes here.
 local turn_ns = vim.api.nvim_create_namespace("pi-chat-turn")
+
+-- Message-entry anchors for the copy feature (`yy` / `:PiCopy`) get their own
+-- namespace for the same reason as `turn_ns`: render code clears `ns` over row
+-- ranges (tool expand/collapse, live updates, footer redraws), and an entry
+-- anchor swallowed by such a clear would silently break copying for the rest of
+-- the session.
+local entry_ns = vim.api.nvim_create_namespace("pi-chat-entry")
 
 local STARTUP_HL_PRIORITY = 200
 
@@ -568,6 +594,7 @@ function History.new(tab)
     self._current_turn_first_agent_response_extmark_id = nil
     self._current_turn_last_agent_response_extmark_id = nil
     self._turn_anchors = {}
+    self._entries = {}
     self._text_batches = { {} } -- invariant: always ends with one open batch
     self._structural_inflight = 0
     self._pending_thinking = {}
@@ -1921,6 +1948,10 @@ function History:add_user_message(msg, timestamp, image_count, queue_type)
         -- and startup-block toggles all move it correctly.
         local anchor = vim.api.nvim_buf_set_extmark(self._buf, turn_ns, label_row, 0, { right_gravity = true })
         self._turn_anchors[#self._turn_anchors + 1] = anchor
+        -- Copy source: the text as authored. The rendered body cannot be used
+        -- for this (it is indented and its markdown tables are drawn as box
+        -- art), so the entry keeps the original string.
+        self:_register_entry("user", label_row, has_message_text and msg or "")
         vim.api.nvim_buf_set_extmark(self._buf, ns, label_row, 0, {
             end_col = #icon,
             hl_group = "PiUserMessageLabel",
@@ -1973,6 +2004,10 @@ function History:on_agent_start(timestamp)
         self:_begin_conversation_content()
         self._agent_start_time = vim.uv.hrtime() / 1e9
         self._first_delta = true
+        -- A new assistant message closes the previous one: `_agent_text_chunks`
+        -- is reset below and no on_agent_end fires between two assistant
+        -- messages of the same run, so hand its streamed text over here.
+        self:_finish_agent_text(table.concat(self._agent_text_chunks or {}))
         self._agent_text_chunks = {}
         self._needs_separator = false
         self._last_was_inline = false
@@ -2006,6 +2041,7 @@ function History:on_agent_start(timestamp)
         local start = self:_append_lines(lines)
         local label_offset = turn_gap and (ends_blank and 1 or 2) or (ends_blank and 0 or 1)
         local label_row = start + label_offset
+        self:_register_entry("assistant", label_row)
         local response_extmark_id = vim.api.nvim_buf_set_extmark(self._buf, ns, label_row, 0, {})
         if not self._current_turn_first_agent_response_extmark_id then
             self._current_turn_first_agent_response_extmark_id = response_extmark_id
@@ -2050,6 +2086,10 @@ function History:on_agent_end(done_verb, opts)
         -- Agent may stop mid-stream with an open fence. Recompute from the
         -- streamed agent text because chunks can split the ``` marker.
         local agent_text = table.concat(self._agent_text_chunks or {})
+        -- Keep the source text of the message that just finished (the buffer
+        -- only has it rendered). `_finish_agent_text` is a no-op for an empty
+        -- reply, e.g. a turn that only made tool calls.
+        self:_finish_agent_text(agent_text)
         if self:_agent_text_has_open_fence(agent_text) then
             self:_append_text("\n```")
         end
@@ -4842,8 +4882,10 @@ function History:clear()
     self._current_turn_first_agent_response_extmark_id = nil
     self._current_turn_last_agent_response_extmark_id = nil
     self._turn_anchors = {}
+    self._entries = {}
     vim.api.nvim_buf_clear_namespace(self._buf, ns, 0, -1)
     vim.api.nvim_buf_clear_namespace(self._buf, turn_ns, 0, -1)
+    vim.api.nvim_buf_clear_namespace(self._buf, entry_ns, 0, -1)
     self:_with_modifiable(function()
         vim.api.nvim_buf_set_lines(self._buf, 0, -1, false, { "" })
     end)
@@ -5030,6 +5072,299 @@ function History:goto_path_at_cursor()
         pcall(vim.api.nvim_win_set_cursor, 0, { lnum, 0 })
     end
     return true
+end
+
+-- ---------------------------------------------------------------------------
+-- Copying: `yy` / `:PiCopy`
+--
+-- What the cursor is on, as SOURCE text. The buffer is not a valid source for
+-- that: markdown tables are rewritten into box art, user bodies carry a
+-- two-space indent, an unclosed fence is auto-closed, and a collapsed tool
+-- block keeps only its tail. Messages therefore keep the string they were
+-- rendered from, anchored by an extmark in `entry_ns` so streaming inserts and
+-- block toggles move the anchor with the row. Memory cost is one reference per
+-- message plus the assistant text `on_agent_end` used to discard; nothing here
+-- runs on the `setup()` path.
+-- ---------------------------------------------------------------------------
+
+---@param buf integer
+---@param ns_id integer
+---@param id? integer
+---@return integer? row 0-indexed, nil when the mark is gone
+local function extmark_row(buf, ns_id, id)
+    if not id then
+        return nil
+    end
+    local ok, pos = pcall(vim.api.nvim_buf_get_extmark_by_id, buf, ns_id, id, {})
+    if not ok or not pos or not pos[1] then
+        return nil
+    end
+    return pos[1]
+end
+
+---@param kind "user"|"assistant"
+---@param label_row integer 0-indexed row of the message's label
+---@param text? string raw message text (assistant text arrives at the next boundary)
+function History:_register_entry(kind, label_row, text)
+    if not self._buf or not vim.api.nvim_buf_is_valid(self._buf) then
+        return
+    end
+    local anchor = vim.api.nvim_buf_set_extmark(self._buf, entry_ns, label_row, 0, {
+        right_gravity = true,
+    })
+    self._entries[#self._entries + 1] = { kind = kind, anchor = anchor, text = text }
+end
+
+--- Hand a finished assistant message's text to the newest entry that is still
+--- waiting for it. Called at the two boundaries a message can end at: the next
+--- `on_agent_start` (no `on_agent_end` fires between two assistant messages of
+--- one run) and `on_agent_end` itself. An empty reply — a turn that only made
+--- tool calls — leaves its entry empty on purpose.
+---@param text string
+function History:_finish_agent_text(text)
+    if not text or text == "" then
+        return
+    end
+    -- The streamed text carries the render-time breathing newline before the
+    -- first line and a trailing newline; neither is part of the message.
+    text = text:gsub("^\n+", ""):gsub("%s+$", "")
+    if text == "" then
+        return
+    end
+    for i = #self._entries, 1, -1 do
+        local entry = self._entries[i]
+        if entry.kind == "assistant" then
+            if not entry.text then
+                entry.text = text
+            end
+            return
+        end
+    end
+end
+
+--- Messages in render order with their current row ranges, dropping entries
+--- whose anchor died (buffer clear, a namespace wipe) the way `_live_turn_rows`
+--- drops dead turn anchors.
+---@return { entry: pi.HistoryEntry, start_row: integer, end_row: integer }[]
+function History:_resolved_entries()
+    local resolved = {}
+    if not self._buf or not vim.api.nvim_buf_is_valid(self._buf) then
+        return resolved
+    end
+    local kept = {}
+    for _, entry in ipairs(self._entries) do
+        local row = extmark_row(self._buf, entry_ns, entry.anchor)
+        if row then
+            resolved[#resolved + 1] = { entry = entry, start_row = row }
+            kept[#kept + 1] = entry
+        end
+    end
+    if #kept ~= #self._entries then
+        self._entries = kept
+    end
+    table.sort(resolved, function(a, b)
+        return a.start_row < b.start_row
+    end)
+    local last = vim.api.nvim_buf_line_count(self._buf) - 1
+    for i, item in ipairs(resolved) do
+        -- A message owns everything up to the next label: its prose, the tool /
+        -- thinking blocks rendered inside it, and the turn's trailing blanks.
+        item.end_row = (resolved[i + 1] and resolved[i + 1].start_row - 1) or last
+    end
+    return resolved
+end
+
+--- Source text of a tool block: its body, never the rendered header/footer
+--- decoration. A collapsed block keeps the complete body in
+--- `expanded_inner_lines` (the buffer holds only the folded tail).
+---@param row integer 0-indexed
+---@return pi.CopyTarget?
+function History:_tool_target_at(row)
+    for _, block in pairs(self._tool_blocks) do
+        local header = extmark_row(self._buf, ns, block.icon_extmark)
+        if header then
+            local footer = extmark_row(self._buf, ns, block.end_extmark) or header
+            if row >= header and row <= footer then
+                local text
+                if block.expanded_inner_lines then
+                    text = table.concat(block.expanded_inner_lines, "\n")
+                elseif footer > header then
+                    text = table.concat(vim.api.nvim_buf_get_lines(self._buf, header + 1, footer, false), "\n")
+                else
+                    -- Inline tool (one row): the row is the whole block.
+                    text = vim.api.nvim_buf_get_lines(self._buf, header, header + 1, false)[1] or ""
+                end
+                return { kind = "tool", text = text, start_row = header, end_row = footer }
+            end
+        end
+    end
+    return nil
+end
+
+--- Source text of a direct bash execution block: the command and its output as
+--- rendered (`bash` blocks have no folded state, so the buffer rows are exact).
+---@param row integer 0-indexed
+---@return pi.CopyTarget?
+function History:_bash_target_at(row)
+    for _, block in pairs(self._bash_blocks) do
+        local header = extmark_row(self._buf, ns, block.header_extmark)
+        if header then
+            local footer = extmark_row(self._buf, ns, block.end_extmark) or header
+            if row >= header and row <= footer then
+                local lines = vim.api.nvim_buf_get_lines(self._buf, header, footer, false)
+                return { kind = "bash", text = table.concat(lines, "\n"), start_row = header, end_row = footer }
+            end
+        end
+    end
+    return nil
+end
+
+--- Source text of the thinking block under the row, from the message parts
+--- (the buffer only ever holds a one-line head summary).
+---@param row integer 0-indexed
+---@return pi.CopyTarget?
+function History:_thinking_target_at(row)
+    for _, block in ipairs(self._thinking_blocks) do
+        if block.visible and block.line_count > 0 then
+            local anchor = extmark_row(self._buf, ns, block.anchor)
+            if anchor and row >= anchor and row < anchor + block.line_count then
+                return {
+                    kind = "thinking",
+                    text = Text.thinking_flat(block.lines),
+                    start_row = anchor,
+                    end_row = anchor + block.line_count - 1,
+                }
+            end
+        end
+    end
+    return nil
+end
+
+--- Source text of the compaction summary under the row.
+---@param row integer 0-indexed
+---@return pi.CopyTarget?
+function History:_compaction_target_at(row)
+    for _, block in ipairs(self._compaction_blocks) do
+        local anchor = extmark_row(self._buf, ns, block.anchor)
+        if anchor and row >= anchor and row < anchor + block.line_count then
+            return {
+                kind = "compaction",
+                text = block.summary or "",
+                start_row = anchor,
+                end_row = anchor + block.line_count - 1,
+            }
+        end
+    end
+    return nil
+end
+
+--- What the row resolves to, most specific first: a compaction block, a direct
+--- bash block, a tool block, a thinking block, then the message containing it.
+---@param row integer 0-indexed
+---@return pi.CopyTarget?
+function History:copy_target_at(row)
+    local target = self:_compaction_target_at(row)
+        or self:_bash_target_at(row)
+        or self:_tool_target_at(row)
+        or self:_thinking_target_at(row)
+    if target then
+        return target
+    end
+    for _, item in ipairs(self:_resolved_entries()) do
+        if row >= item.start_row and row <= item.end_row then
+            return {
+                kind = item.entry.kind,
+                text = item.entry.text or "",
+                start_row = item.start_row,
+                end_row = item.end_row,
+            }
+        end
+    end
+    return nil
+end
+
+--- The target for `[count]yy`: one block/message under the cursor, or `count`
+--- consecutive messages. A count never widens a block target — a tool block is
+--- not a message.
+---@param count? integer
+---@return pi.CopyTarget?
+function History:copy_target_under_cursor(count)
+    local win = self:win()
+    if not win then
+        return nil
+    end
+    local row = vim.api.nvim_win_get_cursor(win)[1] - 1
+    count = math.max(1, count or 1)
+    if count == 1 then
+        return self:copy_target_at(row)
+    end
+    local resolved = self:_resolved_entries()
+    local first
+    for i, item in ipairs(resolved) do
+        if row >= item.start_row and row <= item.end_row then
+            first = i
+            break
+        end
+    end
+    if not first then
+        return nil
+    end
+    local last = math.min(#resolved, first + count - 1)
+    local texts = {}
+    for i = first, last do
+        local text = resolved[i].entry.text
+        if text and text ~= "" then
+            texts[#texts + 1] = text
+        end
+    end
+    return {
+        kind = "messages",
+        text = table.concat(texts, "\n\n"),
+        start_row = resolved[first].start_row,
+        end_row = resolved[last].end_row,
+        count = last - first + 1,
+    }
+end
+
+--- The text `:PiCopy` writes for a 1-indexed line range.
+---
+--- Source text when the range lines up with message boundaries or is exactly
+--- one sub-block; otherwise the buffer's rendered lines, because a partial
+--- selection has no source equivalent (a box-drawn table row, a folded tool
+--- tail). Reporting the difference is the caller's job.
+---@param line1 integer
+---@param line2 integer
+---@return { text: string, whole: boolean, messages: integer, lines: integer }
+function History:copy_range_text(line1, line2)
+    local count = vim.api.nvim_buf_line_count(self._buf)
+    local first = math.max(0, math.min(line1, line2) - 1)
+    local last = math.min(count - 1, math.max(line1, line2) - 1)
+    local sub = self:copy_target_at(first)
+    if sub and sub.kind ~= "user" and sub.kind ~= "assistant" and sub.start_row == first and sub.end_row == last then
+        return { text = sub.text, whole = true, messages = 0, lines = last - first + 1 }
+    end
+    local covered = {}
+    for _, item in ipairs(self:_resolved_entries()) do
+        if item.end_row >= first and item.start_row <= last then
+            if item.start_row < first or item.end_row > last then
+                covered = nil
+                break
+            end
+            covered[#covered + 1] = item
+        end
+    end
+    if covered and #covered > 0 then
+        local texts = {}
+        for _, item in ipairs(covered) do
+            local text = item.entry.text
+            if text and text ~= "" then
+                texts[#texts + 1] = text
+            end
+        end
+        return { text = table.concat(texts, "\n\n"), whole = true, messages = #covered, lines = last - first + 1 }
+    end
+    local lines = vim.api.nvim_buf_get_lines(self._buf, first, last + 1, false)
+    return { text = table.concat(lines, "\n"), whole = false, messages = 0, lines = #lines }
 end
 
 return History
