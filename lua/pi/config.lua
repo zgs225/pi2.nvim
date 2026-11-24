@@ -139,7 +139,11 @@
 ---@field icon? string|false Prefix icon rendered before the component text. Use false to disable.
 ---@field warn? number Percentage threshold for warning highlight (default 70)
 ---@field error? number Percentage threshold for error highlight (default 90)
----@field countdown? boolean Append the distance to pi's automatic compaction threshold ("· 37k to compact"), computed from the effective pi settings (default true)
+
+---@class pi.StatusLineCompactionConfig The auto-compaction marker, optionally followed by the distance to pi's automatic compaction threshold
+---@field icon? string|false Prefix icon rendered before the marker. Use false to disable.
+---@field countdown? boolean|"near" Append the distance to pi's automatic compaction threshold ("󰏗 37k"), resolved from the effective pi settings: false (default) = marker only, true = always, "near" = only once the context reaches `near` percent of the threshold. Unusable settings still show "!" (keep ≥ budget) or "?" (invalid value).
+---@field near? number Percentage of the auto-compaction threshold at which `countdown = "near"` starts showing the distance (default 80)
 
 ---@class pi.StatusLineCostConfig
 ---@field icon? string|false Prefix icon rendered before the component text. Use false to disable.
@@ -168,7 +172,7 @@
 ---@field tokens? pi.StatusLineComponentConfig
 ---@field cache? pi.StatusLineComponentConfig
 ---@field cost? pi.StatusLineCostConfig
----@field compaction? pi.StatusLineComponentConfig
+---@field compaction? pi.StatusLineCompactionConfig
 ---@field context? pi.StatusLineContextConfig
 ---@field attention? pi.StatusLineAttentionConfig
 ---@field model? pi.StatusLineModelConfig
@@ -526,8 +530,8 @@ local defaults = {
             tokens = { icon = "" },
             cache = { icon = "󰆼" },
             cost = { icon = "" },
-            compaction = { icon = false },
-            context = { icon = "", warn = 70, error = 90, countdown = true },
+            compaction = { icon = false, countdown = false, near = 80 },
+            context = { icon = "", warn = 70, error = 90 },
             attention = { icon = "󰵚", counter = false },
             model = { icon = "󰚩", provider = "ambiguous" },
             thinking = {

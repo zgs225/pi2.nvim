@@ -281,7 +281,7 @@ After successful compaction, pi2.nvim renders a collapsed summary block in chat 
 
 Three more surfaces keep a long compaction-heavy session legible:
 
-- **Countdown** — the statusline's `context` component appends `· 37k to compact`, the distance to pi's auto-compaction threshold computed from pi's own `reserveTokens` / `keepRecentTokens` (`compaction.modelOverrides` included). A `keep ≥ budget` combination — nothing is cuttable, upstream #12076 — turns it red with a one-time warning. See [Statusline](usage.md#compaction-countdown).
+- **Countdown** — `statusline.components.compaction.countdown` appends the distance to pi's auto-compaction threshold to the auto-compaction marker (`󰏗 37k`, `󰏗 now` at the boundary), computed from pi's own `reserveTokens` / `keepRecentTokens` (`compaction.modelOverrides` included); it is `false` by default, `true` shows the distance always and `"near"` only once the context reaches `near` percent of the threshold. A `keep ≥ budget` combination — nothing is cuttable, upstream #12076 — shows `󰏗 !` with a one-time warning. See [Statusline](usage.md#compaction-countdown).
 - **Abort and retry** — a single `<Esc>` while the compaction status is showing aborts it (`:PiCompactAbort` / `pi.compact_abort()` do the same), and `:PiCompactRetry` / `pi.compact_retry()` re-runs the last aborted or failed compaction with the same focus. A summarization retry shows up in the spinner as `summary retry 2/3 (429)` instead of a silent spin.
 - **Timeline** — `:PiCompactions` lists every compaction with its numbers and offers jump / diff / copy / re-run actions. See [Compaction timeline](usage.md#compaction-timeline-picompactions).
 

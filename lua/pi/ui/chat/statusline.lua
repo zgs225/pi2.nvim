@@ -83,7 +83,7 @@ local function component_config(name)
     return type(cfg) == "table" and cfg or {}
 end
 
---- Identity of the budget fields the context countdown renders.
+--- Identity of the budget fields the countdown renders.
 --- The push happens on every get_state response and after every compaction,
 --- so an unchanged budget must not re-render the status line.
 ---@param budget pi.CompactionBudget?
@@ -101,18 +101,22 @@ local function budget_key(budget)
     }, "|")
 end
 
---- Distance to pi's automatic compaction threshold, as a suffix of the context
---- component (" · 37k to compact").
---- Returns nil when the countdown is disabled, pi's compaction is off, or no
---- budget was pushed. `threshold <= tokens` means pi compacts at the next
---- turn boundary, so no negative number is ever shown.
----@param cfg table Context component config
+--- Distance to pi's automatic compaction threshold, as the trailing text of the
+--- auto-compaction marker (`󰏗 37k`, `󰏗 now`).
+---
+--- Returns nil unless the component's `countdown` asks for it (`true`, or
+--- `"near"` once the context is within `near` percent of the threshold), pi's
+--- compaction is on, and a budget with a live occupancy was pushed.
+--- `threshold <= tokens` means pi compacts at the next turn boundary, so no
+--- negative number is ever shown. The two "the number cannot be computed"
+--- states are never hidden by `near`: they are the reason it is missing.
+---@param cfg pi.StatusLineCompactionConfig Compaction component config
 ---@param state pi.StatusLineState
----@param tokens integer Current context occupancy
----@return string? suffix
+---@return string? text
 ---@return string? hl
-local function countdown_suffix(cfg, state, tokens)
-    if cfg.countdown == false then
+local function countdown_text(cfg, state)
+    local mode = cfg.countdown
+    if not mode then
         return nil
     end
     local budget = state.compaction_budget
@@ -120,24 +124,34 @@ local function countdown_suffix(cfg, state, tokens)
         return nil
     end
     if budget.pathological then
-        -- keep >= threshold: nothing is cuttable, so the countdown would read
+        -- keep >= threshold: nothing is cuttable, so the distance would read
         -- as a number that never shrinks (pi #12076).
-        return " · keep ≥ budget", "PiStatusLineError"
+        return "!", "PiStatusLineError"
     end
     if budget.invalid then
-        -- The manager warns with the offending path; the status line only
-        -- marks that the number below it is not trustworthy.
-        return " · ?", "PiStatusLineError"
+        -- The manager warns with the offending path; the marker only says the
+        -- distance is unknown.
+        return "?", "PiStatusLineError"
     end
     local threshold = tonumber(budget.threshold)
-    if not threshold then
+    if not threshold or threshold <= 0 then
         return nil
+    end
+    local tokens = tonumber(state.context_tokens)
+    if not tokens then
+        return nil
+    end
+    if mode == "near" then
+        local near = tonumber(cfg.near) or 80
+        if tokens / threshold * 100 < near then
+            return nil
+        end
     end
     local remaining = threshold - tokens
     if remaining <= 0 then
-        return " · at compaction threshold"
+        return "now"
     end
-    return " · " .. format_tokens(remaining) .. " to compact"
+    return format_tokens(remaining)
 end
 
 --- Normalize a component return value into chunks.
@@ -221,9 +235,11 @@ function builtin.cost(state)
     return text
 end
 
---- 63.9%/200k or -/200k when context is unknown, followed by the distance to
---- pi's automatic compaction threshold (" · 37k to compact") when a budget is
---- known and the component's `countdown` is not disabled.
+--- 63.9%/200k or -/200k when context is unknown.
+---
+--- Deliberately text-free: the distance to pi's automatic compaction threshold
+--- lives on the `compaction` marker (`statusline.components.compaction.countdown`),
+--- so this component keeps its width in every mode.
 function builtin.context(state)
     if not state.model_context_window or state.model_context_window <= 0 then
         return nil
@@ -235,36 +251,32 @@ function builtin.context(state)
     end
     local pct = (state.context_tokens / state.model_context_window) * 100
     local text = string.format("%.1f%%/%s", pct, total)
-    local hl
     if cfg.error and pct > cfg.error then
-        hl = "PiStatusLineError"
+        return text, "PiStatusLineError"
     elseif cfg.warn and pct > cfg.warn then
-        hl = "PiStatusLineWarning"
+        return text, "PiStatusLineWarning"
     end
-
-    local suffix, suffix_hl = countdown_suffix(cfg, state, state.context_tokens)
-    if not suffix then
-        return text, hl
-    end
-    -- An unusable budget (pathological/invalid) reads as an error on the whole
-    -- component, but a percentage that already has something to say keeps its
-    -- own warn/error highlight.
-    if suffix_hl == "PiStatusLineError" and not hl then
-        hl = "PiStatusLineError"
-    end
-    -- Separate chunk: the percentage keeps its own highlight, and a narrow
-    -- window truncates the suffix (which comes last) instead of the percentage.
-    return { { text, hl }, { suffix, suffix_hl } }
+    return text
 end
 
---- 󰏗 — auto-compaction enabled (hidden when disabled).
+--- 󰏗 — auto-compaction enabled (hidden when disabled), followed by the
+--- distance to pi's automatic compaction threshold when
+--- `statusline.components.compaction.countdown` asks for it: `󰏗 37k` (always),
+--- `󰏗 now` at/over the threshold, `󰏗 !` / `󰏗 ?` for an unusable budget.
 --- Uses the same glyph as the compaction summary label (`labels.compaction`),
 --- so the status marker and the history blocks share one icon.
 function builtin.compaction(state)
     if not state.auto_compaction then
         return nil
     end
-    return Config.options.labels.compaction
+    local text, hl = countdown_text(component_config("compaction"), state)
+    local glyph = Config.options.labels.compaction
+    if not text then
+        return glyph
+    end
+    -- One chunk: the glyph and its distance are one reading, and the error
+    -- states (`!`, `?`) belong to the marker that lost its number.
+    return glyph .. " " .. text, hl
 end
 
 --- 󰵚 / 󰵚 2

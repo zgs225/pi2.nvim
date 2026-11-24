@@ -117,8 +117,8 @@ require("pi").setup({
             tokens = { icon = "" },
             cache = { icon = "󰆼" },
             cost = { icon = "" },
-            compaction = { icon = false },
-            context = { icon = "", warn = 70, error = 90, countdown = true },
+            compaction = { icon = false, countdown = false, near = 80 },
+            context = { icon = "", warn = 70, error = 90 },
             attention = { icon = "󰵚", counter = false },
             -- provider: "ambiguous" (default) appends a [provider] suffix
             -- when the same model id is served by several providers/endpoints,

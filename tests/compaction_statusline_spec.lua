@@ -1,11 +1,15 @@
--- Statusline compaction countdown (Gitea #127 P0-1): the context component
--- appends the distance to pi's automatic compaction threshold, and the chat
--- wrappers that push a budget / forward a compaction summary / abort a running
--- compaction with a single <Esc>.
+-- Statusline compaction countdown (Gitea #127 P0-1, revised): the distance to
+-- pi's automatic compaction threshold lives on the `compaction` marker
+-- (`󰏗 56k`), not on the `context` component, and it is off by default — the
+-- pre-countdown statusline is the default (A), the compact form is opt-in (B),
+-- and `countdown = "near"` discloses it only once the context is close.
 --
 -- The budget shape is the one `lua/pi/compaction/settings.lua:M.budget`
 -- returns; the canonical case derives its expected numbers from the real
--- module instead of hardcoding them (a hardcoded "37k" would silently rot).
+-- module instead of hardcoding them (a hardcoded "56k" would silently rot).
+--
+-- The second suite covers the chat wrappers that push a budget, forward a
+-- compaction summary and abort a running compaction with a single <Esc>.
 
 local Chat = require("pi.ui.chat")
 local Config = require("pi.config")
@@ -14,6 +18,7 @@ local StatusLine = require("pi.ui.chat.statusline")
 local Stats = require("pi.stats")
 
 local ns = vim.api.nvim_create_namespace("pi-statusline")
+local WINDOW = 200000
 
 --- Empty-handed budget with the `pi.CompactionBudget` shape (200k window,
 --- default reserve/keep => threshold 183616).
@@ -22,7 +27,7 @@ local ns = vim.api.nvim_create_namespace("pi-statusline")
 local function budget(overrides)
     ---@type pi.CompactionBudget
     local b = {
-        window = 200000,
+        window = WINDOW,
         reserve = 16384,
         keep = 20000,
         threshold = 183616,
@@ -40,9 +45,13 @@ end
 describe("statusline compaction countdown", function()
     local buf
     local sl
+    --- The marker glyph the countdown hangs off. Derived, never hardcoded: the
+    --- history block header uses the same `labels.compaction`.
+    local glyph
 
     before_each(function()
         Config.setup({})
+        glyph = Config.options.labels.compaction
         buf = vim.api.nvim_create_buf(false, true)
         vim.api.nvim_win_set_buf(0, buf)
         sl = StatusLine.new(buf, 1, function()
@@ -56,7 +65,16 @@ describe("statusline compaction countdown", function()
         pcall(vim.api.nvim_buf_delete, buf, { force = true })
     end)
 
-    --- Render only the context component so the row is exactly its text.
+    --- Render only the compaction marker so the row is exactly its text.
+    ---@param compaction_cfg table?
+    local function only_compaction(compaction_cfg)
+        Config.options.statusline = {
+            layout = { left = { "compaction" }, center = {}, right = {} },
+            components = { compaction = compaction_cfg or {} },
+        }
+    end
+
+    --- Render only the context component (A mode: no countdown anywhere).
     ---@param context_cfg table?
     local function only_context(context_cfg)
         Config.options.statusline = {
@@ -95,150 +113,179 @@ describe("statusline compaction countdown", function()
         return nil
     end
 
-    --- Percentage text chunk + its highlight.
-    ---@param row pi.StatusLineChunk[]
-    ---@return pi.StatusLineChunk?
-    local function pct_chunk(row)
-        local window = Stats.format_tokens(200000)
-        return chunk_with(row, "/" .. window)
+    --- Model + occupancy + auto-compaction on: the countdown's prerequisites.
+    ---@param tokens integer?
+    local function ready(tokens)
+        sl:update_state({ model = { id = "m", contextWindow = WINDOW }, autoCompactionEnabled = true })
+        if tokens then
+            sl:add_usage({ input = tokens })
+        end
     end
 
-    it("appends the live countdown, computed from the real budget module", function()
-        only_context()
+    --- Tokens at `pct` percent of the default budget's threshold.
+    ---@param pct number
+    ---@return integer
+    local function at_pct(pct)
+        return math.floor(budget().threshold * pct / 100)
+    end
+
+    it("shows the bare marker by default (A: no countdown at all)", function()
+        only_compaction()
+        ready(127800)
+        sl:set_compaction_budget(budget())
+        local text, row = status_row()
+        assert.are.equal(glyph, text)
+        assert.are.equal(glyph, row[1][1], "one chunk: the marker alone")
+        assert.are.equal("PiStatusLine", row[1][2])
+    end)
+
+    it("countdown = true always appends the distance, from the real budget module", function()
+        only_compaction({ countdown = true })
         local effective = {
             reserve = Settings.DEFAULTS.reserve,
             keep = Settings.DEFAULTS.keep,
             enabled = true,
             source = "default",
         }
-        local b = assert(Settings.budget(effective, 200000))
+        local b = assert(Settings.budget(effective, WINDOW))
         assert.are.equal(183616, b.threshold)
         assert.is_false(b.pathological)
 
         local tokens = 127800 -- 63.9% of 200k
-        sl:update_state({ model = { contextWindow = 200000 } })
-        sl:add_usage({ input = tokens })
+        ready(tokens)
         sl:set_compaction_budget(b)
 
-        local expected = string.format(
-            "%.1f%%/%s · %s to compact",
-            (tokens / 200000) * 100,
-            Stats.format_tokens(200000),
-            Stats.format_tokens(b.threshold - tokens)
-        )
-        assert.are.equal("63.9%/200k · 56k to compact", expected)
+        local expected = glyph .. " " .. Stats.format_tokens(b.threshold - tokens)
+        assert.are.equal("󰏗 56k", expected)
         local text, row = status_row()
         assert.are.equal(expected, text)
-        -- Suffix is its own chunk, so the percentage keeps its own highlight.
-        local suffix = chunk_with(row, " to compact")
-        assert.is_not_nil(suffix)
-        assert.are.equal("PiStatusLine", suffix[2], "a healthy countdown is not an error")
+        assert.is_not_nil(chunk_with(row, Stats.format_tokens(b.threshold - tokens)))
+        assert.are.equal("PiStatusLine", row[1][2], "a healthy countdown is not an error")
     end)
 
-    it("counts down to zero as the context grows", function()
-        only_context()
+    it("counts down as the context grows", function()
+        only_compaction({ countdown = true })
         local b = budget()
-        sl:update_state({ model = { contextWindow = 200000 } })
+        ready()
         sl:set_compaction_budget(b)
 
-        sl:add_usage({ input = 100000 })
-        local text = status_row()
-        assert.is_not_nil(text:find(" · " .. Stats.format_tokens(b.threshold - 100000) .. " to compact", 1, true))
+        for _, tokens in ipairs({ 100000, 150000, 180000 }) do
+            sl:add_usage({ input = tokens })
+            assert.are.equal(glyph .. " " .. Stats.format_tokens(b.threshold - tokens), (status_row()))
+        end
     end)
 
-    it("shows 'at compaction threshold' instead of a negative number at/over the threshold", function()
-        only_context()
+    it("shows 'now' at and over the threshold instead of a negative number", function()
+        only_compaction({ countdown = true })
         local b = budget()
-        local expected = string.format(
-            "%.1f%%/%s · at compaction threshold",
-            (b.threshold / 200000) * 100,
-            Stats.format_tokens(200000)
-        )
-        sl:update_state({ model = { contextWindow = 200000 } })
+        ready()
         sl:set_compaction_budget(b)
+
         sl:add_usage({ input = b.threshold })
-        local text = status_row()
-        assert.are.equal(expected, text)
-        assert.is_nil(text:find("-%d", 1, true), "no negative countdown")
+        assert.are.equal(glyph .. " now", (status_row()))
 
-        sl._state.context_tokens = b.threshold + 50000
-        sl:render()
-        text = status_row()
-        assert.is_not_nil(text:find(" · at compaction threshold", 1, true))
+        sl:add_usage({ input = b.threshold + 50000 })
+        local text = status_row()
+        assert.are.equal(glyph .. " now", text)
         assert.is_nil(text:find("-%d", 1, true), "no negative countdown")
     end)
 
-    it("marks a pathological budget (keep >= threshold) as an error", function()
-        only_context()
-        sl:update_state({ model = { contextWindow = 200000 } })
-        sl:add_usage({ input = 127800 })
+    it("countdown = 'near' hides the distance until the context is close", function()
+        only_compaction({ countdown = "near" })
+        local b = budget()
+        ready()
+        sl:set_compaction_budget(b)
+
+        -- 50% and 70% of the threshold: nothing to warn about yet.
+        for _, pct in ipairs({ 50, 70 }) do
+            sl:add_usage({ input = at_pct(pct) })
+            assert.are.equal(glyph, (status_row()), "hidden below the near point")
+        end
+
+        -- 85% of the threshold: past the default near point (80%).
+        local tokens = at_pct(85)
+        sl:add_usage({ input = tokens })
+        assert.are.equal(glyph .. " " .. Stats.format_tokens(b.threshold - tokens), (status_row()))
+    end)
+
+    it("honours a custom near percentage", function()
+        local b = budget()
+        ready()
+        sl:add_usage({ input = at_pct(60) })
+        sl:set_compaction_budget(b)
+
+        only_compaction({ countdown = "near", near = 50 })
+        sl:render()
+        assert.are.equal(glyph .. " " .. Stats.format_tokens(b.threshold - at_pct(60)), (status_row()))
+
+        only_compaction({ countdown = "near", near = 90 })
+        sl:render()
+        assert.are.equal(glyph, (status_row()))
+    end)
+
+    it("marks a pathological budget (keep >= threshold) with '!', near or not", function()
+        only_compaction({ countdown = "near" })
+        ready(127800)
         sl:set_compaction_budget(budget({ keep = 190000, pathological = true }))
         local text, row = status_row()
-        assert.are.equal("63.9%/200k · keep ≥ budget", text)
-        local suffix = chunk_with(row, "keep ≥ budget")
-        assert.is_not_nil(suffix)
-        assert.are.equal("PiStatusLineError", suffix[2])
-        -- The percentage chunk has no warn/error of its own, so the component
-        -- reads as one error.
-        local pct = pct_chunk(row)
-        assert.is_not_nil(pct)
-        assert.are.equal("PiStatusLineError", pct[2])
-    end)
-
-    it("keeps the percentage's own warn highlight when the budget is pathological", function()
-        only_context({ warn = 70, error = 90 })
-        sl:update_state({ model = { contextWindow = 200000 } })
-        sl:add_usage({ input = 150000 }) -- 75% > warn
-        sl:set_compaction_budget(budget({ pathological = true }))
-        local text, row = status_row()
-        assert.are.equal("75.0%/200k · keep ≥ budget", text)
-        local pct = pct_chunk(row)
-        assert.is_not_nil(pct)
-        assert.are.equal("PiStatusLineWarning", pct[2])
-        assert.are.equal("PiStatusLineError", chunk_with(row, "keep ≥ budget")[2])
+        assert.are.equal(glyph .. " !", text, "an unusable budget is never hidden by near")
+        assert.are.equal("PiStatusLineError", chunk_with(row, "!")[2])
     end)
 
     it("marks an invalid settings value with '?' and an error highlight", function()
-        only_context()
-        sl:update_state({ model = { contextWindow = 200000 } })
-        sl:add_usage({ input = 127800 })
+        only_compaction({ countdown = true })
+        ready(127800)
         sl:set_compaction_budget(budget({ invalid = "compaction.reserveTokens" }))
         local text, row = status_row()
-        assert.are.equal("63.9%/200k · ?", text)
-        assert.are.equal("PiStatusLineError", chunk_with(row, " · ?")[2])
+        assert.are.equal(glyph .. " ?", text)
+        assert.are.equal("PiStatusLineError", chunk_with(row, "?")[2])
     end)
 
-    it("renders no suffix when the component's countdown is disabled", function()
-        only_context({ countdown = false })
-        sl:update_state({ model = { contextWindow = 200000 } })
-        sl:add_usage({ input = 127800 })
-        sl:set_compaction_budget(budget())
-        assert.are.equal("63.9%/200k", (status_row()))
-    end)
-
-    it("renders no suffix when pi's compaction is disabled", function()
-        only_context()
-        sl:update_state({ model = { contextWindow = 200000 } })
-        sl:add_usage({ input = 127800 })
+    it("renders no distance when pi's compaction is disabled", function()
+        only_compaction({ countdown = true })
+        ready(127800)
         sl:set_compaction_budget(budget({ enabled = false, pathological = false }))
-        assert.are.equal("63.9%/200k", (status_row()))
+        assert.are.equal(glyph, (status_row()))
     end)
 
-    it("renders today's percentage when no budget is known", function()
-        only_context()
-        sl:update_state({ model = { contextWindow = 200000 } })
-        sl:add_usage({ input = 127800 })
-        assert.are.equal("63.9%/200k", (status_row()))
-    end)
-
-    it("drops the suffix when the budget is cleared", function()
-        only_context()
-        sl:update_state({ model = { contextWindow = 200000 } })
-        sl:add_usage({ input = 127800 })
+    it("renders no distance before the first usage (occupancy unknown)", function()
+        only_compaction({ countdown = true })
+        ready()
         sl:set_compaction_budget(budget())
-        assert.is_not_nil(status_row():find(" to compact", 1, true))
+        assert.are.equal(glyph, (status_row()))
+    end)
+
+    it("drops the distance when the budget is cleared", function()
+        only_compaction({ countdown = true })
+        ready(127800)
+        sl:set_compaction_budget(budget())
+        assert.is_not_nil(status_row():find(glyph .. " ", 1, true))
         sl:set_compaction_budget(nil)
+        assert.are.equal(glyph, (status_row()))
+    end)
+
+    it("hides the marker while auto-compaction is off", function()
+        only_compaction({ countdown = true })
+        ready(127800)
+        sl:set_compaction_budget(budget())
+        sl:update_state({ model = { id = "m", contextWindow = WINDOW }, autoCompactionEnabled = false })
+        assert.are.equal("", (status_row()))
+    end)
+
+    it("leaves the context component text-free in every mode", function()
+        only_context()
+        ready(127800)
+        sl:set_compaction_budget(budget())
         assert.are.equal("63.9%/200k", (status_row()))
+    end)
+
+    it("keeps the context highlight untouched by an unusable budget", function()
+        only_context({ warn = 70, error = 90 })
+        ready(150000) -- 75% > warn
+        sl:set_compaction_budget(budget({ keep = 190000, pathological = true }))
+        local text, row = status_row()
+        assert.are.equal("75.0%/200k", text)
+        assert.are.equal("PiStatusLineWarning", chunk_with(row, "/200k")[2])
     end)
 
     it("hides the component without a context window (no invented denominator)", function()
@@ -252,9 +299,8 @@ describe("statusline compaction countdown", function()
     end)
 
     it("re-renders only when the pushed budget could change the text", function()
-        only_context()
-        sl:update_state({ model = { contextWindow = 200000 } })
-        sl:add_usage({ input = 127800 })
+        only_compaction({ countdown = true })
+        ready(127800)
 
         local renders = 0
         local original_render = StatusLine.render
