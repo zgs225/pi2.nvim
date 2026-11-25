@@ -143,9 +143,10 @@ History._stream_flush_ms = 30
 ---@field pad_bottom? boolean
 ---@field notice? boolean Render a neutral notice instead of an error: the compaction label as the prefix, the `PiCompactionHint` highlight and no alarm rail. For outcomes the user chose (a cancelled compaction), which are not failures.
 
---- One rendered message, kept so `yy` / `:PiCopy` can return the SOURCE text
---- instead of the rendered rows (markdown tables are drawn as box art, user
---- bodies are indented two spaces, collapsed tool blocks keep only a tail).
+--- One rendered message, kept so the copy key (`copy.key`, default `gy`) and
+--- `:PiCopy` can return the SOURCE text instead of the rendered rows (markdown
+--- tables are drawn as box art, user bodies are indented two spaces, collapsed
+--- tool blocks keep only a tail).
 --- The anchor is an extmark in `entry_ns`, so it survives streaming inserts,
 --- block expand/collapse and compaction-block rewrites.
 ---@class pi.HistoryEntry
@@ -185,7 +186,7 @@ local ns = vim.api.nvim_create_namespace("pi-chat")
 -- from `[[` / `]]` navigation. Nothing else writes here.
 local turn_ns = vim.api.nvim_create_namespace("pi-chat-turn")
 
--- Message-entry anchors for the copy feature (`yy` / `:PiCopy`) get their own
+-- Message-entry anchors for the copy feature (`gy` / `:PiCopy`) get their own
 -- namespace for the same reason as `turn_ns`: render code clears `ns` over row
 -- ranges (tool expand/collapse, live updates, footer redraws), and an entry
 -- anchor swallowed by such a clear would silently break copying for the rest of
@@ -5080,7 +5081,7 @@ function History:goto_path_at_cursor()
 end
 
 -- ---------------------------------------------------------------------------
--- Copying: `yy` / `:PiCopy`
+-- Copying: `gy` (configurable) / `:PiCopy`
 --
 -- What the cursor is on, as SOURCE text. The buffer is not a valid source for
 -- that: markdown tables are rewritten into box art, user bodies carry a

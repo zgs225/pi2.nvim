@@ -568,6 +568,14 @@ require("pi").setup({
         },
     },
 
+    -- Copy the message or block under the cursor as source text in the
+    -- history buffer. `yy` is deliberately NOT remapped — it stays vim's
+    -- yank — so this is a key of its own. `false` binds nothing; a key spec
+    -- (`{ "gy", modes = "n" }`) or a list of them is accepted.
+    copy = {
+        key = "gy",
+    },
+
     -- Prompt buffer behavior.
     prompt = {
         -- Readline-style recall of previously submitted prompts, scoped per
@@ -644,7 +652,7 @@ Notes on a few fields:
 - The side layout is **three columns**: the chat column in the middle, a left column and a right column for the panels. `sessions_list.position` / `tasks_panel.position` / `todo.panel.position` choose the column, and the first panel of a column (stacking order: sessions → tasks → todo) owns that column's `width` — so `sessions_list.width` sizes the left column and `tasks_panel.width` the right one. A column exists only while a panel holds it; the chat column absorbs whatever they leave (and is the only flexible column when the tab is taken over, see [Chat & layouts](usage.md#chat--layouts)).
 - `layout.default`, `layout.side`, and `layout.float` each also accept a **function** returning the value, so you can compute sizes from `vim.o.columns` / `vim.o.lines` at open time. A function-return for `side`/`float` is deep-merged over the defaults, so returning a partial table is fine.
 - `panels.<panel>.name` takes a `fun(tab_id): string` that computes the underlying buffer name per tab — useful for distinguishing multiple π conversations in `:buffers`, statuslines, or tab bars.
-- Several fields (`diff.keys`, `dialog.keys`, `zen.keys`) accept **key specs** — plain strings, `{ key, modes = ... }` tables, or lists of those. See [Keymaps](keymaps.md#key-specs).
+- Several fields (`diff.keys`, `dialog.keys`, `zen.keys`, `copy.key`) accept **key specs** — plain strings, `{ key, modes = ... }` tables, or lists of those. See [Keymaps](keymaps.md#key-specs).
 
 `subagent.tools` narrows the tools a **child** sub-session may call; it is deliberately absent from the defaults table because `nil` *is* the default — every child inherits every tool, the pre-feature behavior. Set it to a list of tool names (`{ "read", "grep", "find", "ls" }`) and each child spawned from then on runs with `pi --tools read,grep,find,ls`. That list **replaces** the child's whole tool selection rather than adding to it, so it must name every tool the child needs, and an empty array is rejected (`tools must list at least one tool; omit it to inherit every tool`) instead of meaning "no tools". MCP is the one exception to "the list is the whole switch": pi keeps MCP tools registered whatever the list says, but their default `codemode` exposure leaves them reachable only from `codemode` or `tool_search`, which the allowlist itself can filter away. A child whose list names neither is spawned with `--no-mcp`, so it connects no server and pi does not warn that its MCP tools are unreachable; name `codemode` / `tool_search` (`mcp__…`, patterns and `+`/`-` entries count too) to keep MCP in that child. A single `dispatch_subagents` spawn can override the setting per item, and the resolved allowlist is persisted per child — see [Sessions → Constraining a child's tools](sessions.md#constraining-a-childs-tools).
 

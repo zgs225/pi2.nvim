@@ -116,13 +116,15 @@ With the cursor on a queued message in the history buffer, press `dd`. π remove
 
 ### Copying messages
 
-`yy` in the history buffer copies the **source** text of what the cursor is on: a user or assistant message, a tool block's body, a direct `!` bash block, a thinking block, or a compaction summary. `[count]yy` copies that many consecutive messages (`3yy`).
+`gy` in the history buffer copies the **source** text of what the cursor is on: a user or assistant message, a tool block's body, a direct `!` bash block, a thinking block, or a compaction summary. `[count]gy` copies that many consecutive messages (`3gy`). The key is configurable (`copy.key`, default `"gy"` — see [Configuration](configuration.md)), so you can move it or bind several keys; `gy` is deliberately *not* a yank alias, because `yy` must keep doing what it does in every other buffer.
 
-It copies the source, not the buffer rows, because the rows are a rendering: markdown tables are drawn as box art, a user body carries a two-space indent, an unclosed fence is auto-closed and a **collapsed** tool block keeps only its tail. A tool block is the more specific target — with the cursor on one, `yy` copies its body (the complete saved body even while collapsed) instead of the assistant prose around it.
+In **visual mode** the same key copies the selected line range, with the `:PiCopy` semantics below — whole messages give their source text, anything else the rendered lines — and ends the selection like a real yank.
 
-The write behaves like a Vim yank, so the usual habits work: `"` and `0` are both filled (`"0p` after a later yank still pastes the message), a register prefix is honoured (`"ayy`), and `*`/`+` are mirrored when `'clipboard'` contains `unnamed`/`unnamedplus`.
+It copies the source, not the buffer rows, because the rows are a rendering: markdown tables are drawn as box art, a user body carries a two-space indent, an unclosed fence is auto-closed and a **collapsed** tool block keeps only its tail. A tool block is the more specific target — with the cursor on one, `gy` copies its body (the complete saved body even while collapsed) instead of the assistant prose around it.
 
-The `y` operator is deliberately **not** remapped: `y{motion}`, `V`+`y` and `"ay` keep their normal meaning and yank exactly the lines that are on screen. For an arbitrary range use `:PiCopy`, which needs no mapping of its own:
+The write behaves like a Vim yank, so the usual habits work: `"` and `0` are both filled (`"0p` after a later yank still pastes the message), a register prefix is honoured (`"agy`), and `*`/`+` are mirrored when `'clipboard'` contains `unnamed`/`unnamedplus`.
+
+`yy` itself is **not** remapped: it stays vim's yank on the history buffer exactly as in any other buffer (the visible line, `[count]` lines), so the most reflexive motion in the editor never disagrees with what is on screen. The `y` operator is untouched too: `y{motion}`, `V`+`y` and `"ay` keep their normal meaning. For an arbitrary range use `:PiCopy`, which needs no mapping of its own:
 
 - select lines in the history buffer and run `:'<,'>PiCopy` (or `v` then `:` — Vim fills the range for you);
 - a range that lines up with message boundaries copies the **source** text of those messages, joined by a blank line;

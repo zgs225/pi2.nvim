@@ -64,6 +64,9 @@
 ---@class pi.PromptDraftConfig
 ---@field enabled? boolean Persist the unsent prompt and restore it once after a restart (default: true)
 
+---@class pi.CopyConfig
+---@field key pi.KeySpecs|false Key(s) that copy the message or block under the cursor as source text in the history buffer (default: "gy"). Bound in normal mode (a `[count]` copies that many consecutive messages) and in visual mode (the selected range, like `:PiCopy`). Set `false` to bind nothing and drive the copy from `:PiCopy` or your own mapping of `pi` chat API only.
+
 ---@class pi.RenderConfig
 ---@field engine? string Markdown renderer for the chat history: "render-markdown" (default, requires render-markdown.nvim) or "builtin" (treesitter + custom extmarks)
 
@@ -450,6 +453,7 @@
 ---@field compaction? pi.CompactionConfig Compaction observability (the :PiCompactions timeline, the statusline countdown) and the bundled pi2-compaction extension
 ---@field diff_review pi.DiffReviewConfig
 ---@field zen pi.ZenConfig
+---@field copy pi.CopyConfig Copy-source-text keymap (`yy` is deliberately left native)
 ---@field prompt pi.PromptConfig
 ---@field render pi.RenderConfig
 ---@field dialog pi.DialogConfig
@@ -756,6 +760,9 @@ local defaults = {
             toggle = nil,
             exit = nil,
         },
+    },
+    copy = {
+        key = "gy",
     },
     prompt = {
         history = {
