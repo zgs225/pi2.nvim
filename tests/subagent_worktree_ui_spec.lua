@@ -193,9 +193,30 @@ describe("assigned worktree in sub-agent tool rows", function()
         )
     end)
 
-    it("badges the block header with the requested checkout", function()
-        local args = { items = { { task = "t1", worktree = { create = { name = "wt-a" } } } }, wait = false }
-        assert.are.equal("t1 " .. GLYPH .. " wt-a", SubToolUi.dispatch_header_detail(args))
+    it("keeps the glyph and drops the repeated name when both match", function()
+        -- The common shape: the model reuses one word for the child and its
+        -- checkout. The badge still says "isolated checkout"; printing the label
+        -- twice says nothing.
+        assert.are.equal(
+            "auth-review " .. GLYPH,
+            SubToolUi.item_label({
+                task = "review the auth flow",
+                name = "auth-review",
+                worktree = { create = { name = "auth-review" } },
+            })
+        )
+        Manifest.upsert("child-same", {
+            parent_id = "p",
+            name = "auth-review",
+            task_prompt = "t",
+            config = {},
+            status = "active",
+            reported = false,
+            created_at = "t",
+            last_active_at = "t",
+            assigned_worktree = { kind = "linked", path = "/repo/.worktrees/auth-review", name = "auth-review" },
+        })
+        assert.are.equal("auth-review " .. GLYPH, SubToolUi.item_label({ target = "child-same", message = "hi" }))
     end)
 
     it("shows the request while no result item exists, the created checkout once it does", function()

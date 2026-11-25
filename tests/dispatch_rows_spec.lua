@@ -71,8 +71,10 @@ describe("dispatch_rows", function()
         assert.are.equal("✗", rows[2].mark)
         assert.are.equal("PiToolError", rows[2].mark_hl)
         assert.is_not_nil(rows[2].excerpt)
-        assert.are.equal(string.rep("e", 80), rows[2].excerpt)
-        assert.is_true(#rows[2].excerpt <= 80)
+        assert.are.equal(string.rep("e", 80) .. "…", rows[2].excerpt)
+        -- 80 characters (not bytes) plus the ellipsis: a cut must never split a
+        -- UTF-8 sequence.
+        assert.is_true(vim.fn.strchars(rows[2].excerpt) <= 81)
 
         assert.are.equal("⊘", rows[3].mark)
         assert.are.equal("PiToolError", rows[3].mark_hl)
@@ -129,12 +131,12 @@ describe("dispatch_rows", function()
         assert.are.equal("◐", rows[3].mark)
     end)
 
-    it("prefixes only explicit refs and never the default index ref", function()
+    it("never renders an item ref, explicit or default", function()
         local args = {
             items = {
                 { ref = "alpha", task = "named task" },
-                -- Item 2's default ref is "1": even when the caller echoes the
-                -- default back verbatim it must not render.
+                -- Item 2's default ref is "1", item 3 has none: neither shape is
+                -- a human-readable identity, so no row shows one.
                 { ref = "1", task = "default index ref" },
                 { task = "no ref" },
             },
@@ -149,10 +151,64 @@ describe("dispatch_rows", function()
             },
         }
         local rows = SubToolUi.dispatch_rows(args, details)
-        assert.are.equal("[alpha] named", rows[1].label)
+        assert.are.equal("named", rows[1].label)
         assert.is_nil(rows[2].label:find("[", 1, true), "default index ref never renders")
         assert.matches("default index ref", rows[2].label)
         assert.is_nil(rows[3].label:find("[", 1, true), "absent ref → no prefix")
+        for _, row in ipairs(rows) do
+            assert.is_nil(row.label:find("alpha", 1, true), "explicit refs never render either")
+        end
+    end)
+
+    it("labels an unnamed reuse item by its message, not a truncated id", function()
+        -- The manifest row is gone (a replay in another workspace): the message
+        -- is the only part of the item that survives it.
+        local gone = "0b9c8d7e-6f5a-4b3c-2d1e-9f8a7b6c5d4e"
+        local args = {
+            items = {
+                { target = gone, message = "summarize the findings\nand report" },
+                { target = gone .. "x", message = string.rep("y", 60) },
+            },
+            wait = false,
+        }
+        local details = {
+            status = "completed",
+            items = {
+                { status = "ok", target = gone },
+                { status = "ok", target = gone .. "x" },
+            },
+        }
+        local rows = SubToolUi.dispatch_rows(args, details)
+        -- From the tool input, since the batch record need not echo it back.
+        assert.are.equal('sub-session "summarize the findings and report"', rows[1].label)
+        assert.are.equal('sub-session "' .. string.rep("y", 40) .. '…"', rows[2].label)
+        assert.is_nil(rows[1].label:find("…6c5d4e", 1, true), "no id when a message exists")
+    end)
+
+    it("falls back to the truncated id when a reuse item has no message either", function()
+        local gone = "0b9c8d7e-6f5a-4b3c-2d1e-9f8a7b6c5d4e"
+        local rows = SubToolUi.dispatch_rows(
+            { items = { { target = gone, message = "" } }, wait = false },
+            { status = "completed", items = { { status = "ok", target = gone } } }
+        )
+        assert.are.equal("…6c5d4e", rows[1].label)
+    end)
+
+    it("keeps a stated model / thinking level on the status row", function()
+        local args = {
+            items = { { task = "a", name = "one", model = "gpt-4o" }, { task = "b", name = "two" } },
+            wait = false,
+        }
+        local details = {
+            status = "completed",
+            items = {
+                { status = "ok", task = "a", name = "one", model = "gpt-4o" },
+                { status = "ok", task = "b", name = "two" },
+            },
+        }
+        local rows = SubToolUi.dispatch_rows(args, details)
+        assert.are.equal("one (gpt-4o)", rows[1].label)
+        assert.are.equal("two", rows[2].label)
     end)
 
     it("falls back to the first 40 task characters without a name", function()
@@ -243,28 +299,72 @@ describe("batch_status_text", function()
     end)
 end)
 
-describe("dispatch_header_detail zero-count omission", function()
-    it("omits the zero side of mixed counts (en)", function()
+describe("dispatch_inline_status", function()
+    before_each(function()
+        Config.setup({ title = { lang = "zh" } })
+    end)
+
+    it("counters only when the single item came back cleanly", function()
+        assert.are.equal(
+            "1/1 已完成",
+            SubToolUi.dispatch_inline_status({ status = "completed", summary = { done = 1, total = 1 } })
+        )
+    end)
+
+    it("appends the item's error, flattened and capped, when it failed", function()
+        local details = {
+            status = "failed",
+            summary = { done = 1, total = 1 },
+            items = { { status = "failed", error = "tests: 3 failures\nin history_spec" } },
+        }
+        assert.are.equal("1/1 失败 — tests: 3 failures in history_spec", SubToolUi.dispatch_inline_status(details))
+
+        local long = {
+            status = "failed",
+            summary = { done = 1, total = 1 },
+            items = { { status = "failed", error = string.rep("e", 120) } },
+        }
+        assert.are.equal("1/1 失败 — " .. string.rep("e", 80) .. "…", SubToolUi.dispatch_inline_status(long))
+    end)
+
+    it("cuts an excerpt on characters, never inside a UTF-8 sequence", function()
+        local details = {
+            status = "failed",
+            summary = { done = 1, total = 1 },
+            items = { { status = "failed", error = string.rep("错误", 50) } },
+        }
+        local text = SubToolUi.dispatch_inline_status(details)
+        assert.are.equal("1/1 失败 — " .. string.rep("错误", 40) .. "…", text)
+    end)
+
+    it("surfaces a tool-level rejection, which never arrives as isError", function()
+        assert.are.equal(
+            '! item 1: unknown sub-agent target "nope"',
+            SubToolUi.dispatch_inline_status({ error = 'item 1: unknown sub-agent target "nope"' })
+        )
+    end)
+
+    it("says nothing without details", function()
+        assert.is_nil(SubToolUi.dispatch_inline_status(nil))
+        assert.is_nil(SubToolUi.dispatch_inline_status({}))
+    end)
+end)
+
+describe("dispatch_header_detail", function()
+    it("carries the item count and nothing else (en)", function()
         Config.setup({ title = { lang = "en" } })
         assert.are.equal(
-            "4 items (spawn×4)",
+            "4 items",
             SubToolUi.dispatch_header_detail({
                 items = { { task = "a" }, { task = "b" }, { task = "c" }, { task = "d" } },
             })
         )
+    end)
+
+    it("carries the item count and nothing else (zh)", function()
+        Config.setup({ title = { lang = "zh" } })
         assert.are.equal(
-            "4 items (msg×4)",
-            SubToolUi.dispatch_header_detail({
-                items = {
-                    { target = "i1", message = "m" },
-                    { target = "i2", message = "m" },
-                    { target = "i3", message = "m" },
-                    { target = "i4", message = "m" },
-                },
-            })
-        )
-        assert.are.equal(
-            "4 items (spawn×3 · msg×1)",
+            "4 项",
             SubToolUi.dispatch_header_detail({
                 items = {
                     { task = "a" },
@@ -276,29 +376,11 @@ describe("dispatch_header_detail zero-count omission", function()
         )
     end)
 
-    it("degrades to a bare count when both sides are zero", function()
+    it("says nothing for a single item, which never renders a block", function()
         Config.setup({ title = { lang = "en" } })
-        assert.are.equal(
-            "4 items",
-            SubToolUi.dispatch_header_detail({
-                items = { {}, {}, {}, {} },
-            })
-        )
-    end)
-
-    it("omits zero counts in zh too", function()
-        Config.setup({ title = { lang = "zh" } })
-        assert.are.equal(
-            "4 项 (新建×4)",
-            SubToolUi.dispatch_header_detail({
-                items = { { task = "a" }, { task = "b" }, { task = "c" }, { task = "d" } },
-            })
-        )
-        assert.are.equal(
-            "4 项",
-            SubToolUi.dispatch_header_detail({
-                items = { {}, {}, {}, {} },
-            })
-        )
+        assert.is_nil(SubToolUi.dispatch_header_detail({ items = { { task = "only" } }, wait = false }))
+        assert.is_nil(SubToolUi.dispatch_header_detail({ items = {} }))
+        assert.is_nil(SubToolUi.dispatch_header_detail(nil))
+        assert.is_nil(SubToolUi.dispatch_header_detail({}))
     end)
 end)

@@ -63,12 +63,17 @@ local ok, err = pcall(function()
 
     assert(header, "expected localized dispatch header")
     assert(header_row, "expected the block header row")
-    -- Gap B regression guard: the block header carries the item-count detail
-    -- (zero counts omitted: spawn×1 · msg×1, never "msg×0").
+    -- Gap B regression guard: the block header carries the item count and
+    -- nothing else — the body names every item, and the spawn/reuse breakdown
+    -- is a distinction the rows already make.
     local header_line = vim.api.nvim_buf_get_lines(h:buf(), header_row, header_row + 1, false)[1] or ""
     assert(
-        header_line:find("2 项 (新建×1 · 续聊×1)", 1, true),
-        "expected the block header to carry the item-count detail, got: " .. header_line
+        header_line:find("2 项", 1, true),
+        "expected the block header to carry the item count, got: " .. header_line
+    )
+    assert(
+        not header_line:find("新建", 1, true),
+        "expected no spawn/reuse breakdown on the header, got: " .. header_line
     )
     assert(tree >= 2, "expected item tree lines, got " .. tree)
 
