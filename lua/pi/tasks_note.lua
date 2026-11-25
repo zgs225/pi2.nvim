@@ -13,10 +13,11 @@
 --- alone: every report and check-in opens with the `[SYSTEM NOTIFICATION ...]`
 --- banner and carries one `<background-task ...>` element per task (see
 --- `buildWakeNote` / `buildBatchNote` / `buildCheckInNote` / the startup summary
---- in `extensions/bg-tasks.ts`). The banner check is what keeps the panel pings
---- silent — they share the same `customType` but their content is a short
---- marker (`[Background task b3f2a1 started]`) with no banner. The panel is
---- their visible surface, and a task STARTING is not a report.
+--- in `extensions/bg-tasks.ts`). The banner check is what keeps a short marker
+--- silent: the panel channel writes extension ENTRIES now (never rendered here,
+--- never model context), but an older session's transcript still carries the
+--- `[Background task b3f2a1 started]` ping as a message under the same
+--- `customType`, with no banner. A task STARTING is not a report.
 ---
 ---@class pi.TasksNote
 local M = {}
@@ -26,7 +27,8 @@ local M = {}
 local PREFIX = "⚑ "
 
 --- The banner every report/check-in/startup note opens with. Everything else
---- under `customType == "pi2_bg_task"` is a panel ping.
+--- under `customType == "pi2_bg_task"` is not a report (an older session's
+--- panel ping, a lifecycle marker).
 local BANNER = "[SYSTEM NOTIFICATION"
 
 --- No note line is wider than this; a long command or a batch of tasks must
@@ -198,8 +200,8 @@ end
 --- Display lines for one `pi2_bg_task` custom-message content.
 ---
 --- Returns `{}` for anything that is not a report: a non-string content, an
---- empty one, and — the point of the banner check — a panel ping
---- (`[Background task b3f2a1 started]`), which shares the customType.
+--- empty one, and — the point of the banner check — an older session's panel
+--- ping (`[Background task b3f2a1 started]`), which shares the customType.
 ---@param content any custom-message content
 ---@return string[]
 function M.lines(content)

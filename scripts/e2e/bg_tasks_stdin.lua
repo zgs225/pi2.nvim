@@ -400,6 +400,14 @@ local function main()
     local out_path = RUN_ROOT .. "/read.txt"
 
     vim.env.PI_CODING_AGENT_DIR = agent_dir
+
+    -- Hermetic: never inherit the developer's editor. pi.nvim publishes its
+    -- idle-wake policy through PI_NVIM_BG_TASKS_FILE, and an unfocused editor (or
+    -- `wake_on_completion = "never"`) HOLDS every idle completion instead of
+    -- waking it — which is exactly what several of these assertions measure. CI
+    -- has no such variable, so without this a suite can pass there and fail on a
+    -- laptop.
+    vim.env.PI_NVIM_BG_TASKS_FILE = nil
     vim.env.PI_OFFLINE = "1"
 
     -- These cases exercise the delivery ladder, not the cost gate: opt into a

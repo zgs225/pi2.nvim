@@ -27,6 +27,7 @@
 #   make e2e-bg-reconcile — real-pi e2e: the task table survives a SIGKILLed pi and is adopted by the next run (needs pi; fake provider)
 #   make e2e-bg-stdin — real-pi e2e: a background task keeps its stdin and task_input feeds it (needs pi; fake provider)
 #   make e2e-bg-report — real-pi e2e: a completion report is one structured `<background-task>` block (needs pi; fake provider)
+#   make e2e-bg-panel — real-pi e2e: :PiTasks state is an extension ENTRY (live, not boundary-deferred) and a resumed session rebuilds it from one snapshot digest (needs pi; fake provider)
 #   make e2e-bg-fallback — real-pi e2e: BOTH fallback scenarios — a failed injection retried until the request succeeds, and a run that gives up delivering it yet still wakes with the report (needs pi; fake provider)
 #   make e2e-bg-wake — real-pi e2e: two same-tick completions send ONE coalesced wake naming both tasks (needs pi; fake provider)
 #   make e2e-bg-wake-gate — real-pi e2e: a held completion starts no turn, says why, and rides the next prompt exactly once (needs pi; fake provider)
@@ -72,7 +73,7 @@ RUFF_BIN ?= ruff
 
 export LUAJIT_BIN
 
-.PHONY: test smoke format style lint docs-links check check-selftest check-list parse e2e e2e-reaper e2e-worktrees e2e-bg-delivery e2e-bg-stop e2e-bg-reconcile e2e-bg-stdin e2e-bg-report e2e-bg-ownership e2e-subagent-failure e2e-subagent-worktree e2e-bg-fallback e2e-bg-wake e2e-bg-wake-gate e2e-bg-deadline e2e-bg-until e2e-bg-logs e2e-compaction
+.PHONY: test smoke format style lint docs-links check check-selftest check-list parse e2e e2e-reaper e2e-worktrees e2e-bg-delivery e2e-bg-stop e2e-bg-reconcile e2e-bg-stdin e2e-bg-report e2e-bg-panel e2e-bg-ownership e2e-subagent-failure e2e-subagent-worktree e2e-bg-fallback e2e-bg-wake e2e-bg-wake-gate e2e-bg-deadline e2e-bg-until e2e-bg-logs e2e-compaction
 
 test:
 	PLENARY_PATH=$(PLENARY_PATH) RENDER_MARKDOWN_PATH=$(RENDER_MARKDOWN_PATH) \
@@ -145,6 +146,14 @@ e2e-bg-stdin:
 # model's next request actually carries it. Needs the pi binary only — runs in CI.
 e2e-bg-report:
 	$(NVIM_BIN) --headless -u $(MIN_INIT) -l scripts/e2e/bg_tasks_report.lua
+
+# Real-pi e2e for the PANEL channel: :PiTasks is driven by extension ENTRIES
+# (`pi.appendEntry` → `entry_appended`, immediate) instead of custom messages
+# (deferred to the turn boundary while a run streams), and a resumed session
+# rebuilds its rows from ONE `pi2_bg_tasks_snapshot` digest. Needs the pi binary
+# only — runs in CI.
+e2e-bg-panel:
+	$(NVIM_BIN) --headless -u $(MIN_INIT) -l scripts/e2e/bg_tasks_panel.lua
 
 # Real-pi e2e for the last-resort `context` fallback: a report injected into a
 # request that then fails with a 5xx must be injected AGAIN on the retry and be

@@ -446,18 +446,25 @@ local function report_entries(entries)
     return out
 end
 
---- Every panel message that carries a hold reason.
+--- Every panel record that carries a hold reason.
+---
+--- The panel channel is an extension ENTRY (`pi.appendEntry`), so the hold rides
+--- `entry.data`; an older transcript's `custom_message` ping carries it under
+--- `details`. Both shapes are accepted, because the assertion is about the fact
+--- (the hold was announced exactly once) and not about the transport.
 ---@param entries table[]
 ---@return table[]
 local function held_entries(entries)
     local out = {}
     for index, entry in ipairs(entries) do
-        if
-            entry.type == "custom_message"
-            and type(entry.details) == "table"
-            and type(entry.details.held) == "string"
-        then
-            out[#out + 1] = { index = index, held = entry.details.held, taskId = entry.details.taskId }
+        local details = nil
+        if entry.type == "custom" then
+            details = type(entry.data) == "table" and entry.data or nil
+        elseif entry.type == "custom_message" then
+            details = type(entry.details) == "table" and entry.details or nil
+        end
+        if details and type(details.held) == "string" then
+            out[#out + 1] = { index = index, held = details.held, taskId = details.taskId }
         end
     end
     return out
@@ -592,13 +599,13 @@ local function run_case(name, prefs, expected_reason)
         reports = report_entries(entries),
     })
     local held = held_entries(entries)
-    check(#held == 1, "exactly one panel message announces the hold", { held = held })
+    check(#held == 1, "exactly one panel record announces the hold", { held = held })
     check(held[1].held == expected_reason, "the hold names the expected reason", {
         got = held[1].held,
         want = expected_reason,
     })
     check(held[1].taskId == task_id, "the hold names the task", { got = held[1].taskId, want = task_id })
-    step(("%s: G2 the panel message says held (%s)"):format(name, expected_reason))
+    step(("%s: G2 the panel entry says held (%s)"):format(name, expected_reason))
 
     -- The next user prompt must carry the report, exactly once.
     local before_prompt = #backend.events

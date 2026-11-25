@@ -745,11 +745,12 @@ describe("bg-tasks extension contract", function()
         )
         -- Ordering: an exit nobody observed is neither a signal nor a code, so
         -- the `exitUnknown` test must sit after the signal test and before the
-        -- exit-code test, exactly like `reportStatus`.
-        local panel = assert(src:find("function reportPanel(", 1, true), "reportPanel must exist")
-        local panel_body = src:sub(panel, assert(src:find("function batchDetails(", panel, true)))
-        local unknown_at = assert(panel_body:find("task.exitUnknown", 1, true), "reportPanel must test exitUnknown")
-        local code_at = assert(panel_body:find("task.exitCode === 0", 1, true), "reportPanel must test the exit code")
+        -- exit-code test, exactly like `reportStatus`. The panel's record is built
+        -- in `panelDetails` (one payload for the live entry and the resume digest).
+        local panel = assert(src:find("function panelDetails(", 1, true), "panelDetails must exist")
+        local panel_body = src:sub(panel, assert(src:find("function reportPanel(", panel, true)))
+        local unknown_at = assert(panel_body:find("task.exitUnknown", 1, true), "panelDetails must test exitUnknown")
+        local code_at = assert(panel_body:find("task.exitCode === 0", 1, true), "panelDetails must test the exit code")
         assert.is_true(unknown_at < code_at, "exitUnknown must be tested before the exit code")
         -- The vanished-record reconcile path must reach the panel too, or a
         -- resumed session's unadoptable task would simply not exist there.

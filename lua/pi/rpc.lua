@@ -22,6 +22,7 @@
 ---| "agent_settled"
 ---| "extension_ui_request"
 ---| "extension_error"
+---| "entry_appended"
 ---| "bash_execution_update"
 ---| "queue_update"
 ---| "response"
