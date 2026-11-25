@@ -35,6 +35,7 @@ local TodoToolUi = require("pi.todo.tool_ui")
 ---@field thinking_level string?
 ---@field context_tokens integer?
 ---@field worktree_name? string Linked worktree the viewed session ran in; renders as the `󰙅 name` footer badge
+---@field branch_name? string Branch of the checkout the viewed session ran in (a detached `HEAD` renders its short sha); the `󰘬 name` title badge
 
 -- Module state
 ---@type integer?
@@ -59,6 +60,15 @@ local viewer_tab_counter = -100
 local viewer_on_close = nil
 ---@type boolean
 local viewer_statusline_enabled = true
+-- Title branch badge: the checkout the viewed session ran in, the `HEAD` watcher
+-- following it while the float is open, and the identity of what the title
+-- currently renders (a repaint is skipped when it did not change).
+---@type string?
+local viewer_branch_cwd = nil
+---@type string?
+local viewer_branch_key = nil
+---@type fun()?
+local viewer_branch_unwatch = nil
 ---@type pi.SubsessionViewerStatus
 local viewer_status = {
     model_id = nil,
@@ -286,6 +296,10 @@ end
 -- sub-session row's subtitle and the chat title badge carry.
 local WORKTREE_GLYPH = "󰙅"
 
+-- Nerd-font git glyph, the sibling of `WORKTREE_GLYPH`: the same badge the
+-- chat's history title puts before its branch (`󰘬 feat/x`).
+local BRANCH_GLYPH = "󰘬"
+
 --- Whether the footer carries the worktree badge (`subagent.viewer.worktree`).
 --- Default on: the row already names its checkout, so a viewer that hides it
 --- again would silently drop information the keypress carried in.
@@ -393,11 +407,24 @@ local function resolve_context_window(model_id, provider)
     return nil
 end
 
+--- Float title text: the session's display name, then the checkout's git branch
+--- badge — ` Worker 󰘬 feat/x ` — the same pair, in the same order and glyph, as
+--- the chat's own history title. A session whose checkout is not a repository (or
+--- whose cwd is unknown) gets no badge and no placeholder.
+---
+--- Deliberately no run status: `active` / `idle` / `completed` were the session's
+--- *liveness*, which the conversation itself already answers (a replay that stops
+--- growing, a turn that ends), while `active` also covered a live but idle
+--- session — two different states under one word. What the content cannot show is
+--- which checkout these edits landed in, so the title carries that instead.
 ---@param name string
----@param status string
 ---@return string
-local function format_title(name, status)
-    return string.format(" %s [%s] ", name, status)
+local function format_title(name)
+    local branch = viewer_status.branch_name
+    if type(branch) == "string" and branch ~= "" then
+        return string.format(" %s %s %s ", name, BRANCH_GLYPH, branch)
+    end
+    return string.format(" %s ", name)
 end
 
 ---@param args any
@@ -686,6 +713,82 @@ local function resolve_worktree_name(opts, cwd)
         return nil
     end
     return info.name
+end
+
+--- The git branch module when available: `read` is one cached
+--- `pi.worktree.detect` plus one `<git_dir>/HEAD` file read (no subprocess), and
+--- `watch` is an fs_event on that same file.
+---@return table?
+local function branch_module()
+    local loaded, mod = pcall(require, "pi.git_branch")
+    if loaded and type(mod) == "table" and type(mod.read) == "function" and type(mod.label) == "function" then
+        return mod
+    end
+    return nil
+end
+
+--- Branch record of the checkout the viewed session ran in.
+---
+--- `cwd` is the directory the *session* ran in, never a fallback to Neovim's own:
+--- a preview of another session's checkout must not advertise the editor's branch.
+--- An unknown cwd therefore means no badge.
+---@param cwd string?
+---@return pi.GitBranch?
+local function read_branch(cwd)
+    if type(cwd) ~= "string" or cwd == "" then
+        return nil
+    end
+    local mod = branch_module()
+    if not mod then
+        return nil
+    end
+    local ok, info = pcall(mod.read, cwd)
+    return ok and info or nil
+end
+
+--- Store a branch record as the title badge, repainting only when the rendered
+--- label (or the checkout it came from) actually changed — the title is rebuilt
+--- at every turn boundary and almost never differs.
+---@param info pi.GitBranch?
+local function apply_branch(info)
+    local mod = branch_module()
+    local label = mod and mod.label(info) or nil
+    local name = (type(label) == "string" and label ~= "") and label or nil
+    local git_dir = type(info) == "table" and type(info.git_dir) == "string" and info.git_dir or ""
+    local key = git_dir .. "\0" .. (name or "")
+    if key == viewer_branch_key then
+        return
+    end
+    viewer_branch_key = key
+    viewer_status.branch_name = name
+    M.update_title(viewer_session_name)
+end
+
+--- Follow `HEAD` of the viewed session's checkout for the life of the float, so a
+--- branch switch (the agent's own `git checkout`, `pi.worktree_branch`, or a
+--- terminal next to the editor) updates the title without reopening the preview.
+--- Released by `M.close()`: the handle keeps its callback alive.
+---@param cwd string?
+local function watch_branch(cwd)
+    if viewer_branch_unwatch then
+        pcall(viewer_branch_unwatch)
+        viewer_branch_unwatch = nil
+    end
+    local mod = branch_module()
+    if not mod or type(mod.watch) ~= "function" or type(cwd) ~= "string" or cwd == "" then
+        return
+    end
+    local ok, unsubscribe = pcall(mod.watch, cwd, apply_branch)
+    if ok and type(unsubscribe) == "function" then
+        viewer_branch_unwatch = unsubscribe
+    end
+end
+
+--- Re-read the branch at a turn boundary: the `HEAD` watcher is the live path,
+--- this is its documented fallback for filesystems that report no fs_event
+--- (network mounts, some WSL setups) — the same split the chat title uses.
+local function refresh_branch()
+    apply_branch(read_branch(viewer_branch_cwd))
 end
 
 ---@param path string
@@ -1042,6 +1145,14 @@ function M.close()
     viewer_todo_entries = nil
     viewer_todo_panel_suppressed = false
     viewer_border = nil
+    -- The `HEAD` fs_event handle keeps its callback alive, so a viewer that
+    -- skipped this would leave one watcher behind per preview it ever opened.
+    if viewer_branch_unwatch then
+        pcall(viewer_branch_unwatch)
+        viewer_branch_unwatch = nil
+    end
+    viewer_branch_cwd = nil
+    viewer_branch_key = nil
     close_todo_panel()
     viewer_status = {
         model_id = nil,
@@ -1116,10 +1227,9 @@ local function viewer_shows_session(session)
     return (session.id ~= nil and M.is_open_for(session.id)) or M.is_open_for_session(session)
 end
 
---- Update the viewer window title.
+--- Update the viewer window title (the display name plus the branch badge).
 ---@param name? string
----@param status string
-function M.update_title(name, status)
+function M.update_title(name)
     if not viewer_win or not vim.api.nvim_win_is_valid(viewer_win) then
         return
     end
@@ -1129,7 +1239,7 @@ function M.update_title(name, status)
     local title_name = (viewer_session_name and viewer_session_name ~= "") and viewer_session_name
         or (viewer_child_id or "subsession")
     pcall(vim.api.nvim_win_set_config, viewer_win, {
-        title = format_title(title_name, status),
+        title = format_title(title_name),
         title_pos = "center",
     })
 end
@@ -1162,7 +1272,10 @@ local function handle_live_event(session, msg)
     local t = msg.type
     if t == "agent_start" then
         history:on_agent_start(nil)
-        M.update_title(viewer_session_name, "active")
+        -- A run is where a branch switch happens (`pi.worktree_branch`, a
+        -- `git checkout` in the bash tool): re-read at the boundary as well as
+        -- through the watcher.
+        refresh_branch()
     elseif t == "message_start" then
         local message = msg.message
         if message and message.role == "user" then
@@ -1246,9 +1359,9 @@ local function handle_live_event(session, msg)
         end
     elseif t == "agent_end" or t == "agent_settled" then
         history:on_agent_end()
-        -- Only sub-sessions are manifest-patched on settle; a parent/tab session
-        -- returns to idle instead of claiming a completion it never reports.
-        M.update_title(viewer_session_name, viewer_is_child and "completed" or "idle")
+        -- The run is what moves a checkout, so the boundary re-read is here; the
+        -- title carries no run status (the transcript answers that).
+        refresh_branch()
         M.update_statusline()
     elseif t == "model_change" then
         if msg.modelId then
@@ -1363,7 +1476,6 @@ function M.open(child_id, opts)
     -- 3. Determine if live (Sessions.get_by_id) or dormant (disk)
     local session = Sessions.get_by_id(child_id)
     local is_live = session ~= nil and session.rpc ~= nil and session.rpc:is_running()
-    local status = (entry and entry.status) or (is_live and "active" or "dormant")
     -- The viewed session's id, resolved once for both paths: a live session's
     -- registry id is the id the viewer was opened for, and a dormant session is
     -- known only by that same id. Background-task records folded by the replay
@@ -1451,6 +1563,11 @@ function M.open(child_id, opts)
     -- an owned child checkout can outlive the manifest row's record).
     viewer_status.worktree_name = resolve_worktree_name(opts, session_cwd)
 
+    -- Branch badge for the title, from the same cwd: the linked worktree's own
+    -- `HEAD` when the session ran in one, the main checkout's otherwise.
+    viewer_branch_cwd = session_cwd
+    apply_branch(read_branch(session_cwd))
+
     -- Todo snapshot for the footer chunk and the `T` panel: the per-session
     -- mirror for a live session, the decoded JSONL entries otherwise.
     viewer_todo_details = resolve_todo_details(is_live and session or nil, viewer_todo_entries)
@@ -1487,7 +1604,7 @@ function M.open(child_id, opts)
     local height = math.max(5, math.min(editor_h - 2, total_h))
     local row = math.max(0, math.floor((editor_h - height) / 2))
     local col = math.floor((editor_w - width) / 2)
-    local title = format_title(name, status)
+    local title = format_title(name)
     local initial_chunks = format_statusline(viewer_status)
 
     local win_opts = {
@@ -1517,6 +1634,11 @@ function M.open(child_id, opts)
     viewer_event_queue = nil
     viewer_on_close = opts.on_close
     history:set_win(win)
+
+    -- Follow the checkout's `HEAD` for as long as the float lives; the
+    -- turn-boundary re-read in `handle_live_event` covers filesystems where the
+    -- watcher reports nothing.
+    watch_branch(session_cwd)
 
     vim.wo[win].wrap = true
     vim.wo[win].number = false
