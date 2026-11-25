@@ -79,6 +79,25 @@ The marker also carries the run's **generation speed**, `· 58 tok/s`: the outpu
 
 It prints nothing when a number would say nothing: a provider that reports no `usage.output` (some endpoints only report usage for non-streamed responses), an aborted or errored turn, a message that streamed no content, fewer than **20** output tokens for the whole run (`TurnRate.MIN_TOKENS` — a rate measured over a handful of tokens is sampling noise, not a measurement), and any rate under `1 tok/s`. The marker is written only for turns that streamed in this Neovim — a transcript loaded from a session file carries no live clock, so a resumed conversation shows neither durations nor rates. Set `turn_stats = false` in `setup()` to keep the duration and drop the rate.
 
+### User message alignment
+
+Your own messages are flush left like everything else. `user_message_align = "right"` pushes them — label and body together — to the right edge of the history window, so a conversation reads the way a chat app does:
+
+```
+                     󰇅 Nov 25 2026, 14:32
+  can you check why the reaper test is flaky?
+```
+
+`"left"` is the default and renders exactly as before.
+
+Neovim cannot right-align a *buffer* line: the only right-anchored text it draws is virtual text, which cannot hold selectable body lines with their highlights, and a soft-wrapped line restarts its continuation at column 0. The alignment is therefore written into the buffer as padding, which you can see in three places:
+
+- A message line wider than the window is **hard-wrapped** into several real buffer lines, each padded to the edge (the same reason error and tool output are wrapped: a soft-wrapped continuation would escape to the left edge and split the block apart).
+- The padding is width-dependent, so every right-aligned block is **re-padded when the history window changes width** — a split resize, `:PiToggleLayout`, zen mode, or reopening the chat. This costs nothing at rest: the tracking is created with the first right-aligned block and does no work while the width is unchanged.
+- `yy` / `:PiCopy` still copy **the text you wrote**, never the padded rows (the same source-text contract as the left default).
+
+Alignment is decided when a message is rendered, so switching the option mid-session changes the messages that arrive after the switch; the ones already in the history keep the alignment they were drawn with.
+
 ## Prompt
 
 The prompt buffer (`pi-chat-prompt`) is a regular multi-line buffer where you compose the next message. It clears itself after each submission, but its contents are preserved across `:PiToggleChat`, layout toggles, and tab switches — the buffer lives with the session. The window auto-resizes to fit its content (between 5 and 15 rows) while you type.

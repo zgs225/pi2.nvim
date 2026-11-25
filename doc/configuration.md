@@ -41,6 +41,9 @@ require("pi").setup({
     -- Append the run's generation speed (`· 58 tok/s`) to the turn's completion
     -- marker in the history; false keeps the duration only.
     turn_stats = true,
+    -- Horizontal alignment of user message blocks in the history:
+    -- "left" (default) or "right" (see doc/usage.md#user-message-alignment).
+    user_message_align = "left",
     -- Default expand/collapse state for the startup block
     -- (skills, extensions, startup announcements).
     expand_startup_details = true,

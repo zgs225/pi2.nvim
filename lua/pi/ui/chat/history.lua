@@ -51,6 +51,9 @@
 ---@field _current_turn_first_agent_response_extmark_id integer?
 ---@field _current_turn_last_agent_response_extmark_id integer?
 ---@field _turn_anchors integer[] extmark ids of the user label rows, one per turn, in render order
+---@field _user_blocks pi.UserBlock[] right-aligned user blocks, kept so a window resize can re-pad them
+---@field _realign_pending boolean a realign pass is already queued for the next tick
+---@field _realign_aucmd? integer WinResized/VimResized watcher (created with the first right-aligned block)
 ---@field _entries pi.HistoryEntry[] rendered messages in append order (copy source)
 ---@field _text_batches string[][] sealed/open text-delta batches, one per structural boundary
 ---@field _structural_inflight integer structural dispatches whose callback has not run yet
@@ -191,6 +194,17 @@ local turn_ns = vim.api.nvim_create_namespace("pi-chat-turn")
 -- anchor swallowed by such a clear would silently break copying for the rest of
 -- the session.
 local entry_ns = vim.api.nvim_create_namespace("pi-chat-entry")
+
+-- Anchors for right-aligned user blocks get their own namespace for the same
+-- reason as `turn_ns` / `entry_ns`: the render code clears `ns` over row ranges
+-- (tool-block expand/collapse, live updates, footer redraws), and a swallowed
+-- anchor would silently stop a block from being re-padded on resize.
+local align_ns = vim.api.nvim_create_namespace("pi-chat-user-align")
+
+-- Resize watcher group for right-aligned user blocks. One watcher per History,
+-- created with the first right-aligned block (the default left alignment pays
+-- nothing).
+local align_group = vim.api.nvim_create_augroup("PiHistoryUserAlign", { clear = false })
 
 local STARTUP_HL_PRIORITY = 200
 
@@ -595,6 +609,9 @@ function History.new(tab)
     self._current_turn_first_agent_response_extmark_id = nil
     self._current_turn_last_agent_response_extmark_id = nil
     self._turn_anchors = {}
+    self._user_blocks = {}
+    self._realign_pending = false
+    self._realign_aucmd = nil
     self._entries = {}
     self._text_batches = { {} } -- invariant: always ends with one open batch
     self._structural_inflight = 0
@@ -1661,6 +1678,11 @@ function History:set_win(win)
         -- Window closed: the next open starts pinned to the latest content.
         self._auto_follow = true
         self._pending_cursor = nil
+    else
+        -- The window a session reopens in need not be the width the buffer was
+        -- rendered for: re-pad the right-aligned user blocks (a no-op when no
+        -- block is tracked or the width is unchanged).
+        self:_schedule_user_realign()
     end
 end
 
@@ -1887,6 +1909,146 @@ function History:_render_md_table(tbl)
     end
 end
 
+--- User message alignment (`pi.Options.user_message_align`)
+---
+--- Neovim cannot right-align a *buffer* line: the only right-anchored text it
+--- draws is virtual text (`virt_text_pos = "right_align"`), which cannot carry
+--- selectable body lines with real highlights, and a soft-wrapped line restarts
+--- its continuation at column 0. Right alignment is therefore written into the
+--- buffer as padding, which has two consequences:
+---
+---   * body lines are hard-wrapped to the available width (`Text.wrap`, the same
+---     reason error and tool output are), so no continuation line can escape to
+---     the left edge;
+---   * the padding is width-dependent, so every right-aligned block keeps its
+---     `pi.UserBlockSpec` and is re-rendered when the window width changes
+---     (`_realign_user_blocks`), keeping it flush right after a split resize,
+---     zen mode or a float layout change.
+---
+--- The default left alignment renders exactly as it did before this option
+--- existed and stores nothing.
+
+---@class pi.UserBlockMark
+---@field row integer 0-based row offset inside the block's rendered lines
+---@field start_col integer byte column where the highlight starts
+---@field end_col integer byte column where the highlight ends
+---@field hl string highlight group
+
+--- Everything needed to render one user message block at any window width.
+---@class pi.UserBlockSpec
+---@field align "left"|"right"
+---@field icon string user label glyph
+---@field time_str string formatted timestamp
+---@field queue_tag string trailing steer/follow-up tag ("" when absent)
+---@field queue_hl? string highlight group for `queue_tag`
+---@field body string[] the message's raw lines (unindented, unwrapped)
+---@field image_info? string "N images attached" line
+---@field lead integer blank rows before the label (1 normally, 2 with `turn_separator`)
+
+--- One rendered right-aligned user message, kept so a resize can re-pad it.
+---@class pi.UserBlock
+---@field anchor integer extmark id in `align_ns` tracking the block's first row
+---@field spec pi.UserBlockSpec
+---@field width integer text-area width the current lines were rendered for
+---@field line_count integer number of buffer rows the block currently occupies
+
+---@return "left"|"right"
+local function user_message_align()
+    return Config.options.user_message_align == "right" and "right" or "left"
+end
+
+--- Right edge of the padding: one column of margin, so a padded line can never
+--- wrap into a phantom continuation line.
+---@param width integer
+---@return integer
+local function right_edge(width)
+    return math.max(1, width - 1)
+end
+
+--- Push `text` to the right edge of a `width`-column window with padding spaces.
+---@param text string
+---@param width integer
+---@return string
+local function align_right(text, width)
+    local pad = right_edge(width) - vim.fn.strdisplaywidth(text)
+    if pad <= 0 then
+        return text
+    end
+    return string.rep(" ", pad) .. text
+end
+
+--- Render a user message block: leading gap, label, body, attachment line.
+---@param spec pi.UserBlockSpec
+---@param width integer text-area width of the history window in columns
+---@return string[] lines
+---@return pi.UserBlockMark[] marks highlight spans, rows relative to `lines`
+local function build_user_block(spec, width)
+    local right = spec.align == "right"
+    local lines = {}
+    for _ = 1, spec.lead do
+        lines[#lines + 1] = ""
+    end
+    -- Label: icon, timestamp, optional steer/follow-up tag. Right-aligned with
+    -- the body so it reads as the header of the same block.
+    local label = spec.icon .. " " .. spec.time_str .. spec.queue_tag
+    local label_row = #lines
+    local label_text = right and align_right(label, width) or label
+    local shift = #label_text - #label
+    lines[#lines + 1] = label_text
+    local time_start = shift + #spec.icon + 1
+    ---@type pi.UserBlockMark[]
+    local marks = {
+        { row = label_row, start_col = shift, end_col = shift + #spec.icon, hl = "PiUserMessageLabel" },
+        { row = label_row, start_col = time_start, end_col = time_start + #spec.time_str, hl = "PiMessageDateTime" },
+    }
+    if spec.queue_hl then
+        marks[#marks + 1] = {
+            row = label_row,
+            start_col = time_start + #spec.time_str,
+            end_col = shift + #label,
+            hl = spec.queue_hl,
+        }
+    end
+    lines[#lines + 1] = ""
+    local body = spec.body
+    if right then
+        -- -2: the right margin, plus one column of headroom for fonts that draw
+        -- a PUA glyph one cell wider than utf8proc reports (same note as the
+        -- thinking preview).
+        local avail = math.max(8, right_edge(width) - 2)
+        local wrapped = {}
+        for _, raw in ipairs(body) do
+            for _, chunk in ipairs(Text.wrap(raw, avail)) do
+                wrapped[#wrapped + 1] = chunk
+            end
+        end
+        body = wrapped
+    end
+    -- Body: two-space indent when left, right padding when right.
+    for _, raw in ipairs(body) do
+        local text
+        if not right then
+            text = "  " .. raw
+        elseif raw == "" then
+            text = ""
+        else
+            text = align_right(raw, width)
+        end
+        lines[#lines + 1] = text
+        -- Color user body text with the user role hue (Title.fg)
+        if #text > 0 then
+            marks[#marks + 1] = { row = #lines - 1, start_col = 0, end_col = #text, hl = "PiUserBody" }
+        end
+    end
+    if spec.image_info then
+        local text = right and align_right(spec.image_info, width) or spec.image_info
+        lines[#lines + 1] = ""
+        lines[#lines + 1] = text
+        marks[#marks + 1] = { row = #lines - 1, start_col = 0, end_col = #text, hl = "PiMessageAttachments" }
+    end
+    return lines, marks
+end
+
 ---@param msg string
 ---@param timestamp? number
 ---@param image_count? integer
@@ -1927,70 +2089,196 @@ function History:add_user_message(msg, timestamp, image_count, queue_type)
             queue_tag = "  " .. Config.options.labels.follow_up_message
             queue_tag_hl = "PiFollowUpDelivered"
         end
-        local time_sep = " "
-        local label_line = icon .. time_sep .. time_str .. queue_tag
-        -- Turn gap: extra blank line when turn_separator is on
-        local turn_gap = (had_content and Config.options.turn_separator) and "" or nil
-        local lines = turn_gap and { "", "", label_line, "" } or { "", label_line, "" }
-        -- Indent user body lines
-        for i, line in ipairs(msg_lines) do
-            msg_lines[i] = "  " .. line
-        end
-        vim.list_extend(lines, msg_lines)
-        if image_count and image_count > 0 then
-            local info = format_attachment_info(image_count)
-            lines[#lines + 1] = ""
-            lines[#lines + 1] = info
-        end
+        local spec = {
+            align = user_message_align(),
+            icon = icon,
+            time_str = time_str,
+            queue_tag = queue_tag,
+            queue_hl = queue_tag_hl,
+            body = msg_lines,
+            image_info = (image_count and image_count > 0) and format_attachment_info(image_count) or nil,
+            -- Turn gap: extra blank line when turn_separator is on
+            lead = (had_content and Config.options.turn_separator) and 2 or 1,
+        }
+        local width = self:_history_width()
+        local lines, marks = build_user_block(spec, width)
         local start = self:_append_lines(lines)
-        local label_row = start + (turn_gap and 2 or 1)
+        local label_row = start + spec.lead
         -- Turn anchor: the user label row is where `[[` / `]]` land. An extmark
         -- (not a row number) so streaming appends, tool-block expand/collapse
         -- and startup-block toggles all move it correctly.
         local anchor = vim.api.nvim_buf_set_extmark(self._buf, turn_ns, label_row, 0, { right_gravity = true })
         self._turn_anchors[#self._turn_anchors + 1] = anchor
         -- Copy source: the text as authored. The rendered body cannot be used
-        -- for this (it is indented and its markdown tables are drawn as box
-        -- art), so the entry keeps the original string.
+        -- for this (it is indented/padded and its markdown tables are drawn as
+        -- box art), so the entry keeps the original string.
         self:_register_entry("user", label_row, has_message_text and msg or "")
-        vim.api.nvim_buf_set_extmark(self._buf, ns, label_row, 0, {
-            end_col = #icon,
-            hl_group = "PiUserMessageLabel",
-        })
-        local time_start = #icon + #time_sep
-        local time_end = time_start + #time_str
-        vim.api.nvim_buf_set_extmark(self._buf, ns, label_row, time_start, {
-            end_col = time_end,
-            hl_group = "PiMessageDateTime",
-        })
-        if queue_tag ~= "" then
-            vim.api.nvim_buf_set_extmark(self._buf, ns, label_row, time_end, {
-                end_col = time_end + #queue_tag,
-                hl_group = queue_tag_hl,
-            })
-        end
-        -- Color user body text with the user role hue (Title.fg)
-        local body_start = label_row + 2
-        local body_end = label_row + 1 + #msg_lines
-        for row = body_start, body_end do
-            local line = vim.api.nvim_buf_get_lines(self._buf, row, row + 1, false)[1] or ""
-            if #line > 0 then
-                vim.api.nvim_buf_set_extmark(self._buf, ns, row, 0, {
-                    end_col = #line,
-                    hl_group = "PiUserBody",
-                })
-            end
-        end
-        if image_count and image_count > 0 then
-            local info_row = start + #lines - 1
-            local info_text = lines[#lines]
-            vim.api.nvim_buf_set_extmark(self._buf, ns, info_row, 0, {
-                end_col = #info_text,
-                hl_group = "PiMessageAttachments",
-            })
+        self:_apply_user_marks(start, marks)
+        -- Right alignment is width-dependent: keep the spec so a resize can
+        -- re-render the block. The default left alignment stores nothing.
+        if spec.align == "right" then
+            self:_track_user_block(spec, start, #lines, width)
         end
         self:_scroll_to_bottom()
     end)
+end
+
+--- Apply a block's highlight marks at `row` (the block's first buffer row).
+---@param row integer 0-based row the block starts at
+---@param marks pi.UserBlockMark[]
+function History:_apply_user_marks(row, marks)
+    if not self._buf or not vim.api.nvim_buf_is_valid(self._buf) then
+        return
+    end
+    for _, mark in ipairs(marks) do
+        vim.api.nvim_buf_set_extmark(self._buf, ns, row + mark.row, mark.start_col, {
+            end_col = mark.end_col,
+            hl_group = mark.hl,
+        })
+    end
+end
+
+--- Start tracking a right-aligned block so a window resize can re-pad it.
+---@param spec pi.UserBlockSpec
+---@param row integer 0-based row the block's first line was placed at
+---@param line_count integer rows the block occupies now
+---@param width integer text-area width the block was rendered for
+function History:_track_user_block(spec, row, line_count, width)
+    if not self._buf or not vim.api.nvim_buf_is_valid(self._buf) then
+        return
+    end
+    -- right_gravity = false: the anchor must stay on the block's first row
+    -- while `_realign_user_blocks` replaces the block's own lines in place.
+    local anchor = vim.api.nvim_buf_set_extmark(self._buf, align_ns, row, 0, { right_gravity = false })
+    self._user_blocks[#self._user_blocks + 1] = {
+        anchor = anchor,
+        spec = spec,
+        width = width,
+        line_count = line_count,
+    }
+    self:_ensure_realign_autocmd()
+end
+
+--- Create this History's resize watcher (once, with its first right-aligned
+--- block). It removes itself the first time it fires after the buffer was
+--- wiped, so a closed tab leaves no autocmd behind.
+function History:_ensure_realign_autocmd()
+    if self._realign_aucmd then
+        return
+    end
+    local id
+    id = vim.api.nvim_create_autocmd({ "WinResized", "VimResized" }, {
+        group = align_group,
+        callback = function()
+            if not self._buf or not vim.api.nvim_buf_is_valid(self._buf) then
+                pcall(vim.api.nvim_del_autocmd, id)
+                self._realign_aucmd = nil
+                return
+            end
+            self:_schedule_user_realign()
+        end,
+    })
+    self._realign_aucmd = id
+end
+
+--- Queue a realign pass for the next event-loop tick. A drag resize fires
+--- `WinResized` dozens of times and every pass rewrites buffer rows, so the
+--- passes are coalesced into one per tick.
+function History:_schedule_user_realign()
+    if self._realign_pending or not self._user_blocks or #self._user_blocks == 0 then
+        return
+    end
+    self._realign_pending = true
+    vim.schedule(function()
+        self._realign_pending = false
+        self:_realign_user_blocks()
+    end)
+end
+
+--- The anchor namespaces a user block owns, with the gravity each must keep.
+--- `_realign_user_blocks` rewrites the whole block, and `nvim_buf_set_lines`
+--- collapses the extmarks inside a replaced range (to its end when
+--- `right_gravity` is on), which would move a turn anchor off its label row and
+--- break `[[` / `]]` and `yy`. They are captured and written back explicitly.
+local BLOCK_ANCHORS = {
+    { ns = turn_ns, right_gravity = true },
+    { ns = entry_ns, right_gravity = true },
+    { ns = align_ns, right_gravity = false },
+}
+
+--- Remember the anchors inside `[from_row, to_row)` so they can be restored
+--- after the range is rewritten.
+---@param buf integer
+---@param from_row integer 0-based first row of the range
+---@param to_row integer 0-based row after the last one
+---@return { ns: integer, id: integer, row: integer, col: integer, right_gravity: boolean }[]
+local function capture_block_anchors(buf, from_row, to_row)
+    local out = {}
+    if to_row <= from_row then
+        return out
+    end
+    for _, spec in ipairs(BLOCK_ANCHORS) do
+        local marks = vim.api.nvim_buf_get_extmarks(buf, spec.ns, { from_row, 0 }, { to_row - 1, -1 }, {})
+        for _, mark in ipairs(marks) do
+            out[#out + 1] = {
+                ns = spec.ns,
+                id = mark[1],
+                row = mark[2] - from_row,
+                col = mark[3],
+                right_gravity = spec.right_gravity,
+            }
+        end
+    end
+    return out
+end
+
+--- Put captured anchors back at `from_row` + their relative row.
+---@param buf integer
+---@param from_row integer 0-based first row of the rewritten range
+---@param anchors { ns: integer, id: integer, row: integer, col: integer, right_gravity: boolean }[]
+local function restore_block_anchors(buf, from_row, anchors)
+    for _, anchor in ipairs(anchors) do
+        vim.api.nvim_buf_set_extmark(buf, anchor.ns, from_row + anchor.row, anchor.col, {
+            id = anchor.id,
+            right_gravity = anchor.right_gravity,
+        })
+    end
+end
+
+--- Re-render every tracked right-aligned block for the current history width.
+---
+--- A width change can change a block's row count (wrapping is width-dependent),
+--- so each block's row is re-read from its own anchor right before the write:
+--- Neovim shifts that anchor and every extmark of the content below it itself.
+function History:_realign_user_blocks()
+    if not self._buf or not vim.api.nvim_buf_is_valid(self._buf) then
+        return
+    end
+    if user_message_align() ~= "right" or not self:win() then
+        -- No window to align against: `set_win` schedules a pass when the
+        -- history is shown again, with a width that is real.
+        return
+    end
+    local width = self:_history_width()
+    local kept = {}
+    for _, block in ipairs(self._user_blocks) do
+        local ok, pos = pcall(vim.api.nvim_buf_get_extmark_by_id, self._buf, align_ns, block.anchor, {})
+        local row = (ok and pos and pos[1]) or nil
+        if row and row < vim.api.nvim_buf_line_count(self._buf) then
+            if block.width ~= width then
+                local lines, marks = build_user_block(block.spec, width)
+                local last = math.min(row + block.line_count, vim.api.nvim_buf_line_count(self._buf))
+                local anchors = capture_block_anchors(self._buf, row, last)
+                self:_replace_lines(row, last, lines)
+                restore_block_anchors(self._buf, row, anchors)
+                self:_apply_user_marks(row, marks)
+                block.width = width
+                block.line_count = #lines
+            end
+            kept[#kept + 1] = block
+        end
+    end
+    self._user_blocks = kept
 end
 
 ---@param timestamp? number
@@ -4887,8 +5175,10 @@ function History:clear()
     self._current_turn_first_agent_response_extmark_id = nil
     self._current_turn_last_agent_response_extmark_id = nil
     self._turn_anchors = {}
+    self._user_blocks = {}
     self._entries = {}
     vim.api.nvim_buf_clear_namespace(self._buf, ns, 0, -1)
+    vim.api.nvim_buf_clear_namespace(self._buf, align_ns, 0, -1)
     vim.api.nvim_buf_clear_namespace(self._buf, turn_ns, 0, -1)
     vim.api.nvim_buf_clear_namespace(self._buf, entry_ns, 0, -1)
     self:_with_modifiable(function()
