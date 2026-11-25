@@ -426,6 +426,7 @@
 ---@field show_thinking boolean
 ---@field turn_separator? boolean Extra blank line between conversation turns (default: true)
 ---@field turn_stats? boolean Append the run's generation speed (output tokens per second) to the turn's completion marker in the history (default: true)
+---@field user_message_align "left"|"right" Horizontal alignment of user message blocks in the history: "left" (default) keeps the label and body flush left, "right" pushes both to the window's right edge (default: "left")
 ---@field expand_startup_details boolean Default expand/collapse state for the startup block (skills, extensions, startup announcements). Always rendered; Tab on the block or API call toggles.
 ---@field timestamp_format string Format string passed to os.date for chat message timestamps. Defaults to a non-padded day format using the platform-specific os.date flag.
 ---@field panels pi.Panels
@@ -483,6 +484,8 @@ local defaults = {
     turn_separator = true,
     -- Append the generation speed (`58 tok/s`) to the turn's completion marker.
     turn_stats = true,
+    -- "left" (default) or "right" alignment of user message blocks.
+    user_message_align = "left",
     expand_startup_details = true,
     timestamp_format = Os.is_windows() and "%b %#d %Y, %H:%M" or "%b %-d %Y, %H:%M",
     panels = {
