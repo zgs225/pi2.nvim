@@ -111,6 +111,12 @@ local function start_backend(tag)
         backend.events[#backend.events + 1] = decoded
     end
 
+    -- Hermetic: never inherit the developer's editor. pi.nvim publishes its
+    -- idle-wake policy through PI_NVIM_BG_TASKS_FILE, and an unfocused editor (or
+    -- `wake_on_completion = "never"`) HOLDS every idle completion instead of
+    -- waking it — which is exactly what this script measures.
+    vim.env.PI_NVIM_BG_TASKS_FILE = nil
+
     backend.job = vim.fn.jobstart({
         "pi",
         "--mode",
