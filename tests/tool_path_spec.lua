@@ -97,6 +97,15 @@ describe("pi.path", function()
         assert.are.equal("/etc/hosts", Path.resolve("/etc/hosts", base))
         assert.are.equal(vim.fn.fnamemodify("~/.pi", ":p"):gsub("/$", ""), Path.resolve("~/.pi", base))
     end)
+
+    it("classifies absolute paths lexically, without touching the filesystem", function()
+        assert.is_true(Path.is_absolute("/etc/hosts"))
+        assert.is_true(Path.is_absolute("/nonexistent/dir"))
+        assert.is_true(Path.is_absolute("C:/proj/lua"))
+        assert.is_false(Path.is_absolute("lua/pi"))
+        assert.is_false(Path.is_absolute("./lua"))
+        assert.is_false(Path.is_absolute("~/.pi"))
+    end)
 end)
 
 describe("collapsed path lines", function()
@@ -256,5 +265,47 @@ describe("tool path rendering", function()
 
         assert.is_true(h:goto_path_at_cursor())
         assert.are.equal(vim.fn.resolve(target), vim.fn.resolve(vim.api.nvim_buf_get_name(0)))
+    end)
+
+    -- grep/find/ls take a *directory*, so they cannot use `display_path`
+    -- directly: an already-relative argument has no prefix to strip, and the
+    -- base itself must stay `.` instead of becoming `~/proj`.
+    it("grep/find/ls strip the workspace prefix from an absolute path", function()
+        local h = History.new(TAB)
+        h:set_cwd(dir)
+        h:on_tool_start("grep", "g1", { pattern = "TODO", path = dir .. "/lua/pi" })
+        h:on_tool_start("find", "f1", { pattern = "*.lua", path = dir .. "/lua" })
+        h:on_tool_start("ls", "l1", { path = dir .. "/tests" })
+        pump()
+
+        assert.is_not_nil(row_with(h:buf(), "/TODO/ in lua/pi"))
+        assert.is_not_nil(row_with(h:buf(), "*.lua in lua"))
+        assert.is_not_nil(row_with(h:buf(), "tests"))
+        assert.is_nil(row_with(h:buf(), dir), "the workspace prefix must not be rendered")
+    end)
+
+    it("grep/find/ls collapse the workspace root itself to `.`", function()
+        -- `Path.display` maps the base to the home form (it never yields an
+        -- empty string), so the identity case needs `Path.resolve`: otherwise
+        -- an absolute path to the session cwd would render as `~/proj`.
+        local h = History.new(TAB)
+        h:set_cwd(dir)
+        h:on_tool_start("ls", "l2", { path = dir })
+        pump()
+
+        assert.is_not_nil(row_with(h:buf(), "."))
+        assert.is_nil(row_with(h:buf(), dir), "the workspace prefix must not be rendered")
+        assert.is_nil(row_with(h:buf(), "~"), "the base must not fall back to the home form")
+    end)
+
+    it("grep/find/ls keep an already-relative path verbatim", function()
+        local h = History.new(TAB)
+        h:set_cwd(dir)
+        h:on_tool_start("grep", "g2", { pattern = "x", path = "." })
+        h:on_tool_start("find", "f2", { pattern = "*", path = "../sibling" })
+        pump()
+
+        assert.is_not_nil(row_with(h:buf(), "/x/ in ."))
+        assert.is_not_nil(row_with(h:buf(), "* in ../sibling"))
     end)
 end)

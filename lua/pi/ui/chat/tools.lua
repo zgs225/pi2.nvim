@@ -359,6 +359,27 @@ local function display_path(history, path)
     return Path.display(path, { base = history and history._cwd })
 end
 
+--- Shorten a *directory* argument for display (`grep`/`find`/`ls` take a
+--- `path`, not a file). An already-relative path is returned verbatim: it
+--- carries no workspace prefix to strip, and rewriting it would turn the
+--- ubiquitous `path: "."` into `~/proj` — `pi.path.display` maps the base
+--- itself to the home-relative form rather than to `.`. An absolute path is
+--- shortened like `read`/`edit`/`write` show theirs, with the workspace root
+--- itself collapsing back to `.`.
+---@param history pi.ChatHistory
+---@param path string
+---@return string
+local function display_dir_path(history, path)
+    if not Path.is_absolute(path) then
+        return path
+    end
+    local base = (history and history._cwd) or vim.fn.getcwd()
+    if Path.resolve(path, base) == Path.resolve(base, nil) then
+        return "."
+    end
+    return display_path(history, path)
+end
+
 --- Priority for the builtin-engine treesitter captures over tool input code.
 --- The flat PiToolCall span that covers the whole input line is written
 --- without a priority, so it uses Neovim's default of 4096; a lower number
@@ -2153,7 +2174,7 @@ local renderers = {
                 return
             end
             local pattern = type(args.pattern) == "string" and args.pattern or ""
-            local path = M.optional_arg(args.path) or "."
+            local path = display_dir_path(history, M.optional_arg(args.path) or ".")
             local line = string.format("/%s/ in %s", pattern, path)
             local glob = M.optional_arg(args.glob)
             if glob then
@@ -2174,7 +2195,7 @@ local renderers = {
                 return
             end
             local pattern = type(args.pattern) == "string" and args.pattern or ""
-            local path = M.optional_arg(args.path) or "."
+            local path = display_dir_path(history, M.optional_arg(args.path) or ".")
             local line = string.format("%s in %s", pattern, path)
             if args.limit ~= nil then
                 line = line .. string.format(" (limit %s)", args.limit)
@@ -2190,7 +2211,7 @@ local renderers = {
             if not args then
                 return
             end
-            local path = M.optional_arg(args.path) or "."
+            local path = display_dir_path(history, M.optional_arg(args.path) or ".")
             local line = path
             if args.limit ~= nil then
                 line = line .. string.format(" (limit %s)", args.limit)

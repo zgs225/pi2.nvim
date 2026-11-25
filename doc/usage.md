@@ -963,8 +963,9 @@ Models usually refer to files by absolute path (`/home/you/proj/apps/web/src/Foo
 
 - `read` shows the **file name only** — `read tools.lua (42 lines)`. It is the highest-frequency path in the history, and the line count carries the rest of the signal.
 - `edit` and `write` show the path **relative to the session cwd** — `lua/pi/ui/chat/tools.lua`. A path outside the workspace falls back to `~/…`, and one outside your home directory stays absolute.
+- `grep`, `find` and `ls` treat their `path` argument the same way — `/TODO/ in lua/pi`, not `/TODO/ in /home/you/proj/lua/pi`. Two rules make that safe: an argument already relative (`.` most of the time) is printed **verbatim**, since it has no prefix to strip, and an absolute path pointing at the workspace root itself collapses back to `.` rather than to the home form `~/proj`.
 
-This is display-only. `gf` / [`pi.goto_file_under_cursor()`](#open-file-under-cursor) resolves the real path from the **tool call's arguments**, not from the rendered text, so a shortened (or file-name-only) line still opens the right file. Only `read`/`edit`/`write` are shortened; the search tools (`grep`, `find`, `ls`) print their arguments verbatim — except for the placeholders below.
+This is display-only. `gf` / [`pi.goto_file_under_cursor()`](#open-file-under-cursor) resolves the real path from the **tool call's arguments**, not from the rendered text, so a shortened (or file-name-only) line still opens the right file. The shortening covers those arguments only: what a tool *prints* — a `find`/`ls` file list, the `path:line: text` rows of a `grep` — is rendered as the tool emitted it (which is workspace-relative in practice, and is what [quickfix loading](#quickfix) resolves against the session cwd). Placeholders are the one other thing dropped from an argument — see below.
 
 ### Optional arguments a model stringified
 

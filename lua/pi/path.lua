@@ -27,10 +27,12 @@ local function strip_trailing_slash(p)
     return p
 end
 
+--- Is `p` absolute (POSIX, Windows drive, or UNC)? Purely lexical: the
+--- filesystem is never consulted, so `~` counts as relative.
 ---@param p string
 ---@return boolean
-local function is_absolute(p)
-    return p:sub(1, 1) == "/" or p:match("^%a:[/\\]") ~= nil or p:sub(1, 2) == "\\\\"
+function M.is_absolute(p)
+    return type(p) == "string" and (p:sub(1, 1) == "/" or p:match("^%a:[/\\]") ~= nil or p:sub(1, 2) == "\\\\")
 end
 
 --- `abs` relative to `dir`, or nil when it is not inside it.
@@ -62,7 +64,7 @@ function M.resolve(path, base)
         return p
     end
     local absolute
-    if is_absolute(p) or p == "~" or p:sub(1, 2) == "~/" then
+    if M.is_absolute(p) or p == "~" or p:sub(1, 2) == "~/" then
         absolute = vim.fn.fnamemodify(p, ":p")
     else
         local dir = type(base) == "string" and vim.trim(base) or ""
