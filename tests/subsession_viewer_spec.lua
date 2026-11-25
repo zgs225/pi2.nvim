@@ -213,7 +213,7 @@ describe("pi.ui.subsession_viewer", function()
         local cfg = vim.api.nvim_win_get_config(win)
         assert.is_table(cfg.border)
         assert.equals("╭", cfg.border[1])
-        assert.equals(" Worker Alpha [dormant] ", cfg.title[1][1])
+        assert.equals(" Worker Alpha ", cfg.title[1][1])
         local expected_w = math.max(20, math.min(vim.o.columns - 4, math.floor(vim.o.columns * 0.7)))
         local expected_h = math.max(
             5,
@@ -797,7 +797,7 @@ describe("pi.ui.subsession_viewer", function()
         Sessions.get_by_id = orig_get_by_id
     end)
 
-    it("updates window title when agent_start or agent_end arrives", function()
+    it("keeps the title free of run status across agent_start and agent_end", function()
         local child_id = "child-title-1"
         local rpc_cb = nil
         local mock_session = {
@@ -820,8 +820,7 @@ describe("pi.ui.subsession_viewer", function()
         local orig_get_by_id = Sessions.get_by_id
 
         Manifest.load = function()
-            -- A real child manifest row always carries its parent lineage;
-            -- childness (and the "completed" title below) keys off `parent_id`.
+            -- A real child manifest row always carries its parent lineage.
             return { [child_id] = { name = "Title Worker", status = "idle", parent_id = "p-1" } }
         end
         Sessions.get_by_id = function(id)
@@ -837,19 +836,19 @@ describe("pi.ui.subsession_viewer", function()
 
         local win = Viewer._win()
         local cfg = vim.api.nvim_win_get_config(win)
-        assert.equals(" Title Worker [idle] ", cfg.title[1][1])
+        assert.equals(" Title Worker ", cfg.title[1][1])
 
-        -- agent_start
+        -- The title carries the checkout, never the run state: a preview shows
+        -- the conversation, which answers "is it still running" by itself.
         Viewer.on_session_event(mock_session, { type = "agent_start" })
         pump(100)
         cfg = vim.api.nvim_win_get_config(win)
-        assert.equals(" Title Worker [active] ", cfg.title[1][1])
+        assert.equals(" Title Worker ", cfg.title[1][1])
 
-        -- agent_end
         Viewer.on_session_event(mock_session, { type = "agent_end" })
         pump(100)
         cfg = vim.api.nvim_win_get_config(win)
-        assert.equals(" Title Worker [completed] ", cfg.title[1][1])
+        assert.equals(" Title Worker ", cfg.title[1][1])
 
         Viewer.close()
         Manifest.load = orig_load
@@ -1615,14 +1614,14 @@ describe("pi.ui.subsession_viewer", function()
             assert.is_truthy(text:find("Parent reply", 1, true))
 
             -- No manifest entry and no opts.name -> the raw id is the display name.
-            assert.equals(" " .. parent_id .. " [active] ", win_title(Viewer._win()))
+            assert.equals(" " .. parent_id .. " ", win_title(Viewer._win()))
 
             -- Re-open with an explicit override.
             Viewer.close()
             Viewer.open(parent_id, { name = "Given Parent" })
             calls["get_messages"]({ success = true, data = { messages = {} } })
             pump(80)
-            assert.equals(" Given Parent [active] ", win_title(Viewer._win()))
+            assert.equals(" Given Parent ", win_title(Viewer._win()))
 
             Viewer.close()
             assert.is_false(Viewer.is_open_for_session(mock_session))
@@ -1648,13 +1647,13 @@ describe("pi.ui.subsession_viewer", function()
 
             Viewer.open(id, { name = "Override Name" })
             pump(50)
-            assert.equals(" Override Name [dormant] ", win_title(Viewer._win()))
+            assert.equals(" Override Name ", win_title(Viewer._win()))
             Viewer.close()
 
             -- Manifest entry name still beats the JSONL session_info name.
             Viewer.open(id)
             pump(50)
-            assert.equals(" Manifest Name [dormant] ", win_title(Viewer._win()))
+            assert.equals(" Manifest Name ", win_title(Viewer._win()))
             Viewer.close()
 
             -- Without either, the JSONL session_info name is used.
@@ -1663,7 +1662,7 @@ describe("pi.ui.subsession_viewer", function()
             end
             Viewer.open(id)
             pump(50)
-            assert.equals(" JSONL Name [dormant] ", win_title(Viewer._win()))
+            assert.equals(" JSONL Name ", win_title(Viewer._win()))
             Viewer.close()
         end)
 
@@ -1747,7 +1746,7 @@ describe("pi.ui.subsession_viewer", function()
             assert.equals("google", st.model_provider)
             assert.equals("medium", st.thinking_level)
             assert.equals(5500, st.context_tokens)
-            assert.equals(" Dormant Parent [dormant] ", win_title(Viewer._win()))
+            assert.equals(" Dormant Parent ", win_title(Viewer._win()))
 
             local text = buf_text(Viewer._history():buf())
             assert.is_truthy(text:find("Dormant parent prompt", 1, true))
@@ -1994,7 +1993,7 @@ describe("pi.ui.subsession_viewer", function()
             Viewer.close()
         end)
 
-        it("keeps a non-child title idle on agent_end and agent_settled", function()
+        it("keeps a non-child title unchanged across agent_end and agent_settled", function()
             local parent_id = "parent-title-1"
             local calls = {}
             local mock_session = { id = parent_id, rpc = make_rpc(calls) }
@@ -2014,19 +2013,19 @@ describe("pi.ui.subsession_viewer", function()
             pump(150)
 
             local win = Viewer._win()
-            assert.equals(" " .. parent_id .. " [active] ", win_title(win))
+            assert.equals(" " .. parent_id .. " ", win_title(win))
 
             Viewer.on_session_event(mock_session, { type = "agent_start" })
             pump(60)
-            assert.equals(" " .. parent_id .. " [active] ", win_title(win))
+            assert.equals(" " .. parent_id .. " ", win_title(win))
 
             Viewer.on_session_event(mock_session, { type = "agent_end" })
             pump(60)
-            assert.equals(" " .. parent_id .. " [idle] ", win_title(win))
+            assert.equals(" " .. parent_id .. " ", win_title(win))
 
             Viewer.on_session_event(mock_session, { type = "agent_settled" })
             pump(60)
-            assert.equals(" " .. parent_id .. " [idle] ", win_title(win))
+            assert.equals(" " .. parent_id .. " ", win_title(win))
 
             Viewer.close()
         end)
@@ -2070,6 +2069,105 @@ describe("pi.ui.subsession_viewer", function()
             assert.is_truthy(text:find("after migration text", 1, true))
             Viewer.close()
             assert.is_false(Viewer.is_open_for_session(mock_session))
+        end)
+    end)
+
+    describe("title branch badge", function()
+        ---@type table<string, any>
+        local orig = {}
+
+        before_each(function()
+            orig = {
+                manifest_load = Manifest.load,
+                find_path = Read.find_path,
+                get_by_id = Sessions.get_by_id,
+            }
+            Manifest.load = function()
+                return {}
+            end
+            Sessions.get_by_id = function()
+                return nil
+            end
+        end)
+
+        after_each(function()
+            Viewer.close()
+            Manifest.load = orig.manifest_load
+            Read.find_path = orig.find_path
+            Sessions.get_by_id = orig.get_by_id
+        end)
+
+        --- `<root>/.git/HEAD` fixture: the reader never runs git, the file *is* the
+        --- state (same shape as tests/git_branch_spec.lua). The content must be a
+        --- single writefile item *without* an embedded newline — writefile turns a
+        --- NL inside an item into a NUL byte, which would end up in the label.
+        ---@param head string raw `HEAD` text (no trailing newline)
+        ---@return string root
+        local function repo(head)
+            local root = vim.fn.tempname()
+            vim.fn.mkdir(root .. "/.git", "p")
+            vim.fn.writefile({ head }, root .. "/.git/HEAD")
+            return vim.uv.fs_realpath(root) or root
+        end
+
+        --- Open a dormant viewer for a session whose transcript records `cwd`.
+        ---@param id string
+        ---@param cwd string
+        local function open_dormant(id, cwd)
+            local path = vim.fn.tempname() .. ".jsonl"
+            vim.fn.writefile({
+                vim.json.encode({ type = "session", sessionId = id, cwd = cwd }),
+                vim.json.encode({ type = "session_info", name = "Branch Worker" }),
+                vim.json.encode({ type = "message", message = { role = "user", content = "hi" } }),
+            }, path)
+            Read.find_path = function()
+                return path
+            end
+            Viewer.open(id)
+            pump(80)
+        end
+
+        ---@param win integer
+        ---@return string
+        local function win_title(win)
+            return vim.api.nvim_win_get_config(win).title[1][1]
+        end
+
+        it("badges the checkout's branch, like the chat history title", function()
+            open_dormant("child-branch-1", repo("ref: refs/heads/feat/login-ui"))
+            assert.equals(" Branch Worker 󰘬 feat/login-ui ", win_title(Viewer._win()))
+            assert.equals("feat/login-ui", Viewer._status().branch_name)
+        end)
+
+        it("renders the short sha for a detached HEAD", function()
+            open_dormant("child-branch-2", repo("3db087b2a1c4d5e6f708192a3b4c5d6e7f809a1b"))
+            assert.equals(" Branch Worker 󰘬 3db087b ", win_title(Viewer._win()))
+        end)
+
+        it("draws no badge outside a repository and never borrows the editor's", function()
+            local plain = vim.uv.fs_realpath(tmp_dir) or tmp_dir
+            open_dormant("child-branch-3", plain)
+            assert.equals(" Branch Worker ", win_title(Viewer._win()))
+            assert.is_nil(Viewer._status().branch_name)
+        end)
+
+        it("follows a HEAD switch while open and releases the watcher on close", function()
+            local root = repo("ref: refs/heads/main")
+            local GitBranch = require("pi.git_branch")
+            local before = GitBranch._active_watches()
+
+            open_dormant("child-branch-4", root)
+            assert.equals(before + 1, GitBranch._active_watches())
+            assert.equals(" Branch Worker 󰘬 main ", win_title(Viewer._win()))
+
+            vim.fn.writefile({ "ref: refs/heads/feat/next" }, root .. "/.git/HEAD")
+            local switched = vim.wait(10000, function()
+                return win_title(Viewer._win()) == " Branch Worker 󰘬 feat/next "
+            end, 20)
+            assert.is_true(switched)
+
+            Viewer.close()
+            assert.equals(before, GitBranch._active_watches())
         end)
     end)
 end)

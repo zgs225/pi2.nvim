@@ -100,7 +100,7 @@ Inspect what a block actually uses with `:Inspect` over the coloured text, or li
 | `PiChatHistoryWinbar` | Winbar background for the history panel (side layout) |
 | `PiChatHistoryWinbarTitle` | Winbar title for the history panel (side layout) |
 | `PiChatHistoryWorktree` | Git worktree badge (`󰙅 <name>`, with `*` when dirty/ahead) in the history title — winbar and float title. Only a linked worktree is badged; the `⚠` case (session cwd elsewhere and no glyph to show it — main checkout or a non-worktree directory) renders `PiStatusLineWarning` instead. |
-| `PiChatHistoryBranch` | Git branch of the session's checkout in the history title, after the worktree badge — `󰘬 <branch>`, or `󰘬 <short sha>` for a detached `HEAD`. Never drawn outside a git repository. Dimmer than the worktree badge on purpose: the checkout stays put, the branch moves. |
+| `PiChatHistoryBranch` | Git branch of the session's checkout in the history title, after the worktree badge — `󰘬 <branch>`, or `󰘬 <short sha>` for a detached `HEAD`. Never drawn outside a git repository. Dimmer than the worktree badge on purpose: the checkout stays put, the branch moves. The sub-session viewer's title shows the same badge as plain text (a float title carries no per-chunk highlight), so it does not use this group. |
 | `PiChatPromptWinbar` | Winbar background for the prompt panel (side layout) |
 | `PiChatPromptWinbarTitle` | Winbar title for the prompt panel (side layout) |
 | `PiChatPromptWinbarAttentionTitle` | Winbar title for the prompt panel when attention is pending |
@@ -180,7 +180,7 @@ The dashboard reuses `PiToolHeader` for its section headers, `Comment` for dimme
 | `PiSessionsListDotDim` | Dim phase of blinking dots |
 | `PiSessionsListCurrent` | Marks the current tab's own session dot in the agent color |
 | `PiSessionsListFloatTitle` | Float title for the sessions list window |
-| `PiSessionsListWorktree` | Worktree group header in `:PiSessions` (`󰙅 name · ~/path`), the partition title in the `:PiResume` picker (`󰙅 name` for a linked worktree, the project name for the main checkout), and the `󰙅 name` badge in the sub-session viewer footer |
+| `PiSessionsListWorktree` | Worktree group header in `:PiSessions` (`󰙅 name · ~/path`), the partition title in the `:PiResume` picker (`󰙅 name` for a linked worktree, the project name for the main checkout), and the `󰙅 name` badge in the sub-session viewer footer. The viewer's *title* badge is plain text like every float title, so it carries no highlight. |
 
 ## Background tasks panel
 
