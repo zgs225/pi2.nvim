@@ -80,6 +80,20 @@ When a child's model call is rejected — exhausted quota, invalid API key, rate
 
 Nothing is broken and nothing needs closing: the child process stays alive and reusable. Fix the cause (top up the quota, `/login` or set the provider key) and reuse the child with `dispatch_subagents({ items = { { target = "<id>", message = "…" } } })`, or dispatch again with a different `model`. The same report appears when the prompt itself is rejected (`failed to send task to sub-session: No API key found for …`) and when the child process dies unexpectedly (`sub-agent process exited`).
 
+## The model still greps through bash
+
+The [search-tools extension](extensions.md#bundled-search-tools-extension-extensionssearch-toolsts) steers the model from `bash` to the dedicated `grep` / `find` / `ls` / `read` tools by rewriting the prompt pi assembles for each run. When the model keeps shelling out to `rg`/`grep`/`find`, check these three things first:
+
+1. **Is the extension loaded?** `search_tools.enabled` must not be `false` (it defaults to `true`). The value is read when the RPC process is spawned (`lua/pi/cli.lua`), so flip it and start a new session — an already-running session keeps whatever it was started with. The config option is the only switch: `cli.args` containing `--no-extensions` does **not** disable this extension, because pi still loads the explicit `--extension` paths pi2.nvim passes. If pi could not load the file, it prints `Failed to load extension …` to the RPC process's stderr — that line is the other thing to look for.
+2. **Do the tools actually exist in this session?** The extension writes a guideline only for a tool that is currently **active** (`pi.getActiveTools()`). If `grep` / `find` / `ls` are excluded — by pi's own `defaultTools` setting, by `--tools`/`--exclude-tools` in `cli.args`, or (most often) by a sub-agent `tools` allowlist — the model is correctly never told to use them, and bash keeps being the only way to search. That is the intended behaviour, not a failure.
+3. **Is a sub-agent's allowlist the culprit?** Children inherit nothing: a `dispatch_subagents` item's `tools` array **replaces** the child's entire tool selection. A scout dispatched with `tools = { "read", "bash" }` gets no `grep`, no `find`, and no steering. Add them to the list ([Constraining a child's tools](sessions.md#constraining-a-childs-tools)).
+
+To see the rewritten prompt with your own eyes, export the session: `pi --export <session.jsonl> out.html` renders its first system message as **System Prompt** + **Available Tools**, where the bash entry reads `Execute shell commands (build, test, git, network, pipelines)` when the extension is active and the old `Execute bash commands (ls, grep, find, etc.)` when it is not. For the byte-level proof, `make e2e-search-tools` drives a real `pi --mode rpc` against a fake provider and asserts both the request body the model receives and the system message persisted in the session JSONL, with a negative control run without the extension.
+
+Expectations, so this is not chased as a bug: **steering is a hint layer, not a hard constraint**. The prompt gains a mapping table and a guideline; nothing stops the model from typing `rg -n` into bash, and a model falling back to the shell occasionally is normal — especially for a search whose shape the dedicated tools express badly (a pipeline, a count per directory, a one-off awk). The only hard constraints are a sub-agent `tools` allowlist or `--exclude-tools bash`, and both cost the shell entirely.
+
+Finally, the extension lives in the **RPC** process pi2.nvim spawns: a CLI session (`pi`, `pi -p "…"`) has no steering at all. There the escape hatch is pi's own `pi --append-system-prompt "<text or file>"` (repeatable, see `pi --help`) — pi2.nvim does not add it for you.
+
 ## Process lifecycle
 
 Each π session owns an underlying `pi --mode rpc` subprocess. One tab = one session = one process. The lifecycle is:

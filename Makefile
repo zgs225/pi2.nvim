@@ -41,6 +41,7 @@
 #   make e2e-bg-logs — real-pi e2e: the startup log sweep removes only stale, unknown pi-bash logs (needs pi; fake provider)
 #   make e2e-bg-ownership — real-pi e2e: a fork does not adopt the parent's tasks, a clean quit records its kills
 #   make e2e-compaction — real-pi e2e: the bundled compaction cleaner bounds the file lists pi writes (needs pi; fake provider, no account)
+#   make e2e-search-tools — real-pi e2e: the bundled search-tools extension rewrites the bash snippet/description and adds grep/find/ls guidelines (needs pi; fake provider, no account)
 #   make e2e-subagent-failure — real-pi e2e: a failed child run reaches the parent as a failed item (needs pi; not CI)
 #   make e2e-subagent-worktree — real-pi e2e: a spawn item's assigned worktree is the child's real cwd (needs pi; not CI)
 #   make smoke   — headless end-to-end smoke check (loads the user config, opens the chat)
@@ -78,7 +79,7 @@ RUFF_BIN ?= ruff
 
 export LUAJIT_BIN
 
-.PHONY: test smoke format style lint docs-links check check-selftest check-list parse e2e e2e-reaper e2e-worktrees e2e-bg-delivery e2e-bg-stop e2e-bg-reconcile e2e-bg-stdin e2e-bg-report e2e-bg-panel e2e-bg-ownership e2e-subagent-failure e2e-subagent-worktree e2e-bg-fallback e2e-bg-wake e2e-bg-wake-gate e2e-bg-deadline e2e-bg-until e2e-bg-logs e2e-compaction
+.PHONY: test smoke format style lint docs-links check check-selftest check-list parse e2e e2e-reaper e2e-worktrees e2e-bg-delivery e2e-bg-stop e2e-bg-reconcile e2e-bg-stdin e2e-bg-report e2e-bg-panel e2e-bg-ownership e2e-subagent-failure e2e-subagent-worktree e2e-bg-fallback e2e-bg-wake e2e-bg-wake-gate e2e-bg-deadline e2e-bg-until e2e-bg-logs e2e-compaction e2e-search-tools
 
 test:
 	PLENARY_PATH=$(PLENARY_PATH) RENDER_MARKDOWN_PATH=$(RENDER_MARKDOWN_PATH) \
@@ -219,6 +220,14 @@ e2e-bg-ownership:
 # only (fake provider, no account) — runs in CI.
 e2e-compaction:
 	$(NVIM_BIN) --headless -u $(MIN_INIT) -l scripts/e2e/compaction.lua
+
+# Real-pi e2e for the bundled search-tools extension: the model's actual request
+# body and the session JSONL must both carry a bash snippet/description that no
+# longer advertises grep/find, plus grep/find/ls guidelines, and a negative
+# control without the extension must keep the stock pi prompt. Needs the pi
+# binary only (fake provider, no account) — runs in CI.
+e2e-search-tools:
+	$(NVIM_BIN) --headless -u $(MIN_INIT) -l scripts/e2e/search_tools.lua
 
 # Real-pi e2e for a failed child run (quota/auth/network error) surfacing as a
 # failed batch item with the provider reason instead of an empty `ok`. Uses a

@@ -322,6 +322,12 @@ function M.compaction_extension_path()
     return plugin_root() .. "/extensions/compaction.ts"
 end
 
+--- Absolute path to the bundled search-tools extension.
+---@return string
+function M.search_tools_extension_path()
+    return plugin_root() .. "/extensions/search-tools.ts"
+end
+
 --- The two tools that make every `codemode` / `deferred` exposure tool reachable
 --- (see pi's docs/mcp.md, "Control tool exposure").
 ---@type string[]
@@ -495,6 +501,17 @@ function M.command(opts)
             cmd[#cmd + 1] = compaction_ext
         end
     end
+    -- Inject the bundled search-tools extension: search discipline in the
+    -- system prompt, and a bash description that stops advertising grep/find.
+    local search_tools = Config.options.search_tools or {}
+    if search_tools.enabled ~= false then
+        local st_ext = M.search_tools_extension_path()
+        if vim.fn.filereadable(st_ext) == 1 then
+            cmd[#cmd + 1] = "--extension"
+            cmd[#cmd + 1] = st_ext
+        end
+    end
+
     -- A child tool allowlist replaces the whole tool selection on the pi side,
     -- so the user's own `--tools` in cli.args would fight it (the last flag
     -- would win silently). Strip it from this copy of the command and pass
