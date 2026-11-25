@@ -2147,9 +2147,16 @@ function History:_track_user_block(spec, row, line_count, width)
     if not self._buf or not vim.api.nvim_buf_is_valid(self._buf) then
         return
     end
-    -- right_gravity = false: the anchor must stay on the block's first row
-    -- while `_realign_user_blocks` replaces the block's own lines in place.
-    local anchor = vim.api.nvim_buf_set_extmark(self._buf, align_ns, row, 0, { right_gravity = false })
+    -- right_gravity = true (the default), and this is load-bearing: a mark that
+    -- sits exactly on the end boundary of a replaced range is carried to the
+    -- range's start by `nvim_buf_set_lines` (delete, then insert) when its
+    -- gravity points left. The anchor of the NEXT user block sits exactly
+    -- there, so with left gravity a realign of block N moved block N+1's anchor
+    -- onto block N and the following pass rewrote block N with block N+1's
+    -- text. With right gravity the boundary mark follows the inserted lines and
+    -- stays on its own content, which is what we want; the mark's own block is
+    -- re-anchored explicitly in `_realign_user_blocks`.
+    local anchor = vim.api.nvim_buf_set_extmark(self._buf, align_ns, row, 0, { right_gravity = true })
     self._user_blocks[#self._user_blocks + 1] = {
         anchor = anchor,
         spec = spec,
@@ -2203,7 +2210,7 @@ end
 local BLOCK_ANCHORS = {
     { ns = turn_ns, right_gravity = true },
     { ns = entry_ns, right_gravity = true },
-    { ns = align_ns, right_gravity = false },
+    { ns = align_ns, right_gravity = true },
 }
 
 --- Remember the anchors inside `[from_row, to_row)` so they can be restored

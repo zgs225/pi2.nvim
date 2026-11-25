@@ -98,6 +98,18 @@ local function label_line(history)
 end
 
 ---@param history pi.ChatHistory
+---@return integer[]
+local function label_rows(history)
+    local out = {}
+    for i, line in ipairs(buffer_lines(history)) do
+        if vim.startswith(vim.trim(line), ICON) then
+            out[#out + 1] = i - 1
+        end
+    end
+    return out
+end
+
+---@param history pi.ChatHistory
 ---@param needle string
 ---@return integer?
 local function row_with(history, needle)
@@ -302,6 +314,44 @@ describe("user message alignment", function()
             local target = history:copy_target_at(label_row)
             assert.are.equal("user", target.kind, "yy still resolves the user message")
             assert.are.equal("hi", target.text)
+        end)
+
+        it("re-pads EVERY block, keeping each anchor on its own message", function()
+            history, win = setup_history(40)
+            history:add_user_message("first message", nil)
+            pump(60)
+            history:add_user_message("second message", nil)
+            pump(80)
+
+            vim.api.nvim_win_set_config(win, { relative = "editor", row = 1, col = 1, width = 56, height = 24 })
+            vim.api.nvim_exec_autocmds("WinResized", {})
+            pump(150)
+
+            -- Each label is followed by one blank row, then its own body: a
+            -- realign that pulled the second block's anchor onto the first would
+            -- duplicate one message and drop the other.
+            local labels = label_rows(history)
+            assert.are.equal(2, #labels, "both labels still rendered")
+            local expected = { "first message", "second message" }
+            for i, label_row in ipairs(labels) do
+                assert.are.equal(
+                    edge(history),
+                    dw(buffer_lines(history)[label_row + 1]),
+                    "label " .. i .. " on the edge"
+                )
+                local body = buffer_lines(history)[label_row + 3]
+                assert.is_not_nil(body, "body row " .. i .. " exists")
+                assert.are.equal(expected[i], vim.trim(body), "block " .. i .. " keeps its own text")
+                assert.are.equal(edge(history), dw(body), "block " .. i .. " padded to the new edge")
+            end
+
+            local ans = vim.api.nvim_get_namespaces()["pi-chat-user-align"]
+            local rows = {}
+            for _, block in ipairs(history._user_blocks) do
+                rows[#rows + 1] = vim.api.nvim_buf_get_extmark_by_id(history:buf(), ans, block.anchor, {})[1]
+            end
+            assert.are.equal(2, #rows, "both blocks tracked")
+            assert.is_true(rows[1] < rows[2], "block anchors stayed apart")
         end)
 
         it("leaves the content below the block intact", function()
