@@ -445,6 +445,14 @@ require("pi").setup({
         wake_cache_window_ms = 300000,
     },
 
+    -- Search-tool steering: the bundled search-tools extension rewrites the
+    -- bash tool snippet/description so it stops advertising grep/find, and adds
+    -- grep/find/ls guidelines that point the model at the dedicated tools
+    -- (whose output is capped and says how to widen a search).
+    search_tools = {
+        enabled = true, -- inject the extension into every pi process (default true)
+    },
+
     -- Compaction observability and the bundled pi2-compaction extension.
     -- See doc/usage.md#compaction-timeline and doc/extensions.md.
     compaction = {

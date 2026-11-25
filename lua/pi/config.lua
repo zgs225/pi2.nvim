@@ -213,6 +213,9 @@
 ---@field lang? string|nil Language of generated titles (e.g. "zh-CN", "en"). When nil, the title language follows the conversation (default: nil)
 ---@field model? string Model used for title generation as "provider/modelId". When unset the session's own model is used (default: nil); the pinned model is a fall-back to the session model if it cannot be resolved
 
+---@class pi.SearchToolsConfig
+---@field enabled boolean Inject the bundled search-tools extension: search discipline in the system prompt plus a bash description that stops advertising grep/find (default: true)
+
 ---@class pi.TodoPanelConfig
 ---@field auto_open? boolean Open the todo side panel automatically when a session has unfinished items (default false)
 ---@field height? number Stacked panel height: fraction of the shared column when < 1 (default 0.5, an even split), absolute lines when >= 1
@@ -440,6 +443,7 @@
 ---@field vision pi.VisionConfig
 ---@field title pi.TitleConfig
 ---@field todo pi.TodoConfig
+---@field search_tools pi.SearchToolsConfig
 ---@field sessions_list pi.SessionsListConfig
 ---@field tasks_panel pi.TasksPanelConfig
 ---@field background_tasks pi.BackgroundTasksConfig Completion-wake policy for the bundled background-bash extension (see doc/extensions.md#the-completion-wake-gate)
@@ -587,6 +591,9 @@ local defaults = {
         message = "Press <Esc> again to abort",
     },
     tree = {
+        enabled = true,
+    },
+    search_tools = {
         enabled = true,
     },
     worktree = {
