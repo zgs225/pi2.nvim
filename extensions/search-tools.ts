@@ -8,21 +8,26 @@
  * output that says how to widen the search, structure-aware rendering in the
  * UI, no shell quoting traps).
  *
- * Four levers, because the model sees them all:
+ * Three levers, because the model sees them all:
  *
  *   1. before_agent_start — rewrite the prompt sections that are already
  *      assembled for this run: the bash entry in `sections.tools` gets a
- *      description that no longer advertises grep/find, and the grep/find/ls
+ *      snippet that no longer advertises grep/find, and the grep/find/ls
  *      rules are *replaced* (not appended) in `sections.rules`. Replacement
  *      matters: these tools ship no guidelines, so appending would duplicate
- *      the bullets on every request.
- *   2. registerTool — override the bash declaration itself, so the tool's
- *      `description` (what the request's `tools` array carries) stops telling
- *      the model to grep. `...builtin` is essential: it carries
- *      outputSchema, constrainedSampling, the renderers and prepareArguments,
- *      so only the prompt-facing strings change.
+ *      the bullets on every request. bash *does* carry its own guidelines, so
+ *      the search rule is appended there instead (idempotently: one rule per
+ *      run, however many turns reuse the options).
  *
- *   3. registerTool for `grep` — the builtin grep only answers "matching lines".
+ *      There is deliberately no registerTool for `bash`. `bg-tasks.ts`
+ *      already overrides that tool, pi.nvim injects it first and
+ *      unconditionally, and pi refuses to load two extensions registering the
+ *      same tool name (`Tool "bash" conflicts with …`) — the whole session
+ *      then fails to start, so a second registration is not an option. What
+ *      the model reads in `<tools>` is the snippet above anyway; the
+ *      declaration's `description` is not what this extension steers.
+ *
+ *   2. registerTool for `grep` — the builtin grep only answers "matching lines".
  *      Four extra parameters (`output`, `exclude`, `max_per_file`, `word`) cover
  *      the questions a model otherwise shells out to `rg`/`grep -c`/`grep -l`
  *      for. The search itself is never re-implemented: the builtin runs first
@@ -32,7 +37,7 @@
  *      fast path), because rows under `.git/` are always dropped: ripgrep runs
  *      with `--hidden` and would otherwise hand the model `.git/logs/HEAD`.
  *
- *   4. registerTool for `find` — the same shape. A path pattern reads as
+ *   3. registerTool for `find` — the same shape. A path pattern reads as
  *      "everything under tests/", but pi hands it to fd as a full-path glob, so
  *      a nested `pkg/tests/a_spec.lua` is a legitimate hit for a pattern the
  *      model meant as rooted. `rooted` (default true) keeps only the pattern's
@@ -49,11 +54,7 @@ import type {
 	GrepToolInput,
 	ToolDefinition,
 } from "@earendil-works/pi-coding-agent";
-import {
-	createBashToolDefinition,
-	createFindToolDefinition,
-	createGrepToolDefinition,
-} from "@earendil-works/pi-coding-agent";
+import { createFindToolDefinition, createGrepToolDefinition } from "@earendil-works/pi-coding-agent";
 import fs from "node:fs";
 import path from "node:path";
 import { Type, type TSchema } from "typebox";
@@ -108,6 +109,7 @@ const GREP_NO_MATCHES = "No matches found";
 /** The builtin's own output budget; a rebuilt result must not grow past it. */
 const GREP_MAX_BYTES = 50 * 1024;
 const GREP_BYTES_NOTICE = "[50KB limit reached]";
+const GREP_LINES_NOTICE = "[Some lines truncated to 500 chars. Use read tool to see full lines]";
 
 /** How a delegated find run is ordered before it reaches the model. */
 type FindSort = "path" | "mtime";
@@ -122,8 +124,14 @@ const FIND_DEFAULT_LIMIT = 1000;
 const FIND_MIN_INTERNAL_LIMIT = 200;
 const FIND_MAX_INTERNAL_LIMIT = 5000;
 const FIND_NO_FILES = "No files found matching pattern";
+const FIND_BYTES_NOTICE = "[50KB limit reached]";
 const FIND_NOTE =
 	"Set rooted: false to match the pattern at any depth (the default anchors a relative path pattern at the search directory, as pi 1.6 does); sort: 'mtime' returns the newest files first; paths under .git are always skipped.";
+
+/** Escape RegExp metacharacters, so a caller's text can be used verbatim as a pattern. */
+function escapeRegExp(text: string): string {
+	return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 /** Escape a glob into a RegExp source: `**` crosses directories, `*`/`?` never do. */
 function globToSource(glob: string): string {
@@ -165,17 +173,31 @@ function isUnderGit(filePath: string): boolean {
 }
 
 /**
+ * The builtin's own trailing notice block, which is never a result row:
+ * `[<n> matches limit reached …]`, `[<n> results limit reached …]`,
+ * `[50KB limit reached]` and `[Some lines truncated …]`. A path that merely
+ * starts with `[` (a `[slug].tsx` route file) is a row and parses before this
+ * ever runs.
+ *
+ * @param line one line of the builtin's output
+ */
+function isBuiltinNotice(line: string): boolean {
+	if (/^\[\d+ [a-z]/i.test(line)) {
+		return true;
+	}
+	return line.startsWith("[50KB limit reached") || line.startsWith("[Some lines truncated");
+}
+
+/**
  * Parse the builtin grep's text output. Both row forms survive verbatim: match
  * rows (`path:line: text`, the ones `max_per_file` counts) and the context rows
  * ripgrep emits for `context > 0` (`path-line- text`, which it must never
- * count). The trailing `[notice]` block and `No matches found` are dropped.
+ * count). `No matches found` and the trailing `[notice]` block are dropped.
  */
 function parseGrepOutput(text: string): GrepRow[] {
-	const notice = text.indexOf("\n\n[");
-	const body = notice >= 0 ? text.slice(0, notice) : text;
 	const rows: GrepRow[] = [];
-	for (const line of body.split("\n")) {
-		if (line === "" || line === GREP_NO_MATCHES || line.startsWith("[")) {
+	for (const line of text.split("\n")) {
+		if (line === "" || line === GREP_NO_MATCHES) {
 			continue;
 		}
 		// Match rows first: a match's own text may contain something like `-12-`.
@@ -187,6 +209,11 @@ function parseGrepOutput(text: string): GrepRow[] {
 		const context = GREP_CONTEXT_ROW.exec(line);
 		if (context) {
 			rows.push({ path: context[1], line: Number(context[2]), text: context[3], isMatch: false });
+			continue;
+		}
+		// Unparseable and not a notice: nothing to keep either way.
+		if (isBuiltinNotice(line)) {
+			continue;
 		}
 	}
 	return rows;
@@ -269,14 +296,15 @@ function findLiteralDir(pattern: string): string {
 
 /**
  * Parse the builtin find's text output. Blank lines, `No files found matching
- * pattern` and the trailing `[<n> results limit reached]` notice are dropped.
+ * pattern` and the trailing notice block are dropped; a path that starts with
+ * `[` (`[slug].tsx`) is kept.
  *
  * @param text the builtin's `content[*].text`
  */
 function parseFindOutput(text: string): string[] {
 	const paths: string[] = [];
 	for (const line of text.split("\n")) {
-		if (line === "" || line === FIND_NO_FILES || line.startsWith("[")) {
+		if (line === "" || line === FIND_NO_FILES || isBuiltinNotice(line)) {
 			continue;
 		}
 		paths.push(line);
@@ -296,6 +324,13 @@ export default function searchTools(pi: ExtensionAPI) {
 		const options = event.systemPromptOptions;
 		if (active.has("bash")) {
 			options.toolSnippets.bash = BASH_SNIPPET;
+			// bash ships its own guidelines, so the search rule is appended to them.
+			// Idempotent: the options object is reused across turns, and a second copy
+			// of the rule would keep growing the prompt (and its cache prefix).
+			const rules = options.toolGuidelines.bash ?? [];
+			if (!rules.includes(BASH_RULE)) {
+				options.toolGuidelines.bash = [...rules, BASH_RULE];
+			}
 		}
 		for (const [name, rules] of Object.entries(GUIDELINES)) {
 			if (!active.has(name)) {
@@ -306,15 +341,6 @@ export default function searchTools(pi: ExtensionAPI) {
 			options.toolGuidelines[name] = [...rules];
 		}
 	});
-
-	const builtin = createBashToolDefinition(process.cwd());
-	const bash: ToolDefinition = {
-		...builtin,
-		description: `${builtin.description}\n\n${BASH_RULE}`,
-		promptSnippet: BASH_SNIPPET,
-		promptGuidelines: [...(builtin.promptGuidelines ?? []), BASH_RULE],
-	};
-	pi.registerTool(bash);
 
 	// ------------------------------------------------------------------
 	// grep: the builtin, plus output modes / exclude / per-file cap / word.
@@ -345,7 +371,8 @@ export default function searchTools(pi: ExtensionAPI) {
 		),
 		word: Type.Optional(
 			Type.Boolean({
-				description: "Match the pattern as a whole word (wraps it as \\b(?:pattern)\\b).",
+				description:
+					"Match the pattern as a whole word (wraps it as \\b(?:pattern)\\b). With literal: true the pattern is escaped first, so `foo.bar` matches only `foo.bar`.",
 			}),
 		),
 	}) as unknown as Type.TObject<{
@@ -368,25 +395,29 @@ export default function searchTools(pi: ExtensionAPI) {
 		parameters: grepParameters,
 		async execute(toolCallId, params, signal, onUpdate, ctx) {
 			const raw = params as unknown as GrepParams;
+			const callerLimit = Math.max(1, Math.floor(raw.limit ?? GREP_DEFAULT_LIMIT));
 			// Every call is post-processed — there is deliberately no fast path: the
 			// `.git` filter below must apply to a plain search too.
 			// The post-filters below run after ripgrep, so ask for a wider window than the
 			// caller's limit: otherwise the cap would be spent on rows we then drop.
 			const internalLimit = Math.min(
 				GREP_MAX_INTERNAL_LIMIT,
-				Math.max(raw.limit ?? GREP_DEFAULT_LIMIT, GREP_MIN_INTERNAL_LIMIT) * 5,
+				Math.max(callerLimit, GREP_MIN_INTERNAL_LIMIT) * 5,
 			);
+			// `literal` would hand ripgrep `\b(?:x)\b` as fixed text, which can never match,
+			// so a whole-word match on a literal pattern escapes the text itself instead.
+			const wholeWord = raw.word === true;
 			const delegated: GrepToolInput = {
 				...raw,
-				pattern: raw.word === true ? `\\b(?:${raw.pattern})\\b` : raw.pattern,
+				pattern: wholeWord
+					? `\\b(?:${raw.literal === true ? escapeRegExp(raw.pattern) : raw.pattern})\\b`
+					: raw.pattern,
+				literal: wholeWord ? false : raw.literal,
 				limit: internalLimit,
 			};
 			const result = await builtinGrep.execute(toolCallId, delegated, signal, onUpdate, ctx);
 			const text = result.content?.map((block) => (block.type === "text" ? block.text : "")).join("\n") ?? "";
 			const rows = parseGrepOutput(text);
-			// Only a full window of matches proves the cap cut results off (context rows
-			// do not count towards the builtin's limit either).
-			const capped = rows.filter((row) => row.isMatch).length >= internalLimit;
 
 			const globs: CompiledGlob[] = [];
 			for (const glob of raw.exclude ?? []) {
@@ -396,7 +427,8 @@ export default function searchTools(pi: ExtensionAPI) {
 			}
 			const maxPerFile = raw.max_per_file === undefined ? undefined : Math.max(1, Math.floor(raw.max_per_file));
 			const perFile = new Map<string, number>();
-			const kept: GrepRow[] = [];
+			const filtered: GrepRow[] = [];
+			let matchCount = 0;
 			for (const row of rows) {
 				// `.git` first, always: ripgrep runs with --hidden.
 				if (isUnderGit(row.path)) {
@@ -417,8 +449,28 @@ export default function searchTools(pi: ExtensionAPI) {
 					}
 					perFile.set(row.path, seen + 1);
 				}
+				if (row.isMatch) {
+					matchCount++;
+				}
+				filtered.push(row);
+			}
+
+			// The delegate was asked for a wider window, so the caller's own limit is applied
+			// here, to matches only. The first match past the limit ends the list, which takes
+			// that match's context rows with it (they describe a row that is not shown).
+			const kept: GrepRow[] = [];
+			let shown = 0;
+			for (const row of filtered) {
+				if (row.isMatch) {
+					if (shown >= callerLimit) {
+						break;
+					}
+					shown++;
+				}
 				kept.push(row);
 			}
+			// Either the builtin hit its own (wider) window, or the caller's limit cut the list.
+			const capped = result.details?.matchLimitReached != null || matchCount >= callerLimit;
 
 			const mode: GrepOutputMode = raw.output ?? "content";
 			let body = GREP_NO_MATCHES;
@@ -443,12 +495,17 @@ export default function searchTools(pi: ExtensionAPI) {
 			} else if (kept.length > 0) {
 				body = kept.map(formatGrepRow).join("\n");
 			}
-			const withLimitNotice = capped
-				? `${body}\n\n[${internalLimit} matches limit reached. Use a narrower pattern, exclude or glob for more.]`
-				: body;
+			const withNotices =
+				body +
+				(capped
+					? `\n\n[${callerLimit} matches limit reached. Use limit=${callerLimit * 2} for more, or refine pattern]`
+					: "") +
+				// The builtin still owns these two: re-emitting its text must not lose them.
+				(result.details?.truncation?.truncated === true ? `\n\n${GREP_BYTES_NOTICE}` : "") +
+				(result.details?.linesTruncated === true ? `\n\n${GREP_LINES_NOTICE}` : "");
 			return {
-				content: [{ type: "text" as const, text: capGrepBytes(withLimitNotice) }],
-				details: capped ? { ...(result.details ?? {}), matchLimitReached: internalLimit } : result.details,
+				content: [{ type: "text" as const, text: capGrepBytes(withNotices) }],
+				details: capped ? { ...(result.details ?? {}), matchLimitReached: callerLimit } : result.details,
 			};
 		},
 	};
@@ -510,8 +567,9 @@ export default function searchTools(pi: ExtensionAPI) {
 			}
 
 			if (sort === "mtime") {
-				// Same cwd semantics as the builtin: the caller's wins, the factory's is the floor.
-				const root = ctx?.cwd ?? process.cwd();
+				// The paths are relative to the *search* root (fd is run there and the builtin
+				// relativizes against it), so the stat join must use that root, not the cwd.
+				const root = path.resolve(ctx?.cwd ?? process.cwd(), raw.path ?? ".");
 				const stamps = new Map<string, number>();
 				await Promise.all(
 					paths.map(async (filePath) => {
@@ -529,14 +587,17 @@ export default function searchTools(pi: ExtensionAPI) {
 				paths.sort((a, b) => a.localeCompare(b));
 			}
 
-			const capped = paths.length > limit;
+			// Either fd hit the builtin's own (wider) window, or the caller's limit cut the list.
+			const capped = result.details?.resultLimitReached != null || paths.length > limit;
 			const kept = capped ? paths.slice(0, limit) : paths;
 			const body = kept.length > 0 ? kept.join("\n") : FIND_NO_FILES;
-			const withLimitNotice = capped
-				? `${body}\n\n[${limit} results limit reached. Use limit=${limit * 2} for more, or refine pattern]`
-				: body;
+			const withNotices =
+				body +
+				(capped ? `\n\n[${limit} results limit reached. Use limit=${limit * 2} for more, or refine pattern]` : "") +
+				// The builtin still owns this one: re-emitting its text must not lose it.
+				(result.details?.truncation?.truncated === true ? `\n\n${FIND_BYTES_NOTICE}` : "");
 			return {
-				content: [{ type: "text" as const, text: withLimitNotice }],
+				content: [{ type: "text" as const, text: withNotices }],
 				details: capped ? { ...(result.details ?? {}), resultLimitReached: limit } : result.details,
 			};
 		},

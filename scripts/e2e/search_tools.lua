@@ -17,8 +17,10 @@
 --   A1 the system message carries `- bash: Execute shell commands (build, test, git, network, pipelines)`
 --   A2 it no longer carries `Execute bash commands (ls, grep, find, etc.)`
 --   A3-A5 it carries the grep / find / ls guidelines
---   A6 the bash tool declaration's `description` carries the search rule and no
---      longer advertises `(ls, grep, find, etc.)`
+--   A6 its `<rules>` block carries the bash search rule (`Do NOT use this tool to
+--      search or read files`) — the tool *declaration* is pi's own, because a
+--      second `registerTool("bash")` makes pi refuse to load the extension
+--      alongside bg-tasks.ts (group E is the regression test for that)
 --   A7 the JSONL system message's `sections.tools` / `sections.rules` carry the
 --      same strings
 --   A8 the JSONL `toolsAdded` bash description is byte-identical to the wire one
@@ -26,6 +28,7 @@
 --   B1 the old bash snippet IS there
 --   B2 the grep guideline is NOT there
 --   B3 the bash declaration does NOT carry the search rule
+--   B11 the system message's `<rules>` carry no search rule either
 --
 -- Group C runs the extension's grep override for real (a fresh child per case, a
 -- scripted `grep` toolCall, assertions on the persisted toolResult):
@@ -38,6 +41,12 @@
 --   C7 a match that only exists under .git/ reads as "No matches found"
 --   C8 the same in count mode: every call is filtered, not just the new ones
 --   C9 context lines survive the re-emit, and .git rows still do not
+--   C10 limit=1 returns exactly one match row and says so with the CALLER's limit
+--   C11 word=true + literal=true matches `foo.bar baz` but not `fooXbar`
+--       (the literal must be escaped into the `\b(?:…)\b` wrapper, not passed to
+--       `--fixed-strings`, which can never match it)
+--   C12 output=files lists `[slug].tsx`: a path that starts with `[` is a row, not
+--       one of the builtin's `[notice]` lines
 --
 -- Group D runs the extension's find override for real (a fresh child per case, a
 -- scripted `find` toolCall, assertions on the persisted toolResult). The fixture
@@ -52,6 +61,18 @@
 --   D4 sort='mtime' returns tests/b_spec.lua first and tests/a_spec.lua after it
 --   D5 a `.git`-only pattern (e.lua) reads as "No files found matching pattern"
 --   D6 limit=2 returns two rows plus the `2 results limit reached` notice
+--   D7 path='tests', sort='mtime' returns tests/b_spec.lua first: the mtime stat
+--      joins against the SEARCH root, not the cwd
+--
+-- Group E runs the real argv pi2.nvim builds (`Cli.command` injects bg-tasks.ts
+-- before search-tools.ts, both unconditionally) and asks for `get_state` over
+-- RPC. Two extensions registering the same tool name make pi refuse to load the
+-- second one — the session then never answers — so this group is the regression
+-- test for a conflict no prompt-level assertion can see:
+--   E1 bg-tasks.ts + search-tools.ts: a `response` within 30s, no
+--      `Failed to load extension` / `conflicts with` on stderr
+--   E2 the same argv without search-tools.ts (control): same answer, so E1 really
+--      proves the pair loads together
 --
 -- Needs the pi binary, ripgrep (the grep cases run it for real) and fd (the find
 -- cases run it for real); no account, the provider is fake, so it runs in CI:
@@ -65,6 +86,7 @@ local uv = vim.uv
 
 local PLUGIN_ROOT = vim.fn.fnamemodify(vim.fn.fnamemodify(debug.getinfo(1, "S").source:sub(2), ":p"), ":h:h:h")
 local EXTENSION = PLUGIN_ROOT .. "/extensions/search-tools.ts"
+local BG_EXTENSION = PLUGIN_ROOT .. "/extensions/bg-tasks.ts"
 local RUN_ROOT = vim.fn.tempname() .. "-search-tools"
 
 local PROVIDER = "e2esys"
@@ -305,18 +327,18 @@ end
 
 ---@param session_dir string
 ---@param cwd string
----@param with_extension boolean
+---@param extensions string[] `--extension` paths, in argv order
 ---@return SearchToolsE2EBackend
-local function start_backend(session_dir, cwd, with_extension)
+local function start_backend(session_dir, cwd, extensions)
     vim.fn.mkdir(session_dir, "p")
     vim.fn.mkdir(cwd, "p")
     ---@type SearchToolsE2EBackend
     local backend = { job = 0, session_dir = session_dir, events = {}, stderr = "" }
     local partial = { out = "" }
     local argv = { "pi", "--mode", "rpc" }
-    if with_extension then
+    for _, extension in ipairs(extensions) do
         argv[#argv + 1] = "--extension"
-        argv[#argv + 1] = EXTENSION
+        argv[#argv + 1] = extension
     end
     vim.list_extend(argv, {
         "--tools",
@@ -424,17 +446,17 @@ end
 ---@field name string how the group is named in its assertion ("group A")
 ---@field session_dir string a fresh session dir for the child
 ---@field cwd string the child's cwd
----@field with_extension boolean
+---@field extensions string[] `--extension` paths, in argv order
 
 --- Start one child, run one scripted turn and hand back the request it produced.
---- A/B differ only in `with_extension`; group C reuses this once per case.
+--- A/B differ only in `extensions`; group C reuses this once per case.
 ---@param opts RunGroupOpts
 ---@return SearchToolsE2EBackend
 local function run_group(opts)
     -- The turn counter is per child: each group gets a fresh conversation.
     provider.turn = 0
     local mark = #provider.requests
-    local backend = start_backend(opts.session_dir, opts.cwd, opts.with_extension)
+    local backend = start_backend(opts.session_dir, opts.cwd, opts.extensions)
     run_one_turn(backend)
     check(#provider.requests > mark, ("%s issued a provider request"):format(opts.name), {
         mark = mark,
@@ -570,17 +592,21 @@ end
 
 --- Group C's tree: just enough to tell the four new parameters apart.
 --- No git init and no .gitignore: the tool must filter `.git/` itself, and
---- `dist/` must stay visible (only `exclude` hides it). `a.ts` carries a third,
---- NON-matching line so `context: 1` has a context row to emit (C9).
+--- `dist/` must stay visible (only `exclude` hides it). `a.ts` carries
+--- non-matching lines so `context: 1` has a context row to emit (C9), and the
+--- whole-word targets: `foo bar` (C5), `foo.bar baz` plus `fooXbar` (C11).
+--- `[slug].tsx` proves a path that merely starts with `[` is a row, not one of
+--- the builtin's `[notice]` lines (C12).
 ---@param dir string
 local function write_grep_fixture(dir)
     vim.fn.mkdir(dir .. "/dist", "p")
     vim.fn.mkdir(dir .. "/.git/logs", "p")
     local files = {
-        ["a.ts"] = "alpha one\nalpha two\nnothing here matches\n",
+        ["a.ts"] = "alpha one\nalpha two\nnothing here matches\nfoo bar\nfoo.bar baz\nfooXbar\n",
         ["dist/c.ts"] = "alpha three\n",
         [".git/logs/HEAD"] = "GITONLY32\n",
         ["foobar.ts"] = "foobar\n",
+        ["[slug].tsx"] = "alpha four\n",
     }
     for name, text in pairs(files) do
         local file = assert(io.open(dir .. "/" .. name, "w"))
@@ -616,8 +642,9 @@ local GREP_CASES = {
             end
             check(listed["a.ts"] == true, "C1 files mode lists a.ts", { text = text })
             check(listed["dist/c.ts"] == true, "C1 files mode lists dist/c.ts", { text = text })
+            check(listed["[slug].tsx"] == true, "C1 files mode lists [slug].tsx", { text = text })
             check(a_ts == 1, "C1 files mode lists a.ts exactly once (two matches -> one path)", { text = text })
-            check(#lines == 2, "C1 files mode lists exactly the two matching files", { text = text })
+            check(#lines == 3, "C1 files mode lists exactly the three matching files", { text = text })
         end,
     },
     {
@@ -651,6 +678,9 @@ local GREP_CASES = {
         what = "word=true matches whole words only",
         args = { pattern = "foo", word = true },
         check = function(text)
+            check(text:find("a.ts:4: foo bar", 1, true) ~= nil, "C5 word mode matches the standalone `foo` in a.ts", {
+                text = text,
+            })
             check(text:find("foobar.ts", 1, true) == nil, "C5 word mode does not match foobar.ts", { text = text })
         end,
     },
@@ -702,6 +732,42 @@ local GREP_CASES = {
             check(text:find(".git", 1, true) == nil, "C9 no .git path leaks through", { text = text })
         end,
     },
+    {
+        name = "C10",
+        what = "limit is applied to the re-emitted matches, and named in the notice",
+        args = { pattern = "alpha", limit = 1 },
+        check = function(text)
+            local rows = 0
+            for line in text:gmatch("[^\n]+") do
+                if line:match("^[^:]+:%d+: ") ~= nil then
+                    rows = rows + 1
+                end
+            end
+            check(rows == 1, "C10 limit=1 returns exactly one match row", { rows = rows, text = text })
+            check(
+                text:find("[1 matches limit reached", 1, true) ~= nil,
+                "C10 the notice names the CALLER's limit, not the internal window",
+                { text = text }
+            )
+        end,
+    },
+    {
+        name = "C11",
+        what = "word=true with literal=true escapes the literal into the word wrapper",
+        args = { pattern = "foo.bar", word = true, literal = true },
+        check = function(text)
+            check(text:find("foo.bar baz", 1, true) ~= nil, "C11 word+literal matches `foo.bar baz`", { text = text })
+            check(text:find("fooXbar", 1, true) == nil, "C11 word+literal does not match `fooXbar`", { text = text })
+        end,
+    },
+    {
+        name = "C12",
+        what = "a path starting with `[` is a row, not a notice",
+        args = { pattern = "alpha", output = "files" },
+        check = function(text)
+            check(text:find("[slug].tsx", 1, true) ~= nil, "C12 files mode lists [slug].tsx", { text = text })
+        end,
+    },
 }
 
 --- One case: a fresh child (own session dir), a scripted `grep` toolCall on turn
@@ -721,7 +787,7 @@ local function run_grep_case(index, case, cwd)
         name = case.name,
         session_dir = ("%s/sessions-c%d"):format(RUN_ROOT, index),
         cwd = cwd,
-        with_extension = true,
+        extensions = { EXTENSION },
     })
     local text = tool_result_text(backend.session_dir, "grep")
     stop_backend(backend)
@@ -783,7 +849,7 @@ local function find_rows(text)
 end
 
 ---@class FindCase
----@field name string the case id (D1…D6), also its assertion prefix
+---@field name string the case id (D1…D7), also its assertion prefix
 ---@field what string one-line label for the [step] trace
 ---@field args table the `find` toolCall arguments, spelled out verbatim
 ---@field check fun(text: string, rows: string[]) assertions over the find toolResult text
@@ -889,6 +955,20 @@ local FIND_CASES = {
             )
         end,
     },
+    {
+        name = "D7",
+        what = "sort=mtime stats against the search root, not the cwd",
+        args = { pattern = "*.lua", path = "tests", sort = "mtime" },
+        check = function(text, rows)
+            -- Paths come back relative to the search root (`tests/`), so a stat joined
+            -- against the cwd would fail for both files and fall back to path order.
+            check(#rows == 2, "D7 the tests/ search returns both spec files", { rows = rows, text = text })
+            check(rows[1] == "b_spec.lua", "D7 the newest file (tests/b_spec.lua) comes first", {
+                first = rows[1],
+                text = text,
+            })
+        end,
+    },
 }
 
 --- One case: a fresh child (own session dir), a scripted `find` toolCall on turn
@@ -908,13 +988,70 @@ local function run_find_case(index, case, cwd)
         name = case.name,
         session_dir = ("%s/sessions-d%d"):format(RUN_ROOT, index),
         cwd = cwd,
-        with_extension = true,
+        extensions = { EXTENSION },
     })
     local text = tool_result_text(backend.session_dir, "find")
     stop_backend(backend)
     check(text ~= nil, case.name .. " the transcript holds a find toolResult", case.args)
     ---@cast text string
     return text
+end
+
+--- Group E's cases: the real argv pi2.nvim builds. `Cli.command` injects
+--- bg-tasks.ts unconditionally and BEFORE search-tools.ts, and pi refuses to load
+--- two extensions that register the same tool name — so a `registerTool("bash")`
+--- here made every session fail to start, which no prompt-level assertion could
+--- see. These cases boot that argv for real.
+---@class ExtensionCase
+---@field name string the case id (E1/E2), also its assertion prefix
+---@field what string one-line label for the [step] trace
+---@field extensions string[] the `--extension` paths, in argv order
+
+--- E2 is the control: the same argv minus search-tools.ts. If E1 were green only
+--- because pi ignores load errors, E2 would be green for the same worthless reason.
+---@type ExtensionCase[]
+local EXTENSION_CASES = {
+    {
+        name = "E1",
+        what = "bg-tasks + search-tools boot together and answer get_state",
+        extensions = { BG_EXTENSION, EXTENSION },
+    },
+    {
+        name = "E2",
+        what = "the same argv without search-tools still answers get_state (control)",
+        extensions = { BG_EXTENSION },
+    },
+}
+
+--- Boot the argv, ask for `get_state` and require an answer. A load-time tool
+--- conflict is fatal: pi prints it to stderr and never answers.
+---@param index integer
+---@param case ExtensionCase
+---@param cwd string
+local function run_extension_case(index, case, cwd)
+    local backend = start_backend(("%s/sessions-e%d"):format(RUN_ROOT, index), cwd, case.extensions)
+    send(backend, { id = "get-state", type = "get_state" })
+    local answered = wait_event(backend, function(ev)
+        return ev.type == "response" and ev.id == "get-state"
+    end, 30000, case.name .. " get_state")
+    check(answered ~= nil and answered.success ~= false, case.name .. " the child answers get_state", {
+        extensions = case.extensions,
+        stderr = backend.stderr,
+    })
+    -- The load happens before the first answer, so a response already proves the
+    -- extensions loaded; assert it on stderr anyway, the message is the thing a
+    -- user would see.
+    check(
+        backend.stderr:find("Failed to load extension", 1, true) == nil,
+        case.name .. " stderr carries no extension load error",
+        { stderr = backend.stderr }
+    )
+    check(
+        backend.stderr:find("conflicts with", 1, true) == nil,
+        case.name .. " stderr carries no tool conflict",
+        { stderr = backend.stderr }
+    )
+    stop_backend(backend)
 end
 
 -- ---------------------------------------------------------------------------
@@ -958,7 +1095,7 @@ local function main()
         name = "group A",
         session_dir = RUN_ROOT .. "/sessions-a",
         cwd = cwd,
-        with_extension = true,
+        extensions = { EXTENSION },
     })
     local a_request = a.request
     local a_text = system_text(a_request)
@@ -988,20 +1125,17 @@ local function main()
     })
     step("A1-A5 system prompt: new bash snippet, grep/find/ls guidelines, old snippet gone")
 
-    -- A6
+    -- A6: the search rule rides in `<rules>`, not in a re-registered bash tool —
+    -- a second `registerTool("bash")` is impossible next to bg-tasks.ts (group E).
     local a_bash = bash_declaration(a_request)
     local a_description = a_bash.description or ""
     print("[A bash description] " .. a_description:sub(1, 200):gsub("\n", " / "))
     check(
-        a_description:find(BASH_RULE_HEAD, 1, true) ~= nil,
-        "A6 the bash declaration carries the search rule",
+        a_text:find(BASH_RULE_HEAD, 1, true) ~= nil,
+        "A6 the system message's rules carry the bash search rule",
         { wanted = BASH_RULE_HEAD }
     )
-    check(
-        a_description:find("(ls, grep, find, etc.)", 1, true) == nil,
-        "A6 the bash declaration no longer advertises (ls, grep, find, etc.)"
-    )
-    step("A6 bash declaration: search rule present, ls/grep/find advertisement gone")
+    step("A6 system prompt rules: the bash search rule is present")
 
     -- A7: the session JSONL system message carries the same strings.
     local a_system = first_system_message(session_entries(a.session_dir))
@@ -1041,7 +1175,7 @@ local function main()
         name = "group B",
         session_dir = RUN_ROOT .. "/sessions-b",
         cwd = cwd,
-        with_extension = false,
+        extensions = {},
     })
     local b_request = b.request
     local b_text = system_text(b_request)
@@ -1063,6 +1197,11 @@ local function main()
     check(
         b_text:find(GREP_GUIDELINE, 1, true) == nil,
         "B2 (control) the grep guideline is NOT injected without the extension"
+    )
+    -- B11: the search rule lives in `<rules>`, so the control checks it there.
+    check(
+        b_text:find(BASH_RULE_HEAD, 1, true) == nil,
+        "B11 (control) the system message's rules carry no bash search rule"
     )
     -- B3
     local b_description = bash_declaration(b_request).description or ""
@@ -1096,14 +1235,24 @@ local function main()
         case.check(text, find_rows(text))
         step(case.name .. ": " .. case.what)
     end
-    print("[D] find override: rooted/sort/.git/limit run against a real fd")
+    print("[D] find override: rooted/sort/.git/limit/mtime run against a real fd")
+
+    -- ------------------------------------------------------------------
+    -- Group E: the real argv (bg-tasks.ts + search-tools.ts) really boots.
+    -- ------------------------------------------------------------------
+    for index, case in ipairs(EXTENSION_CASES) do
+        run_extension_case(index, case, cwd)
+        step(case.name .. ": " .. case.what)
+    end
+    print("[E] the production argv boots and answers get_state with both extensions loaded")
 
     print(
         (
-            "ALL search-tools cases passed (the extension rewrites the bash snippet and description,\n"
-            .. "adds grep/find/ls guidelines on the wire AND in the transcript, the negative control\n"
-            .. "keeps the stock pi prompt, and the grep override runs a real ripgrep with its new\n"
-            .. "parameters) in %.2fs"
+            "ALL search-tools cases passed (the extension rewrites the bash snippet,\n"
+            .. "adds grep/find/ls guidelines and the bash search rule on the wire AND in the\n"
+            .. "transcript, the negative control keeps the stock pi prompt, the grep override\n"
+            .. "runs a real ripgrep with its new parameters, the find override a real fd, and\n"
+            .. "the production argv (bg-tasks + search-tools) really loads) in %.2fs"
         ):format((uv.hrtime() - run_started) / 1e9)
     )
     cleanup()
