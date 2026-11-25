@@ -449,8 +449,14 @@ require("pi").setup({
     -- bash tool snippet/description so it stops advertising grep/find, and adds
     -- grep/find/ls guidelines that point the model at the dedicated tools
     -- (whose output is capped and says how to widen a search).
+    -- See doc/extensions.md#bundled-search-tools-extension-extensionssearch-toolsts.
     search_tools = {
-        enabled = true, -- inject the extension into every pi process (default true)
+        -- Inject the extension into every RPC process (default true). Read at
+        -- spawn time, so a change applies to the next session. The extension
+        -- also adds the grep output/exclude/max_per_file/word and find
+        -- sort/rooted parameters; it only reaches pi2.nvim's own RPC sessions,
+        -- never a CLI `pi` run.
+        enabled = true,
     },
 
     -- Compaction observability and the bundled pi2-compaction extension.
