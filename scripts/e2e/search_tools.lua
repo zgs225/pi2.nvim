@@ -27,7 +27,20 @@
 --   B2 the grep guideline is NOT there
 --   B3 the bash declaration does NOT carry the search rule
 --
--- Needs the pi binary, nothing else (the provider is fake), so it runs in CI:
+-- Group C runs the extension's grep override for real (a fresh child per case, a
+-- scripted `grep` toolCall, assertions on the persisted toolResult):
+--   C1 output=files lists both matching files exactly once each (2 matches -> 1 path)
+--   C2 output=count prints a.ts:2 and dist/c.ts:1
+--   C3 exclude={"dist/**"} drops dist/c.ts and keeps a.ts
+--   C4 output=count, max_per_file=1 caps a.ts at one match
+--   C5 word=true does not match foobar.ts
+--   C6 a call with no new parameter keeps the builtin `path:LINE: text` rows
+--   C7 a match that only exists under .git/ reads as "No matches found"
+--   C8 the same in count mode: every call is filtered, not just the new ones
+--   C9 context lines survive the re-emit, and .git rows still do not
+--
+-- Needs the pi binary and ripgrep (the grep cases run it for real); no account,
+-- the provider is fake, so it runs in CI:
 --
 --   make e2e-search-tools
 --   (nvim --headless -u tests/minimal_init.lua -l scripts/e2e/search_tools.lua)
@@ -143,13 +156,48 @@ local function text_response(text)
         .. "data: [DONE]\n\n"
 end
 
+--- An assistant turn that calls one tool. The arguments ride as a JSON *string*,
+--- the shape the OpenAI chat-completions stream uses.
+---@param name string
+---@param args table
+---@return string
+local function tool_call_response(name, args)
+    local arguments = vim.json.encode(vim.json.encode(args))
+    return sse_headers()
+        .. sse_chunk('{"role":"assistant","content":""}')
+        .. sse_chunk(
+            ('{"tool_calls":[{"index":0,"id":"call_%s","type":"function","function":{"name":"%s","arguments":%s}}]}'):format(
+                tostring(uv.hrtime()),
+                name,
+                arguments
+            )
+        )
+        .. sse_chunk("{}", "tool_calls")
+        .. sse_usage_chunk(100)
+        .. "data: [DONE]\n\n"
+end
+
 ---@class SearchToolsE2EProvider
 ---@field server? uv.uv_tcp_t
 ---@field requests table[] decoded request bodies, in arrival order
+---@field turn integer requests answered since the current child started
+---@field script fun(turn: integer, request: table): string the SSE answer for a turn
 
----@param provider SearchToolsE2EProvider
+--- One provider serves every group: groups A/B answer plain text, group C swaps
+--- `script` per case so the first turn calls `grep` instead.
+---@type SearchToolsE2EProvider
+local provider = {
+    requests = {},
+    turn = 0,
+    script = function()
+        return text_response("hello")
+    end,
+}
+
+---@param script fun(turn: integer, request: table): string
 ---@return SearchToolsE2EProvider
-local function start_fake_provider(provider)
+local function start_provider(script)
+    provider.script = script
     local server = assert(uv.new_tcp())
     assert(server:bind("127.0.0.1", 0))
     provider.server = server
@@ -184,7 +232,9 @@ local function start_fake_provider(provider)
                 local ok, decoded = pcall(vim.json.decode, body)
                 check(ok and type(decoded) == "table", "the provider received a JSON request body")
                 provider.requests[#provider.requests + 1] = decoded
-                pcall(client.write, client, text_response("hello"), function()
+                provider.turn = provider.turn + 1
+                local answer = provider.script(provider.turn, decoded)
+                pcall(client.write, client, answer, function()
                     pcall(client.close, client)
                 end)
             end)
@@ -237,6 +287,7 @@ end
 ---@field session_dir string
 ---@field events table[]
 ---@field stderr string
+---@field request? table the request this child produced (set by run_group)
 
 ---@param session_dir string
 ---@param cwd string
@@ -355,6 +406,30 @@ local function run_one_turn(backend)
     check(settled ~= nil, "the scripted run settles", { stderr = backend.stderr })
 end
 
+---@class RunGroupOpts
+---@field name string how the group is named in its assertion ("group A")
+---@field session_dir string a fresh session dir for the child
+---@field cwd string the child's cwd
+---@field with_extension boolean
+
+--- Start one child, run one scripted turn and hand back the request it produced.
+--- A/B differ only in `with_extension`; group C reuses this once per case.
+---@param opts RunGroupOpts
+---@return SearchToolsE2EBackend
+local function run_group(opts)
+    -- The turn counter is per child: each group gets a fresh conversation.
+    provider.turn = 0
+    local mark = #provider.requests
+    local backend = start_backend(opts.session_dir, opts.cwd, opts.with_extension)
+    run_one_turn(backend)
+    check(#provider.requests > mark, ("%s issued a provider request"):format(opts.name), {
+        mark = mark,
+        count = #provider.requests,
+    })
+    backend.request = provider.requests[mark + 1]
+    return backend
+end
+
 -- ---------------------------------------------------------------------------
 -- Wire helpers
 -- ---------------------------------------------------------------------------
@@ -448,6 +523,199 @@ local function tools_added_bash(message)
     return nil
 end
 
+--- The text of the LAST persisted `role == "toolResult"` message for `tool_name`.
+--- This is the tool's real result, not the model's summary of it.
+---@param session_dir string
+---@param tool_name string
+---@return string?
+local function tool_result_text(session_dir, tool_name)
+    local found = nil
+    for _, entry in ipairs(session_entries(session_dir)) do
+        local message = entry.message
+        if
+            entry.type == "message"
+            and type(message) == "table"
+            and message.role == "toolResult"
+            and message.toolName == tool_name
+        then
+            local parts = {}
+            for _, block in ipairs(message.content or {}) do
+                if type(block) == "table" and block.type == "text" then
+                    parts[#parts + 1] = block.text
+                end
+            end
+            found = table.concat(parts, "\n")
+        end
+    end
+    return found
+end
+
+-- ---------------------------------------------------------------------------
+-- Group C: the grep fixture, and the seven cases it proves.
+-- ---------------------------------------------------------------------------
+
+--- Group C's tree: just enough to tell the four new parameters apart.
+--- No git init and no .gitignore: the tool must filter `.git/` itself, and
+--- `dist/` must stay visible (only `exclude` hides it). `a.ts` carries a third,
+--- NON-matching line so `context: 1` has a context row to emit (C9).
+---@param dir string
+local function write_grep_fixture(dir)
+    vim.fn.mkdir(dir .. "/dist", "p")
+    vim.fn.mkdir(dir .. "/.git/logs", "p")
+    local files = {
+        ["a.ts"] = "alpha one\nalpha two\nnothing here matches\n",
+        ["dist/c.ts"] = "alpha three\n",
+        [".git/logs/HEAD"] = "GITONLY32\n",
+        ["foobar.ts"] = "foobar\n",
+    }
+    for name, text in pairs(files) do
+        local file = assert(io.open(dir .. "/" .. name, "w"))
+        file:write(text)
+        file:close()
+    end
+end
+
+---@class GrepCase
+---@field name string the case id (C1…C7), also its assertion prefix
+---@field what string one-line label for the [step] trace
+---@field args table the `grep` toolCall arguments, spelled out verbatim
+---@field check fun(text: string) assertions over the grep toolResult text
+
+--- Every case proves that one parameter survives the trip to a real ripgrep run.
+---@type GrepCase[]
+local GREP_CASES = {
+    {
+        name = "C1",
+        what = "output=files lists each matching file once",
+        args = { pattern = "alpha", output = "files" },
+        check = function(text)
+            local lines = {}
+            for line in text:gmatch("[^\n]+") do
+                lines[#lines + 1] = line
+            end
+            local listed, a_ts = {}, 0
+            for _, line in ipairs(lines) do
+                listed[line] = true
+                if line == "a.ts" then
+                    a_ts = a_ts + 1
+                end
+            end
+            check(listed["a.ts"] == true, "C1 files mode lists a.ts", { text = text })
+            check(listed["dist/c.ts"] == true, "C1 files mode lists dist/c.ts", { text = text })
+            check(a_ts == 1, "C1 files mode lists a.ts exactly once (two matches -> one path)", { text = text })
+            check(#lines == 2, "C1 files mode lists exactly the two matching files", { text = text })
+        end,
+    },
+    {
+        name = "C2",
+        what = "output=count prints path:N per file",
+        args = { pattern = "alpha", output = "count" },
+        check = function(text)
+            check(text:find("a.ts:2", 1, true) ~= nil, "C2 count mode reports a.ts:2", { text = text })
+            check(text:find("dist/c.ts:1", 1, true) ~= nil, "C2 count mode reports dist/c.ts:1", { text = text })
+        end,
+    },
+    {
+        name = "C3",
+        what = "exclude globs drop dist/** from the results",
+        args = { pattern = "alpha", exclude = { "dist/**" } },
+        check = function(text)
+            check(text:find("dist/c.ts", 1, true) == nil, "C3 exclude drops dist/c.ts", { text = text })
+            check(text:find("a.ts:", 1, true) ~= nil, "C3 exclude keeps a.ts", { text = text })
+        end,
+    },
+    {
+        name = "C4",
+        what = "max_per_file caps a file's rows",
+        args = { pattern = "alpha", output = "count", max_per_file = 1 },
+        check = function(text)
+            check(text:find("a.ts:1", 1, true) ~= nil, "C4 max_per_file=1 caps a.ts at one match", { text = text })
+        end,
+    },
+    {
+        name = "C5",
+        what = "word=true matches whole words only",
+        args = { pattern = "foo", word = true },
+        check = function(text)
+            check(text:find("foobar.ts", 1, true) == nil, "C5 word mode does not match foobar.ts", { text = text })
+        end,
+    },
+    {
+        name = "C6",
+        what = "no new parameter -> the builtin row format, unchanged",
+        args = { pattern = "alpha" },
+        check = function(text)
+            local rows = 0
+            for line in text:gmatch("[^\n]+") do
+                rows = rows + 1
+                check(line:match("^[^:]+:%d+: ") ~= nil, "C6 every row keeps the builtin `path:LINE: text` form", {
+                    line = line,
+                })
+            end
+            check(rows >= 3, "C6 the plain search returns both a.ts rows and dist/c.ts", { rows = rows, text = text })
+        end,
+    },
+    {
+        name = "C7",
+        what = ".git is never searched",
+        args = { pattern = "GITONLY32" },
+        check = function(text)
+            check(text == "No matches found", "C7 a .git-only match reads as No matches found", { text = text })
+        end,
+    },
+    {
+        name = "C8",
+        what = "a new parameter filters .git too",
+        args = { pattern = "GITONLY32", output = "count" },
+        check = function(text)
+            check(text == "No matches found", "C8 count mode reads a .git-only match as No matches found", {
+                text = text,
+            })
+        end,
+    },
+    {
+        name = "C9",
+        what = "context rows survive the re-emit",
+        args = { pattern = "alpha", context = 1 },
+        check = function(text)
+            local context_rows = {}
+            for line in text:gmatch("[^\n]+") do
+                if line:match("^[^-]+-%d+- ") ~= nil then
+                    context_rows[#context_rows + 1] = line
+                end
+            end
+            check(#context_rows > 0, "C9 context lines are kept, not dropped", { text = text })
+            check(text:find(".git", 1, true) == nil, "C9 no .git path leaks through", { text = text })
+        end,
+    },
+}
+
+--- One case: a fresh child (own session dir), a scripted `grep` toolCall on turn
+--- 1, plain text on turn 2, then the grep toolResult read back out of the JSONL.
+---@param index integer
+---@param case GrepCase
+---@param cwd string
+---@return string text
+local function run_grep_case(index, case, cwd)
+    provider.script = function(turn)
+        if turn == 1 then
+            return tool_call_response("grep", case.args)
+        end
+        return text_response("done")
+    end
+    local backend = run_group({
+        name = case.name,
+        session_dir = ("%s/sessions-c%d"):format(RUN_ROOT, index),
+        cwd = cwd,
+        with_extension = true,
+    })
+    local text = tool_result_text(backend.session_dir, "grep")
+    stop_backend(backend)
+    check(text ~= nil, case.name .. " the transcript holds a grep toolResult", case.args)
+    ---@cast text string
+    return text
+end
+
 -- ---------------------------------------------------------------------------
 
 local function cleanup()
@@ -458,6 +726,9 @@ local function main()
     if not deps.require_executable("pi", "pi binary not found in PATH (required for this e2e)") then
         return
     end
+    if not deps.require_executable("rg", "ripgrep (rg) not found in PATH (the grep tool needs it)") then
+        return
+    end
     vim.fn.mkdir(RUN_ROOT, "p")
     local agent_dir = RUN_ROOT .. "/agent"
     local cwd = RUN_ROOT .. "/cwd"
@@ -466,9 +737,9 @@ local function main()
     vim.env.PI_CODING_AGENT_DIR = agent_dir
     vim.env.PI_OFFLINE = "1"
 
-    ---@type SearchToolsE2EProvider
-    local provider = { requests = {} }
-    start_fake_provider(provider)
+    start_provider(function()
+        return text_response("hello")
+    end)
     local addr = provider.server:getsockname()
     local port = type(addr) == "table" and addr.port or nil
     check(type(port) == "number" and port > 0, "fake provider did not bind a port", { addr = addr })
@@ -479,10 +750,13 @@ local function main()
     -- ------------------------------------------------------------------
     -- Group A: WITH the extension.
     -- ------------------------------------------------------------------
-    local a = start_backend(RUN_ROOT .. "/sessions-a", cwd, true)
-    run_one_turn(a)
-    check(#provider.requests >= 1, "group A issued a provider request", { count = #provider.requests })
-    local a_request = provider.requests[1]
+    local a = run_group({
+        name = "group A",
+        session_dir = RUN_ROOT .. "/sessions-a",
+        cwd = cwd,
+        with_extension = true,
+    })
+    local a_request = a.request
     local a_text = system_text(a_request)
     print("[A system] " .. (a_text:match("[^\n]*bash[^\n]*") or "(no bash line)"))
     step("A: one scripted turn with the extension")
@@ -559,11 +833,13 @@ local function main()
     -- ------------------------------------------------------------------
     -- Group B: WITHOUT the extension (negative control).
     -- ------------------------------------------------------------------
-    local mark = #provider.requests
-    local b = start_backend(RUN_ROOT .. "/sessions-b", cwd, false)
-    run_one_turn(b)
-    check(#provider.requests > mark, "group B issued a provider request", { mark = mark, count = #provider.requests })
-    local b_request = provider.requests[mark + 1]
+    local b = run_group({
+        name = "group B",
+        session_dir = RUN_ROOT .. "/sessions-b",
+        cwd = cwd,
+        with_extension = false,
+    })
+    local b_request = b.request
     local b_text = system_text(b_request)
     print("[B system] " .. (b_text:match("[^\n]*bash[^\n]*") or "(no bash line)"))
     step("B: one scripted turn without the extension")
@@ -594,11 +870,23 @@ local function main()
 
     stop_backend(b)
 
+    -- ------------------------------------------------------------------
+    -- Group C: grep really runs — the new parameters against real ripgrep.
+    -- ------------------------------------------------------------------
+    write_grep_fixture(cwd)
+    for index, case in ipairs(GREP_CASES) do
+        local text = run_grep_case(index, case, cwd)
+        print(("[%s] %s"):format(case.name, (text:gsub("\n", " | "):sub(1, 120))))
+        case.check(text)
+        step(case.name .. ": " .. case.what)
+    end
+
     print(
         (
             "ALL search-tools cases passed (the extension rewrites the bash snippet and description,\n"
-            .. "adds grep/find/ls guidelines on the wire AND in the transcript, and the negative control\n"
-            .. "keeps the stock pi prompt) in %.2fs"
+            .. "adds grep/find/ls guidelines on the wire AND in the transcript, the negative control\n"
+            .. "keeps the stock pi prompt, and the grep override runs a real ripgrep with its new\n"
+            .. "parameters) in %.2fs"
         ):format((uv.hrtime() - run_started) / 1e9)
     )
     cleanup()
