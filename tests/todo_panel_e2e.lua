@@ -25,6 +25,11 @@ local Manager = require("pi.sessions.manager")
 local ToolUi = require("pi.todo.tool_ui")
 local SessionList = require("pi.ui.sessions")
 
+--- The :PiTodo title as the shared panel shell renders it (nf-md-format-list-
+--- checks + name), by codepoint so the PUA glyph never gets lost in edits. An
+--- empty list keeps the title and puts the placeholder below the header.
+local TODO_TITLE = "  " .. vim.fn.nr2char(0xF0756, 1) .. " Todo"
+
 local failures = 0
 local function check(cond, msg)
     if cond then
@@ -179,7 +184,7 @@ local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
 -- DESIGN.md padding: blank spacer, calm header, blank, then indented rows.
 check(#lines == 6, "panel renders spacer + header + blank + 3 items (got " .. #lines .. ")")
 eq(
-    { "", "  Todo · 1/3 completed", "", "  ✓ write module", "  ◐ write tests", "  ○ review" },
+    { "", TODO_TITLE .. " · 1/3 completed", "", "  ✓ write module", "  ◐ write tests", "  ○ review" },
     lines,
     "standalone panel renders the padded layout"
 )
@@ -248,7 +253,7 @@ Manager._update_todo_mirror("todo_write", v2)
 pump()
 local buf2 = vim.api.nvim_win_get_buf(todo_win)
 local lines2 = vim.api.nvim_buf_get_lines(buf2, 0, -1, false)
-eq("  Todo · 2/3 completed", lines2[2], "refresh renders the new progress header")
+eq(TODO_TITLE .. " · 2/3 completed", lines2[2], "refresh renders the new progress header")
 -- A manual resize persists across refresh: sidebar restacks on
 -- claim/release only, no longer on every refresh.
 vim.api.nvim_win_set_height(todo_win, 14)
@@ -293,7 +298,11 @@ todo_win = vim.api.nvim_get_current_win()
 Manager._update_todo_mirror("todo_write", { details = { todos = {}, completed = 0, total = 0 } })
 pump()
 local lines3 = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(todo_win), 0, -1, false)
-eq({ "", "  no todos" }, lines3, "explicit panel shows the padded no-todos placeholder after clear")
+eq(
+    { "", TODO_TITLE, "", "  no todos" },
+    lines3,
+    "explicit panel keeps the title and shows the no-todos placeholder after clear"
+)
 Todo.close()
 
 -- 6. Replay-style result (details at top level) ----------------------------
@@ -339,14 +348,18 @@ local win_b = Todo.win(tab2)
 check(win_b ~= nil and win_b ~= win_a, "tab 2 panel auto-opened independently")
 local buf_b = vim.api.nvim_win_get_buf(win_b)
 check(buf_b ~= buf_a, "each tab's panel has its own buffer")
-eq("  Todo · 0/1 completed", vim.api.nvim_buf_get_lines(buf_b, 0, -1, false)[2], "tab 2 panel shows its own header")
+eq(
+    TODO_TITLE .. " · 0/1 completed",
+    vim.api.nvim_buf_get_lines(buf_b, 0, -1, false)[2],
+    "tab 2 panel shows its own header"
+)
 eq({ "  ◐ tab two item" }, { vim.api.nvim_buf_get_lines(buf_b, 0, -1, false)[4] }, "tab 2 panel shows its own item")
 
 -- Back on tab 1: its buffer still shows tab one's list (no cross-talk).
 vim.api.nvim_set_current_tabpage(tab1)
 pump(200)
 eq(
-    { "", "  Todo · 0/1 completed", "", "  ○ tab one item" },
+    { "", TODO_TITLE .. " · 0/1 completed", "", "  ○ tab one item" },
     vim.api.nvim_buf_get_lines(buf_a, 0, -1, false),
     "tab 1 panel unaffected by tab 2 refresh"
 )
@@ -360,9 +373,9 @@ Manager._update_todo_mirror("todo_write", { details = { todos = {}, completed = 
 pump()
 check(Todo.is_open(), "manual panel stays open after clear")
 eq(
-    { "", "  no todos" },
+    { "", TODO_TITLE, "", "  no todos" },
     vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(Todo.win(tab1)), 0, -1, false),
-    "manual panel placeholder after clear"
+    "manual panel keeps the title and shows the placeholder after clear"
 )
 -- Auto panel on tab 2 closes on clear.
 vim.api.nvim_set_current_tabpage(tab2)
@@ -392,7 +405,7 @@ local win_deferred = Todo.win(tab1)
 check(win_deferred ~= nil, "entering the session tab consumes the deferred auto-open")
 eq("auto", Todo._opened_by(), "deferred auto-open marks the panel auto")
 eq(
-    "  Todo · 0/1 completed",
+    TODO_TITLE .. " · 0/1 completed",
     vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(win_deferred), 0, -1, false)[2],
     "session tab panel shows the session's todos"
 )

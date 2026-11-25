@@ -45,8 +45,24 @@ local M = {}
 
 local Config = require("pi.config")
 local Ft = require("pi.filetypes")
+local PanelHeader = require("pi.ui.panel_header")
 local Sidebar = require("pi.ui.sidebar")
 local Workspace = require("pi.ui.workspace")
+
+--- Buffer-local namespace of the panel's header/row highlights.
+local ns = vim.api.nvim_create_namespace("pi-todo-panel")
+
+--- The panel's header shell (pi.ui.panel_header): 2-space indent, icon, name
+--- and the progress fraction — the same container as :PiTasks and
+--- :PiCompactions. Only the metric changes per render.
+---@type pi.PanelSpec
+local TITLE_SPEC = {
+    name = "Todo",
+    noun = "todos",
+    -- nf-md-format-list-checks (the todo_write tool icon), by codepoint so the
+    -- PUA glyph never gets lost in edits
+    icon = vim.fn.nr2char(0xF0756, 1),
+}
 
 ---@class pi.TodoItem
 ---@field content string
@@ -162,24 +178,19 @@ local function state_for_tab(tab)
     return session ~= nil and state[session] or nil
 end
 
---- Content lines of the panel for the current state, with the DESIGN.md
---- "whitespace over lines" treatment applied:
----
----   line 1: blank spacer — breathing room between the sessions list and the
----           todo panel (stacked layout reads as one column; without it the
----           todo list collides with the sessions list above)
----   line 2: calm header — 2-space indent + title + progress count
----   line 3: blank — breathing room between header and list
----   line 4+: one line per todo, consistently 2-space indented
----
---- The empty-list placeholder follows the same shape (spacer + indented
---- "no todos"). The returned list is the FINAL render; the panel window
---- never sizes itself to content, so padding is never clipped.
+--- Render lines for the panel's content, with the shared panel shell applied
+--- (lua/pi/ui/panel_header.lua — spacer, title, spacer, then rows or the
+--- placeholder). The title carries the panel-specific metric: the progress
+--- fraction from pi.todo.tool_ui. The returned chunk map holds the extmark
+--- highlights for the header block (PiPanelTitle) and, keyed by buffer line,
+--- nothing else — the checklist rows stay plain.
 --- Returns nil when the panel should render nothing. An empty list renders
---- the placeholder only for manually-opened panels (or when hide_when_empty
---- is false); auto-opened panels are closed by refresh() instead.
+--- the title plus the "no todos" placeholder only for manually-opened panels
+--- (or when hide_when_empty is false); auto-opened panels are closed by
+--- refresh() instead.
 ---@param tab pi.TabId
----@return string[]?
+---@return string[]? lines
+---@return table<integer, [integer, integer, string][]>? chunks
 local function panel_lines(tab)
     local details = state_for_tab(tab)
     local cfg = panel_config()
@@ -189,7 +200,8 @@ local function panel_lines(tab)
         if cfg.hide_when_empty and opened_by[tab] ~= "manual" then
             return nil
         end
-        return { "", "  no todos" }
+        local header = PanelHeader.build(TITLE_SPEC)
+        return header.lines, header.chunks
     end
     local todos = details.todos
     local completed = details.completed or 0
@@ -210,7 +222,7 @@ local function panel_lines(tab)
         end
     end
     -- format_lines leads with its own progress header; the panel replaces it
-    -- with the calmer "Todo · <progress>" title line and keeps the rows.
+    -- with the shell's `Todo · <progress>` title line and keeps the rows.
     local progress = tostring(completed) .. "/" .. tostring(total)
     local p_ok, text = pcall(function()
         return require("pi.todo.tool_ui").progress_text(details)
@@ -218,11 +230,13 @@ local function panel_lines(tab)
     if p_ok and type(text) == "string" and text ~= "" then
         progress = text
     end
-    local out = { "", "  Todo · " .. progress, "" }
+    ---@type pi.PanelRow[]
+    local rows = {}
     for i = 2, #lines do
-        out[#out + 1] = "  " .. tostring(lines[i])
+        rows[#rows + 1] = { line = tostring(lines[i]) }
     end
-    return out
+    local header = PanelHeader.build(vim.tbl_extend("force", TITLE_SPEC, { metric = progress }), rows)
+    return header.lines, header.chunks
 end
 
 --- Rebuild `tab`'s panel buffer contents from `tab`'s viewed session's state
@@ -234,13 +248,23 @@ local function render_buf(tab)
     if not b or not vim.api.nvim_buf_is_valid(b) then
         return false
     end
-    local lines = panel_lines(tab)
+    local lines, chunks = panel_lines(tab)
     if not lines then
         return false
     end
     vim.bo[b].modifiable = true
     vim.api.nvim_buf_set_lines(b, 0, -1, false, lines)
     vim.bo[b].modifiable = false
+    vim.api.nvim_buf_clear_namespace(b, ns, 0, -1)
+    for lnum, line_chunks in pairs(chunks or {}) do
+        for _, chunk in ipairs(line_chunks) do
+            pcall(vim.api.nvim_buf_set_extmark, b, ns, lnum - 1, chunk[1], {
+                end_col = chunk[2],
+                hl_group = chunk[3],
+                priority = 10,
+            })
+        end
+    end
     return true
 end
 
@@ -255,7 +279,7 @@ local function setup_buf(b, tab)
     vim.bo[b].bufhidden = "hide"
     vim.bo[b].swapfile = false
     vim.bo[b].buflisted = false
-    vim.bo[b].filetype = Ft.sessions
+    vim.bo[b].filetype = Ft.todo
     vim.bo[b].modifiable = false
     vim.keymap.set("n", "q", function()
         M.close()

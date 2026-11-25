@@ -1,12 +1,13 @@
 --- Compaction timeline panel (:PiCompactions) — every compaction of a session,
 --- newest first, with the numbers pi reported.
 ---
---- One shared scratch buffer: blank spacer, a dimmed `  󰏗 Compactions (N)` title,
---- a `  ? help · q close` hint, a spacer, then one row per record —
---- `#seq  hh:mm  reason  before → after  duration  cost  read/modified files
---- "summary excerpt"  󰏗pi2`. An aborted/failed record ends with `aborted` /
---- `failed` and renders in `PiStatusLineWarning`; a session without compactions
---- keeps the header and shows a dim `  No compactions in this session` row.
+--- One shared scratch buffer: blank spacer, the dimmed `  󰏗 Compactions · N`
+--- title, a dimmed `  ? help · q close` hint, a spacer, then one row per
+--- record — `#seq  hh:mm  reason  before → after  duration  cost
+--- read/modified files "summary excerpt"  󰏗pi2`. An aborted/failed record ends
+--- with `aborted` / `failed` and renders in `PiStatusLineWarning`; a session
+--- without compactions keeps the header and shows a dim `  no compactions`
+--- placeholder row (the shared panel shell, lua/pi/ui/panel_header.lua).
 ---
 --- Records come from the live `pi.CompactionState` (rich: estimate, duration,
 --- focus text) and, once per session and never per render, from a `get_entries`
@@ -23,6 +24,7 @@ local M = {}
 local Config = require("pi.config")
 local Ft = require("pi.filetypes")
 local Highlights = require("pi.ui.highlights")
+local PanelHeader = require("pi.ui.panel_header")
 local Workspace = require("pi.ui.workspace")
 
 local ns = vim.api.nvim_create_namespace("pi-compactions-list")
@@ -38,8 +40,23 @@ local ns = vim.api.nvim_create_namespace("pi-compactions-list")
 local buf = nil
 ---@type table<pi.TabId, integer> list window per tab
 local wins = {}
---- Buffer lines above the rows: spacer, title, hint, spacer. Row i is line i+N.
-local HEADER_LINES = 4
+
+--- The panel's header shell (pi.ui.panel_header): 2-space indent, icon, name,
+--- record count and the keybinding hint — the same container as :PiTodo and
+--- :PiTasks. Only the count changes per render.
+---@type pi.PanelSpec
+local TITLE_SPEC = {
+    name = "Compactions",
+    noun = "compactions",
+    -- nf-md-archive-arrow-down-outline, the compaction marker used across the
+    -- statusline and the chat blocks; by codepoint so the PUA glyph survives
+    icon = vim.fn.nr2char(0xF03D7, 1),
+    hint = "? help · q close",
+}
+
+--- Row i is line i + HEADER_LINES (spacer, title, hint, spacer).
+local HEADER_LINES = PanelHeader.header_lines(TITLE_SPEC)
+
 --- Display columns a summary excerpt may occupy (the `…` included).
 local SUMMARY_COLS = 48
 ---@type pi.CompactionRecord[] rows of the last render, newest first
@@ -374,10 +391,11 @@ function M.row_cells(rec)
 end
 
 --- Pad and join rows, two spaces apart, with per-line highlight chunks (byte
---- ranges; the chunk's third element is its highlight group).
+--- ranges; the chunk's third element is its highlight group). Lines carry no
+--- leading indent: the shared shell (pi.ui.panel_header) applies it.
 ---@param rows pi.CompactionRowCells[]
 ---@return string[] lines
----@return table<integer, any[]> chunks_by_line
+---@return table<integer, [integer, integer, string][]> chunks_by_line
 local function build_lines(rows)
     ---@type table<integer, integer> widest text per column
     local widths = {}
@@ -389,7 +407,7 @@ local function build_lines(rows)
 
     local lines, chunks_by_line = {}, {}
     for i, row in ipairs(rows) do
-        local line = "  "
+        local line = ""
         ---@type any[]
         local chunks = {}
 
@@ -441,30 +459,25 @@ function M._render()
     end
     records = collect(current_session())
 
-    local title = "  󰏗 Compactions (" .. #records .. ")"
-    local hint = "  ? help · q close"
-    local lines = { "", title, hint, "" }
-    ---@type table<integer, any[]>
-    local line_chunks = {
-        [2] = { { 0, #title, "PiSessionsListDotDim" } },
-        [3] = { { 0, #hint, "PiSessionsListDotDim" } },
-    }
-    if #records == 0 then
-        local empty = "  No compactions in this session"
-        lines[#lines + 1] = empty
-        line_chunks[#lines] = { { 0, #empty, "PiSessionsListDotDim" } }
-    else
+    ---@type pi.PanelRow[]
+    local row_specs = {}
+    if #records > 0 then
         ---@type pi.CompactionRowCells[]
-        local rows = {}
+        local cells = {}
         for i, rec in ipairs(records) do
-            rows[i] = M.row_cells(rec)
+            cells[i] = M.row_cells(rec)
         end
-        local rendered, chunks_by_line = build_lines(rows)
+        local rendered, chunks_by_line = build_lines(cells)
         for i, line in ipairs(rendered) do
-            lines[#lines + 1] = line
-            line_chunks[#lines] = chunks_by_line[i]
+            row_specs[i] = { line = line, chunks = chunks_by_line[i] }
         end
     end
+    -- No records means nothing to count: the shared shell renders the bare
+    -- name plus the `no compactions` placeholder under the hint line.
+    local metric = #records > 0 and tostring(#records) or nil
+    local header = PanelHeader.build(vim.tbl_extend("force", TITLE_SPEC, { metric = metric }), row_specs)
+    local lines = header.lines
+    local line_chunks = header.chunks
 
     vim.bo[buf].modifiable = true
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)

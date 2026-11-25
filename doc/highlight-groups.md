@@ -165,6 +165,14 @@ Inspect what a block actually uses with `:Inspect` over the coloured text, or li
 
 The dashboard reuses `PiToolHeader` for its section headers, `Comment` for dimmed labels, and `PiStatusLineWarning` / `PiStatusLineError` for the context bar above the warn/error thresholds.
 
+## Side panels
+
+The shared container of the side panels (`:PiTodo`, `:PiTasks`, `:PiCompactions` — rendered by `lua/pi/ui/panel_header.lua`).
+
+| Group | Role |
+| --- | --- |
+| `PiPanelTitle` | The whole dimmed header block: the panel title line (`󰝖 Todo · 2/5 completed`, ` Tasks · 1 running · 2 finished`, `󰏗 Compactions · 3`), the optional keybinding hint line (`? help · q close`), and the empty-list placeholder (`no todos`, `no tasks`, `no compactions`). Dim by default (the comment colour, not bold) so the panel's own rows carry the emphasis. |
+
 ## Sessions overview
 
 | Group | Role |

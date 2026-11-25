@@ -231,6 +231,12 @@ local function set_defaults()
     -- the warn/error thresholds uses PiStatusLineWarning/PiStatusLineError).
     vim.api.nvim_set_hl(0, "PiStatsBar", { default = true, fg = func.fg })
 
+    -- Shared header shell of the side panels (:PiTodo / :PiTasks /
+    -- :PiCompactions, lua/pi/ui/panel_header.lua): the title line, its optional
+    -- hint and the empty-list placeholder are dim chrome so the panel's own
+    -- rows carry the emphasis.
+    vim.api.nvim_set_hl(0, "PiPanelTitle", { default = true, fg = comment.fg, bold = false })
+
     -- Subsession viewer todo rows / footer summary: the same three-state
     -- ✓ / ◐ / ○ semantics as the sessions list (done = ok, in-progress =
     -- busy-amber, pending recedes like a comment).

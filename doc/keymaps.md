@@ -83,7 +83,9 @@ Every π buffer gets a stable filetype, so you can target them from your own `Fi
 | `pi-chat-attachments` | Attachments panel |
 | `pi-dialog` | Input and info dialog floats (completion plugins can be disabled here without affecting the prompt) |
 | `pi-sessions` | The [sessions overview](sessions.md#sessions-overview-pisessions) list |
+| `pi-todo` | The [`:PiTodo` panel](usage.md#the-pitodo-panel) list |
 | `pi-tasks` | The [background tasks](#background-tasks-panel-pitasks) panel (`:PiTasks`) |
+| `pi-compactions` | The [compaction timeline](usage.md#compaction-timeline-picompactions) panel (`:PiCompactions`) |
 | `pi-diff-review` | The `:PiDiff` session diff review file list (left area of the panel) |
 
 ## Example setup

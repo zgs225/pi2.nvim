@@ -14,6 +14,11 @@ local Config = require("pi.config")
 local Dialog = require("pi.ui.dialog")
 local Notify = require("pi.notify")
 
+--- The :PiCompactions title as the shared panel shell renders it (the
+--- compaction marker plus the name), by codepoint so the PUA glyph never gets
+--- lost in edits. The record count is appended per render as `· N`.
+local COMP_TITLE = "  " .. vim.fn.nr2char(0xF03D7, 1) .. " Compactions"
+
 local ns = vim.api.nvim_create_namespace("pi-compactions-list")
 
 describe("compaction panel", function()
@@ -285,9 +290,11 @@ describe("compaction panel", function()
         it("shows the empty session text", function()
             open_panel()
             local text = panel_text()
-            assert.is_truthy(text:find("Compactions (0)", 1, true))
+            -- Nothing to count: the shell renders the bare title and keeps the
+            -- hint + placeholder lines underneath.
+            assert.equals(COMP_TITLE, panel_lines()[2])
             assert.is_truthy(text:find("? help · q close", 1, true))
-            assert.is_truthy(text:find("No compactions in this session", 1, true))
+            assert.is_truthy(text:find("no compactions", 1, true))
         end)
 
         it("renders the full column set of a record", function()
@@ -305,7 +312,7 @@ describe("compaction panel", function()
             }
             open_panel()
             local lines = panel_lines()
-            assert.is_truthy(lines[2]:find("Compactions (1)", 1, true))
+            assert.equals(COMP_TITLE .. " · 1", lines[2])
             local row = lines[Panel._header_lines() + 1]
             local expected = table.concat({
                 "  #3",
@@ -622,7 +629,7 @@ describe("compaction panel", function()
                 return panel_text():find("persisted summary", 1, true) ~= nil
             end)
             local text = panel_text()
-            assert.is_truthy(text:find("Compactions (1)", 1, true))
+            assert.is_truthy(text:find(COMP_TITLE .. " · 1", 1, true))
             assert.is_truthy(text:find("persisted summary", 1, true))
             assert.is_truthy(text:find("unknown", 1, true))
             assert.is_truthy(text:find("90k → ?", 1, true))
@@ -639,9 +646,9 @@ describe("compaction panel", function()
             state = { records = { record({ summary = "shared summary", tokens_before = 150000 }) } }
             open_panel()
             vim.wait(1000, function()
-                return panel_text():find("Compactions (1)", 1, true) ~= nil and #entry_requests == 1
+                return panel_text():find(COMP_TITLE .. " · 1", 1, true) ~= nil and #entry_requests == 1
             end)
-            assert.is_truthy(panel_text():find("Compactions (1)", 1, true))
+            assert.is_truthy(panel_text():find(COMP_TITLE .. " · 1", 1, true))
             assert.is_nil(panel_text():find("persisted summary", 1, true))
         end)
 
@@ -649,7 +656,8 @@ describe("compaction panel", function()
             session = nil
             state = nil
             open_panel()
-            assert.is_truthy(panel_text():find("No compactions in this session", 1, true))
+            assert.equals(COMP_TITLE, panel_lines()[2])
+            assert.is_truthy(panel_text():find("no compactions", 1, true))
             assert.equals(0, #entry_requests)
         end)
     end)

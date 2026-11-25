@@ -83,6 +83,10 @@ local Manager = require("pi.sessions.manager")
 local Config = require("pi.config")
 local Sidebar = require("pi.ui.sidebar")
 
+--- The :PiTodo title as the shared panel shell renders it (nf-md-format-list-
+--- checks + name), by codepoint so the PUA glyph never gets lost in edits.
+local TODO_TITLE = "  " .. vim.fn.nr2char(0xF0756, 1) .. " Todo"
+
 --- Monotonic counter so every fake session object is unique.
 local next_fake_id = 0
 
@@ -213,7 +217,7 @@ describe("todo panel session switching", function()
         pump()
         assert.are.equal(1, Todo.current().total, "panel shows the child's list while the child is viewed")
         assert.are.equal("  ◐ CHILD: explore code", panel_lines(tab)[4])
-        assert.are.equal("  Todo · 0/1 completed", panel_lines(tab)[2])
+        assert.are.equal(TODO_TITLE .. " · 0/1 completed", panel_lines(tab)[2])
 
         -- Switch back to the parent: the PARENT's list must render
         -- immediately, with NO further parent todo_write (the stale-children
@@ -256,7 +260,7 @@ describe("todo panel session switching", function()
 
         -- Opening :PiTodo now shows the CHILD's stored list.
         Todo.open()
-        assert.are.equal("  Todo · 0/1 completed", panel_lines(tab)[2])
+        assert.are.equal(TODO_TITLE .. " · 0/1 completed", panel_lines(tab)[2])
         assert.are.equal("  ◐ CHILD: explore code", panel_lines(tab)[4])
     end)
 
