@@ -1,12 +1,17 @@
--- Copying the message under the cursor (`yy`) and a history line range
--- (`:PiCopy`).
+-- Copying the message under the cursor (`copy.key`, default `gy`) and a
+-- history line range (`:PiCopy`).
 --
--- Two properties pull in opposite directions here, so both are pinned:
+-- Three properties are pinned here, and the first two pull in opposite
+-- directions:
 --
 --   * what gets copied is the SOURCE text, not the rendered rows — the buffer
 --     draws markdown tables as box art, indents the user body two spaces and
 --     keeps only the tail of a collapsed tool block, so re-reading the buffer
 --     would not reproduce what was written;
+--   * `yy` stays vim's yank on the history buffer. It is the most reflexive
+--     motion in the editor, so it must keep yanking the line on screen — a
+--     whole message's markdown instead (and `[count]yy` messages instead of
+--     lines) is precisely what the copy feature must not do;
 --   * the register writes behave like a real yank (``"`` + `0`, a register
 --     prefix, 'clipboard' mirroring), or a user's `"ap` / `"0p` habits break.
 
@@ -302,7 +307,7 @@ describe("copy: register semantics", function()
     end)
 end)
 
-describe("copy: yy and :PiCopy wiring", function()
+describe("copy: copy key and :PiCopy wiring", function()
     local chat, win, notices, orig_notify, orig_get, orig_render
 
     before_each(function()
@@ -340,6 +345,7 @@ describe("copy: yy and :PiCopy wiring", function()
 
     after_each(function()
         Manager.get = orig_get
+        Config.options.copy = { key = "gy" }
         vim.notify = orig_notify
         Config.options.render = orig_render
         chat._history:clear()
@@ -353,19 +359,67 @@ describe("copy: yy and :PiCopy wiring", function()
         return chat._history
     end
 
-    it("binds yy on the history buffer only", function()
-        assert.is_true(vim.fn.maparg("yy", "n", false, true).buffer == 1)
-        -- The y operator itself stays native, so `y{motion}` and V+y keep
+    --- Is `lhs` a buffer-local mapping in `mode`? (`maparg` returns `""` when
+    --- nothing is mapped, so a `#` length check would be vacuous on the dict.)
+    ---@param lhs string
+    ---@param mode string
+    ---@return boolean
+    local function mapped(lhs, mode)
+        local found = vim.fn.maparg(lhs, mode, false, true)
+        return type(found) == "table" and found.buffer == 1
+    end
+
+    --- Rebind the copy keys for a different `copy.key`.
+    ---
+    --- `_set_keymaps` is idempotent on purpose (`_keymaps_set`), and it never
+    --- deletes what a previous run bound, so a config change needs both halves:
+    --- drop the old buffer-local keys, then let the map run again.
+    ---@param key pi.KeySpecs|false
+    local function rebind_copy(key)
+        Config.options.copy = { key = key }
+        local buf = history():buf()
+        for _, mode in ipairs({ "n", "x" }) do
+            for _, lhs in ipairs({ "gy", "gY", "yy" }) do
+                pcall(vim.api.nvim_buf_del_keymap, buf, mode, lhs)
+            end
+        end
+        chat._keymaps_set = nil
+        chat:_set_keymaps()
+    end
+
+    it("binds the copy key on the history buffer only, in normal and visual mode", function()
+        assert.is_true(mapped("gy", "n"))
+        assert.is_true(mapped("gy", "x"))
+        -- `yy` is vim's own yank and must stay that way: the old binding
+        -- replaced the most reflexive motion in the editor.
+        assert.is_false(mapped("yy", "n"))
+        -- The y operator itself stays native too, so `y{motion}` and V+y keep
         -- yanking what is on screen.
-        assert.are.equal(0, #vim.fn.maparg("y", "n"))
+        assert.is_false(mapped("y", "n"))
     end)
 
-    it("yy copies the message under the cursor", function()
+    it("yy yanks the visible line, not the message source", function()
+        history():add_user_message("copy me", nil)
+        pump(80)
+        local row = row_with(history(), "copy me")
+        vim.api.nvim_win_set_cursor(win, { row + 1, 0 })
+        vim.fn.setreg('"', "")
+
+        vim.api.nvim_feedkeys("yy", "x", false)
+        pump(20)
+
+        -- The user body is indented in the buffer: the rendered row and the
+        -- authored text differ, and `yy` must return the row.
+        assert.are.equal(buffer_lines(history())[row + 1] .. "\n", vim.fn.getreg('"'))
+        assert.are_not.equal("copy me\n", vim.fn.getreg('"'))
+    end)
+
+    it("the copy key copies the message under the cursor as source text", function()
         history():add_user_message("copy me", nil)
         pump(80)
         vim.api.nvim_win_set_cursor(win, { (row_with(history(), "copy me") or 0) + 1, 0 })
 
-        vim.api.nvim_feedkeys("yy", "x", false)
+        vim.api.nvim_feedkeys("gy", "x", false)
         pump(20)
 
         assert.are.equal("copy me\n", vim.fn.getreg('"'))
@@ -373,6 +427,53 @@ describe("copy: yy and :PiCopy wiring", function()
             (notices[#notices] or ""):find("User message copied", 1, true) ~= nil,
             "expected a copy notification, got " .. tostring(notices[#notices])
         )
+    end)
+
+    it("visual mode copies the selected range and ends the selection", function()
+        render_turn(history(), "range question", "range answer")
+        vim.api.nvim_set_current_win(win)
+        vim.api.nvim_win_set_cursor(win, { 1, 0 })
+        vim.fn.setreg('"', "")
+
+        -- `V` + `G` selects every history line, then the copy key: whole
+        -- messages, so the source text — same contract as `:'<,'>PiCopy`.
+        -- (The native `y` is deliberately NOT pressed first: it would yank the
+        -- rendered rows into the register and make the assertion pass for the
+        -- wrong reason.)
+        vim.api.nvim_feedkeys("V", "x", false)
+        vim.api.nvim_feedkeys("G", "x", false)
+        vim.api.nvim_feedkeys("gy", "x", false)
+        pump(20)
+
+        assert.are.equal("range question\n\nrange answer\n", vim.fn.getreg('"'))
+        -- Like a real yank, the gesture leaves visual mode, so a following
+        -- `p` cannot paste over the selection.
+        assert.are.equal("n", vim.fn.mode())
+    end)
+
+    it("restores the old `yy` binding when copy.key asks for it", function()
+        rebind_copy("yy")
+
+        assert.is_true(mapped("yy", "n"))
+        assert.is_true(mapped("yy", "x"))
+        assert.is_false(mapped("gy", "n"))
+    end)
+
+    it("binds nothing when copy.key is false", function()
+        rebind_copy(false)
+
+        for _, lhs in ipairs({ "gy", "yy" }) do
+            assert.is_false(mapped(lhs, "n"), lhs .. " must not be mapped")
+            assert.is_false(mapped(lhs, "x"), lhs .. " must not be mapped in visual mode")
+        end
+    end)
+
+    it("accepts a key spec list, including a modes override", function()
+        rebind_copy({ "gy", { "gY", modes = "x" } })
+
+        assert.is_true(mapped("gy", "n"))
+        assert.is_true(mapped("gY", "x"))
+        assert.is_false(mapped("gY", "n"))
     end)
 
     it(":PiCopy copies a range as source text", function()

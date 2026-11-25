@@ -239,7 +239,7 @@ require("pi").setup({
 
 ## Keymaps
 
-`pi2.nvim` ships a deliberately small default keymap set (submission, abort, history recall, `<Tab>` block toggles, `gf` file jumps, diff-review keys) and leaves the rest to you. See [doc/keymaps.md](doc/keymaps.md) for the key-spec format, the stable `pi-chat-*` filetypes, and a complete example setup you can adapt.
+`pi2.nvim` ships a deliberately small default keymap set (submission, abort, history recall, `<Tab>` block toggles, `gf` file jumps, `gy` copy-as-source, diff-review keys) and leaves the rest to you. See [doc/keymaps.md](doc/keymaps.md) for the key-spec format, the stable `pi-chat-*` filetypes, and a complete example setup you can adapt.
 
 ## Commands
 

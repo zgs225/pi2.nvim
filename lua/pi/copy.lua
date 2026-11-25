@@ -2,8 +2,9 @@
 ---
 --- A yank is not just "put the text in a register": Vim also fills the
 --- numbered register `0`, honours a register prefix (`"ayy`), and mirrors the
---- system clipboard only when 'clipboard' says so. `:PiCopy` and `yy` have to
---- behave the same way or a user's `"ap`/`"0p` habits break.
+--- system clipboard only when 'clipboard' says so. `:PiCopy` and the copy key
+--- (`copy.key`, default `gy`) have to behave the same way or a user's
+--- `"ap`/`"0p` habits break.
 
 local M = {}
 
@@ -24,7 +25,8 @@ end
 ---
 --- - no register prefix: `"` and `0` are filled, plus `*` / `+` when 'clipboard'
 ---   contains `unnamed` / `unnamedplus`;
---- - a register prefix (`"ayy`): only that register is written;
+--- - a register prefix (`"agy` with the default key): only that register is
+---   written;
 --- - `opts.clipboard`: `+` as well (`:PiCopy!`), so a build without a clipboard
 ---   provider still keeps the text in `"` / `0` instead of silently dropping it.
 ---

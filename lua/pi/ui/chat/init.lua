@@ -686,14 +686,25 @@ function Chat:_set_keymaps()
         self:delete_pending_at_cursor()
     end, { buffer = hbuf, desc = "π: delete queued message under cursor" })
 
-    -- `yy` copies the message or block under the cursor as SOURCE text (raw
-    -- markdown, not the rendered rows). The "y" operator is deliberately left
-    -- alone: `y{motion}`, `V`+`y` and `"ay` keep their vim semantics, and
-    -- `:PiCopy` is the source-text path for an arbitrary visual range.
-    -- `[count]yy` copies that many consecutive messages.
-    vim.keymap.set("n", "yy", function()
-        self:copy_entry(vim.v.count1)
-    end, { buffer = hbuf, desc = "π: copy message under cursor" })
+    -- The copy key (`copy.key`, default `gy`) copies the message or block
+    -- under the cursor as SOURCE text (raw markdown, not the rendered rows),
+    -- and in visual mode the selected line range (`:PiCopy` semantics).
+    --
+    -- It is deliberately not `yy`: `yy` is the most reflexive motion in the
+    -- editor and must keep yanking the line that is on screen, otherwise the
+    -- key silently stops agreeing with the buffer (a whole message's markdown
+    -- instead of the visible row, `[count]yy` messages instead of lines). The
+    -- `y` operator is untouched as well, so `y{motion}`, `V`+`y` and `"ay` keep
+    -- their vim meaning. `[count]{key}` copies that many consecutive messages.
+    local copy_key = Config.options.copy and Config.options.copy.key
+    if copy_key ~= false then
+        local Keys = require("pi.keys")
+        for _, key in ipairs(Keys.resolve(copy_key)) do
+            Keys.bind(hbuf, key, function()
+                self:copy_under_cursor(vim.v.count1)
+            end, { modes = { "n", "x" }, desc = "π: copy message as source text" })
+        end
+    end
 
     -- Turn navigation, vim's section-motion pair: `]]` next turn (user
     -- message), `[[` previous one, counts included (`3]]`). Bound on the prompt
@@ -1075,9 +1086,30 @@ local function copy_label(target)
     return "Assistant message"
 end
 
---- Copy the message or block under the cursor as source text (`yy`).
+--- Copy what the cursor is on as source text (`copy.key`, default `gy`).
 ---
---- "Source" matters: the history buffer shows markdown tables as box art, the
+--- Normal mode copies one message/block (`[count]` consecutive messages). In
+--- visual mode the selected range is copied instead — source text when the
+--- range lines up with message boundaries, the rendered lines otherwise, the
+--- same contract as `:PiCopy` — and the selection ends like a real yank so a
+--- following `p` cannot paste over it.
+---@param count? integer consecutive messages to copy in normal mode (default 1)
+---@return boolean copied
+function Chat:copy_under_cursor(count)
+    local mode = vim.fn.mode()
+    if mode == "v" or mode == "V" or mode == "\22" then
+        local anchor = vim.fn.line("v")
+        local cursor = vim.fn.line(".")
+        vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "n", false)
+        return self:copy_range(math.min(anchor, cursor), math.max(anchor, cursor))
+    end
+    return self:copy_entry(count)
+end
+
+--- Copy the message or block under the cursor as source text.
+---
+--- The normal-mode half of `Chat:copy_under_cursor` (the bound key is
+--- `copy.key`, default `gy`). "Source" matters: the history buffer shows markdown tables as box art, the
 --- user body indented and a collapsed tool block as its tail, so re-reading the
 --- buffer would not reproduce what was written. The history keeps the original
 --- strings for exactly this call.
