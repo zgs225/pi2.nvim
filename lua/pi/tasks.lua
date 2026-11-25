@@ -530,7 +530,11 @@ function M.handle_event(ev, session_id, tab)
         -- payload's output path/pid/signal.
         merge_terminal_fields(task, d)
         task.status = d.kind
-        task.end_time = ts
+        -- A record's own exit time wins over the message timestamp: a snapshot or
+        -- a replayed record is stamped when it was WRITTEN, and reading that as
+        -- the exit time would show "0s ago" for a task that ended minutes ago.
+        local ended = non_null(d.endedAt)
+        task.end_time = type(ended) == "number" and ended > 0 and normalize_ts(ended) or ts
         -- Only the kinds that actually observed an exit may fabricate a code:
         -- `completed` without one defaulted to 0 and `failed` to 1, but an
         -- `unknown` event means nobody saw the exit — defaulting it would
@@ -562,7 +566,8 @@ function M.handle_event(ev, session_id, tab)
         -- a repeat stopped event is idempotent and must not add either.
         if task.status == "running" then
             task.status = "stopped"
-            task.end_time = ts
+            local ended = non_null(d.endedAt)
+            task.end_time = type(ended) == "number" and ended > 0 and normalize_ts(ended) or ts
             task.exit_code = non_null(d.exitCode)
             changed = true
         end
@@ -621,6 +626,59 @@ function M.absorb_message(msg, session_id, tab)
         end
     end
     return M.handle_event({ type = "pi2_bg_task", details = details, timestamp = msg.timestamp }, session_id, tab)
+end
+
+--- Fold one transcript ENTRY into the registry, in every shape the extension
+--- writes one: a `custom` entry (the panel records `pi.appendEntry` appends
+--- the moment a task changes state, and the once-per-session
+--- `pi2_bg_tasks_snapshot` digest a resumed frontend rebuilds its rows from),
+--- a `custom_message` entry, or a `get_messages` message (the `sendMessage`
+--- shape older sessions recorded). Callers that hold a whole transcript do not
+--- have to know which version wrote it.
+---
+--- The digest is a LIST of records: each one goes through the same fold, so an
+--- id-keyed registry cannot tell a snapshot record from a live transition.
+---@param entry table? decoded session entry or custom message
+---@param session_id string? owning session id (nil = unknown ownership)
+---@param tab integer? owning tabpage handle (panel display)
+---@return boolean consumed true when the entry was folded
+function M.absorb_entry(entry, session_id, tab)
+    if type(entry) ~= "table" then
+        return false
+    end
+    -- A message carries the same payload as a `custom_message` entry; only the
+    -- wrapper differs (`role` instead of `type`).
+    if entry.type == nil then
+        return M.absorb_message(entry, session_id, tab)
+    end
+    if entry.type == "custom_message" then
+        return M.absorb_message(entry, session_id, tab)
+    end
+    if entry.type ~= "custom" then
+        return false
+    end
+    if entry.customType == "pi2_bg_tasks_snapshot" then
+        local records = type(entry.data) == "table" and entry.data.tasks or nil
+        if type(records) ~= "table" then
+            return false
+        end
+        local consumed = false
+        for _, record in ipairs(records) do
+            if type(record) == "table" then
+                local folded = M.absorb_message({
+                    customType = "pi2_bg_task",
+                    data = record,
+                    timestamp = entry.timestamp,
+                }, session_id, tab)
+                consumed = consumed or folded
+            end
+        end
+        return consumed
+    end
+    if entry.customType ~= "pi2_bg_task" then
+        return false
+    end
+    return M.absorb_message(entry, session_id, tab)
 end
 
 --- Drop every task owned by the given session (tab closed / session

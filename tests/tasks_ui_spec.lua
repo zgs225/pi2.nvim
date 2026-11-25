@@ -1427,4 +1427,77 @@ describe("pi.tasks panel row for a held report", function()
         local line = Panel.format_line(row, 0, 120)
         assert.is_nil(line:find("held", 1, true))
     end)
+
+    describe("entry_appended (the panel's live channel)", function()
+        --- Feed one `entry_appended` RPC event for a fake session on `tab`. This
+        --- is the extension's `pi.appendEntry` path: core emits it the moment the
+        --- entry is written, where a non-steering custom message would wait for
+        --- the turn's next boundary.
+        ---@param tab pi.TabId
+        ---@param entry table
+        local function feed_entry(tab, entry)
+            Manager.handle_event({ id = "sess-entry", attached_tab = tab }, {
+                type = "entry_appended",
+                entry = entry,
+            })
+        end
+
+        it("folds a per-task panel entry without a message", function()
+            local tab = vim.api.nvim_get_current_tabpage()
+            feed_entry(tab, {
+                type = "custom",
+                customType = "pi2_bg_task",
+                data = { kind = "started", taskId = "entry1", command = "sleep 1", pid = 4242 },
+            })
+
+            local task = Tasks.get("entry1")
+            assert.is_not_nil(task)
+            assert.are.equal("running", task.status)
+            assert.are.equal("sleep 1", task.command)
+            assert.are.equal("sess-entry", task.session_id)
+        end)
+
+        it("auto-opens from a live started entry", function()
+            Config.options.tasks_panel.auto_open = true
+            local tab = vim.api.nvim_get_current_tabpage()
+            feed_entry(tab, {
+                type = "custom",
+                customType = "pi2_bg_task",
+                data = { kind = "started", taskId = "entry2", command = "make test" },
+            })
+            vim.wait(500, function()
+                return Panel.win(tab) ~= nil
+            end, 10)
+            assert.is_not_nil(Panel.win(tab), "a live started entry auto-opens the panel")
+            Panel.close()
+        end)
+
+        it("folds a snapshot digest but never pops the panel for it", function()
+            Config.options.tasks_panel.auto_open = true
+            local tab = vim.api.nvim_get_current_tabpage()
+            feed_entry(tab, {
+                type = "custom",
+                customType = "pi2_bg_tasks_snapshot",
+                data = {
+                    tasks = { { kind = "started", taskId = "snap1", command = "npm run dev" } },
+                },
+            })
+
+            local task = Tasks.get("snap1")
+            assert.is_not_nil(task, "the replay digest rebuilds the row")
+            assert.are.equal("npm run dev", task.command)
+            vim.wait(200)
+            assert.is_nil(Panel.win(tab), "replaying a session must not pop panels")
+        end)
+
+        it("ignores other extensions' entries", function()
+            local tab = vim.api.nvim_get_current_tabpage()
+            feed_entry(tab, {
+                type = "custom",
+                customType = "pi2-todo",
+                data = { todos = {} },
+            })
+            assert.are.equal(0, #Tasks.list("sess-entry"))
+        end)
+    end)
 end)

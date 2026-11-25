@@ -290,6 +290,19 @@ const ADOPT_POLL_MS = 1_000;
  */
 const CLAIM_TYPE = "pi2_bg_tasks_claim";
 const SHUTDOWN_TYPE = "pi2_bg_task_shutdown";
+/**
+ * Digest of the folded task table, appended ONCE per `session_start`.
+ *
+ * The frontend replays a resumed session from `get_messages`, and a custom
+ * ENTRY is not a message (`sessionEntryToContextMessages` drops it), so the
+ * per-task transitions `reportPanel` writes — the ones a live frontend receives
+ * as `entry_appended` — are invisible to a replay. The alternative was fetching
+ * the whole entry list over RPC for the handful of records that matter, which
+ * doubles the resume payload of a multi-megabyte session; this digest is one
+ * entry, at most `MAX_FOLDED_TASKS` records, and the frontend reads it as a live
+ * event. Records are id-keyed on both sides, so a repeated digest is idempotent.
+ */
+const SNAPSHOT_TYPE = "pi2_bg_tasks_snapshot";
 /** Model-facing output cap per call (matches pi's built-in bash). */
 const MAX_OUTPUT_BYTES = 50 * 1024;
 const MAX_OUTPUT_LINES = 2000;
@@ -429,6 +442,13 @@ interface BgTaskDetails {
 	signal?: string | null;
 	/** Set when the report is waiting for the next user turn, not for a wake. */
 	held?: HoldReason;
+	/**
+	 * When the process actually exited (epoch ms). The entry that carries this is
+	 * stamped when it is WRITTEN, but a record replayed from a transcript (the
+	 * startup fold, a snapshot) is not: without the real exit time a resumed row
+	 * would read "0s ago" for a task that ended hours ago.
+	 */
+	endedAt?: number;
 	/**
 	 * When the process actually started (epoch ms). The message that carries
 	 * this is stamped when it is SENT, so an adopted task — one whose process
@@ -649,12 +669,57 @@ function foldTaskEntries(
 		return record;
 	};
 
+	/**
+	 * Apply one panel record to the table. Shared by every shape a record arrives
+	 * in — the `custom` entry `reportPanel` appends, an item of the `SNAPSHOT_TYPE`
+	 * digest, the `details` of a ladder report message, and the OLDER
+	 * `custom_message` shape a `sendMessage` panel ping produced — so a transcript
+	 * written by either version folds the same way: a duplicate `started` never
+	 * un-finishes a settled task, and a terminal record is idempotent.
+	 */
+	const applyDetails = (details: BgTaskDetails | undefined, stamp: number): void => {
+		if (!details || typeof details.taskId !== "string" || details.taskId === "") {
+			return;
+		}
+		const record = ensure(details.taskId, details);
+		if (details.kind === "started") {
+			// A duplicate (or late) `started` for a settled task must not resurrect it.
+			if (record.completed) {
+				return;
+			}
+			const startedAt = typeof details.startedAt === "number" ? details.startedAt : stamp;
+			if (record.startedAt === undefined && Number.isFinite(startedAt)) {
+				record.startedAt = startedAt;
+			}
+			return;
+		}
+		record.completed = true;
+		// The record's own exit time wins over the entry timestamp: a snapshot (or a
+		// report delivered late) is stamped when it is WRITTEN, and reading that as
+		// the exit time would show "0s ago" for a task that ended minutes earlier.
+		const endedAt = typeof details.endedAt === "number" && details.endedAt > 0 ? details.endedAt : stamp;
+		record.endedAt = Number.isFinite(endedAt) ? endedAt : Date.now();
+		record.exitCode =
+			details.exitCode === undefined ? (details.kind === "completed" ? 0 : null) : details.exitCode;
+		record.signal = details.signal ?? null;
+		record.exitUnknown = record.exitCode === null && record.signal === null;
+	};
+
 	for (const entry of entries) {
 		if (entry.type === "custom") {
 			const data = entry.data as
-				| { taskId?: unknown; taskIds?: unknown; pid?: unknown; at?: unknown; sessionId?: unknown; signal?: unknown }
+				| { taskId?: unknown; taskIds?: unknown; pid?: unknown; at?: unknown; sessionId?: unknown; signal?: unknown; tasks?: unknown }
 				| undefined;
-			if (entry.customType === CLAIM_TYPE && typeof data?.taskId === "string") {
+			if (entry.customType === CUSTOM_TYPE) {
+				// The panel record `reportPanel` appends the moment a task changes
+				// state: the authoritative transition, and the same payload a live
+				// frontend receives as `entry_appended`.
+				applyDetails(data as BgTaskDetails | undefined, Date.parse(entry.timestamp));
+			} else if (entry.customType === SNAPSHOT_TYPE && Array.isArray(data?.tasks)) {
+				for (const item of data.tasks) {
+					applyDetails(item as BgTaskDetails, Date.parse(entry.timestamp));
+				}
+			} else if (entry.customType === CLAIM_TYPE && typeof data?.taskId === "string") {
 				claims.set(data.taskId, {
 					pid: typeof data.pid === "number" ? data.pid : undefined,
 					at: typeof data.at === "number" ? data.at : undefined,
@@ -679,29 +744,7 @@ function foldTaskEntries(
 		if (entry.type !== "custom_message" || entry.customType !== CUSTOM_TYPE) {
 			continue;
 		}
-		const details = entry.details as BgTaskDetails | undefined;
-		if (!details || typeof details.taskId !== "string" || details.taskId === "") {
-			continue;
-		}
-		const record = ensure(details.taskId, details);
-		const stamp = Date.parse(entry.timestamp);
-		if (details.kind === "started") {
-			// A duplicate (or late) `started` for a settled task must not resurrect it.
-			if (record.completed) {
-				continue;
-			}
-			const startedAt = typeof details.startedAt === "number" ? details.startedAt : stamp;
-			if (record.startedAt === undefined && Number.isFinite(startedAt)) {
-				record.startedAt = startedAt;
-			}
-			continue;
-		}
-		record.completed = true;
-		record.endedAt = Number.isFinite(stamp) ? stamp : Date.now();
-		record.exitCode =
-			details.exitCode === undefined ? (details.kind === "completed" ? 0 : null) : details.exitCode;
-		record.signal = details.signal ?? null;
-		record.exitUnknown = record.exitCode === null && record.signal === null;
+		applyDetails(entry.details as BgTaskDetails | undefined, Date.parse(entry.timestamp));
 	}
 
 	const records = order
@@ -1825,6 +1868,10 @@ export default function bgTasks(pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => {
 		reconcileSession(ctx);
+		// After the fold: a resumed session's rows are rebuilt by the frontend from
+		// this one digest (see `publishSnapshot`), because the per-task entries are
+		// not messages and so never reach a `get_messages` replay.
+		publishSnapshot();
 		// AFTER the fold, never before: an adopted task is in `tasks` now, so a
 		// running task's log survives even when it is older than the TTL. Once per
 		// process — a `/reload` re-evaluates this module, and the next process
@@ -2636,13 +2683,10 @@ export default function bgTasks(pi: ExtensionAPI) {
 	}
 
 	/**
-	 * Frontend notification (task panel): a display:false custom message sent
-	 * WITHOUT options, so core appends it instantly when idle and at the next
-	 * turn end while streaming. Never `triggerTurn` — this fires mid-tool and
-	 * must not interrupt the running turn; delivering it through followUp
-	 * instead would strand the panel on "running" for the rest of the run.
+	 * The panel's view of one task, in the vocabulary the frontend registry
+	 * folds (see `BgTaskDetails`).
 	 */
-	function reportPanel(task: BgTaskState): void {
+	function panelDetails(task: BgTaskState): BgTaskDetails {
 		// Same ordering as `reportStatus`, because the panel must not contradict it.
 		// The `exitUnknown` test sits AFTER the signal test and BEFORE the exit-code
 		// test: an adopted task that vanished with nobody watching has no exit code
@@ -2658,7 +2702,7 @@ export default function bgTasks(pi: ExtensionAPI) {
 						: task.exitCode === 0
 							? "completed"
 							: "failed";
-		const details = {
+		return {
 			kind,
 			taskId: task.taskId,
 			command: task.command,
@@ -2670,29 +2714,62 @@ export default function bgTasks(pi: ExtensionAPI) {
 			// A terminal report that is held for the next user turn says so, so the
 			// panel can distinguish "done" from "done and waiting for you".
 			held: task.held,
-			// The message is stamped when it is sent, so an adopted task would
+			// The entry is stamped when it is written, so an adopted task would
 			// otherwise render as if it had just started.
 			startedAt: task.startedAt,
+			endedAt: task.endedAt,
 			// Ownership: a session may only adopt/control tasks whose record names it.
 			sessionId: task.sessionId ?? currentSessionId,
-		} satisfies BgTaskDetails;
+		};
+	}
+
+	/**
+	 * Frontend notification (task panel): a custom ENTRY, not a message.
+	 *
+	 * `pi.sendMessage` cannot carry panel state in real time. While a run is
+	 * streaming, core queues a non-steering custom message and appends it at the
+	 * next turn boundary (`agent-session.ts`, `_pendingCustomMessages`) — because a
+	 * message inserted mid-turn would sit between an assistant tool call and its
+	 * result — so a task that exits during a long tool call kept reading "running"
+	 * until that turn ended: measured 7.4 s of lag for a `sleep 3` task followed by
+	 * a `sleep 10` in the same run, and N minutes for an N-minute command. An entry
+	 * is appended, and emitted as `entry_appended`, the moment it is written, and
+	 * entries never enter LLM context (they are not messages), which is exactly
+	 * what UI state needs. The message channel stays for the MODEL — the delivery
+	 * ladder below — so each channel carries what it is good at.
+	 */
+	function reportPanel(task: BgTaskState): void {
 		try {
-			// The panel ping is TUI-only in intent, but it is still a custom
-			// message; without `triggerTurn: false` the streaming default is
-			// `steer`, which opens a turn and made a mere status update look like
-			// autonomous work. (The model-visible delivery reports are a separate
-			// channel, see `deliverAtBoundary`/`flushPending`.)
-			pi.sendMessage(
-				{
-					customType: CUSTOM_TYPE,
-					content: `[Background task ${task.taskId} ${kind}]`,
-					display: false,
-					details,
-				},
-				{ triggerTurn: false },
-			);
+			pi.appendEntry(CUSTOM_TYPE, panelDetails(task));
 		} catch {
 			// Stale ctx after reload: the task still runs; only the panel misses it.
+		}
+	}
+
+	/**
+	 * Publish the folded table as ONE snapshot entry, once per `session_start`.
+	 *
+	 * A frontend that replays a resumed session rebuilds its task rows, and it
+	 * cannot see the per-task entries: `get_messages` projects session entries to
+	 * messages, and a `custom` entry is deliberately dropped there. This digest —
+	 * at most `MAX_FOLDED_TASKS` panel records — is the replay side of the panel
+	 * channel, and the frontend receives it as one `entry_appended` event, so no
+	 * extra RPC round trip (or whole-entry-list payload) is needed.
+	 *
+	 * Written after `reconcileSession`, so it describes the FOLDED table (adopted
+	 * tasks included). Panel side effects are absent on purpose: replaying a
+	 * session must not pop panels — the same rule the frontend's own transcript
+	 * fold follows.
+	 */
+	function publishSnapshot(): void {
+		const records = [...tasks.values()].slice(0, MAX_FOLDED_TASKS).map(panelDetails);
+		if (records.length === 0) {
+			return;
+		}
+		try {
+			pi.appendEntry(SNAPSHOT_TYPE, { tasks: records });
+		} catch {
+			// Stale ctx after reload: the next transition still reaches the panel.
 		}
 	}
 
@@ -2700,34 +2777,14 @@ export default function bgTasks(pi: ExtensionAPI) {
 	 * `details` for a report message. Only a single-task report carries them: the
 	 * frontend task registry keys on `details.taskId`, so a batched message with
 	 * one representative id would fabricate a task row. Panel state always comes
-	 * from the per-task `reportPanel` messages, so omitting them loses nothing.
+	 * from the per-task entries `reportPanel` appends, so omitting them loses
+	 * nothing.
 	 */
 	function batchDetails(batch: BgTaskState[]): { details?: BgTaskDetails } {
 		if (batch.length !== 1) {
 			return {};
 		}
-		const task = batch[0];
-		return {
-			details: {
-				// Mirrors `reportPanel`'s ordering: an exit nobody observed is `unknown`,
-				// never `failed`.
-				kind: task.spawnError
-					? "failed"
-					: task.signal !== null
-						? "stopped"
-						: task.exitUnknown
-							? "unknown"
-							: task.exitCode === 0
-								? "completed"
-								: "failed",
-				taskId: task.taskId,
-				command: task.command,
-				pid: task.pid,
-				outputFile: task.outputFile,
-				exitCode: task.exitCode,
-				signal: task.signal,
-			} satisfies BgTaskDetails,
-		};
+		return { details: panelDetails(batch[0]) };
 	}
 
 	// ------------------------------------------------------------------

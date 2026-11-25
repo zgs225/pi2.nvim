@@ -1066,29 +1066,28 @@ local function apply_bg_task_event(details, timestamp, session_id, tab)
     return consumed == true
 end
 
---- Fold a replayed `pi2_bg_task` custom message (role="custom") into the task
---- registry. A transcript entry is not conversation content, so it renders
---- nothing; but it is the only record of a task's command, and a resumed
---- session's history re-renders `wait_task` / `stop_task` / `task_input`
---- blocks from it. Without this fold those blocks fall back to a bare task id
---- (and the id of a task that already exited in a previous pi process is
---- exactly what a resumed session has in front of it). Panel side effects
---- (auto-open/auto-close) are deliberately skipped: replaying a session must
---- not pop panels.
----@param message table replayed message (role="custom")
+--- Fold a replayed `pi2_bg_task` record into the task registry. A transcript
+--- record is not conversation content, so it renders nothing; but it is the only
+--- place a task's command is written down, and a resumed session's history
+--- re-renders `wait_task` / `stop_task` / `task_input` blocks from it. Without
+--- this fold those blocks fall back to a bare task id (and the id of a task that
+--- already exited in a previous pi process is exactly what a resumed session has
+--- in front of it). `Tasks.absorb_entry` accepts every shape the extension has
+--- written — a `custom` entry (current), a `custom_message` entry, or a
+--- `get_messages` message (older sessions) — so one rule covers all of them.
+--- Panel side effects (auto-open/auto-close) are deliberately skipped: replaying a
+--- session must not pop panels.
+---@param record table replayed message or decoded entry
 ---@param session_id string? owning session id
 ---@param tab integer? owning tabpage handle
-local function replay_bg_task_message(message, session_id, tab)
-    if message.customType ~= "pi2_bg_task" then
-        return
-    end
-    -- The dedupe (a repeated `started` must not un-finish a tracked row) and
-    -- the registry call both live in Tasks.absorb_message, which the
-    -- sub-session viewer calls too: one rule for the parent's transcript and
-    -- a child's, so a task's command/state cannot differ between the two.
+local function fold_bg_task_record(record, session_id, tab)
+    -- The dedupe (a repeated `started` must not un-finish a tracked row) and the
+    -- registry call both live in pi.tasks, which the sub-session viewer calls
+    -- too: one rule for the parent's transcript and a child's, so a task's
+    -- command/state cannot differ between the two.
     -- A raise is downgraded to a warning, as in `apply_bg_task_event`: a
     -- replayed transcript must not break the rebuild it is part of.
-    local ok, err = pcall(Tasks.absorb_message, message, session_id, tab)
+    local ok, err = pcall(Tasks.absorb_entry, record, session_id, tab)
     if not ok then
         Notify.warn("Background task event failed: " .. tostring(err))
     end
@@ -1187,6 +1186,49 @@ local function handle_bg_task_message(message, session_id, tab)
             pcall(vim.api.nvim_set_current_win, cur)
         end
     end)
+end
+
+--- Fold one `pi2_bg_task` record from a replay, containing a failure.
+--- Consume a live `pi2_bg_tasks_snapshot` digest.
+---
+--- The extension appends it once per `session_start`, after folding the
+--- transcript, because the per-task records are `custom` ENTRIES: a
+--- `get_messages` replay projects entries to messages and drops them
+--- (`sessionEntryToContextMessages`), so without the digest a resumed session
+--- would rebuild no rows at all. Folded WITHOUT panel side effects — replaying a
+--- session must not pop a panel — the same rule `fold_bg_task_record` follows.
+---@param entry table decoded session entry (`type="custom"`)
+---@param session_id string? owning session id
+---@param tab integer? owning tabpage handle
+local function handle_bg_task_snapshot(entry, session_id, tab)
+    fold_bg_task_record(entry, session_id, tab)
+end
+
+--- Consume a live `entry_appended` event from the bg-tasks extension.
+---
+--- The panel's state channel is an extension ENTRY, not a message: core appends
+--- an entry (and emits `entry_appended`) the moment it is written, while a
+--- non-steering custom message is queued until the turn's next boundary — so a
+--- task that exited during a long tool call kept reading "running" until that
+--- turn ended. The model still hears about the exit through the delivery ladder
+--- (a `pi2_bg_task` message), which this branch deliberately does not touch.
+---@param entry table decoded session entry (`type="custom"`)
+---@param session_id string? owning session id
+---@param tab integer? owning tabpage handle
+local function handle_bg_task_entry(entry, session_id, tab)
+    if type(entry) ~= "table" or entry.type ~= "custom" then
+        return
+    end
+    if entry.customType == "pi2_bg_tasks_snapshot" then
+        handle_bg_task_snapshot(entry, session_id, tab)
+        return
+    end
+    if entry.customType ~= "pi2_bg_task" or type(entry.data) ~= "table" then
+        return
+    end
+    -- A transition is live: it goes through the same panel handling as the
+    -- message path, so auto-open/auto-close keep working.
+    handle_bg_task_message({ details = entry.data, timestamp = entry.timestamp }, session_id, tab)
 end
 
 ---@param session pi.Session
@@ -1827,6 +1869,20 @@ function M.handle_event(session, msg)
         if chat and not (type(message) == "table" and message.role == "custom") then
             chat:on_message_end(msg)
         end
+    elseif t == "entry_appended" then
+        -- Extension custom entries. bg-tasks owns two: the per-task panel
+        -- records (appended the moment a task changes state, so :PiTasks no
+        -- longer waits for a message the frontend only receives at the next turn
+        -- boundary) and the once-per-session snapshot a resumed session rebuilds
+        -- its rows from. Other extensions' entries (todo checkpoints, vision
+        -- usage) are acknowledged here and handled where they are produced.
+        local entry = msg.entry
+        if type(entry) == "table" and entry.type == "custom" then
+            if entry.customType == "pi2_bg_task" or entry.customType == "pi2_bg_tasks_snapshot" then
+                handle_bg_task_entry(entry, session.id, session.attached_tab)
+            end
+        end
+        return true
     elseif t == "tool_execution_update" then
         if chat then
             chat:on_tool_update(msg.toolName or "tool", msg.toolCallId, msg)
@@ -2515,7 +2571,7 @@ local function replay_messages(session, messages)
             -- delivery report, whose one dim UI-only line is rendered from the
             -- same content the resumed model sees. Every caller starts from a
             -- cleared buffer, so the lines are drawn once per report.
-            replay_bg_task_message(msg, session.id, session.attached_tab or session.tab)
+            fold_bg_task_record(msg, session.id, session.attached_tab or session.tab)
             render_bg_task_note(msg, session.chat)
         end
     end

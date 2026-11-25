@@ -982,3 +982,151 @@ describe("pi.tasks delete_log", function()
         assert.is_true(Tasks.get("gone").log_removed)
     end)
 end)
+
+-- The panel channel: the extension appends a `custom` ENTRY per state change
+-- (`pi.appendEntry`) instead of a custom MESSAGE, because core defers a
+-- non-steering message to the turn boundary while an entry is available
+-- immediately. `absorb_entry` is the one fold that accepts every shape the
+-- extension has written — the live entry, the once-per-session snapshot digest,
+-- a `custom_message` entry and a `get_messages` message.
+describe("pi.tasks absorb_entry", function()
+    --- Append the extension writes for one task (`reportPanel`).
+    ---@param data table
+    ---@param timestamp integer?
+    ---@return table
+    local function panel_entry(data, timestamp)
+        return { type = "custom", customType = "pi2_bg_task", data = data, timestamp = timestamp }
+    end
+
+    before_each(function()
+        Tasks._reset()
+    end)
+
+    it("folds the per-task panel entry the extension appends", function()
+        assert.is_true(Tasks.absorb_entry(
+            panel_entry({
+                kind = "started",
+                taskId = "b1a2b3c",
+                command = "npm run dev",
+                pid = 4242,
+                outputFile = "/tmp/pi-bash-b1a2b3c.log",
+            }, 1000),
+            "sess-A"
+        ))
+
+        local task = Tasks.get("b1a2b3c")
+        assert.is_not_nil(task)
+        assert.are.equal("running", task.status)
+        assert.are.equal("npm run dev", task.command)
+        assert.are.equal(4242, task.pid)
+        assert.are.equal("sess-A", task.session_id)
+    end)
+
+    it("folds a snapshot digest record by record", function()
+        local snapshot = {
+            type = "custom",
+            customType = "pi2_bg_tasks_snapshot",
+            timestamp = 5000,
+            data = {
+                tasks = {
+                    { kind = "started", taskId = "b111111", command = "sleep 900", pid = 17 },
+                    { kind = "completed", taskId = "b222222", command = "make test", exitCode = 0 },
+                },
+            },
+        }
+        assert.is_true(Tasks.absorb_entry(snapshot, "sess-A"))
+
+        assert.are.equal("running", Tasks.get("b111111").status)
+        assert.are.equal("sleep 900", Tasks.get("b111111").command)
+        assert.are.equal("completed", Tasks.get("b222222").status)
+        assert.are.equal(0, Tasks.get("b222222").exit_code)
+        assert.are.equal(2, #Tasks.list("sess-A"))
+    end)
+
+    it("stamps a terminal record with its own exit time, not the entry timestamp", function()
+        -- A snapshot is appended when the session starts, so every record in it is
+        -- stamped "now"; a row that read that as the exit time showed "0s ago" for
+        -- a task that ended ten seconds earlier.
+        local now_ms = os.time() * 1000
+        local started_at = now_ms - 10000
+        local ended_at = now_ms - 4000
+        Tasks.handle_event({
+            type = "pi2_bg_task",
+            timestamp = now_ms,
+            details = { kind = "started", taskId = "b333333", command = "sleep 6", startedAt = started_at },
+        }, "sess-A")
+        Tasks.absorb_entry({
+            type = "custom",
+            customType = "pi2_bg_tasks_snapshot",
+            timestamp = now_ms,
+            data = {
+                tasks = {
+                    {
+                        kind = "completed",
+                        taskId = "b333333",
+                        exitCode = 0,
+                        startedAt = started_at,
+                        endedAt = ended_at,
+                    },
+                },
+            },
+        }, "sess-A")
+
+        local task = Tasks.get("b333333")
+        assert.are.equal("completed", task.status)
+        -- Both stamps go through the same epoch -> uv-clock rebase, so the
+        -- duration survives exactly (a few ms of clock read skew aside).
+        local duration = task.end_time - task.start_time
+        assert.is_true(math.abs(duration - 6000) <= 50, "duration was " .. tostring(duration))
+    end)
+
+    it("does not un-finish a tracked row when a snapshot repeats `started`", function()
+        Tasks.handle_event(started_ev("b444444", 1000), "sess-A")
+        Tasks.handle_event(ev("completed", { taskId = "b444444", exitCode = 0 }, 2000), "sess-A")
+
+        assert.is_true(Tasks.absorb_entry({
+            type = "custom",
+            customType = "pi2_bg_tasks_snapshot",
+            timestamp = 9000,
+            data = { tasks = { { kind = "started", taskId = "b444444", command = "sleep 1" } } },
+        }, "sess-A"))
+
+        assert.are.equal("completed", Tasks.get("b444444").status)
+    end)
+
+    it("folds a get_messages custom message and a custom_message entry", function()
+        -- `entry_appended` carries entries, but a chat replay still delivers the
+        -- older message shape; both must fold through the same entry point.
+        assert.is_true(Tasks.absorb_entry({
+            role = "custom",
+            customType = "pi2_bg_task",
+            details = { kind = "started", taskId = "b555555", command = "watch ls" },
+            timestamp = 1000,
+        }, "sess-A"))
+        assert.is_true(Tasks.absorb_entry({
+            type = "custom_message",
+            customType = "pi2_bg_task",
+            details = { kind = "completed", taskId = "b555555", exitCode = 0 },
+            timestamp = 2000,
+        }, "sess-A"))
+
+        assert.are.equal("completed", Tasks.get("b555555").status)
+    end)
+
+    it("returns false for anything that is not a bg-tasks record", function()
+        assert.is_false(Tasks.absorb_entry(nil, "sess-A"))
+        assert.is_false(Tasks.absorb_entry({ type = "message", role = "user" }, "sess-A"))
+        -- Another extension's checkpoint is not a task record.
+        assert.is_false(Tasks.absorb_entry({
+            type = "custom",
+            customType = "pi2-todo",
+            data = { todos = {} },
+        }, "sess-A"))
+        -- A snapshot without a record list.
+        assert.is_false(Tasks.absorb_entry({
+            type = "custom",
+            customType = "pi2_bg_tasks_snapshot",
+            data = { tasks = "nope" },
+        }, "sess-A"))
+    end)
+end)

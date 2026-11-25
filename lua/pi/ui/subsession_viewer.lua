@@ -433,11 +433,14 @@ end
 --- The fold is a side effect of drawing a transcript, so a raise in the
 --- registry must never abort the replay (or the pre-pass) it is part of: it is
 --- downgraded to a warning, exactly as the parent's transcript fold does
---- (`sessions/manager.lua`, `replay_bg_task_message`).
+--- (`sessions/manager.lua`, `fold_bg_task_record`).
 ---@param record table? transcript entry carrying a pi2_bg_task payload
 ---@param session_id string? id of the viewed session (task-record ownership)
 local function fold_task_record(record, session_id)
-    local ok, err = pcall(Tasks.absorb_message, record, session_id, nil)
+    -- `absorb_entry` takes every shape a record has been written in: a `custom`
+    -- entry, a `custom_message` entry, the `pi2_bg_tasks_snapshot` digest, or a
+    -- `get_messages` message.
+    local ok, err = pcall(Tasks.absorb_entry, record, session_id, nil)
     if not ok then
         Notify.warn("Background task record failed: " .. tostring(err))
     end
@@ -764,13 +767,15 @@ end
 --- Fold a dormant session's background-task records into the task registry.
 ---
 --- The transcript replayed below holds only `role="message"` conversation
---- entries, while a task's lifecycle lives in `custom_message` entries (and, in
---- older files, `type="custom"` ones with the payload under `data`) — both
---- keyed by the task id. Folding them in a pre-pass, in file order, therefore
---- cannot mis-order them against the `wait_task` block that names the task,
---- and folding twice is harmless because the fold is id-keyed (a repeated
---- `started` is inert, a terminal record is idempotent). Panel side effects are
---- deliberately absent: opening a viewer must not pop panels.
+--- entries, while a task's lifecycle lives in `custom` entries — the per-task
+--- panel records `reportPanel` appends, the once-per-session
+--- `pi2_bg_tasks_snapshot` digest, and, in older files, `custom_message` entries
+--- (a `sendMessage` ping) — all keyed by the task id. Folding them in a pre-pass,
+--- in file order, therefore cannot mis-order them against the `wait_task` block
+--- that names the task, and folding twice is harmless because the fold is
+--- id-keyed (a repeated `started` is inert, a terminal record is idempotent).
+--- Panel side effects are deliberately absent: opening a viewer must not pop
+--- panels.
 ---@param entries table[] decoded JSONL entries, in file order
 ---@param session_id string? id of the viewed session (task-record ownership)
 local function fold_task_entries(entries, session_id)
