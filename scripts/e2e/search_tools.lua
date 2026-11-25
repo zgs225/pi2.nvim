@@ -39,8 +39,22 @@
 --   C8 the same in count mode: every call is filtered, not just the new ones
 --   C9 context lines survive the re-emit, and .git rows still do not
 --
--- Needs the pi binary and ripgrep (the grep cases run it for real); no account,
--- the provider is fake, so it runs in CI:
+-- Group D runs the extension's find override for real (a fresh child per case, a
+-- scripted `find` toolCall, assertions on the persisted toolResult). The fixture
+-- is one tree under `<tmp>/cwd`:
+--   tests/a_spec.lua, tests/b_spec.lua   (the rooted target, plus D4's mtimes)
+--   scripts/checks/fixtures/x/tests/c_spec.lua   (the nested `tests/` a loose pattern hits)
+--   other/d.lua, .git/hooks/e.lua (carries GITFIND99, so a --hidden fd run would find it)
+--   D1 pattern 'tests/**/*.lua' keeps both root files, drops the nested c_spec.lua
+--      (rooted default: only the pattern's literal leading directory survives)
+--   D2 the same with rooted=false keeps c_spec.lua: the control that proves D1 filtered
+--   D3 sort='path' returns the rows in ascending lexicographic order
+--   D4 sort='mtime' returns tests/b_spec.lua first and tests/a_spec.lua after it
+--   D5 a `.git`-only pattern (e.lua) reads as "No files found matching pattern"
+--   D6 limit=2 returns two rows plus the `2 results limit reached` notice
+--
+-- Needs the pi binary, ripgrep (the grep cases run it for real) and fd (the find
+-- cases run it for real); no account, the provider is fake, so it runs in CI:
 --
 --   make e2e-search-tools
 --   (nvim --headless -u tests/minimal_init.lua -l scripts/e2e/search_tools.lua)
@@ -717,6 +731,193 @@ local function run_grep_case(index, case, cwd)
 end
 
 -- ---------------------------------------------------------------------------
+-- Group D: the find fixture, and the six cases it proves.
+-- ---------------------------------------------------------------------------
+
+--- Group D's tree. `tests/` at the root is the rooted target; the nested
+--- `scripts/checks/fixtures/x/tests/` is what a `**/`-widened pattern also hits —
+--- D1 vs D2 is exactly the rooted filter. `.git/hooks/e.lua` carries a unique
+--- string so an fd run with `--hidden` would hand it over (D5 proves it does not).
+---@param dir string
+local function write_find_fixture(dir)
+    local files = {
+        ["tests/a_spec.lua"] = "-- a_spec\n",
+        ["tests/b_spec.lua"] = "-- b_spec\n",
+        ["scripts/checks/fixtures/x/tests/c_spec.lua"] = "-- c_spec\n",
+        ["other/d.lua"] = "-- d\n",
+        [".git/hooks/e.lua"] = "GITFIND99\n",
+    }
+    for name, text in pairs(files) do
+        vim.fn.mkdir(vim.fn.fnamemodify(dir .. "/" .. name, ":h"), "p")
+        local file = assert(io.open(dir .. "/" .. name, "w"))
+        file:write(text)
+        file:close()
+    end
+end
+
+--- Stamp `tests/a_spec.lua` an hour old and `tests/b_spec.lua` strictly newest, so
+--- D4's order comes from the fixture and never from write order.
+---@param dir string
+local function stamp_find_fixture(dir)
+    -- Sleep first: the stamp must be strictly newer than every write above, even
+    -- when the whole fixture lands inside one millisecond.
+    uv.sleep(10)
+    local sec, usec = uv.gettimeofday()
+    local now = sec + usec / 1e6
+    assert(uv.fs_utime(dir .. "/tests/a_spec.lua", now - 3600, now - 3600))
+    assert(uv.fs_utime(dir .. "/tests/b_spec.lua", now, now))
+end
+
+--- The path rows of a find toolResult: the trailing `[<n> results limit reached]`
+--- notice is cut off, so it can never be mistaken for a path.
+---@param text string
+---@return string[]
+local function find_rows(text)
+    local notice = text:find("\n\n[", 1, true)
+    local body = notice and text:sub(1, notice - 1) or text
+    local rows = {}
+    for line in body:gmatch("[^\n]+") do
+        rows[#rows + 1] = line
+    end
+    return rows
+end
+
+---@class FindCase
+---@field name string the case id (D1…D6), also its assertion prefix
+---@field what string one-line label for the [step] trace
+---@field args table the `find` toolCall arguments, spelled out verbatim
+---@field check fun(text: string, rows: string[]) assertions over the find toolResult text
+
+---@type FindCase[]
+local FIND_CASES = {
+    {
+        name = "D1",
+        what = "a path pattern is rooted at the search directory",
+        args = { pattern = "tests/**/*.lua" },
+        check = function(text, rows)
+            local listed = {}
+            for _, row in ipairs(rows) do
+                listed[row] = true
+            end
+            check(listed["tests/a_spec.lua"] == true, "D1 the rooted pattern keeps tests/a_spec.lua", { text = text })
+            check(listed["tests/b_spec.lua"] == true, "D1 the rooted pattern keeps tests/b_spec.lua", { text = text })
+            check(
+                listed["scripts/checks/fixtures/x/tests/c_spec.lua"] == nil,
+                "D1 the rooted pattern drops the nested tests/c_spec.lua",
+                { text = text }
+            )
+        end,
+    },
+    {
+        name = "D2",
+        what = "rooted=false keeps pi's wide (unrooted) reading",
+        args = { pattern = "tests/**/*.lua", rooted = false },
+        check = function(text, rows)
+            local listed = {}
+            for _, row in ipairs(rows) do
+                listed[row] = true
+            end
+            check(
+                listed["scripts/checks/fixtures/x/tests/c_spec.lua"] == true,
+                "D2 (control) rooted=false keeps the nested tests/c_spec.lua, so D1 really filtered it",
+                { text = text }
+            )
+            check(listed["tests/a_spec.lua"] == true, "D2 (control) rooted=false keeps tests/a_spec.lua", {
+                text = text,
+            })
+        end,
+    },
+    {
+        name = "D3",
+        what = "sort=path returns ascending lexicographic order",
+        args = { pattern = "**/*.lua", sort = "path" },
+        check = function(text, rows)
+            check(#rows >= 3, "D3 the fixture has more than two lua files to sort", { text = text })
+            for index = 2, #rows do
+                check(
+                    rows[index - 1] < rows[index],
+                    "D3 every row sorts before the next one (lexicographic ascending)",
+                    { previous = rows[index - 1], current = rows[index], text = text }
+                )
+            end
+        end,
+    },
+    {
+        name = "D4",
+        what = "sort=mtime returns the newest file first",
+        args = { pattern = "**/*.lua", sort = "mtime" },
+        check = function(text, rows)
+            check(rows[1] == "tests/b_spec.lua", "D4 the newest file (tests/b_spec.lua) comes first", {
+                first = rows[1],
+                text = text,
+            })
+            local old_index = nil
+            for index, row in ipairs(rows) do
+                if row == "tests/a_spec.lua" then
+                    old_index = index
+                end
+            end
+            check(
+                old_index ~= nil and old_index > 1,
+                "D4 the hour-old tests/a_spec.lua is listed after the newest file",
+                { index = old_index, text = text }
+            )
+        end,
+    },
+    {
+        name = "D5",
+        what = ".git is never searched",
+        args = { pattern = "e.lua" },
+        check = function(text)
+            check(
+                text == "No files found matching pattern",
+                "D5 a .git-only file reads as No files found matching pattern",
+                { text = text }
+            )
+        end,
+    },
+    {
+        name = "D6",
+        what = "limit truncates and says how to widen",
+        args = { pattern = "**/*.lua", limit = 2 },
+        check = function(text, rows)
+            check(#rows == 2, "D6 limit=2 returns exactly two rows", { rows = rows, text = text })
+            check(
+                text:find("2 results limit reached", 1, true) ~= nil,
+                "D6 a truncated result carries the builtin's limit notice",
+                { text = text }
+            )
+        end,
+    },
+}
+
+--- One case: a fresh child (own session dir), a scripted `find` toolCall on turn
+--- 1, plain text on turn 2, then the find toolResult read back out of the JSONL.
+---@param index integer
+---@param case FindCase
+---@param cwd string
+---@return string text
+local function run_find_case(index, case, cwd)
+    provider.script = function(turn)
+        if turn == 1 then
+            return tool_call_response("find", case.args)
+        end
+        return text_response("done")
+    end
+    local backend = run_group({
+        name = case.name,
+        session_dir = ("%s/sessions-d%d"):format(RUN_ROOT, index),
+        cwd = cwd,
+        with_extension = true,
+    })
+    local text = tool_result_text(backend.session_dir, "find")
+    stop_backend(backend)
+    check(text ~= nil, case.name .. " the transcript holds a find toolResult", case.args)
+    ---@cast text string
+    return text
+end
+
+-- ---------------------------------------------------------------------------
 
 local function cleanup()
     pcall(vim.fn.delete, RUN_ROOT, "rf")
@@ -727,6 +928,9 @@ local function main()
         return
     end
     if not deps.require_executable("rg", "ripgrep (rg) not found in PATH (the grep tool needs it)") then
+        return
+    end
+    if not deps.require_executable("fd", "fd not found in PATH (the find tool needs it)") then
         return
     end
     vim.fn.mkdir(RUN_ROOT, "p")
@@ -880,6 +1084,19 @@ local function main()
         case.check(text)
         step(case.name .. ": " .. case.what)
     end
+
+    -- ------------------------------------------------------------------
+    -- Group D: find really runs — rooted / sort / .git / limit against real fd.
+    -- ------------------------------------------------------------------
+    write_find_fixture(cwd)
+    stamp_find_fixture(cwd)
+    for index, case in ipairs(FIND_CASES) do
+        local text = run_find_case(index, case, cwd)
+        print(("[%s] %s"):format(case.name, (text:gsub("\n", " | "):sub(1, 120))))
+        case.check(text, find_rows(text))
+        step(case.name .. ": " .. case.what)
+    end
+    print("[D] find override: rooted/sort/.git/limit run against a real fd")
 
     print(
         (

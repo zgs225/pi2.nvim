@@ -8,7 +8,7 @@
  * output that says how to widen the search, structure-aware rendering in the
  * UI, no shell quoting traps).
  *
- * Three levers, because the model sees them all:
+ * Four levers, because the model sees them all:
  *
  *   1. before_agent_start — rewrite the prompt sections that are already
  *      assembled for this run: the bash entry in `sections.tools` gets a
@@ -31,10 +31,31 @@
  *      all stay pi's. Every call is post-processed (there is deliberately no
  *      fast path), because rows under `.git/` are always dropped: ripgrep runs
  *      with `--hidden` and would otherwise hand the model `.git/logs/HEAD`.
+ *
+ *   4. registerTool for `find` — the same shape. A path pattern reads as
+ *      "everything under tests/", but pi hands it to fd as a full-path glob, so
+ *      a nested `pkg/tests/a_spec.lua` is a legitimate hit for a pattern the
+ *      model meant as rooted. `rooted` (default true) keeps only the pattern's
+ *      literal leading directory; `sort` orders by path (default) or by
+ *      modification time, newest first. Paths under `.git/` are always dropped
+ *      (fd runs with `--hidden`).
  */
 
-import type { ExtensionAPI, GrepToolDetails, GrepToolInput, ToolDefinition } from "@earendil-works/pi-coding-agent";
-import { createBashToolDefinition, createGrepToolDefinition } from "@earendil-works/pi-coding-agent";
+import type {
+	ExtensionAPI,
+	FindToolDetails,
+	FindToolInput,
+	GrepToolDetails,
+	GrepToolInput,
+	ToolDefinition,
+} from "@earendil-works/pi-coding-agent";
+import {
+	createBashToolDefinition,
+	createFindToolDefinition,
+	createGrepToolDefinition,
+} from "@earendil-works/pi-coding-agent";
+import fs from "node:fs";
+import path from "node:path";
 import { Type, type TSchema } from "typebox";
 
 const BASH_SNIPPET = "Execute shell commands (build, test, git, network, pipelines)";
@@ -87,6 +108,22 @@ const GREP_NO_MATCHES = "No matches found";
 /** The builtin's own output budget; a rebuilt result must not grow past it. */
 const GREP_MAX_BYTES = 50 * 1024;
 const GREP_BYTES_NOTICE = "[50KB limit reached]";
+
+/** How a delegated find run is ordered before it reaches the model. */
+type FindSort = "path" | "mtime";
+
+/** The builtin find input plus this extension's two extra parameters. */
+type FindParams = FindToolInput & {
+	rooted?: boolean;
+	sort?: FindSort;
+};
+
+const FIND_DEFAULT_LIMIT = 1000;
+const FIND_MIN_INTERNAL_LIMIT = 200;
+const FIND_MAX_INTERNAL_LIMIT = 5000;
+const FIND_NO_FILES = "No files found matching pattern";
+const FIND_NOTE =
+	"Set rooted: false to match the pattern at any depth (the default anchors a relative path pattern at the search directory, as pi 1.6 does); sort: 'mtime' returns the newest files first; paths under .git are always skipped.";
 
 /** Escape a glob into a RegExp source: `**` crosses directories, `*`/`?` never do. */
 function globToSource(glob: string): string {
@@ -177,6 +214,74 @@ function capGrepBytes(text: string): string {
 	const lastNewline = head.lastIndexOf("\n");
 	const kept = lastNewline > 0 ? head.slice(0, lastNewline) : head;
 	return `${kept}\n\n${GREP_BYTES_NOTICE}`;
+}
+
+/**
+ * Drop the leading `./` segments, exactly as the builtin find does before it
+ * matches.
+ *
+ * @param pattern a find glob
+ */
+function normalizeFindPattern(pattern: string): string {
+	return pattern.replace(/^(?:\.\/)+/, "");
+}
+
+/**
+ * Widen a relative path pattern to the "matches at any depth" reading.
+ *
+ * pi 1.6.0 hands a relative path pattern to `fd --full-path` anchored at the
+ * search root, so `src/*.ts` never matches `pkg/src/a.ts` (pi #12066). That is
+ * the default this tool keeps (`rooted: true`); `rooted: false` asks for the
+ * wider reading, which is what the double-star prefix produces. Absolute
+ * patterns are handed to fd as given and are left alone.
+ *
+ * @param pattern a find glob
+ */
+function widenFindPattern(pattern: string): string {
+	const normalized = normalizeFindPattern(pattern);
+	if (path.isAbsolute(normalized) || !normalized.includes("/") || normalized.startsWith("**/")) {
+		return normalized;
+	}
+	return `**/${normalized}`;
+}
+
+/**
+ * The literal leading directory of a glob: everything before its first `*`, `?`,
+ * `[` or `{`, cut back to the last `/`. An empty result means "no rooting" — a
+ * pattern that starts with a wildcard (a leading double-star, or `*.ts`)
+ * searches everywhere by construction.
+ *
+ * @param pattern a find glob
+ */
+function findLiteralDir(pattern: string): string {
+	const normalized = normalizeFindPattern(pattern);
+	let end = normalized.length;
+	for (let index = 0; index < normalized.length; index++) {
+		if ("*?[{".includes(normalized[index])) {
+			end = index;
+			break;
+		}
+	}
+	const slash = normalized.slice(0, end).lastIndexOf("/");
+	const dir = slash >= 0 ? normalized.slice(0, slash).replace(/\/+$/, "") : "";
+	return dir === "." ? "" : dir;
+}
+
+/**
+ * Parse the builtin find's text output. Blank lines, `No files found matching
+ * pattern` and the trailing `[<n> results limit reached]` notice are dropped.
+ *
+ * @param text the builtin's `content[*].text`
+ */
+function parseFindOutput(text: string): string[] {
+	const paths: string[] = [];
+	for (const line of text.split("\n")) {
+		if (line === "" || line === FIND_NO_FILES || line.startsWith("[")) {
+			continue;
+		}
+		paths.push(line);
+	}
+	return paths;
 }
 
 const GUIDELINES: Record<string, string[]> = {
@@ -348,4 +453,93 @@ export default function searchTools(pi: ExtensionAPI) {
 		},
 	};
 	pi.registerTool(grep);
+
+	// ------------------------------------------------------------------
+	// find: the builtin, plus rooted / sort.
+	// ------------------------------------------------------------------
+	const builtinFind = createFindToolDefinition(process.cwd());
+
+	// Same runtime-exact spread as grep; the static shape is pinned for Static<>.
+	const findParameters = Type.Object({
+		...(builtinFind.parameters as unknown as { properties: Record<string, TSchema> }).properties,
+		rooted: Type.Optional(
+			Type.Boolean({
+				description:
+					"Anchor a relative path pattern at the search directory (default: true, as pi 1.6 does). Set false to match it at any depth, so 'tests/*.lua' also finds 'pkg/tests/a.lua'. Absolute patterns are always matched as given.",
+			}),
+		),
+		sort: Type.Optional(
+			Type.Union([Type.Literal("path"), Type.Literal("mtime")], {
+				description: "Result order: 'path' (default, lexicographic) or 'mtime' (newest first).",
+			}),
+		),
+	}) as unknown as Type.TObject<{
+		pattern: Type.TString;
+		path: Type.TOptional<Type.TString>;
+		limit: Type.TOptional<Type.TNumber>;
+		rooted: Type.TOptional<Type.TBoolean>;
+		sort: Type.TOptional<Type.TUnion<[Type.TLiteral<"path">, Type.TLiteral<"mtime">]>>;
+	}>;
+
+	const find: ToolDefinition<typeof findParameters, FindToolDetails | undefined> = {
+		...builtinFind,
+		description: `${builtinFind.description}\n\n${FIND_NOTE}`,
+		parameters: findParameters,
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
+			const raw = params as unknown as FindParams;
+			const rooted = raw.rooted !== false && !path.isAbsolute(normalizeFindPattern(raw.pattern));
+			const sort: FindSort = raw.sort ?? "path";
+			const limit = Math.max(1, Math.floor(raw.limit ?? FIND_DEFAULT_LIMIT));
+			// The post-filters below drop paths, so ask fd for a wider window than the
+			// caller's limit: a cap spent on dropped paths would under-report.
+			const internalLimit = Math.min(
+				FIND_MAX_INTERNAL_LIMIT,
+				Math.max(limit, FIND_MIN_INTERNAL_LIMIT) * 5,
+			);
+			const delegated: FindToolInput = { ...raw, pattern: widenFindPattern(raw.pattern), limit: internalLimit };
+			const result = await builtinFind.execute(toolCallId, delegated, signal, onUpdate, ctx);
+			const text = result.content?.map((block) => (block.type === "text" ? block.text : "")).join("\n") ?? "";
+
+			// `.git` first, always: fd runs with --hidden.
+			let paths = parseFindOutput(text).filter((filePath) => !isUnderGit(filePath));
+			if (rooted) {
+				const literalDir = findLiteralDir(raw.pattern);
+				if (literalDir !== "") {
+					paths = paths.filter((filePath) => filePath === literalDir || filePath.startsWith(`${literalDir}/`));
+				}
+			}
+
+			if (sort === "mtime") {
+				// Same cwd semantics as the builtin: the caller's wins, the factory's is the floor.
+				const root = ctx?.cwd ?? process.cwd();
+				const stamps = new Map<string, number>();
+				await Promise.all(
+					paths.map(async (filePath) => {
+						try {
+							const stat = await fs.promises.stat(path.join(root, filePath));
+							stamps.set(filePath, stat.mtimeMs);
+						} catch {
+							// A path fd listed but stat cannot see is not "newest": sort it last.
+							stamps.set(filePath, 0);
+						}
+					}),
+				);
+				paths.sort((a, b) => (stamps.get(b) ?? 0) - (stamps.get(a) ?? 0) || a.localeCompare(b));
+			} else {
+				paths.sort((a, b) => a.localeCompare(b));
+			}
+
+			const capped = paths.length > limit;
+			const kept = capped ? paths.slice(0, limit) : paths;
+			const body = kept.length > 0 ? kept.join("\n") : FIND_NO_FILES;
+			const withLimitNotice = capped
+				? `${body}\n\n[${limit} results limit reached. Use limit=${limit * 2} for more, or refine pattern]`
+				: body;
+			return {
+				content: [{ type: "text" as const, text: withLimitNotice }],
+				details: capped ? { ...(result.details ?? {}), resultLimitReached: limit } : result.details,
+			};
+		},
+	};
+	pi.registerTool(find);
 }
