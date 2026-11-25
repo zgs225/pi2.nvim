@@ -175,6 +175,11 @@ end
 --- Append the assigned worktree badge to a label: `worker 󰙅 wt-1`. Without a
 --- worktree the label is returned untouched, so a non-isolated dispatch renders
 --- exactly as before.
+---
+--- A checkout named exactly like the item (`{ create = { name = "auth-review" } }`
+--- on an item named `auth-review`, and the common case where the model reuses one
+--- word for both) keeps the glyph and drops the repeated name: the badge is there
+--- to say "isolated checkout", and printing the label twice says nothing.
 ---@param label string
 ---@param worktree any
 ---@return string
@@ -183,7 +188,73 @@ function M.with_worktree(label, worktree)
     if not wt then
         return label
     end
+    if wt == label then
+        return label .. " " .. WORKTREE_GLYPH
+    end
     return label .. " " .. WORKTREE_GLYPH .. " " .. wt
+end
+
+--- A one-line rendering of `text`: newlines and whitespace runs collapsed, ANSI
+--- stripped. Declared before the label helpers below because a Lua `local` is
+--- not hoisted: one declared after its first use is just nil there.
+--- Lazy require: pi.ui.chat.tools requires this module at load time.
+---@param text string
+---@return string
+local function flatten(text)
+    return require("pi.ui.chat.tools").flatten_line(text)
+end
+
+--- Characters of a reuse item's `message` kept as its fallback label.
+local MESSAGE_LABEL_CHARS = 40
+
+--- Characters of an error excerpt on a failed row, and of an inline row's status.
+local EXCERPT_CHARS = 80
+
+--- First `EXCERPT_CHARS` **characters** of `text`, flattened, `…` when cut.
+---
+--- Characters, not bytes: `error:sub(1, 80)` on a Chinese message cuts a UTF-8
+--- sequence in half and puts the raw fragment (`<e9><94>`) in the buffer, which
+--- is what a failed row used to render.
+---@param text string
+---@param max? integer characters to keep (default EXCERPT_CHARS)
+---@return string
+function M.excerpt(text, max)
+    max = max or EXCERPT_CHARS
+    local flat = flatten(text)
+    if vim.fn.strchars(flat) <= max then
+        return flat
+    end
+    return vim.fn.strcharpart(flat, 0, max) .. "…"
+end
+
+--- Label of a reuse item the manifest cannot name.
+---
+--- A `{ target, message }` item carries no name of its own: its label comes from
+--- the manifest row of the child it names. That row can be absent — the block is
+--- replayed on another machine, or from another workspace — and the id is then
+--- all that is left of the child's identity. A truncated UUID says nothing a
+--- human can read, and two unnamed rows are indistinguishable from each other,
+--- while the follow-up `message` is durable (it lives in the transcript, not in
+--- the manifest) and states what the row asked for. It is the fallback that
+--- survives a replay.
+---@param item? table
+---@return string?
+function M.reuse_message_label(item)
+    local message = type(item) == "table" and item.message or nil
+    if type(message) ~= "string" then
+        return nil
+    end
+    local text = vim.trim(flatten(message))
+    if text == "" then
+        return nil
+    end
+    if vim.fn.strchars(text) > MESSAGE_LABEL_CHARS then
+        text = vim.fn.strcharpart(text, 0, MESSAGE_LABEL_CHARS) .. "…"
+    end
+    if M.resolve_lang() == "zh" then
+        return ("子会话「%s」"):format(text)
+    end
+    return ('sub-session "%s"'):format(text)
 end
 
 --- Item label with the worktree explicitly given. `worktree` is the actual
@@ -191,10 +262,16 @@ end
 --- needs at most one manifest lookup for both its name and its checkout.
 --- `false` suppresses the badge entirely (an item that never started, whose
 --- request therefore never reached a child).
+---
+--- `fallback_item` is the same item in its other shape — the tool input when
+--- `item` is a result row, or the other way round — consulted only for the
+--- `message` a reuse item needs when the manifest cannot name its child: a batch
+--- snapshot normally echoes the message back, but an older record need not.
 ---@param item table
 ---@param worktree table|false?
+---@param fallback_item? table
 ---@return string
-local function label_with_worktree(item, worktree)
+local function label_with_worktree(item, worktree, fallback_item)
     local suppress = worktree == false
     if type(item.task) == "string" and item.task ~= "" then
         local label
@@ -213,7 +290,13 @@ local function label_with_worktree(item, worktree)
         local assigned = not suppress
                 and (worktree or (entry and type(entry.assigned_worktree) == "table" and entry.assigned_worktree))
             or nil
-        return M.with_worktree(name or M.short_id(item.target) or item.target, assigned)
+        -- Name (manifest) > message (survives a replay) > truncated id.
+        local label = name
+            or M.reuse_message_label(item)
+            or M.reuse_message_label(fallback_item)
+            or M.short_id(item.target)
+            or item.target
+        return M.with_worktree(label, assigned)
     end
     return "?"
 end
@@ -291,6 +374,15 @@ function M.item_config_label(item, cwd)
     return nil
 end
 
+--- Header detail of a **block** dispatch: the item count and nothing else.
+---
+--- The body already names every item and marks its state, so anything more on the
+--- header spends ink on what the next lines say: the block used to name its only
+--- item (a verbatim duplicate of the row below it) and, for a fan-out, break the
+--- count down into `新建×N · 续聊×M` — a distinction the rows make by themselves,
+--- and one that competed with the aggregate state the header already carries to
+--- the right of the name. A single item never renders a block at all (see
+--- M.dispatch_inline), which is why only `N 项` / `N items` remains.
 ---@param args? table
 ---@return string?
 function M.dispatch_header_detail(args)
@@ -298,42 +390,11 @@ function M.dispatch_header_detail(args)
         return nil
     end
     local n = #args.items
-    if n == 0 then
+    if n < 2 then
         return nil
     end
-    if n == 1 then
-        local label = M.item_label(args.items[1])
-        local cfg = M.item_config_label(args.items[1])
-        if cfg then
-            return label .. " (" .. cfg .. ")"
-        end
-        return label
-    end
-    local spawn_n, msg_n = 0, 0
-    for _, item in ipairs(args.items) do
-        if type(item.task) == "string" and item.task ~= "" then
-            spawn_n = spawn_n + 1
-        elseif type(item.target) == "string" then
-            msg_n = msg_n + 1
-        end
-    end
-    local lang = M.resolve_lang()
-    if lang == "zh" then
-        if spawn_n > 0 and msg_n > 0 then
-            return ("%d 项 (新建×%d · 续聊×%d)"):format(n, spawn_n, msg_n)
-        elseif spawn_n > 0 then
-            return ("%d 项 (新建×%d)"):format(n, spawn_n)
-        elseif msg_n > 0 then
-            return ("%d 项 (续聊×%d)"):format(n, msg_n)
-        end
+    if M.resolve_lang() == "zh" then
         return ("%d 项"):format(n)
-    end
-    if spawn_n > 0 and msg_n > 0 then
-        return ("%d items (spawn×%d · msg×%d)"):format(n, spawn_n, msg_n)
-    elseif spawn_n > 0 then
-        return ("%d items (spawn×%d)"):format(n, spawn_n)
-    elseif msg_n > 0 then
-        return ("%d items (msg×%d)"):format(n, msg_n)
     end
     return ("%d items"):format(n)
 end
@@ -344,8 +405,8 @@ end
 --- `details` is the parsed tool result once it has landed. A result item's
 --- `worktree` is authoritative and replaces the request badge, so an inline row
 --- whose item asked for a checkout (`{ create }`, or a borrow the child never
---- got) ends up naming the real one; without details — the running phase, or a
---- block replayed before any result — the request is what is drawn.
+--- got) ends up naming the real one; before the result lands — the row is always
+--- written first — the request is what is drawn.
 ---@param args? table tool input (`items`) of an inline dispatch
 ---@param details? table parsed tool result details
 ---@return string?
@@ -402,13 +463,6 @@ local DISPATCH_MARKS = {
     cancelled = { glyph = "⊘", hl = "PiToolError" },
 }
 
----@param text string
----@return string
-local function flatten(text)
-    -- Lazy require: pi.ui.chat.tools requires this module at load time.
-    return require("pi.ui.chat.tools").flatten_line(text)
-end
-
 --- Final body rows for a dispatch_subagents block: exactly one row per args
 --- item, carrying the tree prefix, the item's state mark, its label and (for
 --- failed/cancelled items) a truncated error excerpt. details.items and
@@ -455,17 +509,6 @@ function M.dispatch_rows(args, details)
             local spec = DISPATCH_MARKS[status] or DISPATCH_MARKS.queued
             mark, mark_hl = spec.glyph, spec.hl
         end
-        -- Only a ref the caller passed explicitly is shown; the default
-        -- 0-based index ref (normalize_item's fallback) is noise.
-        local ref ---@type string?
-        if
-            type(aitem) == "table"
-            and type(aitem.ref) == "string"
-            and aitem.ref ~= ""
-            and aitem.ref ~= tostring(i - 1)
-        then
-            ref = aitem.ref
-        end
         -- The result item is authoritative for the assignment (it is what the
         -- batch actually gave the child); the args item is the fallback for a
         -- block replayed before any result detail exists.
@@ -480,7 +523,22 @@ function M.dispatch_rows(args, details)
         if item_wt and (status == "failed" or status == "cancelled") and not started then
             item_wt = nil
         end
-        local label = (ref and ("[%s] "):format(ref) or "") .. label_with_worktree(base_item, item_wt)
+        -- An item's `ref` is a correlation id the model uses, never something a
+        -- human reads: it is deliberately not rendered (it used to be, once the
+        -- caller passed one explicitly, which put a second identity token next
+        -- to the label — `[explorer] explorer` when the two happened to match).
+        local label = label_with_worktree(base_item, item_wt, aitem)
+        -- The model / thinking level the item was dispatched with, when one was
+        -- stated at all: the running-phase tree shows it, so dropping it when
+        -- the mark lands made the same row lose content at the end of the run.
+        -- `aitem` is the fallback for a record that does not echo them back.
+        local cfg = M.item_config_label(base_item)
+        if not cfg and base_item ~= aitem then
+            cfg = M.item_config_label(aitem)
+        end
+        if cfg then
+            label = label .. " (" .. cfg .. ")"
+        end
         local excerpt ---@type string?
         if
             (status == "failed" or status == "cancelled")
@@ -488,7 +546,7 @@ function M.dispatch_rows(args, details)
             and type(ditem.error) == "string"
             and ditem.error ~= ""
         then
-            excerpt = flatten(ditem.error:sub(1, 80))
+            excerpt = M.excerpt(ditem.error)
         end
         rows[i] = {
             prefix = i == n and "  └─ " or "  ├─ ",
@@ -653,6 +711,43 @@ function M.batch_outcome_text(details)
     return base .. " · " .. join_labels(marks)
 end
 
+--- Status extra of the **inline** dispatch row: the batch counters plus, since
+--- there is exactly one item, the reason it did not come back cleanly.
+---
+--- An inline row has no body, so the counter alone (`1/1 失败`) would hide the
+--- only thing worth reading — the error the block used to append after the row as
+--- `— <excerpt>`. A tool-level rejection (a malformed item, an unknown target)
+--- arrives as a *normal* result carrying `details.error`, never as `isError`, so
+--- it is surfaced here as well: the row is otherwise completely silent about why
+--- nothing ran.
+---@param details? table
+---@return string?
+function M.dispatch_inline_status(details)
+    if type(details) ~= "table" then
+        return nil
+    end
+    if type(details.error) == "string" and details.error ~= "" then
+        return "! " .. M.excerpt(details.error)
+    end
+    local base = M.batch_status_text(details)
+    local items = details.items
+    if type(items) ~= "table" then
+        return base
+    end
+    for _, item in ipairs(items) do
+        if
+            type(item) == "table"
+            and (item.status == "failed" or item.status == "cancelled")
+            and type(item.error) == "string"
+            and item.error ~= ""
+        then
+            local excerpt = M.excerpt(item.error)
+            return base and (base .. " — " .. excerpt) or excerpt
+        end
+    end
+    return base
+end
+
 ---@param details? table
 ---@return string?
 function M.list_subagents_status(details)
@@ -787,17 +882,23 @@ function M.failure_report(name, reason)
     return ('[Sub-session "%s" failed] %s'):format(name, detail)
 end
 
---- dispatch uses inline rendering only for a single item with wait:true.
+--- dispatch renders inline for a **single** item, like `read` or `bash`: one row
+--- naming the item (plus the model / thinking level it was given) with a status
+--- at the end of the line.
+---
+--- `wait` no longer decides the shape. It only decides whether the tool call
+--- blocks, which the row cannot show anyway: the batch marks that would make a
+--- block worth its second line are drawn once, from the snapshot the call
+--- returns, so a single-item tree was a row repeating the header detail verbatim
+--- above a mark that never changed. A real fan-out keeps the block, where one
+--- row per item and its state mark are the whole point.
 ---@param args? table
 ---@return boolean
 function M.dispatch_inline(args)
     if type(args) ~= "table" or type(args.items) ~= "table" then
         return true
     end
-    if #args.items ~= 1 then
-        return false
-    end
-    return args.wait == true
+    return #args.items == 1
 end
 
 return M

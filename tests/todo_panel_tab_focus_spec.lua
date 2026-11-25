@@ -83,6 +83,10 @@ local Manager = require("pi.sessions.manager")
 local Config = require("pi.config")
 local Sidebar = require("pi.ui.sidebar")
 
+--- The :PiTodo title as the shared panel shell renders it (nf-md-format-list-
+--- checks + name), by codepoint so the PUA glyph never gets lost in edits.
+local TODO_TITLE = "  " .. vim.fn.nr2char(0xF0756, 1) .. " Todo"
+
 --- Build a details payload as the todo_write tool would produce.
 ---@param items { content: string, status: string }[]
 ---@return table
@@ -159,7 +163,7 @@ describe("todo panel per-session state", function()
 
             -- :PiTodo-equivalent: the panel shows the session's todos, not 'no todos'.
             local lines = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(win1), 0, -1, false)
-            assert.are.equal("  Todo · 1/1 completed", lines[2])
+            assert.are.equal(TODO_TITLE .. " · 1/1 completed", lines[2])
             assert.are.equal("  ✓ write module", lines[4])
 
             -- No cross-talk: re-entering the session-less tab opens nothing.

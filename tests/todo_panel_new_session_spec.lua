@@ -80,6 +80,10 @@ local Config = require("pi.config")
 local Sidebar = require("pi.ui.sidebar")
 local Manifest = require("pi.subsessions.manifest")
 
+--- The :PiTodo title as the shared panel shell renders it (nf-md-format-list-
+--- checks + name), by codepoint so the PUA glyph never gets lost in edits.
+local TODO_TITLE = "  " .. vim.fn.nr2char(0xF0756, 1) .. " Todo"
+
 local next_fake_id = 0
 
 --- Create a fake session with stubbed RPC and Chat for testing the real Manager paths.
@@ -283,7 +287,7 @@ describe("todo panel new_session and conversation replacement", function()
         assert.are.equal("manual", Todo._opened_by())
         local lines_before = panel_lines(tab)
         assert.is_truthy(lines_before)
-        assert.are.equal("  Todo · 1/3 completed", lines_before[2])
+        assert.are.equal(TODO_TITLE .. " · 1/3 completed", lines_before[2])
 
         -- /new executes
         Manager.new_session()
@@ -293,7 +297,8 @@ describe("todo panel new_session and conversation replacement", function()
         assert.are.equal("manual", Todo._opened_by())
         local lines_after = panel_lines(tab)
         assert.is_truthy(lines_after)
-        assert.are.equal("  no todos", lines_after[2], "placeholder is rendered instead of stale todos")
+        assert.are.equal(TODO_TITLE, lines_after[2], "the shell keeps its title after /new")
+        assert.are.equal("  no todos", lines_after[4], "placeholder is rendered instead of stale todos")
     end)
 
     it("auto_open_pending is cleared: a stale marker for that tab does not re-open the panel", function()
@@ -364,7 +369,7 @@ describe("todo panel new_session and conversation replacement", function()
         assert.are.equal(1, Todo.current().total)
         local lines = panel_lines(tab)
         assert.is_truthy(lines)
-        assert.are.equal("  Todo · 0/1 completed", lines[2])
+        assert.are.equal(TODO_TITLE .. " · 0/1 completed", lines[2])
         assert.are.equal("  ◐ CONV-B: new task", lines[4])
     end)
 

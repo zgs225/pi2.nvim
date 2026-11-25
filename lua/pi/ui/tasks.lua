@@ -2,11 +2,12 @@
 ---
 --- One shared scratch buffer lists the tasks known to pi.tasks (running
 --- first, then newest terminal), one row per task: status dot, spinner,
---- command summary and an `id · duration` subtitle. The buffer opens with a
---- blank spacer, a dimmed `  Tasks · <n> running · <m> finished` title and a
---- blank spacer, and every row renders with a 2-space indent — the todo
---- panel's layout (lua/pi/todo/init.lua `panel_lines`); an empty list shows
---- a dim `  no tasks` placeholder instead of the rows. By default the
+--- command summary and an `id · duration` subtitle. The container is the
+--- shared panel shell (lua/pi/ui/panel_header.lua): a blank spacer, the dimmed
+--- `  <icon> Tasks · <n> running · <m> finished` title, a blank spacer, then
+--- every row with the same 2-space indent; an empty list keeps the bare
+--- `Tasks` title and shows a dim `  no tasks` placeholder instead of the rows.
+--- By default the
 --- list is scoped to the current tab's session; `A` toggles the all-tasks
 --- view, where rows owned by another session render dimmed with a `#tab`
 --- prefix in the subtitle. The buffer is global: each tab that opens the
@@ -28,6 +29,7 @@ local M = {}
 local Config = require("pi.config")
 local Ft = require("pi.filetypes")
 local Highlights = require("pi.ui.highlights")
+local PanelHeader = require("pi.ui.panel_header")
 local Workspace = require("pi.ui.workspace")
 local Tasks = require("pi.tasks")
 
@@ -48,10 +50,20 @@ local buf = nil
 ---@type table<pi.TabId, integer> list window per tab
 local wins = {}
 
---- Buffer lines rendered above the task rows: blank spacer, title, blank
---- spacer (the todo panel's spacer/header/spacer shape). Task row `i` lives
---- at buffer line `i + HEADER_LINES`; the header lines never enter `rows`.
-local HEADER_LINES = 3
+--- The panel's header shell (pi.ui.panel_header): 2-space indent, icon, name
+--- and the running/finished metric — the same container as :PiTodo and
+--- :PiCompactions. Only the metric changes per render.
+---@type pi.PanelSpec
+local TITLE_SPEC = {
+    name = "Tasks",
+    noun = "tasks",
+    -- nf-dev-terminal, by codepoint so the PUA glyph never gets lost in edits
+    icon = vim.fn.nr2char(0xE795, 1),
+}
+
+--- Task row `i` lives at buffer line `i + HEADER_LINES`; the header lines
+--- never enter `rows`.
+local HEADER_LINES = PanelHeader.header_lines(TITLE_SPEC)
 
 ---@type pi.TasksRow[] rows of the last render (index == row order; the
 --- buffer line of row i is i + HEADER_LINES)
@@ -192,7 +204,8 @@ end
 ---@param now_ms integer? reference time for relative ages (defaults to uv.now())
 ---@param current_session_id string? owning session of the panel's tab; nil disables foreign-row rendering
 ---@return string line
----@return integer[][] chunks
+---@return [integer, integer, string][] chunks 0-based byte ranges, relative
+---   to `line` (the shell indent is applied by pi.ui.panel_header)
 function M.format_line(row, tick, width, now_ms, current_session_id)
     width = width or 80
     now_ms = now_ms or uv.now()
@@ -451,41 +464,39 @@ function M._render()
             finished = finished + 1
         end
     end
-    local title = "  Tasks"
+    -- No rows means nothing to count: the shared shell then renders the bare
+    -- name and the `no tasks` placeholder instead of a `0 running · 0 finished`.
+    local metric = nil
     if #rows > 0 then
-        title = title .. (" · %d running · %d finished"):format(running, finished)
+        metric = ("%d running · %d finished"):format(running, finished)
     end
 
-    ---@type string[]
-    local lines = { "", title, "" }
-    -- Loosely typed: each entry is a { col_start, col_end, hl_group } triple,
-    -- whose string hl_group the `integer[][]` shape of format_line() does not
-    -- express (assigning literals to it trips the type checker).
-    ---@type table<integer, any[]>
-    local line_chunks = {
-        [2] = { { 0, #title, "PiTasksListDotDim" } },
-    }
-    for i, row in ipairs(rows) do
-        local width = 80
-        for _, win in pairs(wins) do
-            if vim.api.nvim_win_is_valid(win) then
-                width = math.max(width, vim.api.nvim_win_get_width(win))
-            end
+    -- Rows are formatted against the widest visible list window; the summary
+    -- budget inside format_line subtracts the shell indent.
+    local width = 80
+    for _, win in pairs(wins) do
+        if vim.api.nvim_win_is_valid(win) then
+            width = math.max(width, vim.api.nvim_win_get_width(win))
         end
-        local line, chunks = M.format_line(row, blink_tick + spinner_tick, width, nil, session_id)
-        -- 2-space indent: shift every byte column right by the indent width.
-        local indented = {}
-        for _, chunk in ipairs(chunks) do
-            indented[#indented + 1] = { chunk[1] + 2, chunk[2] + 2, chunk[3] }
-        end
-        lines[#lines + 1] = "  " .. line
-        line_chunks[#lines] = indented
-        row.marker_col = indented[1][1] + 1
-        row.marker_len = indented[1][2] - indented[1][1]
     end
-    if #rows == 0 then
-        lines[#lines + 1] = "  no tasks"
-        line_chunks[#lines] = { { 0, #"  no tasks", "PiTasksListDotDim" } }
+    ---@type pi.PanelRow[]
+    local row_specs = {}
+    for i, row in ipairs(rows) do
+        local line, chunks = M.format_line(row, blink_tick + spinner_tick, width, nil, session_id)
+        row_specs[i] = { line = line, chunks = chunks }
+    end
+
+    local header = PanelHeader.build(vim.tbl_extend("force", TITLE_SPEC, { metric = metric }), row_specs)
+    local lines = header.lines
+    local line_chunks = header.chunks
+    -- The current-row marker sits on the status dot: the first chunk of the
+    -- row's already-indented line.
+    for i, row in ipairs(rows) do
+        local chunks = line_chunks[header.header_lines + i]
+        if chunks and chunks[1] then
+            row.marker_col = chunks[1][1] + 1
+            row.marker_len = chunks[1][2] - chunks[1][1]
+        end
     end
 
     vim.bo[buf].modifiable = true

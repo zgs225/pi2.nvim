@@ -78,6 +78,11 @@ local Config = require("pi.config")
 local Manager = require("pi.sessions.manager")
 local Sidebar = require("pi.ui.sidebar")
 
+--- The :PiTodo title as the shared panel shell renders it (the nf-md-format-
+--- list-checks icon plus the panel name), by codepoint so the PUA glyph never
+--- gets lost in edits. The progress metric is appended per render.
+local TODO_TITLE = "  " .. vim.fn.nr2char(0xF0756, 1) .. " Todo"
+
 --- Chat-less fake sessions bound to tabs, so the todo panel's per-session
 --- state has a routing session and its viewed-session resolution
 --- (manager.get_for_tab) finds it. Keyed by tab handle: each tab gets its own
@@ -286,8 +291,12 @@ describe("todo panel", function()
             assert.is_true(Todo.is_open())
             local bufnr = vim.api.nvim_win_get_buf(vim.api.nvim_get_current_win())
             local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+            -- The shared shell keeps the title on an empty list; the
+            -- placeholder sits below the header block.
             assert.are.equal("", lines[1])
-            assert.are.equal("  no todos", lines[2])
+            assert.are.equal(TODO_TITLE, lines[2])
+            assert.are.equal("", lines[3])
+            assert.are.equal("  no todos", lines[4])
         end)
 
         it("close is a safe no-op when nothing is open", function()
@@ -317,7 +326,7 @@ describe("todo panel", function()
             local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
             -- DESIGN.md padding: blank spacer, calm header, blank, indented rows.
             assert.are.equal("", lines[1])
-            assert.are.equal("  Todo · 1/3 completed", lines[2])
+            assert.are.equal(TODO_TITLE .. " · 1/3 completed", lines[2])
             assert.are.equal("", lines[3])
             assert.are.equal("  ✓ write code", lines[4])
             assert.are.equal("  ◐ run tests", lines[5])
@@ -333,7 +342,7 @@ describe("todo panel", function()
             end)
             local bufnr = vim.api.nvim_win_get_buf(vim.api.nvim_get_current_win())
             local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
-            assert.are.equal("  Todo · 0/1 completed", lines[2])
+            assert.are.equal(TODO_TITLE .. " · 0/1 completed", lines[2])
             assert.are.equal("  ○ only item", lines[4])
         end)
     end)
@@ -556,13 +565,13 @@ describe("todo panel", function()
             -- Distinct buffers, each showing its own tab's list.
             assert.are_not.equal(buf1, buf2)
             local lines2 = vim.api.nvim_buf_get_lines(buf2, 0, -1, false)
-            assert.are.equal("  Todo · 0/1 completed", lines2[2])
+            assert.are.equal(TODO_TITLE .. " · 0/1 completed", lines2[2])
             assert.are.equal("  ○ tab two", lines2[4])
 
             -- Back on tab 1: its panel buffer still shows tab one's list.
             vim.api.nvim_set_current_tabpage(tab1)
             local lines1 = vim.api.nvim_buf_get_lines(buf1, 0, -1, false)
-            assert.are.equal("  Todo · 0/1 completed", lines1[2])
+            assert.are.equal(TODO_TITLE .. " · 0/1 completed", lines1[2])
             assert.are.equal("  ○ tab one", lines1[4])
 
             -- Cleanup: drop both panels, then close the extra tab.
@@ -639,7 +648,9 @@ describe("todo panel", function()
             end)
             assert.is_true(Todo.is_open())
             local bufnr = vim.api.nvim_win_get_buf(vim.api.nvim_get_current_win())
-            assert.are.equal("  no todos", vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)[2])
+            local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+            assert.are.equal(TODO_TITLE, lines[2], "the title survives the empty list")
+            assert.are.equal("  no todos", lines[4])
         end)
     end)
 
@@ -665,7 +676,8 @@ describe("todo panel", function()
             -- Panel window remains (explicitly opened), but content shows the placeholder.
             local bufnr = vim.api.nvim_win_get_buf(vim.api.nvim_get_current_win())
             local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
-            assert.are.equal("  no todos", lines[2])
+            assert.are.equal(TODO_TITLE, lines[2], "the title survives the empty list")
+            assert.are.equal("  no todos", lines[4])
         end)
     end)
 

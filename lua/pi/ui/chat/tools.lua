@@ -1935,7 +1935,7 @@ local renderers = {
             end
             return SubToolUi.dispatch_header_detail(args)
         end,
-        -- A single item with `wait: true` stays inline, so its row is written
+        -- A single item is inline whatever `wait` says, so its row is written
         -- before the batch result exists and `inline_text` can only show the
         -- item's *request* (a borrowed path, or `+new` / a requested name for
         -- `worktree.create`, which has no checkout yet). Once the result lands
@@ -1946,28 +1946,29 @@ local renderers = {
             end
             return SubToolUi.dispatch_inline_detail(args, SubToolUi.result_details(result))
         end,
+        -- Counters, plus the one item's error excerpt: an inline row has no body
+        -- to carry why a dispatch did not run.
         inline_status = function(result)
-            return SubToolUi.batch_status_text(SubToolUi.result_details(result))
+            return SubToolUi.dispatch_inline_status(SubToolUi.result_details(result))
         end,
-        -- No input_visible/output_visible thresholds: the item task tree (on_start,
-        -- rewritten in place to one status row per item on_end) is the signal
-        -- content (edit-like), so the block stays fully expanded by default in
-        -- every phase (running / completed wait:true / completed wait:false /
-        -- replay). The only remaining fold trigger is the generic window-width
-        -- overflow truncation in history.lua.
+        -- No input_visible/output_visible thresholds: the item status rows
+        -- (on_start, rewritten in place on_end) are the signal content
+        -- (edit-like), so the block stays fully expanded by default in every
+        -- phase (running / completed wait:true / completed wait:false / replay).
+        -- The only remaining fold trigger is the generic window-width overflow
+        -- truncation in history.lua.
         on_start = function(history, args)
             if SubToolUi.dispatch_inline(args) or type(args) ~= "table" or type(args.items) ~= "table" then
                 return
             end
             for i, item in ipairs(args.items) do
                 local prefix = i == #args.items and "  └─ " or "  ├─ "
-                local ref = type(item.ref) == "string" and item.ref ~= "" and ("[%s] "):format(item.ref) or ""
                 local label = SubToolUi.item_label(item)
                 local cfg = SubToolUi.item_config_label(item)
                 if cfg then
                     label = label .. " (" .. cfg .. ")"
                 end
-                render_body_line(history, prefix .. ref .. label)
+                render_body_line(history, prefix .. label)
             end
         end,
         on_end = function(history, args, result, is_error, insert_at)
@@ -2032,8 +2033,7 @@ local renderers = {
                 err_text = extract_result_text(result)
             end
             if err_text and err_text ~= "" then
-                insert_at =
-                    render_body_line(history, "  ! " .. M.flatten_line(err_text:sub(1, 80)), "PiToolError", insert_at)
+                insert_at = render_body_line(history, "  ! " .. SubToolUi.excerpt(err_text), "PiToolError", insert_at)
             end
             return insert_at
         end,

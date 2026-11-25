@@ -48,10 +48,11 @@ describe("subagent tool_ui", function()
         assert.are.equal("…eeeeee", SubToolUi.short_id(id))
     end)
 
-    it("dispatch is inline only for single item with wait:true", function()
+    it("dispatch is inline for a single item, block for a fan-out", function()
         assert.is_true(SubToolUi.dispatch_inline({ items = { { task = "x" } }, wait = true }))
+        assert.is_true(SubToolUi.dispatch_inline({ items = { { task = "x" } }, wait = false }))
         assert.is_false(SubToolUi.dispatch_inline({ items = { { task = "x" }, { task = "y" } }, wait = true }))
-        assert.is_false(SubToolUi.dispatch_inline({ items = { { task = "x" } }, wait = false }))
+        assert.is_false(SubToolUi.dispatch_inline({ items = { { task = "x" }, { task = "y" } }, wait = false }))
     end)
 
     it("formats completion reports in zh and en", function()
@@ -197,6 +198,7 @@ describe("subagent tool_ui", function()
     it("renderer uses dynamic inline for dispatch", function()
         local renderer = Tools.get_renderer("dispatch_subagents")
         assert.is_true(Tools.is_inline(renderer, { items = { { task = "a" } }, wait = true }))
+        assert.is_true(Tools.is_inline(renderer, { items = { { task = "a" } }, wait = false }))
         assert.is_false(Tools.is_inline(renderer, { items = { { task = "a" }, { task = "b" } }, wait = true }))
     end)
 
@@ -268,8 +270,10 @@ describe("subagent tool_ui", function()
             assert.are.equal("claude-3-5-haiku · think: medium", label)
         end)
 
-        it("formats dispatch_header_detail with config for single item", function()
-            local detail = SubToolUi.dispatch_header_detail({
+        it("keeps the header detail free of item detail for a single item", function()
+            -- A single item is rendered inline (dispatch_inline), so the block
+            -- header never names it: the name belongs on the row, once.
+            assert.is_nil(SubToolUi.dispatch_header_detail({
                 items = {
                     {
                         task = "analyze",
@@ -278,8 +282,28 @@ describe("subagent tool_ui", function()
                         thinking_level = "high",
                     },
                 },
-            })
-            assert.are.equal("analyzer (claude-3-7-sonnet · think: high)", detail)
+            }))
+        end)
+
+        it("keeps the item config on the status rows once the marks land", function()
+            local args = {
+                items = {
+                    { task = "first task", name = "task-one", model = "gpt-4o", thinking_level = "high" },
+                    { task = "second task", name = "task-two" },
+                },
+                wait = false,
+            }
+            local details = {
+                status = "completed",
+                items = {
+                    { status = "ok", task = "first task", name = "task-one" },
+                    { status = "ok", task = "second task", name = "task-two" },
+                },
+            }
+            local rows = SubToolUi.dispatch_rows(args, details)
+            -- The running-phase tree shows it, so the final row must not lose it.
+            assert.are.equal("task-one (gpt-4o · think: high)", rows[1].label)
+            assert.are.equal("task-two", rows[2].label)
         end)
 
         it("inline_text includes model and thinking level for single item", function()
@@ -329,19 +353,24 @@ describe("subagent tool_ui", function()
             local lines = vim.api.nvim_buf_get_lines(h:buf(), 0, -1, false)
             local t1_found, t2_found, t3_found = false, false, false
             for _, line in ipairs(lines) do
-                if line:find("[t1]", 1, true) and line:find("claude-3-7-sonnet · think: high", 1, true) then
+                if line:find("task-one", 1, true) and line:find("claude-3-7-sonnet · think: high", 1, true) then
                     t1_found = true
                 end
-                if line:find("[t2]", 1, true) and line:find("(gpt-4o)", 1, true) then
+                if line:find("task-two", 1, true) and line:find("(gpt-4o)", 1, true) then
                     t2_found = true
                 end
-                if line:find("[t3]", 1, true) and line:find("task-three", 1, true) and not line:find("%(") then
+                if line:find("task-three", 1, true) and not line:find("%(") then
                     t3_found = true
                 end
             end
             assert.is_true(t1_found, "line for t1 should include model and thinking level")
             assert.is_true(t2_found, "line for t2 should include model alone")
             assert.is_true(t3_found, "line for t3 without config should not have parenthesis")
+            -- The item `ref` is a model-side correlation id and is never drawn.
+            for _, line in ipairs(lines) do
+                assert.is_nil(line:find("[t1]", 1, true), "refs must not render: " .. line)
+                assert.is_nil(line:find("[t2]", 1, true), "refs must not render: " .. line)
+            end
         end)
     end)
 end)

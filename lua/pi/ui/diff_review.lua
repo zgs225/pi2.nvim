@@ -745,6 +745,9 @@ local function find_editor_win()
         [Ft.attachments] = true,
         [Ft.dialog] = true,
         [Ft.sessions] = true,
+        [Ft.todo] = true,
+        ["pi-tasks"] = true,
+        ["pi-compactions"] = true,
         [Ft.diff_review] = true,
     }
     for _, w in ipairs(vim.api.nvim_tabpage_list_wins(0)) do

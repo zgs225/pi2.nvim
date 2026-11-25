@@ -5022,6 +5022,9 @@ local PI_PANEL_FILETYPES = {
     [Ft.attachments] = true,
     [Ft.dialog] = true,
     [Ft.sessions] = true,
+    [Ft.todo] = true,
+    ["pi-tasks"] = true,
+    ["pi-compactions"] = true,
 }
 
 --- Open the file referenced on the history line under the cursor in an editor

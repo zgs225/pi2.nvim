@@ -12,6 +12,10 @@ local Sidebar = require("pi.ui.sidebar")
 local Config = require("pi.config")
 local Manager = require("pi.sessions.manager")
 
+--- The shared panel shell renders the panel's tool icon before its name
+--- (nf-dev-terminal here), by codepoint so the PUA glyph never gets lost.
+local ICON = vim.fn.nr2char(0xE795, 1)
+
 --- Windows created by a test to stand in for another panel's window;
 --- closed in after_each so a failed assertion can't leak a stray split.
 ---@type integer[]
@@ -366,8 +370,8 @@ describe("tasks panel UI", function()
             Panel.open()
             local lines = panel_lines()
             assert.are.equal("", lines[1], "leading blank spacer")
-            assert.are.equal("  Tasks · 2 running · 2 finished", lines[2])
-            assert.is_truthy(hl_on_line(2).PiTasksListDotDim, "title renders dimmed")
+            assert.are.equal("  " .. ICON .. " Tasks · 2 running · 2 finished", lines[2])
+            assert.is_truthy(hl_on_line(2).PiPanelTitle, "title renders dimmed")
             assert.are.equal("", lines[3], "blank spacer between title and rows")
             -- Rows start after the 3-line header and carry the 2-space indent.
             assert.are.equal("  ", lines[4]:sub(1, 2), "first row indented by 2")
@@ -380,7 +384,7 @@ describe("tasks panel UI", function()
             seed({ id = "stop1", status = "stopped", start_time = base - 20000, end_time = base - 15000 })
 
             Panel.open()
-            assert.are.equal("  Tasks · 0 running · 2 finished", panel_lines()[2])
+            assert.are.equal("  " .. ICON .. " Tasks · 0 running · 2 finished", panel_lines()[2])
         end)
 
         it("resolves the row under the cursor past the title header", function()
@@ -449,11 +453,12 @@ describe("tasks panel UI", function()
             local lines = panel_lines()
             assert.are.equal(4, #lines)
             assert.are.equal("", lines[1])
-            assert.are.equal("  Tasks", lines[2], "title carries no counts without tasks")
+            assert.are.equal("  " .. ICON .. " Tasks", lines[2], "title carries no counts without tasks")
             assert.is_nil(lines[2]:find("·", 1, true), "no counts appended")
             assert.are.equal("", lines[3])
             assert.are.equal("  no tasks", lines[4])
-            assert.is_truthy(hl_on_line(4).PiTasksListDotDim, "placeholder renders dimmed")
+            assert.is_truthy(hl_on_line(2).PiPanelTitle, "title keeps its dim shell style")
+            assert.is_truthy(hl_on_line(4).PiPanelTitle, "placeholder renders dimmed")
         end)
     end)
 
