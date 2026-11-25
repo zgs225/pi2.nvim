@@ -69,8 +69,11 @@ describe("scoped_models.state_path", function()
     end)
 
     it("still honours the test override", function()
-        ScopedModels._set_path("/tmp/pi2nvim-scope-test")
-        assert.are.equal("/tmp/pi2nvim-scope-test", ScopedModels.state_path("2"))
+        -- Built by the test itself: spelling a real location here is what the
+        -- `spec-host-layout` gate forbids (G34).
+        local override = vim.fn.tempname() .. "-scope-test"
+        ScopedModels._set_path(override)
+        assert.are.equal(override, ScopedModels.state_path("2"))
     end)
 end)
 

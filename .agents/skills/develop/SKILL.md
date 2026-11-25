@@ -117,14 +117,14 @@ Merge 前对文档做一次显式核对（流程图 M2，Phase rule `Docs gate`�
 
 ## Gotchas
 
-G1–G33 are indexed in the quick-reference table at the top of `references/gotchas.md`, with full 现象/根因/修法 and minimal reproductions below it. Read the full entry before relying on a one-liner. Most frequent traps: G1/G2/G3 (expr-mapping keys), G4/G5 (headless e2e), G6 (visual needs a GUI screenshot), G14 (spec scoping), G19 (three config spots), G21 (restart nvim after editing `lua/pi/**`), G23 (worktree test layers), G24 (LuaJIT-parseable syntax — gated by `make parse`). Most of them now name the spec that pins them in a `回归守护` line — start there instead of re-deriving the trap.
+G1–G34 are indexed in the quick-reference table at the top of `references/gotchas.md`, with full 现象/根因/修法 and minimal reproductions below it. Read the full entry before relying on a one-liner. Most frequent traps: G1/G2/G3 (expr-mapping keys), G4/G5 (headless e2e), G6 (visual needs a GUI screenshot), G14 (spec scoping), G19 (three config spots), G21 (restart nvim after editing `lua/pi/**`), G23 (worktree test layers), G24 (LuaJIT-parseable syntax — gated by `make parse`). Most of them now name the spec that pins them in a `回归守护` line — start there instead of re-deriving the trap.
 
 ## Cross-references
 
 - `references/worktree.md` — why worktrees, exact setup/verification/cleanup commands, layer caveats.
 - `references/architecture.md` — module map, hard design constraints, rationale for standard places.
 - `references/testing.md` — layer details, pitfalls, isolation recipe, verification discipline, script usage.
-- `references/gotchas.md` — quick-reference table + full 现象/根因/修法 for G1–G33 with minimal reproductions.
+- `references/gotchas.md` — quick-reference table + full 现象/根因/修法 for G1–G34 with minimal reproductions.
 - `references/checks.md` — the static gates: `scripts/checks/` architecture, the fixture contract, how to add a rule, the pinned toolchain (`.mise.toml`), and what is deliberately not a static check.
 - `references/gitea.md` — issue lifecycle on Gitea via `gt` (gitea-cli): auth/keyring, the `GITEA_TOKEN` pitfall, create / comment / label / close.
 - `AGENTS.md` — architecture charter, style, type-annotation conventions.

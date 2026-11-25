@@ -37,9 +37,14 @@ describe("pi.compaction.extension", function()
     describe("state_path", function()
         it("defaults to a run-dir file named after the pid", function()
             Extension._reset()
-            local path = Extension.state_path()
-            assert.matches("pi2nvim%-compaction%-config%-" .. tostring(vim.fn.getpid()) .. "$", path)
-            assert.matches("[/\\]run[/\\]", path)
+            -- The expectation is DERIVED from `stdpath("run")`, never spelled out:
+            -- the run dir is `/run/user/<uid>/…` only on a systemd Linux box — on
+            -- macOS it is `$TMPDIR/nvim.<user>/<random>` (G34, gated by
+            -- `make check`'s `spec-host-layout`).
+            assert.are.equal(
+                vim.fn.stdpath("run") .. "/pi2nvim-compaction-config-" .. tostring(vim.fn.getpid()),
+                Extension.state_path()
+            )
         end)
 
         it("honours the _set_path override", function()

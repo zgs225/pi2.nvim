@@ -123,6 +123,11 @@ local EXTENSION = PLUGIN_ROOT .. "/extensions/compaction.ts"
 local TODO_EXTENSION = PLUGIN_ROOT .. "/extensions/todo.ts"
 local TAG = ("%d-%d"):format(uv.os_getpid(), os.time())
 local RUN_ROOT = vim.fn.tempname() .. "-compaction"
+-- The host's temp root, DERIVED from the path above rather than spelled out
+-- (G34): `/tmp` on Linux, `/var/folders/...` on macOS. `:h` of a `tempname()`
+-- is exactly the directory the scratch files below are created under, so a
+-- prefix test against it is the portable form of "no scratch path survives".
+local TEMP_ROOT = vim.fn.fnamemodify(RUN_ROOT, ":h")
 -- The project tree lives OUTSIDE tmpdir(): the cleaner drops everything under
 -- tmpdir() (that is the filter under test), so files that must SURVIVE it
 -- cannot live there. `~/.local/state` is a normal, uninteresting path.
@@ -1173,7 +1178,9 @@ local function main()
     local block = read_files_block(first_summary)
     check(block ~= nil, "the first summary carries a <read-files> block")
     local first_paths = block_paths(block)
-    check(first_summary:find("/tmp/", 1, true) == nil, "no scratch path survives in the summary")
+    check(first_summary:find(TEMP_ROOT, 1, true) == nil, "no scratch path survives in the summary", {
+        temp_root = TEMP_ROOT,
+    })
     for _, path in ipairs(temp_paths) do
         local name = vim.fn.fnamemodify(path, ":t")
         check(first_summary:find(name, 1, true) == nil, "a dropped scratch file must not appear in the summary", {

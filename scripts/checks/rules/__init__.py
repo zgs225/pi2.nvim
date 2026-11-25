@@ -13,6 +13,7 @@ from .docs_keymaps import DocsKeymaps
 from .expr_mapping import ExprMapping
 from .parse_luajit import ParseLuajit
 from .skill_inline_pkill import SkillInlinePkill
+from .spec_host_layout import SpecHostLayout
 from .spec_scope import SpecScope
 from .test_isolation import TestIsolation
 from .uv_fast_event import UvFastEvent
@@ -22,6 +23,7 @@ ALL: list[Check] = [
     ConfigThreeSpots(),
     ConfigReadAtCallTime(),
     SpecScope(),
+    SpecHostLayout(),
     ExprMapping(),
     TestIsolation(),
     UvFastEvent(),

@@ -4,6 +4,11 @@
 #                  -u tests/minimal_init.lua for every child).
 #                  This is the CI unit gate (`.github/workflows/tests.yml`, pushed to
 #                  main + every PR, judged by exit code only).
+#                  Every child runs with `XDG_RUNTIME_DIR` pointed at a fresh path
+#                  with no `/run/` component (`TEST_RUN_DIR` overrides it), so a
+#                  spec that assumes the Linux run dir is red here and in CI, not
+#                  only on a macOS laptop (G34; the static half is
+#                  `make check`'s `spec-host-layout`).
 #                  Concurrency is CAPPED (`TEST_JOBS`, default 8): plenary's
 #                  `test_directory` spawns one child nvim per spec file and joins
 #                  them all at once, which at ~170 files kills children and makes

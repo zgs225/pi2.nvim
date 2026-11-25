@@ -125,8 +125,11 @@ describe("vision", function()
         end)
 
         it("still honours the test override", function()
-            Vision._set_path("/tmp/pi2nvim-vision-test")
-            assert.are.equal("/tmp/pi2nvim-vision-test", Vision.state_path())
+            -- Built by the test itself: spelling a real location here is what the
+            -- `spec-host-layout` gate forbids (G34).
+            local override = vim.fn.tempname() .. "-vision-test"
+            Vision._set_path(override)
+            assert.are.equal(override, Vision.state_path())
         end)
     end)
 

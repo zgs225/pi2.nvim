@@ -26,6 +26,8 @@
 --   TEST_FILTER  glob for a subset, e.g. TEST_FILTER='tests/prompt_*_spec.lua'
 --   NVIM_BIN     nvim to spawn (default: this nvim)
 --   MIN_INIT     the hermetic init for the children (default tests/minimal_init.lua)
+--   TEST_RUN_DIR run dir to hand the children (default: a generated path without a
+--                `/run/` component — see the probe below, G34)
 
 local uv = vim.uv
 
@@ -57,6 +59,34 @@ local child_timeout_ms = (tonumber(vim.env.TEST_TIMEOUT or "") or 300) * 1000
 -- harness invocation, so reproduce it rather than inventing a second one.
 local plenary_dir = vim.env.PLENARY_PATH or vim.fn.expand("~/.local/share/nvim/lazy/plenary.nvim")
 local filter = vim.env.TEST_FILTER
+
+-- Run-dir probe (G34): no spec may assume where `stdpath("run")` points. It is
+-- `/run/user/<uid>/nvim…` on a systemd Linux box and
+-- `$TMPDIR/nvim.<user>/<random>` on macOS (or wherever the user put
+-- `$XDG_RUNTIME_DIR`), so a spec that asserts the first shape passes in CI and is
+-- red only on the author's laptop — which is exactly how
+-- `tests/compaction_extension_spec.lua` shipped an `assert.matches("[/\\]run[/\\]")`
+-- assertion. Every child therefore runs with an `XDG_RUNTIME_DIR` whose path has
+-- no `/run/` component, so the same assumption fails on Linux, in CI, before the
+-- push. The static half of this gate is `make check`'s `spec-host-layout`; this
+-- half also catches the shapes a matcher cannot see (a path built at runtime, an
+-- expectation derived through another module).
+--
+-- Two measured facts shaped this: Neovim does NOT create `XDG_RUNTIME_DIR` (with
+-- it set but absent, `stdpath("run")` is that path and `isdirectory()` is 0), so
+-- the harness creates it here; and `TEST_RUN_DIR` overrides the generated path
+-- explicitly rather than falling back to the real dir, because a gate that
+-- silently checks nothing is the failure mode the probe exists to prevent.
+local run_dir = vim.env.TEST_RUN_DIR or (vim.fn.tempname() .. "-xdg-runtime")
+if vim.fn.isdirectory(run_dir) == 0 then
+    vim.fn.mkdir(run_dir, "p")
+end
+if vim.fn.isdirectory(run_dir) == 0 then
+    io.stderr:write("run_tests: cannot create the run-dir probe at " .. run_dir .. "\n")
+    vim.cmd("cq 1")
+end
+vim.env.XDG_RUNTIME_DIR = run_dir
+local owns_run_dir = vim.env.TEST_RUN_DIR == nil
 
 ---@return string[] sorted absolute spec paths
 local function collect()
@@ -156,6 +186,7 @@ sweeper:start(5000, 5000, function()
 end)
 
 io.write(string.format("run_tests: %d spec files, %d at a time\n", total, jobs))
+io.write(string.format("run_tests: run dir %s (no /run/ component — a spec may not assume one, G34)\n", run_dir))
 io.flush()
 
 for _ = 1, math.min(jobs, total) do
@@ -192,5 +223,9 @@ for _, f in ipairs(failed) do
     end
 end
 io.flush()
+
+if owns_run_dir then
+    pcall(vim.fn.delete, run_dir, "rf")
+end
 
 vim.cmd("cq " .. (#failed > 0 and 1 or 0))
