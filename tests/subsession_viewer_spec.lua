@@ -1107,6 +1107,14 @@ describe("pi.ui.subsession_viewer", function()
             end
         end
         assert.is_true(found_err_hl)
+
+        -- Unknown context (nothing reported yet, or after a compaction):
+        -- `?/200k` like the chat statusline and :PiSessionStats, never a word.
+        local _, plain_unknown = Viewer._format_statusline({
+            model_id = "claude",
+            model_context_window = 200000,
+        })
+        assert.is_truthy(plain_unknown:find("?/200k", 1, true))
     end)
 
     it("leads the statusline with the viewed session's worktree badge", function()

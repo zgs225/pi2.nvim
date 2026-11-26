@@ -279,6 +279,14 @@ After successful compaction, pi2.nvim renders a collapsed summary block in chat 
 
 `150k → 42k` are pi's measured occupancy and its estimate of the rebuilt context (`(est.)` marks the estimate; an older pi without `estimatedTokensAfter` keeps the before-only form), followed by the reason (`manual` / `threshold` / `overflow`) and how long the summary took. Focus the block and press `<Tab>` to expand the backend-generated summary. The expanded block ends with the metadata pi reported for that compaction: the entry id the kept tail starts at (`kept from:`), the bounded file lists (`files: 12 read · 4 modified · 18 omitted`), the summary request's own cost (`summary: 8.2k in / 1.1k out · $0.003`), and — when it applies — `will retry after compaction`, `aborted`, or the failure message. Blocks replayed from a resumed session render the same header when the record is available, and the before-only form when it is not.
 
+A finished compaction also leaves one neutral line at the **bottom** of the rebuilt transcript, so the completion is never a silent event — the block itself may sit above the viewport once the retained tail has been replayed:
+
+```
+󰏗 Compaction finished · 150k → 42k (est.)
+```
+
+It is UI only: nothing is persisted, and a resumed session renders the block instead. It is a chat line rather than a notification, so a background tab is not interrupted. The statusline `context` component reports an **unknown** context (`?/200k`) until the next response, because the retained tail's last assistant usage describes the *pre-compaction* prompt — the same rule pi's own footer applies, and the reason `:PiSessionStats` shows `?` there too.
+
 Three more surfaces keep a long compaction-heavy session legible:
 
 - **Countdown** — `statusline.components.compaction.countdown` appends the distance to pi's auto-compaction threshold to the auto-compaction marker (`󰏗 37k`, `󰏗 now` at the boundary), computed from pi's own `reserveTokens` / `keepRecentTokens` (`compaction.modelOverrides` included); it is `false` by default, `true` shows the distance always and `"near"` only once the context reaches `near` percent of the threshold. A `keep ≥ budget` combination — nothing is cuttable, upstream #12076 — shows `󰏗 !` with a one-time warning. See [Statusline](usage.md#compaction-countdown).
