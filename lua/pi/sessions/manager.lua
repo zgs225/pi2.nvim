@@ -960,6 +960,31 @@ local function retry_status_text(retry)
     return text
 end
 
+--- One-line confirmation for the chat after a successful compaction:
+--- `Compaction finished · 150k → 21k (est.)`.
+---
+--- The transcript block above records what happened; this line is the
+--- completion signal, so a compaction that leaves the window showing the same
+--- numbers does not read as a no-op (the block itself can sit above the
+--- viewport after the rebuild). It is UI only: nothing is persisted, and a
+--- resumed session still renders the block.
+---@param result table compaction result from `compaction_end`
+---@return string
+local function compaction_finished_text(result)
+    local format_tokens = require("pi.stats").format_tokens
+    local segments = { "Compaction finished" }
+    local before = tonumber(result.tokensBefore)
+    local after = tonumber(result.estimatedTokensAfter)
+    if before then
+        local text = format_tokens(before)
+        if after then
+            text = text .. " → " .. format_tokens(after) .. " (est.)"
+        end
+        segments[#segments + 1] = text
+    end
+    return table.concat(segments, " · ")
+end
+
 ---@param args any
 ---@return table?
 local function normalize_tool_args(args)
@@ -1632,7 +1657,7 @@ function M.handle_event(session, msg)
                 -- A cancellation is not a failure: the user pressed the
                 -- double-<Esc> gesture (or ran :PiCompactAbort), so the notice
                 -- stays neutral instead of raising the error alarm.
-                chat:on_error("Compaction cancelled", { pad_top = true, pad_bottom = true, notice = true })
+                chat:add_notice("Compaction cancelled")
                 chat:flush_compaction_queue(msg.willRetry == true)
             elseif type(msg.errorMessage) == "string" and msg.errorMessage ~= "" then
                 chat:set_compacting(false)
@@ -2421,6 +2446,14 @@ local function replay_messages(session, messages)
     session.chat:set_replaying(true)
     local pending_agent_end = false
     local tool_call_args = {} ---@type table<string, table>
+    --- Timestamp of the latest replayed compaction (its summary message).
+    ---@type number?
+    local latest_compaction_ts = nil
+    --- Timestamp of the latest assistant usage that actually wrote the context
+    --- reading. Compared against the compaction to decide whether the number is
+    --- still the pre-compaction occupancy (see the note before `set_replaying`).
+    ---@type number?
+    local last_usage_ts = nil
     for _, msg in ipairs(messages) do
         local role = msg.role
         -- Flush pending agent_end before a user message
@@ -2523,6 +2556,9 @@ local function replay_messages(session, messages)
             local stop = msg.stopReason
             if stop ~= "aborted" and stop ~= "error" and type(msg.usage) == "table" then
                 session.chat:add_usage(msg.usage)
+                if (msg.usage.input or 0) > 0 then
+                    last_usage_ts = tonumber(msg.timestamp)
+                end
             end
         elseif role == "toolResult" then
             local tool_call_id = msg.toolCallId or msg.toolUseId or ""
@@ -2547,6 +2583,10 @@ local function replay_messages(session, messages)
             -- reported; an unmatched replay renders as before.
             local summary = msg.summary or ""
             local tokens_before = tonumber(msg.tokensBefore) or 0
+            -- A summary without a timestamp cannot be ordered against the
+            -- usage it must invalidate; `math.huge` says "no usage is newer",
+            -- which degrades to an unknown context instead of a stale number.
+            latest_compaction_ts = tonumber(msg.timestamp) or math.huge
             session.chat:append_compaction_summary(
                 summary,
                 tokens_before,
@@ -2579,13 +2619,23 @@ local function replay_messages(session, messages)
     if pending_agent_end then
         session.chat:on_agent_end()
     end
+    -- The usage of an assistant message describes the prompt it answered, so
+    -- after a compaction the retained tail's last usage is the PRE-compaction
+    -- occupancy: the number the compaction just freed. pi applies the same rule
+    -- (`getContextUsage` trusts usage only from a response after the latest
+    -- compaction) and reports an unknown context until the next response; the
+    -- statusline renders it as `?/200k`. A later assistant message — live or
+    -- part of a newer replay — restores the reading.
+    if latest_compaction_ts ~= nil and (last_usage_ts == nil or last_usage_ts <= latest_compaction_ts) then
+        session.chat:clear_context()
+    end
     session.chat:set_replaying(false)
 end
 
 ---@param session pi.Session
----@param _result table
+---@param result table compaction result (`compaction_end`'s `result`)
 ---@param will_retry boolean
-rebuild_after_compaction = function(session, _result, will_retry)
+rebuild_after_compaction = function(session, result, will_retry)
     session._compaction_rebuilding = true
     session._compaction_event_queue = {}
     if will_retry and session.chat then
@@ -2612,6 +2662,7 @@ rebuild_after_compaction = function(session, _result, will_retry)
             session.chat:clear_for_compaction_rebuild()
             show_startup_block(session, CommandsCache.list())
             replay_messages(session, messages)
+            session.chat:add_notice(compaction_finished_text(result))
             M.refresh_state(session)
             vim.schedule(function()
                 finish_compaction_rebuild(session, not will_retry, will_retry)

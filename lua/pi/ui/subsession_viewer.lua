@@ -149,7 +149,7 @@ local function build_context_chunk(status)
                 hl = "PiStatusLineWarning"
             end
         else
-            text = "-/" .. total
+            text = "?/" .. total
         end
     elseif status.context_tokens and status.context_tokens > 0 then
         text = Stats.format_tokens(status.context_tokens)

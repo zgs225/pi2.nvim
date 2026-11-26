@@ -596,7 +596,7 @@ The **center** group is centered in the window and has placement priority: when 
 | `tokens` | `↑3.8k ↓58k` | Total input/output tokens used this session |
 | `cache` | `R7.2M W416k` | Total prompt-cache read/write |
 | `cost` | `$7.665` | Session cost is greater than zero |
-| `context` | `63.9%/200k` | Current context window usage — percentage + total. Deliberately text-free: the compaction distance lives on the `compaction` marker |
+| `context` | `63.9%/200k` / `?/200k` | Current context window usage — percentage + total. Deliberately text-free: the compaction distance lives on the `compaction` marker. It reads `?/200k` while the context is unknown — before the first response, and after a compaction until a response lands, because the retained tail's usage describes the pre-compaction prompt (the same reading pi's own footer and `:PiSessionStats` show) |
 | `compaction` | `󰏗` / `󰏗 37k` | Auto-compaction is enabled — the same icon as the compaction summary label. With `countdown` on it also carries the distance to pi's automatic compaction threshold — see [Compaction countdown](#compaction-countdown) |
 | `attention` | `󰵚` / `󰵚 2` | There's at least one pending attention request |
 | `model` | `claude-opus-4-6` / `claude-opus-4-6  [anthropic]` | A model is active. The `[provider]` suffix appears when the same model id is served by several providers (or by one provider through several base URLs) — see the `provider` option below |

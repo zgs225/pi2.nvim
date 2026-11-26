@@ -235,7 +235,10 @@ function builtin.cost(state)
     return text
 end
 
---- 63.9%/200k or -/200k when context is unknown.
+--- 63.9%/200k — or ?/200k when the context is unknown: nothing has been
+--- reported yet, or the last compaction has no response after it (see
+--- `StatusLine:clear_context`), the same reading the pi TUI's footer and
+--- `:PiSessionStats` show.
 ---
 --- Deliberately text-free: the distance to pi's automatic compaction threshold
 --- lives on the `compaction` marker (`statusline.components.compaction.countdown`),
@@ -247,7 +250,7 @@ function builtin.context(state)
     local cfg = component_config("context")
     local total = format_tokens(state.model_context_window)
     if not state.context_tokens then
-        return "-/" .. total
+        return "?/" .. total
     end
     local pct = (state.context_tokens / state.model_context_window) * 100
     local text = string.format("%.1f%%/%s", pct, total)
@@ -544,6 +547,22 @@ function StatusLine:add_usage(usage)
     s.total_cost = s.total_cost + cost
     -- Overwrite: latest message is the best context window estimate
     s.context_tokens = (usage.input or 0) + (usage.output or 0) + (usage.cacheRead or 0) + (usage.cacheWrite or 0)
+    self:render()
+end
+
+--- Drop the context-window reading, keeping the accumulated totals.
+---
+--- An assistant usage describes the prompt it answered, so after a compaction
+--- the retained tail's usage is the PRE-compaction occupancy, and reading it as
+--- the current context would show the number the compaction just freed. pi has
+--- the same rule (`getContextUsage`: usage is only trusted from an assistant
+--- that responded after the latest compaction) and reports an unknown context
+--- until the next response; the component renders that as `?/200k`.
+function StatusLine:clear_context()
+    if self._state.context_tokens == nil then
+        return
+    end
+    self._state.context_tokens = nil
     self:render()
 end
 

@@ -19,7 +19,7 @@ All highlight groups are defined with `default = true`, so they can be overridde
 | `PiErrorRail` | Vertical rail drawn alongside hard-wrapped error lines |
 | `PiCompactionLabel` | Icon label for compaction summaries |
 | `PiCompactionText` | Body text inside compaction summaries |
-| `PiCompactionHint` | Expand/collapse hint inside collapsed compaction summaries |
+| `PiCompactionHint` | Expand/collapse hint inside collapsed compaction summaries, and neutral compaction notices in the chat (a cancellation, a finished compaction) |
 | `PiCompactionMeta` | Metadata rows inside an expanded compaction summary (kept boundary, file counts, summary usage) |
 | `PiCompactionWarn` | Failure rows inside an expanded compaction summary (aborted, retry pending, error) |
 | `PiMessageDateTime` | Timestamp next to messages |

@@ -271,6 +271,102 @@ describe("compaction events", function()
         assert.are.equal(150000, chat._history._compaction_blocks[1].tokens_before)
     end)
 
+    it("reports an unknown context after a compaction until a post-compaction response", function()
+        -- The projection a compaction rebuild replays: the summary, then the
+        -- retained tail, whose last assistant turn answered the PRE-compaction
+        -- prompt. Its usage is the occupancy the compaction just freed, so it is
+        -- not the current context (pi's `getContextUsage` refuses it too).
+        messages = {
+            { role = "compactionSummary", summary = "S", tokensBefore = 150000, timestamp = 2000 },
+            {
+                role = "assistant",
+                content = { { type = "text", text = "tail" } },
+                stopReason = "stop",
+                usage = { input = 148000, output = 2000 },
+                timestamp = 1000,
+            },
+        }
+        feed(session, { type = "agent_start" }, { type = "agent_end", messages = {} })
+        feed(session, { type = "compaction_start", reason = "manual" })
+        feed(session, {
+            type = "compaction_end",
+            reason = "manual",
+            result = { summary = "S", tokensBefore = 150000, estimatedTokensAfter = 20000 },
+        })
+        wait_for(function()
+            return session._compaction_rebuilding ~= true
+        end, "the rebuild must finish")
+        wait_for(function()
+            return #chat._history._compaction_blocks == 1
+        end, "the block must be replayed")
+
+        assert.is_nil(
+            chat._prompt:statusline()._state.context_tokens,
+            "the retained usage is the pre-compaction occupancy, not the current context"
+        )
+    end)
+
+    it("keeps the context reading when the replayed response came after the compaction", function()
+        -- A session resumed after a compaction that already ran another turn:
+        -- the assistant message is newer than the summary, so its usage is the
+        -- real current occupancy and must survive the replay.
+        messages = {
+            { role = "compactionSummary", summary = "S", tokensBefore = 150000, timestamp = 1000 },
+            {
+                role = "assistant",
+                content = { { type = "text", text = "after" } },
+                stopReason = "stop",
+                usage = { input = 5000, output = 100 },
+                timestamp = 3000,
+            },
+        }
+        feed(session, { type = "agent_start" }, { type = "agent_end", messages = {} })
+        feed(session, { type = "compaction_start", reason = "manual" })
+        feed(session, {
+            type = "compaction_end",
+            reason = "manual",
+            result = { summary = "S", tokensBefore = 150000, estimatedTokensAfter = 20000 },
+        })
+        wait_for(function()
+            return session._compaction_rebuilding ~= true
+        end, "the rebuild must finish")
+
+        assert.are.equal(5100, chat._prompt:statusline()._state.context_tokens)
+    end)
+
+    it("renders a finished compaction as a neutral notice in the chat, not a notification", function()
+        messages = { { role = "compactionSummary", summary = "S", tokensBefore = 150000, timestamp = 1 } }
+        feed(session, { type = "agent_start" }, { type = "agent_end", messages = {} })
+        feed(session, { type = "compaction_start", reason = "manual" })
+        feed(session, {
+            type = "compaction_end",
+            reason = "manual",
+            result = { summary = "S", tokensBefore = 150000, estimatedTokensAfter = 20000 },
+        })
+        wait_for(function()
+            return history_text():find("Compaction finished", 1, true) ~= nil
+        end, "the completion notice must render in the chat")
+
+        local row = rows_with("Compaction finished")[1]
+        assert.is_not_nil(row, "the notice row must exist")
+        local line = vim.api.nvim_buf_get_lines(chat._history._buf, row, row + 1, false)[1]
+        assert.are.equal(
+            Config.options.labels.compaction .. " Compaction finished · 150k → 20k (est.)",
+            line,
+            "the notice carries the numbers pi reported"
+        )
+        local highlights = row_highlights(row)
+        assert.is_true(has(highlights, "PiCompactionHint"), "the notice uses the hint highlight")
+        assert.is_false(has(highlights, "PiError"), "a finished compaction is not an error")
+        assert.is_false(has(highlights, "PiErrorRail"), "a finished compaction raises no alarm rail")
+        for _, note in ipairs(notes) do
+            assert.is_nil(
+                note.msg:find("Compact", 1, true),
+                "the completion is announced in the chat, never by a notification: " .. note.msg
+            )
+        end
+    end)
+
     it("records aborted and failed compactions, keeping their notices", function()
         feed(session, { type = "agent_start" }, { type = "agent_end", messages = {} })
 

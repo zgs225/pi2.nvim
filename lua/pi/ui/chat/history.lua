@@ -144,7 +144,7 @@ History._stream_flush_ms = 30
 ---@class pi.ChatErrorOpts
 ---@field pad_top? boolean
 ---@field pad_bottom? boolean
----@field notice? boolean Render a neutral notice instead of an error: the compaction label as the prefix, the `PiCompactionHint` highlight and no alarm rail. For outcomes the user chose (a cancelled compaction), which are not failures.
+---@field notice? boolean Render a neutral notice instead of an error: the compaction label as the prefix, the `PiCompactionHint` highlight and no alarm rail. For outcomes that are not failures (a cancelled or a finished compaction).
 
 --- One rendered message, kept so the copy key (`copy.key`, default `gy`) and
 --- `:PiCopy` can return the SOURCE text instead of the rendered rows (markdown

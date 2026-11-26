@@ -2406,6 +2406,16 @@ function Chat:add_usage(usage)
     self._prompt:statusline():add_usage(usage)
 end
 
+--- Forget the current context-window reading, keeping the accumulated totals.
+---
+--- Called when a replay's last assistant usage predates the latest compaction:
+--- that number is the occupancy the compaction freed, not the current context
+--- (pi's own `getContextUsage` applies the same rule). The status line renders
+--- the unknown state as `?/200k`.
+function Chat:clear_context()
+    self._prompt:statusline():clear_context()
+end
+
 --- Set or clear an extension status value on the status line.
 ---@param key string
 ---@param value string? nil to clear
@@ -2487,6 +2497,14 @@ end
 ---@param opts? pi.ChatErrorOpts
 function Chat:on_error(error_message, opts)
     self._history:on_error(error_message, opts)
+end
+
+--- Render one neutral notice line in the history (the compaction label as the
+--- prefix, `PiCompactionHint`, no alarm rail). For outcomes that are not
+--- failures: a cancelled or a finished compaction.
+---@param text string
+function Chat:add_notice(text)
+    self._history:on_error(text, { pad_top = true, pad_bottom = true, notice = true })
 end
 
 ---@param error_message string

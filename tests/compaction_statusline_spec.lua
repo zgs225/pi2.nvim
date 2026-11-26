@@ -280,6 +280,15 @@ describe("statusline compaction countdown", function()
         assert.are.equal("63.9%/200k", (status_row()))
     end)
 
+    it("renders an unknown context as ?/200k, never a word", function()
+        only_context()
+        ready(127800)
+        -- After a compaction the last usage describes the pre-compaction
+        -- prompt: the reading is dropped, not rendered as prose.
+        sl:clear_context()
+        assert.are.equal("?/200k", (status_row()))
+    end)
+
     it("keeps the context highlight untouched by an unusable budget", function()
         only_context({ warn = 70, error = 90 })
         ready(150000) -- 75% > warn
