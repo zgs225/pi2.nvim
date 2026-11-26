@@ -351,6 +351,29 @@
 ---@field max_height number max height as fraction of screen (<1) or lines (>=1)
 ---@field keys pi.DialogKeys
 
+---@class pi.AskKeys
+---@field down pi.KeySpecs Move the cursor down one option
+---@field up pi.KeySpecs Move the cursor up one option
+---@field next_question pi.KeySpecs Go to the next question
+---@field prev_question pi.KeySpecs Go to the previous question
+---@field first pi.KeySpecs Jump to the first option (like vim's `gg`)
+---@field last pi.KeySpecs Jump to the last option (like vim's `G`)
+---@field select pi.KeySpecs Confirm the cursored option (single-select: tick it and move on; multi-select: toggle it)
+---@field toggle pi.KeySpecs Toggle the cursored option in a multi-select question
+---@field clear pi.KeySpecs Clear every selection of the current question
+---@field free_text pi.KeySpecs Answer the current question with free text instead of an option
+---@field submit pi.KeySpecs Send the answers to the model (only when every question is answered)
+---@field cancel pi.KeySpecs Cancel the ask; the model then gets "no answers" and must state its assumption
+
+---@class pi.AskConfig
+---@field enabled? boolean Inject the bundled ask extension (the `ask` tool) into parent RPC processes (default true). Sub-sessions never get it
+---@field max_questions? integer Maximum number of questions per ask call; more is rejected with a correctable error (default 4)
+---@field max_options? integer Maximum number of options per question; more is rejected with a correctable error (default 4)
+---@field allow_free_text? boolean Offer a free-text answer in addition to the options, and accept text-only questions (default true)
+---@field timeout_ms? integer|nil Milliseconds to wait for an answer before the ask is cancelled; nil waits forever (default nil)
+---@field ui? "float" Presentation of the ask dialog (default "float", the only supported value)
+---@field keys pi.AskKeys Keymaps inside the ask dialog
+
 --- A single styled text chunk: { text, hl_group? }.
 ---@alias pi.CustomBlockChunk string[]
 
@@ -458,6 +481,7 @@
 ---@field prompt pi.PromptConfig
 ---@field render pi.RenderConfig
 ---@field dialog pi.DialogConfig
+---@field ask pi.AskConfig The bundled ask tool: a bounded set of multiple-choice questions the model blocks on (see doc/ask.md)
 ---@field verbs pi.VerbsConfig Verb pairs for status messages, picked randomly per run
 ---@field mention_providers? table<string, pi.MentionProviderFn|pi.MentionProviderSpec> Custom dynamic @-mention providers: name → function returning context text (or a spec table with fn/description/lang). Mentioning `@name` attaches the returned text to the message.
 ---@field on_widget? fun(key: string, lines: string[]?, placement: string?): pi.CustomBlock? Handle extension setWidget calls. Return a custom block to render inline in history, or nil to ignore. Not called for `:startup` widgets (keys ending with `:startup`), which are always stored as startup announcements and rendered in the system preamble.
@@ -757,6 +781,28 @@ local defaults = {
             cancel = nil,
         },
     },
+    ask = {
+        enabled = true,
+        max_questions = 4,
+        max_options = 4,
+        allow_free_text = true,
+        timeout_ms = nil,
+        ui = "float",
+        keys = {
+            down = "j",
+            up = "k",
+            next_question = "l",
+            prev_question = "h",
+            first = "gg",
+            last = "G",
+            select = "<CR>",
+            toggle = "<Space>",
+            clear = "x",
+            free_text = "i",
+            submit = "ZZ",
+            cancel = { "<Esc>", "q", "ZQ" },
+        },
+    },
     zen = {
         width = nil,
         keys = {
@@ -879,6 +925,12 @@ function M.setup(opts)
     -- every compaction event, so live setup() calls apply without respawning
     -- the RPC process (same rationale as vision/title/todo/bg-tasks).
     require("pi.compaction.extension").publish(M.options.compaction and M.options.compaction.extension)
+
+    -- The bundled ask extension re-reads its options (enabled / limits /
+    -- allow_free_text / timeout_ms) from a runtime file on every tool call and
+    -- before_agent_start event, so live setup() calls apply without respawning
+    -- the RPC process (same rationale as todo/title/bg-tasks).
+    require("pi.ask").publish(M.options.ask)
 end
 
 --- Resolve a config value that may be a function, merging the result with

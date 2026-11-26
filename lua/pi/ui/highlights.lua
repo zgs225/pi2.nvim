@@ -198,6 +198,14 @@ local function set_defaults()
     vim.api.nvim_set_hl(0, "PiFloat", { default = true, bg = normal.bg })
     vim.api.nvim_set_hl(0, "PiFloatBorder", { default = true, fg = comment.fg, bg = normal.bg })
     vim.api.nvim_set_hl(0, "PiDialogTitle", { default = true, fg = title.fg, bold = true })
+    -- Ask float (lua/pi/ui/ask.lua): the short question header / chip row and
+    -- option descriptions are muted, the cursored option and its pointer carry
+    -- the normal foreground, answered rows read as resolved and unanswered or
+    -- cancelled rows as a warning.
+    vim.api.nvim_set_hl(0, "PiAskHeader", { default = true, fg = comment.fg })
+    vim.api.nvim_set_hl(0, "PiAskOption", { default = true, fg = normal.fg, bold = true })
+    vim.api.nvim_set_hl(0, "PiAskAnswer", { default = true, fg = diag_hint.fg })
+    vim.api.nvim_set_hl(0, "PiAskCancelled", { default = true, fg = diag_warn.fg })
     vim.api.nvim_set_hl(0, "PiChatHistoryFloatTitle", { default = true, fg = user.fg, bold = true })
     vim.api.nvim_set_hl(0, "PiChatPromptFloatTitle", { default = true, fg = comment.fg, bg = normal.bg })
     vim.api.nvim_set_hl(

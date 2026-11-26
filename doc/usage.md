@@ -52,7 +52,7 @@ Each chat contains three panels:
 | `prompt` | `pi-chat-prompt` | Where you type the next message. Multi-line buffer. |
 | `attachments` | `pi-chat-attachments` | Pending image attachments queued for the next message. |
 
-The filetype names are stable — you can target them from your own `FileType` autocmds (see [Keymaps](keymaps.md) for an example). Input and info dialog buffers use the stable `pi-dialog` filetype, so completion plugins can be disabled there without affecting the prompt.
+The filetype names are stable — you can target them from your own `FileType` autocmds (see [Keymaps](keymaps.md) for an example). Input and info dialog buffers use the stable `pi-dialog` filetype, so completion plugins can be disabled there without affecting the prompt; the [ask](ask.md) questionnaire float uses `pi-ask`.
 
 Use `:PiToggleLayout` to swap `side` ↔ `float` without losing the conversation, and `:PiToggleChat` to hide and re-show the whole π UI of the tab — the chat windows plus the side panels (`:PiSessions`, `:PiTasks`, `:PiTodo`, `:PiCompactions`). The panels that were open when it hid are reopened on the next toggle, while a panel you had already closed stays closed; with no session in the tab the toggle still closes the panels it can see. Neither command stops the agent. To actually shut down the underlying `pi --mode rpc` process for the current tab, use `:PiStop`.
 

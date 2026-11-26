@@ -125,6 +125,10 @@ Inspect what a block actually uses with `:Inspect` over the coloured text, or li
 | Group | Role |
 | --- | --- |
 | `PiDialogTitle` | Dialog title bar |
+| `PiAskHeader` | The [ask](ask.md) float's question header line and the chip of the current question; the `ask · N questions` header row of the ask tool block in the history |
+| `PiAskOption` | Option rows in the ask float (label plus the `> ` cursor marker) |
+| `PiAskAnswer` | A question already answered: its `■` chip in the ask float, and its `✓` row in the ask tool block |
+| `PiAskCancelled` | An ask that was cancelled (the float's cancelled state, the `⊘` row in the tool block, and every unanswered question row) |
 
 ## Diff review
 

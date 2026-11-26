@@ -8,7 +8,7 @@ local Dialog = require("pi.ui.dialog")
 local Diff = require("pi.ui.diff")
 local Notify = require("pi.notify")
 
----@alias pi.AttentionKind "diff"|"select"|"confirm"|"input"|"editor"
+---@alias pi.AttentionKind "diff"|"select"|"confirm"|"input"|"editor"|"ask"
 
 ---@class pi.AttentionEntry
 ---@field id string
@@ -16,6 +16,9 @@ local Notify = require("pi.notify")
 ---@field kind pi.AttentionKind
 ---@field expires_at integer?
 ---@field open fun(): boolean opened
+---@field hidden boolean? Set when the user dismissed the request without answering
+--- it: it stays in the queue (the backend is still blocked) but no longer pops
+--- back up on prompt focus — only an explicit :PiAttention opens it again.
 
 ---@class pi.AttentionTabState
 ---@field count integer
@@ -222,6 +225,8 @@ local function kind_label(kind)
         return "selection"
     elseif kind == "editor" then
         return "editor input"
+    elseif kind == "ask" then
+        return "answers to questions"
     end
     return "input"
 end
@@ -311,6 +316,77 @@ local function build_entry(session, msg)
     local expires_at = type(msg.timeout) == "number" and (now_ms() + msg.timeout) or nil
 
     if msg.method == "select" then
+        if msg.title == "__pi_ask__" then
+            return {
+                id = id,
+                seq = next_attention_seq(),
+                kind = "ask",
+                expires_at = expires_at,
+                open = function()
+                    local timeout = remaining_timeout_ms(expires_at)
+                    if timeout ~= nil and timeout <= 0 then
+                        return false
+                    end
+                    local Ask = require("pi.ui.ask")
+                    local payload = type(msg.options) == "table" and msg.options[1] or nil
+                    local req, err = Ask.decode(payload)
+                    if not req then
+                        -- The extension falls back to plain dialogs when the
+                        -- host cannot decode the payload; never leave it blocked.
+                        send_response(session, {
+                            type = "extension_ui_response",
+                            id = id,
+                            value = vim.json.encode({ v = 1, error = "unsupported", detail = err }),
+                        })
+                        return true
+                    end
+                    -- A Lua error inside the float (a malformed `ask.keys`
+                    -- entry, a failed buffer call) would otherwise leave this
+                    -- entry dropped and the backend blocked forever, so the
+                    -- failure is reported like an undecodable payload.
+                    local ok, opened, reason = pcall(Ask.open, req, {
+                        timeout = timeout,
+                        on_done = function(result)
+                            send_response(session, {
+                                type = "extension_ui_response",
+                                id = id,
+                                value = vim.json.encode(result),
+                            })
+                        end,
+                        -- Hiding the float (closed by any other means) must not
+                        -- answer for the user: put the request back in the queue
+                        -- so :PiAttention can reopen it, and the backend keeps
+                        -- waiting exactly as it did before.
+                        on_hide = function()
+                            M.present(session, msg, { force_queue = true, hidden = true })
+                        end,
+                    })
+                    if not ok then
+                        send_response(session, {
+                            type = "extension_ui_response",
+                            id = id,
+                            value = vim.json.encode({ v = 1, error = "unsupported", detail = tostring(opened) }),
+                        })
+                        return true
+                    end
+                    if not opened and (reason == nil or reason == "busy") then
+                        -- Another ask float is already showing: queue this one so
+                        -- the backend keeps waiting instead of being dropped.
+                        M.present(session, msg, { force_queue = true })
+                    elseif not opened then
+                        -- Nothing to show (no questions): answer so the extension
+                        -- degrades instead of re-queueing forever.
+                        send_response(session, {
+                            type = "extension_ui_response",
+                            id = id,
+                            value = vim.json.encode({ v = 1, error = "unsupported", detail = tostring(reason) }),
+                        })
+                    end
+                    return true
+                end,
+            }
+        end
+
         local payload = decode_diff_payload(msg.title)
         if payload then
             return {
@@ -537,18 +613,36 @@ end
 M.prune_stale_queue = prune_stale_queue
 M._prune_stale_queue = prune_stale_queue
 
---- Present a blocking extension UI request immediately only when the π
---- prompt has focus and there is no draft; otherwise queue it for later.
+--- Present an extension UI request right away when it can be shown without
+--- taking the screen from someone else: a blocking `ask` for the current tab
+--- always can (the model is stalled until it is answered), everything else only
+--- while the π prompt has focus and no draft. Anything else is queued.
 ---@param session pi.Session
 ---@param msg pi.RpcEvent
+---@param opts? { force_queue?: boolean, hidden?: boolean } When `force_queue` is
+--- set the request is queued even if the prompt is focused, so a float the user
+--- just dismissed does not immediately reopen. `hidden` additionally keeps it out
+--- of the auto-open-on-prompt-focus path: only :PiAttention reopens it.
 ---@return boolean handled
-function M.present(session, msg)
+function M.present(session, msg, opts)
     local entry = build_entry(session, msg)
     if not entry then
         return false
     end
 
-    if session.chat and session.chat:has_prompt_focus() and not session.chat:has_draft() then
+    local force_queue = type(opts) == "table" and opts.force_queue == true
+    if type(opts) == "table" and opts.hidden == true then
+        entry.hidden = true
+    end
+    -- A blocking `ask` is not a dialog that can wait: the model cannot continue
+    -- until it is answered, so gating it on prompt focus stalled the turn behind
+    -- whatever window happened to be current while the agent streamed. It opens
+    -- whenever its own tab is showing. Every other kind keeps the gate — popping
+    -- a diff or a select over a window the user is typing in is what the queue is
+    -- for.
+    local blocking = entry.kind == "ask" and session.tab == vim.api.nvim_get_current_tabpage()
+    local prompt_ready = session.chat ~= nil and session.chat:has_prompt_focus() and not session.chat:has_draft()
+    if not force_queue and (blocking or prompt_ready) then
         if not entry.open() then
             notify_expired(entry.kind)
         end
@@ -586,6 +680,8 @@ local function find_oldest_visible_entry()
     return best_session, best_index, best_entry
 end
 
+--- Hidden entries are skipped here on purpose: this is the auto-open path
+--- (prompt focus), and a request the user dismissed must not pop straight back.
 ---@param tab pi.TabId
 ---@return pi.Session?, integer?, pi.AttentionEntry?
 local function find_oldest_visible_entry_for_tab(tab)
@@ -596,7 +692,11 @@ local function find_oldest_visible_entry_for_tab(tab)
     for _, session in ipairs(sessions()) do
         if session.tab == tab then
             for i, entry in ipairs(pending_entries(session)) do
-                if is_visible(session, entry) and (not best_entry or entry.seq < best_entry.seq) then
+                if
+                    not entry.hidden
+                    and is_visible(session, entry)
+                    and (not best_entry or entry.seq < best_entry.seq)
+                then
                     best_session = session
                     best_index = i
                     best_entry = entry
@@ -630,6 +730,8 @@ local function open_pending_entry(session, index, entry, opts)
             vim.api.nvim_set_current_tabpage(session.tab)
         end
     end
+
+    entry.hidden = nil
 
     if entry.open() then
         return true, false

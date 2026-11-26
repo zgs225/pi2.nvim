@@ -1,12 +1,12 @@
 # Attention & dialogs
 
-Extensions can ask the user for input mid-turn — selects, confirms, free-form text, multi-line editors, and the [diff review](diff-review.md) are all different flavors of the same thing under the hood: an `extension_ui_request` that blocks the agent until the user responds. pi2.nvim calls these **attention requests**, and they share a single queue and UI surface.
+Extensions can ask the user for input mid-turn — selects, confirms, free-form text, multi-line editors, the [ask tool](ask.md)'s questionnaire, and the [diff review](diff-review.md) are all different flavors of the same thing under the hood: an `extension_ui_request` that blocks the agent until the user responds. pi2.nvim calls these **attention requests**, and they share a single queue and UI surface.
 
 ## Immediate vs queued
 
 When a request arrives, pi2.nvim decides between showing it immediately and queueing it:
 
-- **Immediate** — if the current tab's π prompt is focused _and_ has no draft text, the request is dispatched right away. This is the common case while you're actively working with the agent: confirmations, selects, and diffs just pop up as soon as they're needed.
+- **Immediate** — a blocking [`ask`](ask.md) request for the current tab is dispatched right away, even if you are in another window or have draft text: the model is stalled until it is answered. Every other kind needs the current tab's π prompt focused _and_ draft-free, and is dispatched right away when that holds. This is the common case while you're actively working with the agent: confirmations, selects, and diffs just pop up as soon as they're needed.
 - **Queued** — otherwise (you're editing another file, you have draft text in the prompt, you're in a different tab, or the session is running detached in the background while viewing a sub-session), the request is added to a per-session queue, an attention indicator lights up in the statusline, and a notification appears so you don't lose track of it. The agent stays blocked on that request regardless. Requests for detached background sessions survive tab detachment as long as their backend process is running.
 
 Queued requests can be opened on demand with:
@@ -18,7 +18,9 @@ Both are no-ops when there's nothing queued.
 
 ## Auto-open on prompt focus
 
-By default (`attention.auto_open_on_prompt_focus = true`), simply focusing the π prompt with an empty draft pulls the next queued request for the current tab automatically. This matches the mental model of "the prompt is the place where the agent talks to you" — when you show up at the prompt ready to interact, π dispatches whatever's pending.
+By default (`attention.auto_open_on_prompt_focus = true`), simply focusing the π prompt with an empty draft pulls the next queued request for the current tab automatically.
+
+Requests you dismissed without answering (a hidden [ask](ask.md) float, closed with `:q`) are skipped here on purpose: they stay in the queue — the agent is still blocked on them — but do not pop back up until you run `:PiAttention`. This matches the mental model of "the prompt is the place where the agent talks to you" — when you show up at the prompt ready to interact, π dispatches whatever's pending.
 
 Disable this if you prefer to control the timing manually:
 
@@ -67,7 +69,7 @@ vim.api.nvim_create_autocmd("User", {
     pattern = "PiAttentionRequested",
     callback = function(event)
         local data = event.data
-        -- data.tab (nil for detached background sessions), data.kind ("diff"|"select"|"confirm"|"input"|"editor"),
+        -- data.tab (nil for detached background sessions), data.kind ("diff"|"select"|"confirm"|"input"|"editor"|"ask"),
         -- data.tab_count, data.total_count
     end,
 })
@@ -77,7 +79,7 @@ The built-in `attention` statusline component already uses this state — see [S
 
 ## Dialog UI
 
-Selects and confirms render through `vim.ui.select`, so they appear in whatever picker you have configured (telescope's `ui-select` extension, snacks.nvim, the built-in picker, …). Every call passes a stable `kind` — `pi-thinking-level`, `pi-model`, `pi-resume-session`, `pi-diff-note`, `pi-extension-select`, `pi-confirm`, or plain `pi-select` — which picker backends can use for per-source customization. Inputs and editors are custom floating windows with the `pi-dialog` filetype. Style and keys for the floats live under `dialog` in `setup()`:
+Selects and confirms render through `vim.ui.select`, so they appear in whatever picker you have configured (telescope's `ui-select` extension, snacks.nvim, the built-in picker, …). The one exception is the model's questionnaire, which pi2.nvim renders itself as the [ask float](ask.md) (kind `ask`) rather than through `vim.ui.select`. Every call passes a stable `kind` — `pi-thinking-level`, `pi-model`, `pi-resume-session`, `pi-diff-note`, `pi-extension-select`, `pi-confirm`, or plain `pi-select` — which picker backends can use for per-source customization. Inputs and editors are custom floating windows with the `pi-dialog` filetype. Style and keys for the floats live under `dialog` in `setup()`:
 
 ```lua
 require("pi").setup({

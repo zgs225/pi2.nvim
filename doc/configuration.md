@@ -178,7 +178,9 @@ require("pi").setup({
     -- Attention queue for user-input requests (confirms, selects, etc.)
     attention = {
         -- Auto-open the next pending attention request when the
-        -- current tab's prompt is refocused and empty.
+        -- current tab's prompt is refocused and empty. A blocking
+        -- `ask` request ignores this gate and opens as soon as it
+        -- arrives for the tab you are looking at.
         -- If false, needs :PiAttention command to pull what's pending.
         auto_open_on_prompt_focus = true,
         -- Notify when the agent finishes a turn, unless history is being
@@ -559,6 +561,24 @@ require("pi").setup({
         },
     },
 
+    -- The bundled ask tool: the model blocks on a bounded set of
+    -- multiple-choice questions answered in a float (see doc/ask.md).
+    ask = {
+        enabled = true,          -- default on; false hides the tool from the model entirely (live, next turn)
+        max_questions = 4,
+        max_options = 4,
+        allow_free_text = true,
+        timeout_ms = nil,        -- nil = wait forever; a number cancels the ask on timeout
+        ui = "float",            -- currently only "float"
+        keys = {
+            down = "j", up = "k",
+            next_question = "l", prev_question = "h",
+            first = "gg", last = "G",
+            select = "<CR>", toggle = "<Space>", clear = "x",
+            free_text = "i", submit = "ZZ", cancel = { "<Esc>", "q", "ZQ" },
+        },
+    },
+
     -- Zen mode for composing larger prompts
     zen = {
         -- Prompt width in columns. nil = textwidth if set, otherwise 80.
@@ -655,7 +675,8 @@ Notes on a few fields:
 - The side layout is **three columns**: the chat column in the middle, a left column and a right column for the panels. `sessions_list.position` / `tasks_panel.position` / `todo.panel.position` choose the column, and the first panel of a column (stacking order: sessions → tasks → todo) owns that column's `width` — so `sessions_list.width` sizes the left column and `tasks_panel.width` the right one. A column exists only while a panel holds it; the chat column absorbs whatever they leave (and is the only flexible column when the tab is taken over, see [Chat & layouts](usage.md#chat--layouts)).
 - `layout.default`, `layout.side`, and `layout.float` each also accept a **function** returning the value, so you can compute sizes from `vim.o.columns` / `vim.o.lines` at open time. A function-return for `side`/`float` is deep-merged over the defaults, so returning a partial table is fine.
 - `panels.<panel>.name` takes a `fun(tab_id): string` that computes the underlying buffer name per tab — useful for distinguishing multiple π conversations in `:buffers`, statuslines, or tab bars.
-- Several fields (`diff.keys`, `dialog.keys`, `zen.keys`, `copy.key`) accept **key specs** — plain strings, `{ key, modes = ... }` tables, or lists of those. See [Keymaps](keymaps.md#key-specs).
+- `ask` configures the [ask tool](ask.md), which lets the model block on up to `max_questions` multiple-choice questions (each with at most `max_options` options). `ask.enabled` is on by default and applies live — the extension re-reads the published options on every tool call, so `false` takes effect on the next turn and a questionnaire already on screen stays answerable; sub-sessions never get the tool. `ask.timeout_ms` defaults to `nil`, which waits forever; a number cancels the ask after that many milliseconds (the model is told no answers were given and must state its assumption). `ask.ui` accepts only `"float"` — the keyed questionnaire window described in [Ask → Keys](ask.md#keys). `ask.keys` maps the float's vim-style actions and is read when the float opens.
+- Several fields (`diff.keys`, `dialog.keys`, `ask.keys`, `zen.keys`, `copy.key`) accept **key specs** — plain strings, `{ key, modes = ... }` tables, or lists of those. See [Keymaps](keymaps.md#key-specs).
 
 `subagent.tools` narrows the tools a **child** sub-session may call; it is deliberately absent from the defaults table because `nil` *is* the default — every child inherits every tool, the pre-feature behavior. Set it to a list of tool names (`{ "read", "grep", "find", "ls" }`) and each child spawned from then on runs with `pi --tools read,grep,find,ls`. That list **replaces** the child's whole tool selection rather than adding to it, so it must name every tool the child needs, and an empty array is rejected (`tools must list at least one tool; omit it to inherit every tool`) instead of meaning "no tools". MCP is the one exception to "the list is the whole switch": pi keeps MCP tools registered whatever the list says, but their default `codemode` exposure leaves them reachable only from `codemode` or `tool_search`, which the allowlist itself can filter away. A child whose list names neither is spawned with `--no-mcp`, so it connects no server and pi does not warn that its MCP tools are unreachable; name `codemode` / `tool_search` (`mcp__…`, patterns and `+`/`-` entries count too) to keep MCP in that child. A single `dispatch_subagents` spawn can override the setting per item, and the resolved allowlist is persisted per child — see [Sessions → Constraining a child's tools](sessions.md#constraining-a-childs-tools).
 
