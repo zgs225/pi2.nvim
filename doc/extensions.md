@@ -10,7 +10,7 @@ pi2.nvim is extension-aware. When pi runs under `--mode rpc`, extensions can add
 | `setStatus` | `state.extensions[key]` in the statusline state (readable by custom [statusline](usage.md#statusline) components) |
 | `setWidget` with key ending in `:startup` | [Startup block](#extension-startup-announcements) announcement |
 | `setWidget` with any other key | Your `on_widget` config hook (see below) |
-| `select` | Dialog or [diff review](diff-review.md), depending on the payload |
+| `select` | Dialog, [ask](ask.md) float, or [diff review](diff-review.md), depending on the payload |
 | `confirm` | Confirmation dialog |
 | `input` / `editor` | Input dialog |
 | `setTitle`, `set_editor_text` | Currently ignored (warned once) |
@@ -239,6 +239,10 @@ When `todo.enabled` is true (default), pi2.nvim injects `extensions/todo.ts` int
 **Config transport:** `enabled` / `remind_after_turns` / `max_items` are published by pi2.nvim to the `PI_NVIM_TODO_FILE` runtime file (a JSON file under `stdpath("run")`, named per Neovim instance so concurrent nvim processes don't clobber each other). The process env is frozen at spawn, so the extension re-reads the file on every relevant event — live `setup()` calls apply without respawning the RPC process (same pattern as the [auto-title](sessions.md#auto-session-titles) extension).
 
 **Chat rendering:** pi2.nvim gives `todo_write` a dedicated tool-block renderer (the three-state ✓/◐/○ checklist) and mirrors the latest list into the `:PiTodo` side panel — see [Usage → Todo list](usage.md#todo-list).
+
+## Bundled ask extension (`extensions/ask.ts`)
+
+When `ask.enabled` is true (default), pi2.nvim injects `extensions/ask.ts` into **parent** RPC processes only — a sub-session never gets it, because a child has no user to ask. The extension registers one Agent-callable tool, `ask`, which blocks on 1–4 multiple-choice questions answered in a vim-keyed float (see [The ask tool](ask.md)); the payload travels through the reserved `__pi_ask__` select title (the same title-tunnel the sub-agent action tools use), and the host answers `{ "v": 1, "error": "unsupported" }` when it cannot decode it, which makes the extension fall back to one plain `select` per question instead of failing. Its options (`enabled` / `max_questions` / `max_options` / `allow_free_text` / `timeout_ms`) reach already-spawned processes through the `PI_NVIM_ASK_FILE` runtime file, re-read on every tool call and every turn start, so a live `setup()` applies without a respawn.
 
 ## Bundled background-tasks extension (`extensions/bg-tasks.ts`)
 

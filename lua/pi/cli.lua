@@ -288,6 +288,13 @@ function M.todo_extension_path()
     return plugin_root() .. "/extensions/todo.ts"
 end
 
+--- Absolute path to the bundled pi extension backing the ask tool (bounded
+--- multiple-choice questions the model blocks on).
+---@return string
+function M.ask_extension_path()
+    return plugin_root() .. "/extensions/ask.ts"
+end
+
 --- Absolute path to the bundled pi extension reporting the backend model
 --- scope (pi --models / enabledModels) for :PiSelectModel fallback.
 ---@return string
@@ -461,6 +468,23 @@ function M.command(opts)
         if vim.fn.filereadable(todo_ext) == 1 then
             cmd[#cmd + 1] = "--extension"
             cmd[#cmd + 1] = todo_ext
+        end
+    end
+    -- Inject the ask extension into parent processes only: a sub-session can
+    -- never ask the user (the mechanism is disabled at that layer by design,
+    -- see doc/ask.md), so `opts.subagent ~= false` gates it.
+    --
+    -- `ask.enabled` is deliberately NOT checked here. The extension reads it
+    -- from PI_NVIM_ASK_FILE and registers inactive (`defaultActive: false`)
+    -- when it is off, then reconciles the active tool set on every
+    -- before_agent_start. Gating the injection instead would make only
+    -- enabled -> disabled live: a process started with the tool off would never
+    -- load the extension, so turning it back on would need a new session.
+    if opts.subagent ~= false then
+        local ask_ext = M.ask_extension_path()
+        if vim.fn.filereadable(ask_ext) == 1 then
+            cmd[#cmd + 1] = "--extension"
+            cmd[#cmd + 1] = ask_ext
         end
     end
     -- Inject the background bash tasks extension unconditionally (like

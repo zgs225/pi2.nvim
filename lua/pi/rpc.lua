@@ -409,11 +409,21 @@ function Rpc:start(opts)
     -- setup() call — so option changes apply without respawning the RPC
     -- process (same rationale as todo/bg-tasks).
     require("pi.compaction.extension").publish(Config.options.compaction and Config.options.compaction.extension)
+    -- The ask extension reads its options (enabled / max_questions / max_options /
+    -- allow_free_text / timeout_ms) from PI_NVIM_ASK_FILE on every tool call and
+    -- before_agent_start event. Republish here so a process spawned before any
+    -- setup() call still sees the resolved defaults; config.setup republishes on
+    -- every live setup() call, so option changes apply without respawning the
+    -- RPC process (same rationale as the todo file).
+    require("pi.ask").publish(Config.options.ask)
     local env = {
         PI_NVIM_VISION_FILE = require("pi.vision").state_path(),
         PI_NVIM_TITLE_FILE = require("pi.title").state_path(),
         PI_NVIM_SCOPE_FILE = scope_path,
         PI_NVIM_TODO_FILE = require("pi.todo.tool_ui").state_path(),
+        -- The ask extension re-reads its question/option limits, free-text flag
+        -- and timeout from this file on every tool call.
+        PI_NVIM_ASK_FILE = require("pi.ask").state_path(),
         -- The bg-tasks extension re-reads its completion-wake policy (and whether a
         -- human is at the editor) from this file at every paid-turn decision.
         PI_NVIM_BG_TASKS_FILE = require("pi.tasks").state_path(),

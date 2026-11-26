@@ -458,6 +458,63 @@ M.check = function()
         vim.health.ok("compaction runtime file: `" .. require("pi.compaction.extension").state_path() .. "`")
     end
 
+    -- ── Bundled ask extension ──────────────────────────────────────────
+    -- The `ask` tool (bounded multiple-choice questions the model blocks on)
+    -- fails in three user-diagnosable ways: the file is missing, the runtime
+    -- config was never written (the extension then silently runs on its
+    -- defaults), and a pi too old for the blocking host call.
+    local ask_cfg = Config.options.ask or {}
+    if ask_cfg.enabled ~= false then
+        local ask_path = Cli.ask_extension_path()
+        if vim.uv.fs_stat(ask_path) then
+            vim.health.ok("bundled ask extension found (`" .. ask_path .. "`)")
+        else
+            vim.health.warn("bundled ask extension not found at " .. ask_path, {
+                "Reinstall pi2.nvim or set `ask = { enabled = false }` to disable the ask tool",
+            })
+        end
+
+        -- Runtime file: the extension re-reads enabled / max_questions /
+        -- max_options / allow_free_text / timeout_ms from it on every tool
+        -- call. No file means the values never reached a process, so the
+        -- extension would answer its own defaults.
+        local Ask = require("pi.ask")
+        local published = Ask.published()
+        if published then
+            -- Report the value the extension actually acts on: a `false` here is
+            -- a working state (the tool is registered inactive), not a problem.
+            vim.health.ok("ask runtime config: " .. (published.enabled and "enabled" or "disabled by config"))
+        else
+            vim.health.warn("ask runtime config has not been written yet (" .. Ask.state_path() .. ")", {
+                "It is written by `config.setup()` and by every RPC spawn; restart Neovim or run `:PiReload`",
+                "Without it the ask extension runs on its defaults; set `ask = { enabled = false }` to disable it",
+            })
+        end
+
+        -- Version floor: the ask tool needs the blocking ctx.ui.select host call
+        -- plus the AbortSignal / timeout options (verified on pi 1.6.0). Below
+        -- the floor the host answers `unsupported` and the extension falls back
+        -- to one plain select per question — degraded, no crash.
+        local ask_min = "1.6.0"
+        if pi_version then
+            local cmp_ask = Compat.compare_versions(pi_version, ask_min)
+            if cmp_ask == nil then
+                vim.health.warn(
+                    "Could not compare pi version `" .. pi_version .. "` against the ask minimum `" .. ask_min .. "`"
+                )
+            elseif cmp_ask < 0 then
+                vim.health.warn("pi version `" .. pi_version .. "` is older than the ask minimum `" .. ask_min .. "`", {
+                    "Upgrade pi to " .. ask_min .. "+ so the ask dialog renders natively",
+                    "With an older pi each question falls back to a plain select; set `ask = { enabled = false }` to disable the ask tool",
+                })
+            else
+                vim.health.ok(
+                    "pi version `" .. pi_version .. "` satisfies the ask requirement (pi >= " .. ask_min .. ")"
+                )
+            end
+        end
+    end
+
     -- ── Three-column layout ───────────────────────────────────────────
     -- The layout resolves itself from config at open time, so the only thing
     -- worth reporting here is a configuration the user cannot see fail:

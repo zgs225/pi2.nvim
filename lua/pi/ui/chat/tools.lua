@@ -6,6 +6,7 @@ local Ansi = require("pi.ui.chat.ansi")
 local Tasks = require("pi.tasks")
 local SubToolUi = require("pi.subsessions.tool_ui")
 local TodoToolUi = require("pi.todo.tool_ui")
+local AskStrings = require("pi.ask.strings")
 local CodemodeToolUi = require("pi.codemode.tool_ui")
 
 local M = {}
@@ -1411,6 +1412,70 @@ local function list_tasks_rows(result)
     return #rows > 0 and rows or nil
 end
 
+--- Body of the `ask` tool block. The answers are the payload: the extension's
+--- reply text only counts them (`answered 2/3`), so the block renders the
+--- questions with the labels the user picked, from `result.details`. Question
+--- ids are the join key; the positional fallback keeps a details table without
+--- ids usable.
+---@param history pi.ChatHistory
+---@param args table?
+---@param result table?
+---@param is_error boolean?
+---@param insert_at integer?
+---@return integer?
+local function render_ask_block(history, args, result, is_error, insert_at)
+    local details = type(result) == "table" and result.details or nil
+    if type(details) ~= "table" then
+        -- No details (an older extension, or an aborted call): fall back to the
+        -- reply text, same as default_renderer.on_end.
+        return render_result_output(history, args, result, is_error, insert_at)
+    end
+    if details.cancelled then
+        return render_body_line(history, AskStrings.t("cancelled"), "PiAskCancelled", insert_at)
+    end
+    local questions = type(details.questions) == "table" and details.questions or {}
+    local answers = type(details.answers) == "table" and details.answers or {}
+    insert_at = render_body_line(history, AskStrings.questions_header(#questions), "PiAskHeader", insert_at)
+    if #answers == 0 then
+        -- No answer records at all: the header count is all this block knows.
+        return insert_at
+    end
+    ---@type table<string, table>
+    local by_id = {}
+    for _, answer in ipairs(answers) do
+        if type(answer) == "table" and answer.id ~= nil then
+            by_id[tostring(answer.id)] = answer
+        end
+    end
+    for index, question in ipairs(questions) do
+        local q = type(question) == "table" and question or {}
+        local answer = by_id[tostring(q.id)] or answers[index]
+        local branch = index == #questions and "  └─ " or "  ├─ "
+        local header = type(q.header) == "string" and q.header or tostring(q.id or "")
+        local line, hl
+        if type(answer) == "table" and answer.answered then
+            hl = "PiAskAnswer"
+            local detail
+            if answer.custom then
+                detail = AskStrings.t("wrote") .. tostring(answer.custom)
+            elseif type(answer.labels) == "table" and #answer.labels > 0 then
+                ---@type string[]
+                local labels = {}
+                for _, label in ipairs(answer.labels) do
+                    labels[#labels + 1] = tostring(label)
+                end
+                detail = table.concat(labels, ", ")
+            end
+            line = branch .. header .. " ✓" .. (detail and (" " .. detail) or "")
+        else
+            hl = "PiAskCancelled"
+            line = branch .. header .. " · " .. AskStrings.t("unanswered")
+        end
+        insert_at = render_body_line(history, line, hl, insert_at)
+    end
+    return insert_at
+end
+
 ---@type table<string, pi.ToolRenderer>
 local renderers = {
     -- Synthetic block rendered by pi.nvim (not a real tool call): the
@@ -1424,6 +1489,14 @@ local renderers = {
             end
         end,
         on_end = render_result_output,
+    },
+    -- Ask tool: a blocking questions window. The block body is the answer
+    -- record, so it never collapses (a folded answer list hides the very thing
+    -- the user clicked), and it has no on_start: while the window is open the
+    -- window itself is the UI, and the empty block costs one row.
+    ask = {
+        always_expanded = true,
+        on_end = render_ask_block,
     },
     bash = {
         input_visible = 1,

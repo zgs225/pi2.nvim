@@ -52,6 +52,26 @@ The output and preview buffers are read-only (`pi-task-output` filetype) and car
 | `q` | Close the panel |
 | `?` | Toggle a help overlay listing these keys |
 
+## Ask float
+
+The [ask](ask.md) questionnaire is the one π window with its own vim-style keymap set. Every key is **buffer-local** on the float (filetype `pi-ask`) and fires only while it has focus; the plugin binds nothing of them globally. The float is normal mode only — it refuses insert mode, so a stray `startinsert` cannot turn `j`/`k` into E21 errors.
+
+| Key | Action |
+| --- | --- |
+| `j` / `k` | Move the cursor down / up one option |
+| `l` / `h` | Next / previous question (multi-question asks) |
+| `gg` / `G` | First / last option |
+| `<CR>` | Confirm the cursored option and advance; on the last question, submit |
+| `<Space>` | Toggle the cursored option on a multi-select question (same as `<CR>` on a single-select one) |
+| `1`–`9` | Select the option at that position |
+| `x` | Clear every selection of the current question |
+| `i` | Answer the current question with free text |
+| `ZZ` | Submit the whole questionnaire (asks first when a question is unanswered) |
+| `<Esc>` / `q` / `ZQ` | Cancel the ask |
+| `<C-w>c` / `:q` | Close the float without cancelling it (the request returns to the attention queue) |
+
+Every key above except `1`–`9` is configurable through `ask.keys` (see [Configuration](configuration.md)); `1`–`9` are always bound.
+
 ## Key specs
 
 Several config fields (`diff.keys`, `dialog.keys`, `zen.keys`) accept a **key spec** instead of a plain string, so you can pin mappings to specific modes and bind multiple keys to the same action. A key spec is one of:
@@ -82,6 +102,7 @@ Every π buffer gets a stable filetype, so you can target them from your own `Fi
 | `pi-chat-prompt` | Prompt panel |
 | `pi-chat-attachments` | Attachments panel |
 | `pi-dialog` | Input and info dialog floats (completion plugins can be disabled here without affecting the prompt) |
+| `pi-ask` | The [ask](ask.md) questionnaire float (the model asking you multiple-choice questions) |
 | `pi-sessions` | The [sessions overview](sessions.md#sessions-overview-pisessions) list |
 | `pi-todo` | The [`:PiTodo` panel](usage.md#the-pitodo-panel) list |
 | `pi-tasks` | The [background tasks](#background-tasks-panel-pitasks) panel (`:PiTasks`) |
