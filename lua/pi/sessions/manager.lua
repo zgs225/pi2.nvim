@@ -3423,9 +3423,9 @@ end
 --- start the process in that cwd — or recover the checkout first.
 ---
 --- Falls back to the historical single-workspace list when there is nothing to
---- discover (no worktree module, no `list`/`snapshot_worktrees`, and neither a
---- `.worktrees`, a snapshot store, nor git's linked-worktree registry) — plain
---- sessions keep their exact old behaviour and ordering.
+--- discover (no worktree module, no `list`/`snapshot_worktrees`, and neither the
+--- repository's worktree root, a snapshot store, nor git's linked-worktree
+--- registry) — plain sessions keep their exact old behaviour and ordering.
 ---@param callback fun(items: pi.ResumeSessionInfo[])
 local function collect_resume_sessions(callback)
     local History = require("pi.sessions.history")
@@ -3513,14 +3513,20 @@ local function collect_resume_sessions(callback)
         cwds[#cwds + 1] = checkout
         return cwds
     end
-    local has_worktrees_dir = vim.fn.isdirectory(repo_root .. "/.worktrees") == 1
+    -- The layout lives in exactly one place (`Worktree.worktrees_root`), so the
+    -- probe asks the module instead of spelling the directory out — still a plain
+    -- directory test: no subprocess, no file read. A module that cannot name its
+    -- root (`nil`) leaves the cheap gate open rather than claiming the
+    -- repository holds no checkouts; the git listing below decides.
+    local worktrees_root = type(Worktree.worktrees_root) == "function" and Worktree.worktrees_root(repo_root) or nil
+    local may_have_worktrees = worktrees_root == nil or vim.fn.isdirectory(worktrees_root) == 1
     local has_snapshot_dir = vim.fn.isdirectory(common_dir .. "/pi2-worktree-snapshots") == 1
     -- git's registry of linked worktrees (`<git common dir>/worktrees/<name>`).
     -- A directory probe, so "does this repository have other checkouts?" is
     -- answered without spawning git; it keeps cross-checkout resume working for
     -- repositories whose checkouts were created outside pi.
     local has_linked_registry = vim.fn.isdirectory(common_dir .. "/worktrees") == 1
-    if not has_worktrees_dir and not has_snapshot_dir and not has_linked_registry then
+    if not may_have_worktrees and not has_snapshot_dir and not has_linked_registry then
         -- Nothing to discover here: keep the historical synchronous
         -- single-workspace picker and never spawn git for it.
         callback(items)
@@ -3663,15 +3669,56 @@ local function find_continue_session_path(current_session_file, cwd)
     return nil
 end
 
+--- Worktree metadata of the session `:PiContinue` runs from, when the
+--- continued transcript was recorded in that same checkout.
+---
+--- The resume picker hands `prepare_resume_target` a row's `worktree_info`, so a
+--- deleted checkout is recreated before the session opens. `:PiContinue` only
+--- has a transcript, and a checkout deleted underneath the running process
+--- (`rm -rf`, `git worktree remove --force` from a shell) leaves a recorded cwd
+--- that no longer exists — `Worktree.detect` reads the directory, so nothing can
+--- name its repository and worktree afterwards. The live session already holds
+--- that metadata (create / resume / bind put it there), and continuing into an
+--- *older* transcript of the same workspace means its recorded cwd is exactly
+--- that checkout's path. Compared by path, never parsed out of one: a
+--- transcript recorded elsewhere gets no metadata it never had.
+---@param recorded_cwd string
+---@return table? worktree
+local function current_worktree_for(recorded_cwd)
+    local session = M.get()
+    if not session then
+        return nil
+    end
+    local worktree = linked_worktree(session.worktree)
+    if not worktree then
+        return nil
+    end
+    local path = type(worktree.path) == "string" and worktree.path or nil
+    local repo_root = type(worktree.repo_root) == "string" and worktree.repo_root or nil
+    if not path or not repo_root or repo_root == "" then
+        return nil
+    end
+    if not same_path(path, recorded_cwd) then
+        return nil
+    end
+    return worktree
+end
+
 --- Open a continued session through the same safe path as `:PiResume` (restart
 --- the process when its cwd differs, never reuse the wrong process).
+---
+--- The target carries the worktree metadata of the checkout this tab runs in
+--- (see `current_worktree_for`), so continuing into a session recorded in that
+--- checkout recovers it through `prepare_resume_target` when the directory is
+--- gone — the same snapshot recovery the picker gets, instead of an in-place
+--- resume in a dead cwd.
 ---@param session_path string
 ---@param opts? pi.SessionCreateOpts
 local function continue_into_session(session_path, opts)
     local info = require("pi.sessions.history").parse(session_path)
     local target = nil
     if type(info) == "table" and type(info.cwd) == "string" and info.cwd ~= "" then
-        target = { cwd = info.cwd, session_id = info.id }
+        target = { cwd = info.cwd, session_id = info.id, worktree = current_worktree_for(info.cwd) }
     end
     open_resume_target(session_path, opts, false, target)
 end

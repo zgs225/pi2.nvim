@@ -129,6 +129,9 @@ describe("sub-session checkout create/adopt", function()
             end
             return true, nil
         end
+        function fake.worktrees_root(root)
+            return root .. "/.worktrees"
+        end
         function fake.resolve_base(opts, cb)
             wt.calls.base[#wt.calls.base + 1] = vim.deepcopy(opts)
             if wt.base_error then

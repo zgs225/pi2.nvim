@@ -470,10 +470,12 @@ function M.clone()
 end
 
 --- Start a fresh conversation in a new git worktree (`pi.worktree_new`): the
---- worktree is created under `<repo>/.worktrees/<name>` on a detached HEAD and
---- a new tab runs its pi process with that directory as cwd. The current tab's
---- session is left untouched. Refused when the current session already runs in
---- a worktree (no nesting).
+--- worktree is created under the repository's worktree root
+--- (`Worktree.worktrees_root`, `<repo>/.worktrees/<name>` today) on a detached
+--- HEAD and a new tab runs its pi process with that directory as cwd. The
+--- checkout is excluded through git's `info/exclude` (the tracked `.gitignore`
+--- is never touched), and the current tab's session is left untouched. Refused
+--- when the current session already runs in a worktree (no nesting).
 ---@param opts? pi.WorktreeOpts
 function M.worktree_new(opts)
     require("pi.worktree_session").new(opts)
@@ -492,7 +494,8 @@ end
 --- Open a fresh session in an **existing** directory
 --- (`:Pi worktree=<name>` / `:PiNewTab worktree=<name>`, `:PiSessions` → `n` / `N`):
 --- nothing is ever removed, so a failure leaves the user's work alone. `name`
---- resolves to `<repo>/.worktrees/<name>` — a managed linked checkout, or an
+--- resolves under the repository's worktree root (`Worktree.worktrees_root`; to
+--- `<repo>/.worktrees/<name>` today) — a managed linked checkout, or an
 --- error naming how to create one (the `:Pi*` commands pass `create = true`,
 --- which creates the checkout first; the Lua default is an existing checkout
 --- only). `cwd` wins over `name` and may be any existing directory: a linked

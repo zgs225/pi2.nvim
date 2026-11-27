@@ -2150,8 +2150,9 @@ end
 
 --- Label the `N` picker shows for one existing worktree: name · ~/path ·
 --- branch (or `detached`). The label is display only — the entry's own `path`
---- is what the picker opens, so a worktree git manages outside
---- `<repo>/.worktrees/` is reachable just like a pi-created one.
+--- is what the picker opens, so a worktree git manages outside the
+--- repository's worktree root (`Worktree.worktrees_root`) is reachable just like
+--- a pi-created one.
 ---@param entry pi.WorktreeListEntry
 ---@return string
 local function worktree_pick_label(entry)

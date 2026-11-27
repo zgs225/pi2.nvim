@@ -165,6 +165,11 @@ local function install_worktree(overrides)
         end
         return true, nil
     end
+    -- Layout owner (`pi.worktree`): the specs create their checkouts under the
+    -- repository's `.worktrees`, so the stub reports that root.
+    wt.worktrees_root = function(root)
+        return root .. "/.worktrees"
+    end
     wt.detect = function()
         return nil
     end
@@ -277,7 +282,7 @@ describe("worktree target resolution", function()
         end
     end)
 
-    it("resolves an existing sibling name under <repo>/.worktrees", function()
+    it("resolves an existing sibling name in the repository's worktree root", function()
         local repo = mkdir(vim.fn.tempname() .. "-repo")
         vim.fn.mkdir(repo .. "/.worktrees/wt2", "p")
         local wt = install_worktree()
@@ -309,6 +314,78 @@ describe("worktree target resolution", function()
         assert.is_nil(resolved)
         assert.is_not_nil(err)
         assert.is_truthy(err:find("not found", 1, true))
+        -- The message names the root the name was joined under, never a
+        -- hardcoded `<repo>/.worktrees` (a different layout would make it lie).
+        assert.is_truthy(err:find(repo .. "/.worktrees", 1, true))
+    end)
+
+    it("refuses a checkout that belongs to a different repository", function()
+        -- Regression: the name is joined and probed, then the detected checkout
+        -- was accepted on `kind == "linked"` alone. A shared worktree root (or
+        -- a name that hits another repository's checkout) therefore resolved to
+        -- *another* repository's worktree, and `:PiNewTab worktree=main`
+        -- opened a session there.
+        local repo = mkdir(vim.fn.tempname() .. "-repo")
+        local other = mkdir(vim.fn.tempname() .. "-other-repo")
+        vim.fn.mkdir(repo .. "/.worktrees/main", "p")
+        local wt = install_worktree()
+        wt.detect = function(path)
+            if path == repo .. "/.worktrees/main" then
+                return fake_info({
+                    name = "main",
+                    path = path,
+                    repo_root = other,
+                    git_dir = other .. "/.git/worktrees/main",
+                    common_dir = other .. "/.git",
+                })
+            end
+            return nil
+        end
+        Sessions.get = function()
+            return fake_session({ worktree = fake_info({ name = "wt1", repo_root = repo }) })
+        end
+
+        local resolved, err = WorktreeSession._resolve_target("main")
+        assert.is_nil(resolved)
+        assert.is_not_nil(err)
+        assert.is_truthy(err:find("belongs to a different repository", 1, true))
+        assert.is_truthy(err:find(other, 1, true))
+    end)
+
+    it("accepts a checkout whose metadata repository root is stale but whose common dir matches", function()
+        -- `pi2-worktree.json` records `repo_root`, which goes stale when the
+        -- repository is moved (`mv /repo /elsewhere`), while `common_dir` is
+        -- git's own identity and moves with it. `common_dir` decides first —
+        -- the same standard `resolve_assigned_worktree` applies in
+        -- pi.subsessions — so a legitimate checkout is not refused as foreign.
+        local repo = mkdir(vim.fn.tempname() .. "-repo")
+        local checkout = repo .. "/.worktrees/wt2"
+        vim.fn.mkdir(checkout, "p")
+        local stale = vim.fn.tempname() .. "-old-location"
+        local expected = {
+            kind = "linked",
+            name = "wt2",
+            path = checkout,
+            repo_root = stale,
+            common_dir = repo .. "/.git",
+        }
+        local wt = install_worktree()
+        wt.detect = function(path)
+            if path == checkout then
+                return expected
+            end
+            if path == repo then
+                return { kind = "main", name = "repo", path = repo, repo_root = repo, common_dir = repo .. "/.git" }
+            end
+            return nil
+        end
+        Sessions.get = function()
+            return fake_session({ worktree = fake_info({ name = "wt1", repo_root = repo }) })
+        end
+
+        local resolved, err = WorktreeSession._resolve_target("wt2")
+        assert.is_nil(err)
+        assert.equals(expected, resolved)
     end)
 end)
 
@@ -1256,6 +1333,32 @@ describe("worktree recovery for cross-worktree resume", function()
         assert.equals(0, create_calls)
     end)
 
+    it("refuses an existing checkout of another repository instead of returning it", function()
+        local other = mkdir(vim.fn.tempname() .. "-other-repo")
+        local target = repo .. "/.worktrees/wt1"
+        vim.fn.mkdir(target, "p")
+        wt.detect = function(path)
+            if path == target then
+                return { kind = "linked", name = "wt1", path = target, repo_root = other }
+            end
+            return nil
+        end
+        local create_calls = 0
+        wt.create = function(_, cb)
+            create_calls = create_calls + 1
+            cb(nil, "should not be called")
+        end
+
+        local result, err
+        WorktreeSession.recover_worktree({ repo_root = repo, name = "wt1" }, function(info, e)
+            result, err = info, e
+        end)
+        assert.is_nil(result)
+        assert.is_truthy(err:find("belongs to a different repository", 1, true))
+        assert.is_truthy(err:find(other, 1, true))
+        assert.equals(0, create_calls)
+    end)
+
     it("prepare_resume_target keeps an existing target and recovers a missing one", function()
         local existing = mkdir(vim.fn.tempname() .. "-exists")
         local target
@@ -1266,7 +1369,11 @@ describe("worktree recovery for cross-worktree resume", function()
         assert.equals(existing, target.cwd)
 
         -- Missing checkout with an integrated child row: recovery opens a new
-        -- worktree at the current HEAD.
+        -- worktree at the current HEAD. Deliberately WITHOUT `worktree`
+        -- metadata: `Worktree.locate` names the vanished checkout from git's
+        -- worktree registry, so a target that only has a cwd (`:PiContinue`, a
+        -- `:PiSessions n` row, a row carrying only `assigned_worktree`) is
+        -- recovered exactly like one whose row records the metadata.
         Manifest.locate = function(id)
             assert.equals("child-9", id)
             return { integration = { state = "applied" } }
@@ -1274,24 +1381,180 @@ describe("worktree recovery for cross-worktree resume", function()
         wt.latest_snapshot = function()
             return nil
         end
+        local missing = repo .. "/.worktrees/wt-missing"
+        local located = {}
+        wt.locate = function(path)
+            located[#located + 1] = path
+            if vim.fs.normalize(path) == vim.fs.normalize(missing) then
+                return { repo_root = repo, name = "wt-missing", path = missing, missing = true }
+            end
+            return nil
+        end
+        local created = {}
         wt.create = function(opts, cb)
+            created[#created + 1] = opts
             local path = repo .. "/.worktrees/" .. opts.name
             vim.fn.mkdir(path, "p")
             cb({ kind = "linked", name = opts.name, path = path, repo_root = repo }, nil)
         end
         local recovered
-        WorktreeSession.prepare_resume_target({
-            cwd = repo .. "/.worktrees/wt-missing",
-            session_id = "child-9",
-        }, function(ctx)
+        WorktreeSession.prepare_resume_target({ cwd = missing, session_id = "child-9" }, function(ctx)
             recovered = ctx
         end)
         wait_for(function()
             return recovered ~= nil
         end)
-        assert.equals(repo .. "/.worktrees/wt-missing", recovered.cwd)
+        assert.same({ missing }, located)
+        assert.equals("wt-missing", created[1].name)
+        assert.equals(missing, recovered.cwd)
         assert.equals("wt-missing", recovered.worktree.name)
         assert.is_not_nil(find_note("Recovered worktree", vim.log.levels.INFO))
+    end)
+
+    it("recovers a vanished linked checkout from its git registration, not its path", function()
+        -- The deleted reverse parser (`^(.-)/\.worktrees/([^/]+)$`) could only
+        -- name a repository for a cwd under `<repo>/.worktrees`: any other
+        -- layout silently fell through to an in-place resume with no recovery,
+        -- no error and no warning. `Worktree.detect` cannot replace it either —
+        -- it reads the checkout's own `.git`, so it answers nothing for a
+        -- directory that is gone (which is why stubbing it to answer here
+        -- proved only that the stub worked). `Worktree.locate` resolves
+        -- metadata-first from git's worktree registry, so neither the layout
+        -- nor the survival of the recorded checkout decides whether it is
+        -- recovered: the snapshot is restored into a **fresh** checkout at
+        -- `<worktrees_root>/<name>`, never back at the recorded path.
+        Manifest.locate = function()
+            return { integration = { state = "applied" } }
+        end
+        wt.latest_snapshot = function()
+            return nil
+        end
+        local elsewhere = vim.fn.tempname() .. "-elsewhere/wt-elsewhere"
+        local located = {}
+        wt.locate = function(path)
+            located[#located + 1] = path
+            if vim.fs.normalize(path) == vim.fs.normalize(elsewhere) then
+                return {
+                    repo_root = repo,
+                    name = "wt-elsewhere",
+                    path = elsewhere,
+                    git_dir = repo .. "/.git/worktrees/wt-elsewhere",
+                    missing = true,
+                }
+            end
+            return nil
+        end
+        -- Real `detect` answers nothing for a directory that is gone.
+        wt.detect = function()
+            return nil
+        end
+        local created = {}
+        wt.create = function(opts, cb)
+            created[#created + 1] = opts
+            local path = repo .. "/.worktrees/" .. opts.name
+            vim.fn.mkdir(path, "p")
+            cb({
+                kind = "linked",
+                name = opts.name,
+                path = path,
+                repo_root = repo,
+                common_dir = repo .. "/.git",
+            }, nil)
+        end
+
+        local recovered
+        WorktreeSession.prepare_resume_target({ cwd = elsewhere, session_id = "child-elsewhere" }, function(ctx)
+            recovered = ctx
+        end)
+        wait_for(function()
+            return recovered ~= nil
+        end)
+        assert.same({ elsewhere }, located)
+        assert.equals("wt-elsewhere", created[1].name)
+        assert.equals(repo .. "/.worktrees/wt-elsewhere", recovered.cwd)
+        assert.are_not.equal(elsewhere, recovered.cwd)
+        assert.is_not_nil(recovered.worktree)
+        assert.equals("wt-elsewhere", recovered.worktree.name)
+        assert.equals(repo, recovered.worktree.repo_root)
+        assert.is_not_nil(find_note("Recovered worktree", vim.log.levels.INFO))
+    end)
+
+    it("refuses a different checkout that now sits at the worktree root", function()
+        -- The recorded checkout was moved (`git worktree move`) before it was
+        -- deleted, so `name` comes from metadata while
+        -- `<worktrees_root>/<name>` now holds an unrelated checkout of the same
+        -- repository. Reusing it would resume this conversation in someone
+        -- else's checkout.
+        local foreign = repo .. "/.worktrees/wt1"
+        vim.fn.mkdir(foreign, "p")
+        local recorded = repo .. "/.worktrees/wt1-moved"
+        wt.detect = function(path)
+            if path == foreign then
+                return {
+                    kind = "linked",
+                    name = "wt1",
+                    path = foreign,
+                    repo_root = repo,
+                    common_dir = repo .. "/.git",
+                }
+            end
+            return nil
+        end
+        local create_calls = 0
+        wt.create = function(_, cb)
+            create_calls = create_calls + 1
+            cb(nil, "should not be called")
+        end
+
+        local result, err
+        WorktreeSession.recover_worktree({ repo_root = repo, name = "wt1", path = recorded }, function(info, e)
+            result, err = info, e
+        end)
+        assert.is_nil(result)
+        assert.is_truthy(err:find("refusing to resume in another checkout", 1, true))
+        assert.is_truthy(err:find(recorded, 1, true))
+        assert.is_truthy(err:find(foreign, 1, true))
+        assert.equals(0, create_calls)
+    end)
+
+    it("accepts a checkout whose metadata repository root is stale but whose common dir matches", function()
+        -- A repository that was `mv`-d leaves a stale `repo_root` in
+        -- `pi2-worktree.json`; `common_dir` is git's own identity and does not
+        -- move, so it decides first (`git worktree move` and a symlinked main
+        -- root normalize on both sides anyway) — the standard
+        -- `resolve_assigned_worktree` applies in pi.subsessions.
+        local target = repo .. "/.worktrees/wt1"
+        vim.fn.mkdir(target, "p")
+        local stale = vim.fn.tempname() .. "-old-location"
+        local detected = {
+            kind = "linked",
+            name = "wt1",
+            path = target,
+            repo_root = stale,
+            common_dir = repo .. "/.git",
+        }
+        wt.detect = function(path)
+            if path == target then
+                return detected
+            end
+            if path == repo then
+                return { kind = "main", name = "repo", path = repo, repo_root = repo, common_dir = repo .. "/.git" }
+            end
+            return nil
+        end
+        local create_calls = 0
+        wt.create = function(_, cb)
+            create_calls = create_calls + 1
+            cb(nil, "should not be called")
+        end
+
+        local result, err
+        WorktreeSession.recover_worktree({ repo_root = repo, name = "wt1", path = target }, function(info, e)
+            result, err = info, e
+        end)
+        assert.is_nil(err)
+        assert.equals(detected, result)
+        assert.equals(0, create_calls)
     end)
 
     it("reports no worktree metadata for the main checkout", function()
@@ -1327,6 +1590,73 @@ describe("worktree recovery for cross-worktree resume", function()
         assert.is_not_nil(target)
         assert.equals(plain, target.cwd)
         assert.is_nil(target.worktree)
+    end)
+
+    it("warns when the worktree registry cannot be inspected (N1)", function()
+        -- `Worktree.locate` throwing used to degrade to the in-place resume
+        -- silently: the session then opens somewhere the row never recorded and
+        -- nothing says why the checkout was not recovered.
+        local gone = repo .. "/.worktrees/wt-uninspectable"
+        wt.locate = function()
+            error("registry unreadable")
+        end
+
+        local target
+        WorktreeSession.prepare_resume_target({ cwd = gone, session_id = "child-x" }, function(ctx)
+            target = ctx
+        end)
+        local note = find_note("cannot inspect the worktree registry", vim.log.levels.WARN)
+        assert.is_not_nil(note, "a throwing locate must be reported, not swallowed")
+        assert.is_truthy(note.msg:find(gone, 1, true))
+        assert.is_truthy(note.msg:find("registry unreadable", 1, true))
+        -- Still degrades (no invented worktree), just not silently.
+        assert.is_not_nil(target)
+        assert.equals("child-x", target.session_id)
+        assert.is_nil(target.cwd)
+    end)
+
+    it("says so when it resumes in place with a recorded cwd that is gone (N3)", function()
+        -- A checkout moved outside the layout AND pruned (or a cwd recorded in a
+        -- subdirectory of it) cannot be named by `Worktree.locate`; the session
+        -- resumes in place. Keep that control flow, but name the dead path.
+        local gone = repo .. "/.worktrees/wt-forgotten"
+        wt.locate = function()
+            return nil
+        end
+
+        local target
+        WorktreeSession.prepare_resume_target({ cwd = gone, session_id = "child-y" }, function(ctx)
+            target = ctx
+        end)
+        local note = find_note("resuming the session in place", vim.log.levels.INFO)
+        assert.is_not_nil(note, "an in-place resume of a dead cwd must be announced")
+        assert.is_truthy(note.msg:find(gone, 1, true))
+        assert.equals("child-y", target.session_id)
+        assert.is_nil(target.cwd)
+    end)
+
+    it("reports a missing worktrees_root through the callback instead of throwing (N4)", function()
+        -- Every other caller guards the layout helper; a `Worktree` table without
+        -- it must report "support unavailable" here too, never throw.
+        wt.worktrees_root = nil
+
+        local result, err
+        WorktreeSession.recover_worktree({ repo_root = repo, name = "wt1" }, function(info, e)
+            result, err = info, e
+        end)
+        assert.is_nil(result)
+        assert.is_truthy(tostring(err):find("Worktree support is unavailable", 1, true))
+    end)
+
+    it("refuses a named target when worktrees_root is missing, instead of throwing (N4)", function()
+        wt.worktrees_root = nil
+        Sessions.get = function()
+            return fake_session({ worktree = fake_info({ repo_root = repo }) })
+        end
+
+        local resolved, err = WorktreeSession._resolve_target("wt2")
+        assert.is_nil(resolved)
+        assert.is_truthy(tostring(err):find("Worktree support is unavailable", 1, true))
     end)
 end)
 
@@ -1465,6 +1795,50 @@ describe("real recover_worktree after release/removal", function()
         assert.same({ "brand new" }, vim.fn.readfile(recovered.path .. "/new.txt"))
         local head = vim.trim(git(recovered.path, "rev-parse", "HEAD"))
         assert.equals(base, head)
+        vim.fn.delete(repo, "rf")
+    end)
+
+    it("names a checkout deleted by hand from git's registration and restores it", function()
+        -- The H1 case end to end: a target that carries only a cwd (`:PiContinue`
+        -- where the live session has no worktree metadata, a `:PiSessions n`
+        -- row without `worktree_info`) whose checkout was deleted by hand.
+        -- `Worktree.detect` cannot answer for a directory that is gone, so
+        -- without `Worktree.locate` the repository and name stayed nil and the
+        -- target fell through to an in-place resume of a dead cwd: no
+        -- recovery, no error, no warning. The registration git keeps names it,
+        -- and the snapshot is restored into a fresh checkout.
+        local repo = make_repo()
+        local info = create(repo, "wt-gone")
+        local base = info.base_sha
+        local snapshot_path, snapshot_err
+        Worktree.snapshot(info, function(value, e)
+            snapshot_path, snapshot_err = value, e
+        end)
+        wait_for(function()
+            return snapshot_path ~= nil or snapshot_err ~= nil
+        end)
+        assert.is_not_nil(snapshot_path, tostring(snapshot_err))
+        vim.fn.delete(info.path, "rf")
+        assert.equals(0, vim.fn.isdirectory(info.path))
+        assert.is_nil(Worktree.detect(info.path))
+
+        local target, target_err
+        WorktreeSession.prepare_resume_target({ cwd = info.path }, function(value, e)
+            target, target_err = value, e
+        end)
+        wait_for(function()
+            return target ~= nil or target_err ~= nil
+        end)
+        assert.is_nil(target_err)
+        assert.is_not_nil(target)
+        -- Recovery creates at `Worktree.worktrees_root(repo)`; here that is the
+        -- recorded path again, so the assertion is "a live checkout, not the
+        -- dead cwd it must never resume in".
+        assert.equals(info.path, target.cwd)
+        assert.equals(1, vim.fn.isdirectory(target.cwd))
+        assert.is_not_nil(target.worktree)
+        assert.equals("wt-gone", target.worktree.name)
+        assert.equals(base, vim.trim(git(target.cwd, "rev-parse", "HEAD")))
         vim.fn.delete(repo, "rf")
     end)
 end)

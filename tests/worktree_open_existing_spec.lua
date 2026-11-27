@@ -138,6 +138,9 @@ local function install_worktree(overrides)
         end
         return true, nil
     end
+    wt.worktrees_root = function(root)
+        return root .. "/.worktrees"
+    end
     wt.detect = function(dir)
         wt.calls.detect[#wt.calls.detect + 1] = dir
         if type(dir) == "string" and vim.fs.normalize(dir) == vim.fs.normalize(CHECKOUT) then

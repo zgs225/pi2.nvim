@@ -32,13 +32,13 @@ local DiffReview = require("pi.ui.diff_review")
 --- Target of the worktree operations that act on an existing checkout
 --- (`pi.worktree_apply/ship/remove`).
 ---@class pi.WorktreeTargetOpts
----@field name? string Worktree name under `<repo>/.worktrees/` (default: the current session's worktree).
+---@field name? string Worktree name under `Worktree.worktrees_root` (default: the current session's worktree).
 
 --- Options of the `worktree=<name>` start flag
 --- (`:Pi worktree=<name>` / `:PiNewTab worktree=<name>`).
 ---@class pi.WorktreeOpenOpts
----@field name? string Existing worktree name under `<repo>/.worktrees/`.
----@field repo_cwd? string Repository scope for `name`: the repository `<repo>/.worktrees/<name>` is
+---@field name? string Existing worktree name under `Worktree.worktrees_root`.
+---@field repo_cwd? string Repository scope for `name`: the repository's checkout of that name is
 --- resolved in and, with `create`, the cwd the checkout is created from. It wins over the repository the
 --- current tab happens to run in (another repo's identical name never resolves to, nor is refused by, this
 --- tab's checkout), must be a git checkout, and is ignored when `cwd` is given. Because it only *scopes a
@@ -167,6 +167,79 @@ local function same_worktree(a, b)
     return same_path(a.path, b.path)
 end
 
+--- `Worktree.locate(path)` — the repository and worktree name of a checkout
+--- whose directory need not exist any more.
+---
+--- Tolerated like every other optional `Worktree` function here: a module that
+--- is missing the helper yields nil, and the caller keeps its historical
+--- behaviour instead of erroring out. A helper that *throws*, however, is
+--- reported before degrading: the caller falls back to an in-place resume, and
+--- doing that silently is the loss class this whole path exists to remove.
+---@param Worktree table?
+---@param path string? Recorded checkout path.
+---@return pi.WorktreeLocator? locator
+local function locate_checkout(Worktree, path)
+    if not Worktree or type(Worktree.locate) ~= "function" then
+        return nil
+    end
+    if type(path) ~= "string" or path == "" then
+        return nil
+    end
+    local ok, locator = pcall(Worktree.locate, path)
+    if not ok then
+        Notify.warn("cannot inspect the worktree registry for " .. path .. ": " .. tostring(locator))
+        return nil
+    end
+    if type(locator) ~= "table" then
+        return nil
+    end
+    return locator
+end
+
+--- The repository identities a detected checkout carries.
+---@param info table
+---@return string? common_dir Shared git dir, when present.
+---@return string? repo_root Main work tree, when present.
+local function repository_ids(info)
+    local common = type(info.common_dir) == "string" and info.common_dir ~= "" and info.common_dir or nil
+    local root = type(info.repo_root) == "string" and info.repo_root ~= "" and info.repo_root or nil
+    return common, root
+end
+
+--- Does a detected checkout belong to the repository a command resolves in?
+---
+--- `common_dir` decides whenever **both** sides have one: it is git's own
+--- shared git dir, so a repository that was moved (`mv /repo /elsewhere`) — its
+--- `pi2-worktree.json` still naming the old `repo_root` — does not make a
+--- legitimate recovery look foreign, `git worktree move` does not either, and a
+--- symlinked main root normalizes on both sides (`same_path`). `repo_root` is
+--- only the fallback when a side has no `common_dir`. This is the same standard
+--- `resolve_assigned_worktree` applies in `pi.subsessions`.
+---@param Worktree table
+---@param info table Detected checkout (`Worktree.detect`).
+---@param repo_root string Repository being resolved (or recovered) in.
+---@return boolean same
+---@return string? actual Repository the checkout belongs to (nil = cannot be determined).
+---@return string? expected Repository the caller expected (nil = cannot be determined).
+local function same_repository(Worktree, info, repo_root)
+    local checkout_common, checkout_root = repository_ids(info)
+    local expected_common, expected_root = nil, nil
+    if type(Worktree.detect) == "function" and type(repo_root) == "string" and vim.fn.isdirectory(repo_root) == 1 then
+        local detected = Worktree.detect(repo_root)
+        if type(detected) == "table" then
+            expected_common, expected_root = repository_ids(detected)
+        end
+    end
+    expected_root = expected_root or repo_root
+    if checkout_common and expected_common then
+        return same_path(checkout_common, expected_common), checkout_common, expected_common
+    end
+    if not checkout_root then
+        return false, nil, expected_root
+    end
+    return same_path(checkout_root, expected_root), checkout_root, expected_root
+end
+
 --- Validate the shape of `repo_cwd` (nil = no scope at all).
 ---
 --- A passed value must be a usable repository path: silently treating a
@@ -247,9 +320,11 @@ end
 ---
 --- Without a name this is the current session's worktree (falling back to the
 --- linked worktree its cwd lives in, for resumed sessions). A name is
---- validated and then joined under `<repo>/.worktrees/<name>`, so it can never
---- escape the checkout directory; the resolved directory must be a linked git
---- worktree (`Worktree.detect`).
+--- validated and then joined under the repository's worktree root
+--- (`Worktree.worktrees_root(repo_root) .. "/" .. name`), so it can never escape
+--- that directory; the resolved directory must be a linked git worktree of the
+--- **same** repository (`Worktree.detect`), never another repository's
+--- checkout.
 ---
 --- `repo_cwd` scopes the name to that repository (see `repo_scope_root`);
 --- without it the repository is the current session's, exactly as before. It
@@ -345,13 +420,34 @@ local function resolve_target(name, repo_cwd, opts)
         return nil, "Not inside a git repository: cannot resolve worktree '" .. wanted .. "'"
     end
 
-    local path = repo_root .. "/.worktrees/" .. wanted
+    -- Guarded like every other caller of the layout helper (`pi.commands`,
+    -- `pi.subsessions`): a `Worktree` table without it must report through this
+    -- function's error return, never throw. Only the *named* branch needs it,
+    -- so the nameless resolution above still works.
+    if type(Worktree.worktrees_root) ~= "function" then
+        return nil, "Worktree support is unavailable (pi.worktree module missing)"
+    end
+    local root = Worktree.worktrees_root(repo_root)
+    local path = root .. "/" .. wanted
     if vim.fn.isdirectory(path) == 0 then
-        return nil, string.format("Worktree '%s' not found under %s/.worktrees", wanted, repo_root), "missing"
+        return nil, string.format("Worktree '%s' not found under %s", wanted, root), "missing"
     end
     local info = type(Worktree.detect) == "function" and Worktree.detect(path) or nil
     if type(info) ~= "table" or info.kind ~= "linked" then
         return nil, "Not a git worktree: " .. path
+    end
+    -- The name resolved to a checkout, but not necessarily to one of *this*
+    -- repository: a shared worktree root (or a name that happens to hit
+    -- another repository's checkout) must never hand back an unrelated
+    -- checkout — that would open a session in the wrong repository.
+    -- `common_dir` first, `repo_root` only as its fallback (`same_repository`).
+    local same, actual, expected = same_repository(Worktree, info, repo_root)
+    if not actual then
+        return nil, string.format("Cannot determine the repository of worktree '%s' at %s", wanted, info.path or path)
+    end
+    if not same then
+        return nil,
+            string.format("Worktree '%s' belongs to a different repository: %s (expected %s)", wanted, actual, expected)
     end
     return info
 end
@@ -642,13 +738,14 @@ end
 --- it) and may be **any existing directory**: a linked worktree becomes worktree
 --- metadata, while the main checkout — or a directory outside any repository —
 --- starts an ordinary session whose cwd is that path. A `name` reuses
---- `resolve_target`, so it still has to be a managed linked checkout under
---- `<repo>/.worktrees/<name>`; a missing one is an error (the `"missing"` code
+--- `resolve_target`, so it still has to be a managed linked checkout under the
+--- repository's worktree root (`Worktree.worktrees_root`); a missing one is an
+--- error (the `"missing"` code
 --- lets `open_existing` create it when asked) that points at the two ways to
 --- create it, never an implicit create.
 ---
 --- `opts.repo_cwd` scopes `name` to an explicit repository: the name resolves
---- under *that* repository's `.worktrees/`, and a bad scope (non-string, blank,
+--- under *that* repository's worktree root, and a bad scope (non-string, blank,
 --- missing directory, not a git checkout) is a clear error — never a resolution
 --- in the repository this tab runs in. It is only consulted on the `name` path:
 --- a non-empty `cwd` wins outright and ignores `repo_cwd` entirely, valid or not
@@ -1037,7 +1134,8 @@ end
 --- checkout first when `opts.create` is set and the name does not exist yet.
 ---
 --- Without `create` nothing is created and nothing is removed. `name` must be
---- a managed linked checkout under `<repo>/.worktrees/<name>`; `cwd` may be any
+--- a managed linked checkout under the repository's worktree root
+--- (`Worktree.worktrees_root`); `cwd` may be any
 --- existing directory — a linked worktree (attached as worktree metadata), the
 --- main checkout or a plain project dir (both ordinary sessions). Only the
 --- *session* is new — the directory keeps whatever state the user left in it,
@@ -1635,22 +1733,6 @@ end
 ---@field worktree? table Worktree metadata when the target is a managed worktree.
 ---@field session_id? string Session id used to look up integration metadata.
 
---- Split `<repo>/.worktrees/<name>` into its repository root and worktree name.
----@param path string
----@return string? repo_root
----@return string? name
-local function split_worktree_path(path)
-    if type(path) ~= "string" or path == "" then
-        return nil, nil
-    end
-    local norm = vim.fs.normalize(path)
-    local repo_root, name = norm:match("^(.-)[/\\]%.worktrees[/\\]([^/\\]+)$")
-    if type(repo_root) == "string" and repo_root ~= "" and type(name) == "string" and name ~= "" then
-        return repo_root, name
-    end
-    return nil, nil
-end
-
 --- Snapshot record for a removed worktree, or nil + reason when unavailable.
 --- Tolerant by design: the git-side module owns the record shape and may not
 --- have shipped `latest_snapshot` yet.
@@ -1788,14 +1870,23 @@ end
 ---     snapshot into the new worktree;
 ---   * neither → explicit error. The session is never silently opened in the
 ---     main checkout, and nothing is ever written there.
----@param opts { repo_root: string, name: string, session_id?: string, base_sha?: string, mode?: string }
+---
+--- A directory already sitting at `<worktrees_root>/<name>` is only reused when
+--- it is *the* recorded checkout (`opts.path`, the path the session ran in):
+--- ownership is checked by `common_dir` first (`same_repository`), then the
+--- checkout has to be the one that was recorded. Anything else is somebody
+--- else's checkout — reported, never resumed in, never deleted or recreated.
+---@param opts { repo_root: string, name: string, session_id?: string, base_sha?: string, mode?: string, path?: string }
 ---@param cb fun(info: table?, err: string?)
 function M.recover_worktree(opts, cb)
     if type(opts) ~= "table" or type(cb) ~= "function" then
         return
     end
     local Worktree = worktree_module()
-    if not Worktree or type(Worktree.create) ~= "function" then
+    -- `worktrees_root` is used unconditionally below (the joined path), so it is
+    -- part of "support is available": a module without it must report through
+    -- `cb`, never throw.
+    if not Worktree or type(Worktree.create) ~= "function" or type(Worktree.worktrees_root) ~= "function" then
         cb(nil, "Worktree support is unavailable (pi.worktree module missing)")
         return
     end
@@ -1817,10 +1908,52 @@ function M.recover_worktree(opts, cb)
         end
     end
 
-    local path = repo_root .. "/.worktrees/" .. name
+    local path = Worktree.worktrees_root(repo_root) .. "/" .. name
     if vim.fn.isdirectory(path) == 1 then
         local info = type(Worktree.detect) == "function" and Worktree.detect(path) or nil
         if type(info) == "table" then
+            -- Same ownership standard as `resolve_target`: an existing checkout
+            -- only counts when it belongs to the repository being recovered
+            -- (`common_dir` first, `repo_root` as its fallback).
+            local same, actual, expected = same_repository(Worktree, info, repo_root)
+            if not actual then
+                cb(
+                    nil,
+                    string.format("Cannot determine the repository of worktree '%s' at %s", name, info.path or path)
+                )
+                return
+            end
+            if not same then
+                cb(
+                    nil,
+                    string.format(
+                        "Worktree '%s' belongs to a different repository: %s (expected %s)",
+                        name,
+                        actual,
+                        expected
+                    )
+                )
+                return
+            end
+            -- A checkout of the same repository is still not necessarily the
+            -- one this session ran in: a checkout that was moved before it
+            -- disappeared leaves `<worktrees_root>/<name>` free for someone
+            -- else's checkout of the same name. Only the recorded checkout may
+            -- be handed back; another one is reported, never reused (and never
+            -- deleted or recreated — this call does not own it).
+            local recorded = type(opts.path) == "string" and opts.path ~= "" and opts.path or nil
+            if recorded and not same_path(info.path, recorded) then
+                cb(
+                    nil,
+                    string.format(
+                        "Worktree '%s' was recorded at %s, but the checkout now at %s is a different one; refusing to resume in another checkout",
+                        name,
+                        recorded,
+                        info.path or path
+                    )
+                )
+                return
+            end
             cb(info)
             return
         end
@@ -1956,7 +2089,12 @@ end
 --- back as `worktree` — the main checkout and a plain directory resume as
 --- ordinary sessions). A missing managed worktree is recovered through
 --- `recover_worktree` (integration metadata / snapshot), never by silently
---- opening the session in the main checkout.
+--- opening the session in the main checkout. The repository and worktree name
+--- come from the row's metadata, else from `Worktree.locate` on the recorded
+--- cwd — which resolves a checkout that no longer exists from git's worktree
+--- registry, so neither the layout nor the survival of the checkout decides
+--- whether it is recovered. The path's shape is never parsed here: layout
+--- knowledge lives in `pi.worktree`.
 ---@param target pi.ResumeTarget
 ---@param cb fun(target: pi.ResumeTarget?)
 function M.prepare_resume_target(target, cb)
@@ -2009,15 +2147,28 @@ function M.prepare_resume_target(target, cb)
     local repo_root = worktree and worktree.repo_root or nil
     local name = worktree and worktree.name or nil
     if type(repo_root) ~= "string" or repo_root == "" or type(name) ~= "string" or name == "" then
-        local derived_root, derived_name = split_worktree_path(existing or cwd or "")
-        repo_root = repo_root or derived_root
-        name = name or derived_name
+        -- The checkout is gone by definition here (`existing` is not a
+        -- directory), so `Worktree.detect` — which reads the checkout's own
+        -- `.git` — cannot name it. `Worktree.locate` resolves metadata-first
+        -- from git's worktree registry instead, so a managed checkout that was
+        -- deleted (or `git worktree move`-d before it disappeared) still yields
+        -- its repository and name and is recovered below. The old reverse path
+        -- parser only understood `<repo>/.worktrees/<name>`, and the layout of a
+        -- checkout must not decide whether it is recovered.
+        local locator = locate_checkout(Worktree, existing)
+        repo_root = repo_root or locator and locator.repo_root
+        name = name or locator and locator.name
     end
     if type(repo_root) ~= "string" or repo_root == "" or type(name) ~= "string" or name == "" then
         if not worktree then
-            -- A plain session whose recorded cwd no longer exists (and which is
-            -- not a managed `<repo>/.worktrees/<name>` path): keep the old
-            -- in-place resume instead of inventing a worktree for it.
+            -- A plain session whose recorded cwd no longer exists and which
+            -- `Worktree.locate` cannot name either (it never was a checkout, or
+            -- its registration is gone): keep the old in-place resume instead
+            -- of inventing a worktree for it — but say so, because the session
+            -- is about to open in whatever directory this process runs in.
+            Notify.info(
+                "Recorded working directory no longer exists; resuming the session in place: " .. tostring(existing)
+            )
             cb({ session_id = target.session_id })
             return
         end
@@ -2034,6 +2185,9 @@ function M.prepare_resume_target(target, cb)
         name = name,
         session_id = target.session_id,
         base_sha = worktree and worktree.base_sha or nil,
+        -- The path the session was recorded at: recovery may only hand that
+        -- checkout back, never a different one now sitting at the joined path.
+        path = type(existing) == "string" and existing ~= "" and existing or nil,
     }, function(info, err)
         if not valid_info(info) then
             Notify.error("Failed to recover worktree '" .. tostring(name) .. "': " .. tostring(err or "unknown error"))

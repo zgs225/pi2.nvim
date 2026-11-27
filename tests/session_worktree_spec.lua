@@ -1398,6 +1398,9 @@ describe("worktree discovery and continue for resume", function()
             validate_name = function()
                 return true
             end,
+            worktrees_root = function(root)
+                return root .. "/.worktrees"
+            end,
             latest_snapshot = function(root, name)
                 assert.equals(repo, root)
                 assert.equals("gone", name)

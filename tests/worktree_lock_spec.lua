@@ -212,7 +212,10 @@ describe("worktree lock on create", function()
         reset_retention()
         root = tempdir()
         repo = root .. "/repo"
-        vim.fn.mkdir(repo, "p")
+        -- `create` writes its exclusion into `<common>/info/exclude` before adding
+        -- the worktree, so the fake repository needs the `.git` marker it would
+        -- have in reality.
+        vim.fn.mkdir(repo .. "/.git", "p")
         calls = {}
     end)
 
