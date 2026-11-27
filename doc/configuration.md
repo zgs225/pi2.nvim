@@ -371,6 +371,8 @@ require("pi").setup({
         max_items = 20, -- maximum items per todo list; exceeding it rejects the call so the model keeps the list focused
         panel = {
             auto_open = false, -- open the :PiTodo panel automatically when the session's todo list becomes non-empty
+            -- open the panel together with the chat; it then behaves like a manual open (keeps the `no todos` placeholder)
+            open_with_chat = false,
             height = 0.5, -- share of the panel's column: fraction (<1), or absolute lines (>=1)
             position = "right", -- side column: "left" | "right"; "above"/"below" keep stacking around the :PiSessions panel
             width = 40, -- column width when the todo panel opens the column on its own (fraction <1 = share of the editor width)
@@ -428,6 +430,11 @@ require("pi").setup({
         -- Open the panel automatically when a background task starts in the
         -- current tab (default false).
         auto_open = false,
+        -- Open the panel together with the chat — on screen the moment the
+        -- session opens, and again after a layout switch — instead of waiting
+        -- for a task. While it is on, the all-tasks-finished auto-close is
+        -- disabled: the panel belongs to the chat UI (default false).
+        open_with_chat = false,
         -- Note: the float layout is fixed (editor-centered at 0.5 x 0.4 with a
         -- rounded border); width/height/position apply to the side layout only.
     },
@@ -673,6 +680,7 @@ require("pi").setup({
 Notes on a few fields:
 
 - The side layout is **three columns**: the chat column in the middle, a left column and a right column for the panels. `sessions_list.position` / `tasks_panel.position` / `todo.panel.position` choose the column, and the first panel of a column (stacking order: sessions → tasks → todo) owns that column's `width` — so `sessions_list.width` sizes the left column and `tasks_panel.width` the right one. A column exists only while a panel holds it; the chat column absorbs whatever they leave (and is the only flexible column when the tab is taken over, see [Chat & layouts](usage.md#chat--layouts)).
+- **Opening a panel with the chat**: `sessions_list.auto_open`, `tasks_panel.open_with_chat` and `todo.panel.open_with_chat` all hook the same point — the moment the chat's windows are created — so the panel is on screen as soon as the session opens (and again after `:PiToggleLayout` / `:PiToggleChat` re-shows the chat). They differ in what happens afterwards: the sessions list is unrelated to panel data, a chat-opened todo panel behaves like a manual open (it keeps the `no todos` placeholder instead of closing when the list empties), and a chat-opened tasks panel is exempt from the all-tasks-finished auto-close. `tasks_panel.auto_open` / `todo.panel.auto_open` are the data-driven counterparts (open when a task starts / when the first todo arrives) and can be combined with `open_with_chat`.
 - `layout.default`, `layout.side`, and `layout.float` each also accept a **function** returning the value, so you can compute sizes from `vim.o.columns` / `vim.o.lines` at open time. A function-return for `side`/`float` is deep-merged over the defaults, so returning a partial table is fine.
 - `panels.<panel>.name` takes a `fun(tab_id): string` that computes the underlying buffer name per tab — useful for distinguishing multiple π conversations in `:buffers`, statuslines, or tab bars.
 - `ask` configures the [ask tool](ask.md), which lets the model block on up to `max_questions` multiple-choice questions (each with at most `max_options` options). `ask.enabled` is on by default and applies live — the extension re-reads the published options on every tool call, so `false` takes effect on the next turn and a questionnaire already on screen stays answerable; sub-sessions never get the tool. `ask.timeout_ms` defaults to `nil`, which waits forever; a number cancels the ask after that many milliseconds (the model is told no answers were given and must state its assumption). `ask.ui` accepts only `"float"` — the keyed questionnaire window described in [Ask → Keys](ask.md#keys). `ask.keys` maps the float's vim-style actions and is read when the float opens.

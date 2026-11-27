@@ -109,7 +109,7 @@ end
 --- Panel configuration with defensive defaults: the config/highlights half of
 --- this feature may not have landed yet, so every lookup degrades to the
 --- frozen contract values.
----@return { mode: "follow"|"side"|"float", position: string, width: integer, height: integer }
+---@return { mode: "follow"|"side"|"float", position: string, width: integer, height: integer, open_with_chat?: boolean }
 local function panel_cfg()
     ---@type table
     local defaults = { mode = "follow", position = "right", width = 40, height = 12 }
@@ -1389,8 +1389,16 @@ end
 --- Auto-close entry point from the session pipeline: close the panel in
 --- `tab`. Defers while the panel (or one of its output views) has focus;
 --- the deferred close flushes on WinLeave/WinClosed and on the panel tick.
+---
+--- `tasks_panel.open_with_chat` opts the panel OUT: a panel that opens with the
+--- chat is part of the chat UI (a persistent column, like :PiSessions), so the
+--- "no running task left" close would tear it down right after the first task
+--- finished instead of leaving it where the user put it.
 ---@param tab integer
 function M.request_auto_close(tab)
+    if panel_cfg().open_with_chat then
+        return
+    end
     if not win_for(tab) then
         return
     end
