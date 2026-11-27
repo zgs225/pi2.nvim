@@ -81,22 +81,28 @@ It prints nothing when a number would say nothing: a provider that reports no `u
 
 ### User message alignment
 
-Your own messages are flush left like everything else. `user_message_align = "right"` pushes them — label and body together — to the right edge of the history window, so a conversation reads the way a chat app does:
+Your own messages are flush left like everything else. `user_message_align = "right"` turns each of them into a **box** on the right edge of the history window, so a conversation reads the way a chat app does:
 
 ```
-                     󰇅 Nov 25 2026, 14:32
-  can you check why the reaper test is flaky?
+                  󰇅 Nov 25 2026, 14:32
+                  can you check why the reaper
+                  test is flaky?
 ```
 
-`"left"` is the default and renders exactly as before.
+The box is as wide as its own widest line — the label included, it is the box's header — inside two bounds. At most `user_message_max_width`: a fraction of the history width (default `0.75`), a column count if you give it a number above `1`, or `0` for no cap. At least `user_message_min_width` columns (default `24`, `0` = let the content decide). The defaults come from the usual reading measure — 45–75 characters per line is where prose reads best, and 75% of the shipped 80-column side layout is ~58 columns — while the floor keeps a two-word message from collapsing into a sliver, and lifts a cap that would fall below it.
 
-Neovim cannot right-align a *buffer* line: the only right-anchored text it draws is virtual text, which cannot hold selectable body lines with their highlights, and a soft-wrapped line restarts its continuation at column 0. The alignment is therefore written into the buffer as padding, which you can see in three places:
+The text is **left-aligned inside the box**: every row starts on one left column and the widest of them ends on the right edge. When the floor is what set the width (a short message), no row reaches the edge — the box is right-aligned, its contents are not, exactly like a short chat bubble. A body line wider than the cap **word-wraps** to it. The label is a floor rather than a target: a timestamp plus a steer/follow-up tag wider than the cap widens the box instead of being cut.
 
-- A message line wider than the window is **hard-wrapped** into several real buffer lines, each padded to the edge (the same reason error and tool output are wrapped: a soft-wrapped continuation would escape to the left edge and split the block apart).
-- The padding is width-dependent, so every right-aligned block is **re-padded when the history window changes width** — a split resize, `:PiToggleLayout`, zen mode, or reopening the chat. This costs nothing at rest: the tracking is created with the first right-aligned block and does no work while the width is unchanged.
-- `yy` / `:PiCopy` still copy **the text you wrote**, never the padded rows (the same source-text contract as the left default).
+`"left"` is the default and renders exactly as before. Both bounds only apply to `"right"`.
 
-Alignment is decided when a message is rendered, so switching the option mid-session changes the messages that arrive after the switch; the ones already in the history keep the alignment they were drawn with.
+Neovim cannot right-align a *buffer* line: the only right-anchored text it draws is virtual text, which cannot hold selectable body lines with their highlights, and a soft-wrapped line restarts its continuation at column 0. The alignment is therefore written into the buffer as padding, which you can see in four places:
+
+- A message line wider than the box is **word-wrapped** into several real buffer lines, every one of them starting on the box's left column (the same reason error and tool output are hard-wrapped: a soft-wrapped continuation would escape to the left edge and split the box apart). A single word wider than the box is broken at the width — there is no space to break at.
+- The padding, and a fractional cap, are width-dependent, so every right-aligned box is **re-laid out when the history window changes width** — a split resize, `:PiToggleLayout`, zen mode, or reopening the chat. This costs nothing at rest: the tracking is created with the first right-aligned box and does no work while the width is unchanged.
+- `gy` / `:PiCopy` still copy **the text you wrote**, never the padded or wrapped rows (the same source-text contract as the left default).
+- The box keeps a one-column right margin, so a padded row can never wrap into a phantom continuation line.
+
+Alignment and both bounds are decided when a message is rendered, so switching the option or changing a bound mid-session changes the messages that arrive after the change; the ones already in the history keep the layout they were drawn with until the next re-render (a resize, a layout toggle, or reopening the chat).
 
 ## Prompt
 
@@ -320,6 +326,8 @@ The file content itself is **not inlined**. Pi assumes the agent has a `read` to
 Mentions are validated against the filesystem at send time. Paths are resolved relative to the **session's workspace** — the directory its pi process runs in, which is Neovim's cwd for an ordinary session and the checkout's own path for a [worktree session](worktrees.md#what-a-worktree-session-is). A path that lives inside the workspace is rendered relative to it (`@lua/pi/init.lua`), matching how pi resolves the mention, even when Neovim's cwd differs. Anything that doesn't resolve to an existing file or directory is sent through unchanged, so a stray `@todo` in your message stays a stray `@todo`.
 
 Trailing punctuation works the way you'd expect: `(@lua/pi/init.lua)` and `Look at @lua/pi/init.lua.` both expand cleanly without dragging the punctuation into the path.
+
+Your own messages are shown back **as you wrote them**. Pi stores the *expanded* text in the session transcript, so a replayed message (a resumed session, or a compaction rebuild) would otherwise put `[directory: lua/pi]` in the middle of your sentence — and markdown even colours `[...]` as a link reference. The history renders pi's expansion back as `@lua/pi`, `@lua/pi/init.lua#L42`, `@lua/pi/init.lua#L10-40`, and `gy` / `:PiCopy` return that same form, which re-expands when you paste it into the prompt. Fenced code blocks in the message are left byte-identical, since a pasted snippet may contain that syntax on purpose.
 
 While typing, `@mentions` are highlighted in the prompt buffer so you can see at a glance which references will expand.
 

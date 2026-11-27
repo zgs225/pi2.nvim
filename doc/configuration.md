@@ -44,6 +44,12 @@ require("pi").setup({
     -- Horizontal alignment of user message blocks in the history:
     -- "left" (default) or "right" (see doc/usage.md#user-message-alignment).
     user_message_align = "left",
+    -- Width bounds of a right-aligned user message box:
+    -- `user_message_max_width` is a fraction of the history width (<= 1) or a
+    -- column count (> 1), 0 = no cap; `user_message_min_width` is a column
+    -- floor, 0 = the content decides.
+    user_message_max_width = 0.75,
+    user_message_min_width = 24,
     -- Default expand/collapse state for the startup block
     -- (skills, extensions, startup announcements).
     expand_startup_details = true,

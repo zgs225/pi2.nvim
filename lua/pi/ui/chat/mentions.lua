@@ -145,6 +145,95 @@ function M.expand(text, cwd)
     return result
 end
 
+--- pi's own expansion syntax (what `M.expand` produces), mapped back to the
+--- mention the user typed. Only pi's exact shapes are recognised, and the path
+--- may not cross a `]` or a newline, so ordinary prose brackets are left alone.
+local DISPLAY_RULES = {
+    {
+        pattern = "^%[file: ([^%]\n]-), lines: (%d+)%-(%d+)%]",
+        render = function(path, from, to)
+            return "@" .. path .. "#L" .. from .. "-" .. to
+        end,
+    },
+    {
+        pattern = "^%[file: ([^%]\n]-), line: (%d+)%]",
+        render = function(path, line)
+            return "@" .. path .. "#L" .. line
+        end,
+    },
+    {
+        pattern = "^%[file: ([^%]\n]-)%]",
+        render = function(path)
+            return "@" .. path
+        end,
+    },
+    {
+        pattern = "^%[directory: ([^%]\n]-)%]",
+        render = function(path)
+            return "@" .. path
+        end,
+    },
+}
+
+--- Render an expanded mention back as the authored one, for the history.
+---
+--- `M.expand` rewrites `@path` into pi's own syntax before a message is sent,
+--- and pi stores the EXPANDED text in the session transcript. A live message
+--- reaches the history as authored, but a replayed one (resume, compaction
+--- rebuild) carries the expansion, which reads as leaked internal syntax in the
+--- middle of the user's own sentence — and markdown even colours `[...]` as a
+--- link reference. Rewriting it here also keeps `gy` / `:PiCopy` returning text
+--- that re-expands when pasted back into the prompt.
+---
+--- A pure string transform: anything that is not exactly one of pi's expansion
+--- shapes is returned byte-identical, so prose and code are safe. Callers that
+--- want to protect fenced code must skip those lines themselves (the history
+--- renders a message's fences verbatim).
+---@param text string
+---@return string
+function M.display(text)
+    if not text:find("[", 1, true) then
+        return text
+    end
+    local parts = {}
+    local pos, n = 1, #text
+    local function push(s)
+        if s ~= "" then
+            parts[#parts + 1] = s
+        end
+    end
+    while pos <= n do
+        local bracket = text:find("[", pos, true)
+        if not bracket then
+            push(text:sub(pos))
+            break
+        end
+        push(text:sub(pos, bracket - 1))
+        local rest = text:sub(bracket)
+        local consumed, rendered
+        for _, rule in ipairs(DISPLAY_RULES) do
+            -- `find`, not `match`: the caller needs the whole match's length to
+            -- advance, and only `find` reports it (anchored, so s == 1).
+            local s, e, path, x, y = rest:find(rule.pattern)
+            -- An empty path is not something `expand` can produce, so it is not
+            -- rewritten (`[file: ]` in prose stays as typed).
+            if s and type(path) == "string" and path ~= "" then
+                consumed = e - s + 1
+                rendered = rule.render(path, x, y)
+                break
+            end
+        end
+        if rendered then
+            push(rendered)
+            pos = bracket + consumed
+        else
+            push("[")
+            pos = bracket + 1
+        end
+    end
+    return table.concat(parts)
+end
+
 --- Insert an @-mention at the cursor in the pi prompt buffer.
 --- The mention is rendered relative to the workspace pi resolves it in: an
 --- explicit `opts.cwd` wins, otherwise the session's own cwd. A worktree

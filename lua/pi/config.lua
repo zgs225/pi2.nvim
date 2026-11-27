@@ -455,6 +455,8 @@
 ---@field turn_separator? boolean Extra blank line between conversation turns (default: true)
 ---@field turn_stats? boolean Append the run's generation speed (output tokens per second) to the turn's completion marker in the history (default: true)
 ---@field user_message_align "left"|"right" Horizontal alignment of user message blocks in the history: "left" (default) keeps the label and body flush left, "right" pushes both to the window's right edge (default: "left")
+---@field user_message_max_width number Widest a right-aligned user message box may get: a fraction of the history text width (<= 1, so `1` is the whole column) or a column count (> 1); 0 = no cap. A fraction is the useful form: prose reads best at 45-75 characters per line, and 0.75 lands at ~58 columns in the shipped 80-column side layout (default: 0.75). Only read when `user_message_align = "right"`
+---@field user_message_min_width number Narrowest a right-aligned user message box may get, in columns — a very short message still renders as a box of this width, and it lifts a cap that falls below it; 0 = let the content decide (default: 24). Only read when `user_message_align = "right"`
 ---@field expand_startup_details boolean Default expand/collapse state for the startup block (skills, extensions, startup announcements). Always rendered; Tab on the block or API call toggles.
 ---@field timestamp_format string Format string passed to os.date for chat message timestamps. Defaults to a non-padded day format using the platform-specific os.date flag.
 ---@field panels pi.Panels
@@ -516,6 +518,11 @@ local defaults = {
     turn_stats = true,
     -- "left" (default) or "right" alignment of user message blocks.
     user_message_align = "left",
+    -- Width bounds of a right-aligned box: `user_message_max_width` is a
+    -- fraction of the history width (<= 1) or a column count (> 1), 0 = no cap;
+    -- `user_message_min_width` is a column floor, 0 = the content decides.
+    user_message_max_width = 0.75,
+    user_message_min_width = 24,
     expand_startup_details = true,
     timestamp_format = Os.is_windows() and "%b %#d %Y, %H:%M" or "%b %-d %Y, %H:%M",
     panels = {
