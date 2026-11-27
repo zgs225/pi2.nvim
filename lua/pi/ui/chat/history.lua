@@ -180,6 +180,7 @@ local Stats = require("pi.stats")
 local Ansi = require("pi.ui.chat.ansi")
 local Render = require("pi.ui.render")
 local Text = require("pi.ui.chat.text")
+local Mentions = require("pi.ui.chat.mentions")
 
 local ns = vim.api.nvim_create_namespace("pi-chat")
 
@@ -1916,18 +1917,29 @@ end
 --- draws is virtual text (`virt_text_pos = "right_align"`), which cannot carry
 --- selectable body lines with real highlights, and a soft-wrapped line restarts
 --- its continuation at column 0. Right alignment is therefore written into the
---- buffer as padding, which has two consequences:
+--- buffer as padding, which has three consequences:
 ---
----   * body lines are hard-wrapped to the available width (`Text.wrap`, the same
----     reason error and tool output are), so no continuation line can escape to
----     the left edge;
+---   * a right-aligned message is a **block**: its widest line (the label
+---     included — it is the block's header) sets the block width, and every
+---     line gets the SAME left padding. The text is therefore left-aligned
+---     inside a box that is itself flush right, which is what a chat app looks
+---     like: the longest line ends on the right edge, the short ones start on
+---     the same left column.
+---   * the block width is capped by `pi.Options.user_message_max_width` (a
+---     fraction of the history width or a column count; 0 = no cap) so a
+---     right-aligned message never spans a wide window. Body lines are
+---     word-wrapped to that width (`Text.wrap_words`, the same reason error and
+---     tool output are hard-wrapped: a soft-wrapped continuation would restart
+---     at column 0 and escape the block).
 ---   * the padding is width-dependent, so every right-aligned block keeps its
 ---     `pi.UserBlockSpec` and is re-rendered when the window width changes
 ---     (`_realign_user_blocks`), keeping it flush right after a split resize,
----     zen mode or a float layout change.
+---     zen mode or a float layout change. The cap is re-resolved per pass, so a
+---     fractional cap follows the window.
 ---
 --- The default left alignment renders exactly as it did before this option
---- existed and stores nothing.
+--- existed (same `"  "` indent, same extmarks), stores no spec and creates no
+--- autocmd.
 
 ---@class pi.UserBlockMark
 ---@field row integer 0-based row offset inside the block's rendered lines
@@ -1966,19 +1978,65 @@ local function right_edge(width)
     return math.max(1, width - 1)
 end
 
---- Push `text` to the right edge of a `width`-column window with padding spaces.
+--- The width budget for one right-aligned block, in columns.
+---
+--- `ceiling` is what the window allows: the text area minus the right margin
+--- and the one column of headroom for fonts that draw a PUA glyph a cell wider
+--- than utf8proc reports (the same note as the thinking preview). `wrap` is
+--- where the body wraps, from `pi.Options.user_message_max_width` — a fraction
+--- of the history width (<= 1, so `1` is the whole column), a column count
+--- (> 1), or 0/nil for no cap — clamped to the ceiling. `min` is
+--- `pi.Options.user_message_min_width`, the narrowest a box may get (0 = the
+--- content decides); it also lifts a cap that would fall below it, so the body
+--- always has room for the minimum.
+---@class pi.UserBlockLimits
+---@field ceiling integer hard limit: the window's text area minus its margins
+---@field wrap integer width the body is wrapped to
+---@field min integer floor on the block's width
+
+---@param width integer history text-area width
+---@return pi.UserBlockLimits
+local function block_limits(width)
+    local ceiling = math.max(8, right_edge(width) - 2)
+    local min = Config.options.user_message_min_width
+    if type(min) ~= "number" or min <= 0 then
+        min = 0
+    else
+        min = math.min(math.floor(min), ceiling)
+    end
+    local wrap = ceiling
+    local max = Config.options.user_message_max_width
+    if type(max) == "number" and max > 0 then
+        local cols = max <= 1 and math.floor(width * max) or math.floor(max)
+        wrap = math.max(8, math.min(ceiling, cols))
+    end
+    return { ceiling = ceiling, wrap = math.max(wrap, min), min = min }
+end
+
+--- One line of a right-aligned block: `text` pushed right by the block's
+--- shared left padding. Using one `shift` for every line is what makes the
+--- text left-aligned inside a block that is itself flush right.
 ---@param text string
----@param width integer
+---@param shift integer byte count of the padding (ASCII spaces)
 ---@return string
-local function align_right(text, width)
-    local pad = right_edge(width) - vim.fn.strdisplaywidth(text)
-    if pad <= 0 then
+local function block_line(text, shift)
+    if shift <= 0 then
         return text
     end
-    return string.rep(" ", pad) .. text
+    return string.rep(" ", shift) .. text
 end
 
 --- Render a user message block: leading gap, label, body, attachment line.
+---
+--- With `"right"` alignment the block is laid out as a box: the widest line
+--- (label included — it is the block's header and must not stick out to the
+--- left of the body) sets the box width, bounded by `block_limits`: never wider
+--- than the cap, never narrower than the minimum, and never past the window
+--- ceiling. The whole box is pushed to the right edge, so every line starts at
+--- the same column and the widest one ends on the edge. A box narrower than the
+--- cap stays flush right instead of growing out to it, and the label is a floor
+--- rather than a target: a timestamp + steer tag wider than the cap widens the
+--- box instead of being cut. The body is word-wrapped to `wrap`.
 ---@param spec pi.UserBlockSpec
 ---@param width integer text-area width of the history window in columns
 ---@return string[] lines
@@ -1989,12 +2047,31 @@ local function build_user_block(spec, width)
     for _ = 1, spec.lead do
         lines[#lines + 1] = ""
     end
-    -- Label: icon, timestamp, optional steer/follow-up tag. Right-aligned with
-    -- the body so it reads as the header of the same block.
     local label = spec.icon .. " " .. spec.time_str .. spec.queue_tag
+    local body = spec.body
+    local shift = 0
+    if right then
+        local lim = block_limits(width)
+        local body_max = 0
+        local wrapped = {}
+        for _, raw in ipairs(body) do
+            for _, chunk in ipairs(Text.wrap_words(raw, lim.wrap)) do
+                wrapped[#wrapped + 1] = chunk
+                body_max = math.max(body_max, vim.fn.strdisplaywidth(chunk))
+            end
+        end
+        body = wrapped
+        -- The box hugs its widest line, floored at the configured minimum and
+        -- at the label (the header is never capped or cut), capped at `wrap`
+        -- for the body and at the ceiling for everything.
+        local box = math.max(vim.fn.strdisplaywidth(label), lim.min, math.min(body_max, lim.wrap))
+        box = math.min(box, lim.ceiling)
+        shift = math.max(0, right_edge(width) - box)
+    end
+    -- Label: icon, timestamp, optional steer/follow-up tag. Left-aligned inside
+    -- the block, so it reads as the header of the same box.
     local label_row = #lines
-    local label_text = right and align_right(label, width) or label
-    local shift = #label_text - #label
+    local label_text = right and block_line(label, shift) or label
     lines[#lines + 1] = label_text
     local time_start = shift + #spec.icon + 1
     ---@type pi.UserBlockMark[]
@@ -2011,21 +2088,8 @@ local function build_user_block(spec, width)
         }
     end
     lines[#lines + 1] = ""
-    local body = spec.body
-    if right then
-        -- -2: the right margin, plus one column of headroom for fonts that draw
-        -- a PUA glyph one cell wider than utf8proc reports (same note as the
-        -- thinking preview).
-        local avail = math.max(8, right_edge(width) - 2)
-        local wrapped = {}
-        for _, raw in ipairs(body) do
-            for _, chunk in ipairs(Text.wrap(raw, avail)) do
-                wrapped[#wrapped + 1] = chunk
-            end
-        end
-        body = wrapped
-    end
-    -- Body: two-space indent when left, right padding when right.
+    -- Body: two-space indent when left, the block's shared left padding when
+    -- right (blank rows stay truly empty, never padded).
     for _, raw in ipairs(body) do
         local text
         if not right then
@@ -2033,19 +2097,21 @@ local function build_user_block(spec, width)
         elseif raw == "" then
             text = ""
         else
-            text = align_right(raw, width)
+            text = block_line(raw, shift)
         end
         lines[#lines + 1] = text
-        -- Color user body text with the user role hue (Title.fg)
+        -- Color user body text with the user role hue (Title.fg). The span
+        -- starts on the block's left column: the padding is empty space, not
+        -- text.
         if #text > 0 then
-            marks[#marks + 1] = { row = #lines - 1, start_col = 0, end_col = #text, hl = "PiUserBody" }
+            marks[#marks + 1] = { row = #lines - 1, start_col = shift, end_col = #text, hl = "PiUserBody" }
         end
     end
     if spec.image_info then
-        local text = right and align_right(spec.image_info, width) or spec.image_info
+        local text = right and block_line(spec.image_info, shift) or spec.image_info
         lines[#lines + 1] = ""
         lines[#lines + 1] = text
-        marks[#marks + 1] = { row = #lines - 1, start_col = 0, end_col = #text, hl = "PiMessageAttachments" }
+        marks[#marks + 1] = { row = #lines - 1, start_col = shift, end_col = #text, hl = "PiMessageAttachments" }
     end
     return lines, marks
 end
@@ -2070,12 +2136,22 @@ function History:add_user_message(msg, timestamp, image_count, queue_type)
         local msg_lines = has_message_text and vim.split(msg, "\n", { plain = true }) or {}
         -- Treesitter highlights fenced code blocks — an unclosed fence bleeds
         -- into everything below. We track fence parity and auto-close if odd.
+        --
+        -- Outside a fence, pi's stored mention expansion is rendered back as the
+        -- mention the user typed: a live message carries `@path`, but a replayed
+        -- one (resume, compaction rebuild) carries what pi stored in the
+        -- transcript, `[directory: path/]` / `[file: path, line: N]`. Code is
+        -- left byte-identical — a pasted snippet may legitimately contain it.
         local fences = 0
-        for _, line in ipairs(msg_lines) do
+        for i, line in ipairs(msg_lines) do
             if line:match("^```") then
                 fences = fences + 1
+            elseif fences % 2 == 0 then
+                msg_lines[i] = Mentions.display(line)
             end
         end
+        -- Copy source: the preferred form, without the auto-closed fence below.
+        local display_msg = table.concat(msg_lines, "\n")
         if fences % 2 == 1 then
             msg_lines[#msg_lines + 1] = "```"
         end
@@ -2110,10 +2186,13 @@ function History:add_user_message(msg, timestamp, image_count, queue_type)
         -- and startup-block toggles all move it correctly.
         local anchor = vim.api.nvim_buf_set_extmark(self._buf, turn_ns, label_row, 0, { right_gravity = true })
         self._turn_anchors[#self._turn_anchors + 1] = anchor
-        -- Copy source: the text as authored. The rendered body cannot be used
-        -- for this (it is indented/padded and its markdown tables are drawn as
-        -- box art), so the entry keeps the original string.
-        self:_register_entry("user", label_row, has_message_text and msg or "")
+        -- Copy source: the text as authored, and in the form the buffer shows.
+        -- The rendered body cannot be used for this (it is indented/padded and
+        -- its markdown tables are drawn as box art), so the entry keeps the
+        -- original string. `display_msg` is `msg` with pi's mention expansions
+        -- restored (`@legado-server/`), so pasting a `gy` copy back into the
+        -- prompt re-expands exactly as when the message was first sent.
+        self:_register_entry("user", label_row, has_message_text and display_msg or "")
         self:_apply_user_marks(start, marks)
         -- Right alignment is width-dependent: keep the spec so a resize can
         -- re-render the block. The default left alignment stores nothing.

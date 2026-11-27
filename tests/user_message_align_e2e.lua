@@ -110,22 +110,65 @@ local function user_blocks(hbuf, icon)
     return out
 end
 
---- Assert every body row of every block ends exactly on `edge` (the text-area
---- width minus the one-column right margin) and never overflows it.
+--- Leading padding of a rendered row, in columns (the padding is ASCII spaces).
+---@param line string
+---@return integer
+local function left_col(line)
+    return #(line:match("^ *") or "")
+end
+
+--- The configured floor on a box's width, in columns (0 = none).
+---@return integer
+local function min_width()
+    local minw = require("pi.config").options.user_message_min_width
+    if type(minw) ~= "number" or minw <= 0 then
+        return 0
+    end
+    return minw
+end
+
+--- Assert the block contract on every block: all rows start on the label's left
+--- column, the BOX's right edge sits on `edge` (the text-area width minus the
+--- one-column right margin) and nothing overflows it. A box is at least
+--- `user_message_min_width` wide, so a short one does not put a glyph on the
+--- edge: the box is right-aligned, the text inside it is left-aligned.
 ---@param blocks { label: string, body: string[] }[]
 ---@param edge integer
 ---@return string? first offending row, or nil
-local function first_off_edge(blocks, edge)
+local function block_geometry_error(blocks, edge)
     for _, block in ipairs(blocks) do
-        if dw(block.label) ~= edge then
-            return "label:" .. block.label
+        local left = left_col(block.label)
+        local content = dw(block.label) - left
+        if dw(block.label) > edge then
+            return "label overflow:" .. block.label
         end
         for _, row in ipairs(block.body) do
+            if left_col(row) ~= left then
+                return "off the block's left column:" .. row
+            end
             if dw(row) > edge then
                 return "overflow:" .. row
             end
-            if dw(row) ~= edge then
-                return "off:" .. row
+            content = math.max(content, dw(row) - left)
+        end
+        local box = math.max(content, min_width())
+        if left + box ~= edge then
+            return ("box does not end on the edge (left=%d box=%d):%s"):format(left, box, block.label)
+        end
+    end
+    return nil
+end
+
+--- First body row wider than `cap` display columns, ignoring the label (the
+--- label is a floor, never capped).
+---@param blocks { label: string, body: string[] }[]
+---@param cap integer
+---@return string? first row over the cap, or nil
+local function over_cap(blocks, cap)
+    for _, block in ipairs(blocks) do
+        for _, row in ipairs(block.body) do
+            if dw(row) - left_col(row) > cap then
+                return row
             end
         end
     end
@@ -168,6 +211,14 @@ local ok_body, err = pcall(function()
         layout = { default = "side", side = { width = 64 } },
     })
     check("option resolved from setup()", Config.options.user_message_align == "right")
+    check(
+        "the shipped width bounds are a 75% cap and a 24-column floor",
+        Config.options.user_message_max_width == 0.75 and Config.options.user_message_min_width == 24,
+        ("max=%s min=%s"):format(
+            tostring(Config.options.user_message_max_width),
+            tostring(Config.options.user_message_min_width)
+        )
+    )
     local icon = Config.options.labels.user_message
 
     require("pi").show({ layout = "side" })
@@ -215,19 +266,65 @@ local ok_body, err = pcall(function()
     local blocks = user_blocks(hbuf, icon)
     check("three user message blocks rendered", #blocks == 3, "got=" .. #blocks)
     check(
-        "every user row ends on the right edge of the real history text area",
-        first_off_edge(blocks, edge) == nil,
-        ("text_area=%d edge=%d off=%s"):format(tw, edge, vim.inspect(first_off_edge(blocks, edge)))
+        "every block is flush right and internally left-aligned",
+        block_geometry_error(blocks, edge) == nil,
+        ("text_area=%d edge=%d off=%s"):format(tw, edge, vim.inspect(block_geometry_error(blocks, edge)))
     )
     check(
         "the CJK message is padded by display width, not byte length",
-        blocks[2] ~= nil and squash(block_text(blocks[2])) == squash(messages[2]) and dw(blocks[2].body[1]) == edge,
+        blocks[2] ~= nil and squash(block_text(blocks[2])) == squash(messages[2]),
         blocks[2] and block_text(blocks[2]) or "missing"
     )
     check(
-        "the long message hard-wrapped instead of overflowing",
+        "the long message wrapped instead of overflowing",
         blocks[3] ~= nil and #blocks[3].body >= 2 and squash(block_text(blocks[3])) == squash(messages[3]),
         blocks[3] and ("rows=" .. #blocks[3].body) or "missing"
+    )
+    check(
+        "the shipped 75% cap bounds every body row of the default render",
+        over_cap(blocks, math.floor(tw * Config.options.user_message_max_width)) == nil,
+        tostring(over_cap(blocks, math.floor(tw * Config.options.user_message_max_width)))
+    )
+
+    -- The width cap: a box is at most `user_message_max_width` columns wide,
+    -- still flush right, still internally left-aligned. The cap is read at
+    -- render time, so only the message added AFTER it takes effect here; the
+    -- layout toggle below re-renders the earlier ones and is where every block
+    -- is checked against it.
+    local cap = 28
+    Config.options.user_message_max_width = cap
+    chat:add_user_message(string.rep("k", 100), nil)
+    pump(300)
+    local capped_blocks = user_blocks(hbuf, icon)
+    check("the capped message rendered as its own block", #capped_blocks == 4, "got=" .. #capped_blocks)
+    local capped = capped_blocks[#capped_blocks]
+    check(
+        "the cap makes the box exactly `cap` wide and keeps it flush right",
+        capped ~= nil and left_col(capped.label) == edge - cap,
+        capped and ("left=%d want=%d"):format(left_col(capped.label), edge - cap) or "missing"
+    )
+    check(
+        "the capped message wraps instead of spanning the window",
+        capped ~= nil and #capped.body >= 4 and squash(block_text(capped)) == string.rep("k", 100),
+        capped and ("rows=" .. #capped.body) or "missing"
+    )
+    check(
+        "every row of the capped block stays inside the cap",
+        capped ~= nil and over_cap({ capped }, cap) == nil,
+        capped and tostring(over_cap({ capped }, cap)) or "missing"
+    )
+
+    -- The floor: a two-letter message still renders as a box `min_width` wide,
+    -- so a short message reads as a bubble instead of a sliver on the edge.
+    chat:add_user_message("ok", nil)
+    pump(300)
+    local floored_blocks = user_blocks(hbuf, icon)
+    local floored = floored_blocks[#floored_blocks]
+    check("the short message rendered as its own block", #floored_blocks == 5, "got=" .. #floored_blocks)
+    check(
+        "a short message keeps the minimum box width",
+        floored ~= nil and left_col(floored.label) == edge - min_width(),
+        floored and ("left=%d want=%d"):format(left_col(floored.label), edge - min_width()) or "missing"
     )
 
     -- (1) The layout toggle reopens the history window at a different width;
@@ -255,11 +352,16 @@ local ok_body, err = pcall(function()
         ("side=%d float=%d"):format(tw, tw_float)
     )
     local blocks_float = user_blocks(fbuf, icon)
-    check("all three blocks survived the layout toggle", #blocks_float == 3, "got=" .. #blocks_float)
+    check("all five blocks survived the layout toggle", #blocks_float == 5, "got=" .. #blocks_float)
     check(
-        "every block re-padded for the float layout",
-        first_off_edge(blocks_float, edge_float) == nil,
-        ("edge=%d off=%s"):format(edge_float, vim.inspect(first_off_edge(blocks_float, edge_float)))
+        "every block re-laid out for the float layout",
+        block_geometry_error(blocks_float, edge_float) == nil,
+        ("edge=%d off=%s"):format(edge_float, vim.inspect(block_geometry_error(blocks_float, edge_float)))
+    )
+    check(
+        "the cap survived the re-render: no block is wider than the cap",
+        over_cap(blocks_float, cap) == nil,
+        tostring(over_cap(blocks_float, cap))
     )
 
     -- (2) A REAL editor resize. Headless has no UI, so `columns` alone fires
@@ -278,13 +380,19 @@ local ok_body, err = pcall(function()
     local blocks_after = user_blocks(vim.api.nvim_win_get_buf(layout:history_win()), icon)
     local edge_after = tw_after - 1
     check(
-        "every block re-padded to the NEW edge after the real resize",
-        first_off_edge(blocks_after, edge_after) == nil,
-        ("edge=%d off=%s"):format(edge_after, vim.inspect(first_off_edge(blocks_after, edge_after)))
+        "every block re-laid out for the NEW edge after the real resize",
+        block_geometry_error(blocks_after, edge_after) == nil,
+        ("edge=%d off=%s"):format(edge_after, vim.inspect(block_geometry_error(blocks_after, edge_after)))
     )
-    local same = #blocks_after == #blocks
-    for i = 1, math.min(#blocks, #blocks_after) do
-        same = same and squash(block_text(blocks_after[i])) == squash(messages[i])
+    check(
+        "the cap still holds after the real resize",
+        over_cap(blocks_after, cap) == nil,
+        tostring(over_cap(blocks_after, cap))
+    )
+    local expected_texts = { messages[1], messages[2], messages[3], string.rep("k", 100), "ok" }
+    local same = #blocks_after == #expected_texts
+    for i = 1, math.min(#expected_texts, #blocks_after) do
+        same = same and squash(block_text(blocks_after[i])) == squash(expected_texts[i])
     end
     check("every message kept its own text through the realigns", same, "got=" .. #blocks_after)
 end)

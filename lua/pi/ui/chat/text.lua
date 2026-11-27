@@ -90,6 +90,86 @@ function M.wrap(s, w)
     return chunks
 end
 
+--- Word-boundary hard-wrap: like `wrap`, but a break is taken at the last
+--- space/tab that fits instead of mid-word. A word wider than `w` has no break
+--- to take and is broken by display width (a long URL, a CJK run).
+---
+--- The whitespace a break consumes is dropped from the rendered chunks, so no
+--- chunk begins with padding of its own: a right-aligned block lines its rows
+--- up on one left column, and a leading space would read as a stray indent.
+--- Display-only, like every rendered row — `gy` / `:PiCopy` return the authored
+--- source text, never these chunks.
+---@param s string
+---@param w integer
+---@return string[]
+function M.wrap_words(s, w)
+    local dw = vim.fn.strdisplaywidth
+    if w <= 0 or dw(s) <= w then
+        return { s }
+    end
+    local chunks = {}
+    local rest = s
+    while rest ~= "" do
+        if dw(rest) <= w then
+            chunks[#chunks + 1] = rest
+            break
+        end
+        -- Widest prefix that fits, measured column-relative so a tab expands
+        -- the way the renderer will see it (same walk as M.wrap).
+        local fit_end, fit_w, i = 0, 0, 1
+        while i <= #rest do
+            local len = M.utf8_len(rest:byte(i))
+            local cw = dw(rest:sub(i, i + len - 1), fit_w)
+            if fit_w + cw > w then
+                break
+            end
+            fit_w = fit_w + cw
+            fit_end = i + len - 1
+            i = i + len
+        end
+        if fit_end == 0 then
+            -- One character wider than `w`: it gets a line of its own.
+            fit_end = M.utf8_len(rest:byte(1))
+        end
+        -- Greedy word wrap: keep everything that fits, and only look for a
+        -- break when the next character is inside a word. A whitespace right
+        -- after the fitting prefix IS the break (cut there), otherwise fall
+        -- back to the last space/tab at or before it (cut before the word that
+        -- does not fit); with neither, a word wider than `w` is hard-broken.
+        -- A UTF-8 continuation byte is never 32/9, so the byte walk is safe.
+        local head, tail
+        local next_byte = rest:byte(fit_end + 1)
+        if next_byte == 32 or next_byte == 9 then
+            head = rest:sub(1, fit_end)
+            tail = rest:sub(fit_end + 1):gsub("^[ \t]+", "")
+        else
+            local cut
+            for j = fit_end, 1, -1 do
+                local b = rest:byte(j)
+                if b == 32 or b == 9 then
+                    cut = j
+                    break
+                end
+            end
+            if cut and cut > 1 then
+                head = rest:sub(1, cut - 1)
+                tail = rest:sub(cut + 1):gsub("^[ \t]+", "")
+            else
+                head = rest:sub(1, fit_end)
+                tail = rest:sub(fit_end + 1)
+            end
+        end
+        if head == "" then
+            -- Only whitespace fitted (a run of spaces longer than `w`).
+            head = rest:sub(1, fit_end)
+            tail = rest:sub(fit_end + 1)
+        end
+        chunks[#chunks + 1] = head
+        rest = tail
+    end
+    return chunks
+end
+
 --- Keep the trailing slice of s that fits in w display columns (rolling window).
 ---@param s string
 ---@param w integer

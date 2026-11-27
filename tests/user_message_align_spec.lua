@@ -1,11 +1,14 @@
--- User message alignment (`user_message_align`).
+-- User message alignment (`user_message_align`, `user_message_max_width`).
 --
 -- The default is "left" and must stay byte-identical to the rendering that
 -- existed before the option: body lines indented two spaces, no padding, no
--- bookkeeping. "right" pushes the label and the body to the window's right
--- edge, which in a buffer can only be done with padding spaces — so the block
--- has to be recomputed when the window width changes, and its body lines have
--- to be hard-wrapped (a soft-wrapped continuation would restart at column 0).
+-- bookkeeping. "right" renders a message as a BLOCK: the widest line (the
+-- label included) sets the block width, capped by `user_message_max_width`,
+-- and every line is padded by the SAME amount — the text is left-aligned
+-- inside a box that is itself flush right. Padding is the only way a buffer
+-- line can be right-aligned, so the block is recomputed when the window width
+-- changes and its body lines are word-wrapped (a soft-wrapped continuation
+-- would restart at column 0).
 --
 -- These assert buffer content and extmarks; the visual result (font-dependent
 -- glyph widths, the actual right edge on screen) needs a GUI screenshot.
@@ -121,6 +124,65 @@ local function row_with(history, needle)
     return nil
 end
 
+--- Leading padding of a rendered row, in columns (the padding is ASCII spaces).
+---@param line string
+---@return integer
+local function left_col(line)
+    return #(line:match("^ *") or "")
+end
+
+--- One rendered block as written (padding included): its label row and its body
+--- rows, so both the shared left column and the right edge are measurable.
+---@param history pi.ChatHistory
+---@return { label: string, body: string[] }[]
+local function blocks(history)
+    local lines = buffer_lines(history)
+    local out = {}
+    local i = 1
+    while i <= #lines do
+        if vim.startswith(vim.trim(lines[i]), ICON) then
+            local body = {}
+            local j = i + 2 -- label row, then exactly one blank
+            while j <= #lines and vim.trim(lines[j]) ~= "" do
+                body[#body + 1] = lines[j]
+                j = j + 1
+            end
+            out[#out + 1] = { label = lines[i], body = body }
+            i = j
+        else
+            i = i + 1
+        end
+    end
+    return out
+end
+
+--- The configured floor on a box's width, in columns (0 = none).
+---@return integer
+local function min_width()
+    local minw = Config.options.user_message_min_width
+    if type(minw) ~= "number" or minw <= 0 then
+        return 0
+    end
+    return minw
+end
+
+--- Assert the block contract: every row starts on the label's left column, the
+--- box's right edge sits on `edge` (a box is at least `user_message_min_width`
+--- wide, so the widest row need not reach it), and nothing overflows.
+---@param block { label: string, body: string[] }
+---@param edge integer
+local function assert_block_shape(block, edge)
+    local left = left_col(block.label)
+    local content = dw(block.label) - left
+    for _, row in ipairs(block.body) do
+        assert.are.equal(left, left_col(row), "row off the block's left column: " .. vim.trim(row))
+        assert.is_true(dw(row) <= edge, "row overflows the right edge: " .. vim.trim(row))
+        content = math.max(content, dw(row) - left)
+    end
+    assert.is_true(left + content <= edge, "label row overflows the right edge")
+    assert.are.equal(edge, left + math.max(content, min_width()), "the box does not end on the right edge")
+end
+
 describe("user message alignment", function()
     local history, win, orig
 
@@ -128,6 +190,10 @@ describe("user message alignment", function()
         Highlights.setup()
         orig = Config.options
         Config.options.render = { engine = "builtin" }
+        -- `orig` aliases the live options table, so the width bounds are reset
+        -- to their shipped values explicitly instead of being read back off it.
+        Config.options.user_message_max_width = 0.75
+        Config.options.user_message_min_width = 24
         require("pi.ui.render")._reset()
     end)
 
@@ -137,6 +203,8 @@ describe("user message alignment", function()
             history, win = nil, nil
         end
         Config.options.user_message_align = orig.user_message_align
+        Config.options.user_message_max_width = 0.75
+        Config.options.user_message_min_width = 24
         Config.options.render = orig.render
         require("pi.ui.render")._reset()
     end)
@@ -175,15 +243,32 @@ describe("user message alignment", function()
             Config.options.user_message_align = "right"
         end)
 
-        it("pushes the body to the right edge with display-width padding", function()
+        it("puts the block flush right with the body on the label's column", function()
             history, win = setup_history(40)
             history:add_user_message("hello there", nil)
             pump(80)
 
-            local body = body_lines(history)
-            assert.are.equal(1, #body)
-            assert.are.equal("hello there", vim.trim(body[1]))
-            assert.are.equal(edge(history), dw(body[1]), "body ends on the right edge")
+            local block = blocks(history)[1]
+            assert.is_not_nil(block)
+            -- The box (not necessarily the label: a 24-column floor is wider
+            -- than the label) ends on the edge; the body starts on its column.
+            assert.are.equal(left_col(block.label), left_col(block.body[1]), "body starts on the label's column")
+            assert.are.equal("hello there", vim.trim(block.body[1]))
+            assert_block_shape(block, edge(history))
+        end)
+
+        it("left-aligns every body row inside the block", function()
+            history, win = setup_history(60)
+            history:add_user_message("short\na much longer second line here", nil)
+            pump(80)
+
+            local block = blocks(history)[1]
+            assert.are.equal(2, #block.body)
+            assert.are.equal(left_col(block.label), left_col(block.body[1]))
+            assert.are.equal(left_col(block.label), left_col(block.body[2]))
+            assert.is_true(dw(block.body[1]) < edge(history), "the short row stops before the edge")
+            assert.are.equal(edge(history), dw(block.body[2]), "the widest row ends on the edge")
+            assert_block_shape(block, edge(history))
         end)
 
         it("pads by display width, not byte length", function()
@@ -191,32 +276,45 @@ describe("user message alignment", function()
             history:add_user_message("你好", nil)
             pump(80)
 
-            local body = body_lines(history)
-            assert.are.equal("你好", vim.trim(body[1]))
-            assert.are.equal(edge(history), dw(body[1]), "CJK text still ends on the edge")
+            local block = blocks(history)[1]
+            assert.are.equal("你好", vim.trim(block.body[1]))
+            assert.are.equal(left_col(block.label), left_col(block.body[1]))
+            assert_block_shape(block, edge(history))
         end)
 
-        it("right-aligns the label with the body", function()
-            history, win = setup_history(40)
-            history:add_user_message("hi", nil)
-            pump(80)
-
-            local label = label_line(history)
-            assert.is_not_nil(label)
-            assert.are.equal(edge(history), dw(label), "label ends on the right edge")
-        end)
-
-        it("hard-wraps a line wider than the window and pads every chunk", function()
+        it("hard-wraps a word wider than the block, on one shared column", function()
             history, win = setup_history(40)
             history:add_user_message(string.rep("x", 120), nil)
             pump(80)
 
-            local body = body_lines(history)
-            assert.is_true(#body >= 4, "long line wrapped into several rows")
-            for _, line in ipairs(body) do
-                assert.are.equal(edge(history), dw(line), "every chunk ends on the right edge")
+            local block = blocks(history)[1]
+            assert.is_true(#block.body >= 4, "long word wrapped into several rows")
+            for _, row in ipairs(block.body) do
+                assert.are.equal(left_col(block.label), left_col(row), "chunk off the block's column")
+                assert.is_true(dw(row) - left_col(row) <= edge(history) - 2, "chunk wider than the text area")
             end
-            assert.are.equal(120, #table.concat(vim.tbl_map(vim.trim, body), ""), "no characters lost")
+            assert.are.equal(120, #table.concat(vim.tbl_map(vim.trim, block.body), ""), "no characters lost")
+            assert_block_shape(block, edge(history))
+        end)
+
+        it("breaks prose between words instead of mid-word", function()
+            local text = "the quick brown fox jumps over the lazy dog and keeps on running"
+            history, win = setup_history(40)
+            history:add_user_message(text, nil)
+            pump(80)
+
+            local block = blocks(history)[1]
+            assert.is_true(#block.body >= 2, "the line wrapped")
+            for _, row in ipairs(block.body) do
+                local body = vim.trim(row)
+                -- every rendered row is a run of whole words from the message
+                assert.is_truthy((" " .. text .. " "):find(" " .. body .. " ", 1, true), "mid-word break: " .. body)
+            end
+            assert.are.equal(
+                (text:gsub("%s+", " ")),
+                (table.concat(vim.tbl_map(vim.trim, block.body), " "):gsub("%s+", " ")),
+                "the rendered rows rejoin into the message"
+            )
         end)
 
         it("keeps blank message lines blank instead of padding them", function()
@@ -250,6 +348,124 @@ describe("user message alignment", function()
         end)
     end)
 
+    describe("width bounds", function()
+        before_each(function()
+            Config.options.user_message_align = "right"
+        end)
+
+        it("ships a 75% cap and a 24-column floor", function()
+            -- The literals `before_each` resets to; the shipped values are
+            -- asserted end to end in tests/user_message_align_e2e.lua, which
+            -- runs with the real setup() defaults.
+            assert.are.equal(0.75, Config.options.user_message_max_width)
+            assert.are.equal(24, Config.options.user_message_min_width)
+        end)
+
+        it("caps the block content to a column count", function()
+            -- 30 is safely wider than the label, so the body sets the block
+            -- width and the expected left column is exact.
+            Config.options.user_message_max_width = 30
+            history, win = setup_history(60)
+            history:add_user_message(string.rep("x", 120), nil)
+            pump(80)
+
+            local block = blocks(history)[1]
+            assert.are.equal(edge(history) - 30, left_col(block.label), "a 30-column block, flush right")
+            for _, row in ipairs(block.body) do
+                assert.is_true(dw(row) - left_col(block.label) <= 30, "row wider than the cap: " .. vim.trim(row))
+            end
+            assert_block_shape(block, edge(history))
+        end)
+
+        it("accepts a fraction of the history width", function()
+            Config.options.user_message_max_width = 0.5
+            history, win = setup_history(60)
+            history:add_user_message(string.rep("y", 120), nil)
+            pump(80)
+
+            local block = blocks(history)[1]
+            assert.are.equal(edge(history) - 30, left_col(block.label), "half of a 60-column window")
+            assert_block_shape(block, edge(history))
+        end)
+
+        it("lets the label widen the box: the cap applies to the body", function()
+            Config.options.user_message_max_width = 8
+            Config.options.user_message_min_width = 0
+            history, win = setup_history(60)
+            history:add_user_message("hi", nil)
+            pump(80)
+
+            local block = blocks(history)[1]
+            local label_w = dw(block.label) - left_col(block.label)
+            assert.is_true(label_w > 8, "the label alone is wider than the cap")
+            assert.are.equal(edge(history) - label_w, left_col(block.label))
+            assert.are.equal(left_col(block.label), left_col(block.body[1]))
+            assert.are.equal(edge(history), dw(block.label), "the label still ends on the edge")
+        end)
+
+        it("renders a short message as a box of the minimum width", function()
+            history, win = setup_history(80)
+            history:add_user_message("ok", nil)
+            pump(80)
+
+            local block = blocks(history)[1]
+            assert.are.equal(edge(history) - min_width(), left_col(block.label), "the box is min_width wide")
+            assert.are.equal(left_col(block.label), left_col(block.body[1]))
+            assert.is_true(dw(block.label) < edge(history), "a short box does not fill its own width")
+            assert_block_shape(block, edge(history))
+        end)
+
+        it("a minimum of 0 lets the content decide", function()
+            Config.options.user_message_min_width = 0
+            history, win = setup_history(80)
+            history:add_user_message("ok", nil)
+            pump(80)
+
+            local block = blocks(history)[1]
+            local label_w = dw(block.label) - left_col(block.label)
+            assert.are.equal(edge(history) - label_w, left_col(block.label))
+            assert.are.equal(edge(history), dw(block.label), "the label ends on the edge")
+        end)
+
+        it("the minimum lifts a cap that would fall below it", function()
+            Config.options.user_message_max_width = 0.1
+            history, win = setup_history(80)
+            history:add_user_message(string.rep("w", 90), nil)
+            pump(80)
+
+            local block = blocks(history)[1]
+            assert.are.equal(edge(history) - min_width(), left_col(block.label), "the floor wins over the cap")
+            for _, row in ipairs(block.body) do
+                assert.is_true(dw(row) - left_col(block.label) <= min_width(), "row wider than the floor")
+            end
+            assert_block_shape(block, edge(history))
+        end)
+
+        it("a cap wider than the window changes nothing", function()
+            Config.options.user_message_max_width = 500
+            Config.options.user_message_min_width = 0
+            history, win = setup_history(60)
+            history:add_user_message("short\na much longer second line here", nil)
+            pump(80)
+
+            local block = blocks(history)[1]
+            assert.are.equal(edge(history), dw(block.body[2]), "the widest row still ends on the edge")
+            assert_block_shape(block, edge(history))
+        end)
+
+        it("is ignored by the left alignment", function()
+            Config.options.user_message_max_width = 20
+            Config.options.user_message_align = "left"
+            history, win = setup_history(60)
+            history:add_user_message("hello there", nil)
+            pump(80)
+
+            local body = body_lines(history)
+            assert.are.equal("  hello there", body[1], "left mode keeps its two-space indent")
+            assert.are.equal(0, #history._user_blocks, "left alignment still stores nothing")
+        end)
+    end)
+
     describe("resize", function()
         before_each(function()
             Config.options.user_message_align = "right"
@@ -259,35 +475,56 @@ describe("user message alignment", function()
             history, win = setup_history(40)
             history:add_user_message("hello there", nil)
             pump(80)
-            assert.are.equal(39, dw(body_lines(history)[1]))
+            local before_left = left_col(blocks(history)[1].label)
 
             vim.api.nvim_win_set_config(win, { relative = "editor", row = 1, col = 1, width = 60, height = 24 })
             vim.api.nvim_exec_autocmds("WinResized", {})
             pump(120)
 
-            local body = body_lines(history)
-            assert.are.equal(1, #body)
-            assert.are.equal("hello there", vim.trim(body[1]))
-            assert.are.equal(edge(history), dw(body[1]), "re-padded to the new edge")
-            assert.are.equal(59, dw(body[1]))
+            local block = blocks(history)[1]
+            assert.are.equal("hello there", vim.trim(block.body[1]))
+            assert.is_true(left_col(block.label) > before_left, "the block moved further right")
+            assert_block_shape(block, edge(history))
         end)
 
         it("re-wraps when the window gets narrower, keeping the content", function()
+            -- No cap: this test is about the window driving the wrap width.
+            Config.options.user_message_max_width = 0
             history, win = setup_history(60)
             history:add_user_message(string.rep("y", 50), nil)
             pump(80)
-            assert.are.equal(1, #body_lines(history), "fits on one row at 60 columns")
+            assert.are.equal(1, #blocks(history)[1].body, "fits on one row at 60 columns")
 
             vim.api.nvim_win_set_config(win, { relative = "editor", row = 1, col = 1, width = 30, height = 24 })
             vim.api.nvim_exec_autocmds("WinResized", {})
             pump(120)
 
-            local body = body_lines(history)
-            assert.is_true(#body >= 2, "the line wrapped after shrinking")
-            assert.are.equal(50, #table.concat(vim.tbl_map(vim.trim, body), ""), "no characters lost")
-            for _, line in ipairs(body) do
-                assert.are.equal(edge(history), dw(line), "every chunk ends on the new edge")
+            local block = blocks(history)[1]
+            assert.is_true(#block.body >= 2, "the line wrapped after shrinking")
+            assert.are.equal(50, #table.concat(vim.tbl_map(vim.trim, block.body), ""), "no characters lost")
+            for _, row in ipairs(block.body) do
+                assert.are.equal(left_col(block.label), left_col(row), "every chunk on the block's column")
             end
+            assert_block_shape(block, edge(history))
+        end)
+
+        it("keeps the cap across a resize", function()
+            Config.options.user_message_max_width = 30
+            history, win = setup_history(60)
+            history:add_user_message(string.rep("z", 90), nil)
+            pump(80)
+            assert.are.equal(edge(history) - 30, left_col(blocks(history)[1].label))
+
+            vim.api.nvim_win_set_config(win, { relative = "editor", row = 1, col = 1, width = 40, height = 24 })
+            vim.api.nvim_exec_autocmds("WinResized", {})
+            pump(150)
+
+            local block = blocks(history)[1]
+            assert.are.equal(edge(history) - 30, left_col(block.label), "still 30 columns, re-flushed right")
+            for _, row in ipairs(block.body) do
+                assert.is_true(dw(row) - left_col(block.label) <= 30, "row wider than the cap")
+            end
+            assert_block_shape(block, edge(history))
         end)
 
         it("keeps the turn anchor and the copy entry on the label row", function()
@@ -332,17 +569,12 @@ describe("user message alignment", function()
             -- duplicate one message and drop the other.
             local labels = label_rows(history)
             assert.are.equal(2, #labels, "both labels still rendered")
+            local rendered = blocks(history)
+            assert.are.equal(2, #rendered, "both blocks rendered")
             local expected = { "first message", "second message" }
-            for i, label_row in ipairs(labels) do
-                assert.are.equal(
-                    edge(history),
-                    dw(buffer_lines(history)[label_row + 1]),
-                    "label " .. i .. " on the edge"
-                )
-                local body = buffer_lines(history)[label_row + 3]
-                assert.is_not_nil(body, "body row " .. i .. " exists")
-                assert.are.equal(expected[i], vim.trim(body), "block " .. i .. " keeps its own text")
-                assert.are.equal(edge(history), dw(body), "block " .. i .. " padded to the new edge")
+            for i, block in ipairs(rendered) do
+                assert.are.equal(expected[i], vim.trim(block.body[1]), "block " .. i .. " keeps its own text")
+                assert_block_shape(block, edge(history))
             end
 
             local ans = vim.api.nvim_get_namespaces()["pi-chat-user-align"]

@@ -147,4 +147,64 @@ describe("pi.ui.chat.text", function()
             assert.are.equal(s, table.concat(Text.wrap(s, 10), ""))
         end)
     end)
+
+    describe("wrap_words", function()
+        it("returns the line unchanged when it fits", function()
+            assert.are.same({ "hello there" }, Text.wrap_words("hello there", 20))
+        end)
+
+        it("returns the line unchanged for w <= 0", function()
+            assert.are.same({ "hello" }, Text.wrap_words("hello", 0))
+        end)
+
+        it("breaks between words, not inside one", function()
+            assert.are.same({ "the quick", "brown fox" }, Text.wrap_words("the quick brown fox", 10))
+        end)
+
+        it("never starts a chunk with whitespace", function()
+            for _, chunk in ipairs(Text.wrap_words("the quick brown fox jumps over", 9)) do
+                assert.are.equal(chunk, vim.trim(chunk):gsub("^%s+", ""))
+                assert.is_false(vim.startswith(chunk, " "), "chunk starts with a space: " .. chunk)
+            end
+        end)
+
+        it("never emits a chunk wider than the width", function()
+            local s = "the quick brown fox jumps over the lazy dog and keeps running far away"
+            for _, chunk in ipairs(Text.wrap_words(s, 12)) do
+                assert.is_true(vim.fn.strdisplaywidth(chunk) <= 12, chunk)
+            end
+        end)
+
+        it("hard-breaks a word wider than the width (no characters lost)", function()
+            local word = string.rep("x", 30)
+            local chunks = Text.wrap_words("a " .. word, 10)
+            assert.are.equal(word, table.concat(chunks, ""):gsub("^a", ""))
+            for _, chunk in ipairs(chunks) do
+                assert.is_true(vim.fn.strdisplaywidth(chunk) <= 10, chunk)
+            end
+        end)
+
+        it("drops only the whitespace a break consumes", function()
+            local s = "alpha beta gamma"
+            local joined = table.concat(Text.wrap_words(s, 6), " ")
+            assert.are.equal(s, joined)
+        end)
+
+        it("hard-breaks CJK by display width", function()
+            -- 6 CJK chars = 12 cols; w=5 fits 2 chars (4 cols) per chunk
+            assert.are.same({ "你好", "世界", "你好" }, Text.wrap_words("你好世界你好", 5))
+        end)
+
+        it("places a single over-wide char on its own line", function()
+            assert.are.same({ "aa 你", "bb" }, Text.wrap_words("aa 你 bb", 5))
+        end)
+
+        it("keeps a run of spaces from producing an empty chunk", function()
+            local chunks = Text.wrap_words("ab" .. string.rep(" ", 12) .. "cd", 6)
+            for _, chunk in ipairs(chunks) do
+                assert.is_true(#chunk > 0, "empty chunk")
+            end
+            assert.are.equal("abcd", table.concat(chunks, ""):gsub("%s+", ""))
+        end)
+    end)
 end)
