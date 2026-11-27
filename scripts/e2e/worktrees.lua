@@ -452,7 +452,7 @@ local function scenario_s2(repo_dir, w1)
     check(not exists(repo_dir .. "/.worktrees/nested"), "nested refusal created no checkout")
 end
 
---- S1: create — checkout, detached HEAD, metadata, gitignore, generated name.
+--- S1: create — checkout, detached HEAD, metadata, exclude file, generated name.
 ---@param repo_dir string
 local function scenario_s1(repo_dir)
     step("S1 create a named worktree")
@@ -489,12 +489,20 @@ local function scenario_s1(repo_dir)
     check(meta.path == realpath(wt), "metadata records the checkout path", { meta = meta })
     check(meta.base_sha == base, "metadata records the base commit", { meta = meta })
 
-    local ignore = read(repo_dir .. "/.gitignore") or ""
+    -- Repo hygiene: the tracked `.gitignore` is never touched; the anchored
+    -- exclude line goes to git's per-user `<common>/info/exclude` instead.
+    local gitignore = read(repo_dir .. "/.gitignore")
+    check(gitignore == nil, "create did not write a .gitignore", { gitignore = gitignore })
+    local exclude = read(repo_dir .. "/.git/info/exclude") or ""
     local count = 0
-    for _ in ignore:gmatch("/%.worktrees/") do
+    for _ in exclude:gmatch("/%.worktrees/") do
         count = count + 1
     end
-    check(count == 1, "/.worktrees/ appears in .gitignore exactly once", { gitignore = ignore })
+    check(count == 1, "/.worktrees/ appears in info/exclude exactly once", { exclude = exclude })
+    local repo_status = git({ "status", "--porcelain" }, repo_dir)
+    check(repo_status:find(".worktrees", 1, true) == nil, "the repository's git status is clean of .worktrees", {
+        status = repo_status,
+    })
     check(vim.trim(git({ "diff", "--cached" }, repo_dir)) == "", "nothing is staged")
     check(vim.trim(git({ "status", "--porcelain" }, wt)) == "", "checkout starts clean")
 

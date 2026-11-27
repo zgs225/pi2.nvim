@@ -651,7 +651,12 @@ end
 ---@param cb fun(info: pi.SubsessionWorktree?, owned: boolean, base_ignored: boolean, err: string?)
 local function resolve_create_target(parent_cwd, request, cb)
     local mod = worktree_mod()
-    if not mod or type(mod.create) ~= "function" or type(mod.detect) ~= "function" then
+    if
+        not mod
+        or type(mod.create) ~= "function"
+        or type(mod.detect) ~= "function"
+        or type(mod.worktrees_root) ~= "function"
+    then
         return cb(nil, false, false, "worktree support is unavailable")
     end
     if type(parent_cwd) ~= "string" or parent_cwd == "" then
@@ -661,7 +666,7 @@ local function resolve_create_target(parent_cwd, request, cb)
     local create = type(request.create) == "table" and request.create or {}
     local repo_cwd = repository_scope(cwd)
     local name = create.name
-    local target = name and (repo_cwd .. "/.worktrees/" .. name) or nil
+    local target = name and (mod.worktrees_root(repo_cwd) .. "/" .. name) or nil
     if target and vim.fn.isdirectory(target) == 1 then
         -- Same validation as a borrowed path: an existing linked checkout of the
         -- same repository, canonicalized from git's own metadata. A directory

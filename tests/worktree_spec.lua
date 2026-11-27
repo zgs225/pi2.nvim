@@ -1,4 +1,4 @@
--- Unit tests for pi.worktree: name validation, .gitignore bookkeeping,
+-- Unit tests for pi.worktree: name validation, ignore-file bookkeeping,
 -- metadata/pointer parsing, detection over a fabricated worktree tree, binding,
 -- and the create/status state machine driven by an injected runner.
 --
@@ -134,30 +134,34 @@ describe("worktree names", function()
     end)
 end)
 
-describe("worktree .gitignore line", function()
+describe("worktree info/exclude line", function()
     it("appends the anchored directory line to empty content", function()
-        assert.are.equal("/.worktrees/\n", W._append_gitignore_line("", "/.worktrees/"))
+        assert.are.equal("/.worktrees/\n", W._append_exclude_line("", "/.worktrees/"))
     end)
 
     it("preserves existing entries and adds a separating newline", function()
-        assert.are.equal("*.log\n/.worktrees/\n", W._append_gitignore_line("*.log", "/.worktrees/"))
+        assert.are.equal("*.log\n/.worktrees/\n", W._append_exclude_line("*.log", "/.worktrees/"))
     end)
 
-    it("is idempotent for every equivalent spelling", function()
+    it("is idempotent for the very same line, whitespace and CRLF included", function()
         for _, body in ipairs({
             "/.worktrees/\n",
-            "/.worktrees\n",
-            ".worktrees/\n",
-            ".worktrees\n",
             "  /.worktrees/  \n",
             "*.log\r\n/.worktrees/\r\n",
         }) do
-            assert.is_nil(W._append_gitignore_line(body, "/.worktrees/"), body)
+            assert.is_nil(W._append_exclude_line(body, "/.worktrees/"), body)
         end
     end)
 
+    it("appends a differently spelled equivalent: coverage is git's call, not ours", function()
+        -- `git check-ignore --no-index` decides whether any source already ignores
+        -- the path; an unanchored spelling in this file is a different line and is
+        -- not what this helper looks for.
+        assert.are.equal("/.worktrees\n/.worktrees/\n", W._append_exclude_line("/.worktrees\n", "/.worktrees/"))
+    end)
+
     it("does not treat a commented entry as present", function()
-        assert.are.equal("#/.worktrees/\n/.worktrees/\n", W._append_gitignore_line("#/.worktrees/", "/.worktrees/"))
+        assert.are.equal("#/.worktrees/\n/.worktrees/\n", W._append_exclude_line("#/.worktrees/", "/.worktrees/"))
     end)
 end)
 
@@ -378,7 +382,7 @@ describe("worktree create (injected runner)", function()
         Config.setup({})
         root = tempdir()
         repo = root .. "/repo"
-        vim.fn.mkdir(repo, "p")
+        vim.fn.mkdir(repo .. "/.git", "p")
         calls = {}
         setup_cwd = nil
         setup_code, setup_stderr = nil, nil
@@ -459,7 +463,9 @@ describe("worktree create (injected runner)", function()
         assert.are.equal("base-sha-1", info.base_sha)
         assert.are.equal("isolated", info.mode)
 
-        assert.are.equal("/.worktrees/\n", table.concat(vim.fn.readfile(repo .. "/.gitignore"), "\n") .. "\n")
+        assert.are.equal("/.worktrees/\n", table.concat(vim.fn.readfile(repo .. "/.git/info/exclude"), "\n") .. "\n")
+        -- The tracked ignore file is never created or edited.
+        assert.is_nil(vim.uv.fs_stat(repo .. "/.gitignore"))
 
         local meta =
             vim.json.decode(table.concat(vim.fn.readfile(repo .. "/.git/worktrees/wt-1/pi2-worktree.json"), ""))
@@ -475,19 +481,28 @@ describe("worktree create (injected runner)", function()
                 :find('"session_id":null', 1, true)
         )
 
-        -- Ordered steps: gitignore before `worktree add`, and a detached checkout.
+        -- Ordered steps: exclude line before `worktree add`, and a detached checkout.
         assert.is_true(index_of(calls, "rev-parse --show-toplevel") < index_of(calls, "check-ignore"))
         assert.is_true(index_of(calls, "check-ignore") < index_of(calls, "worktree add"))
         assert.is_truthy(index_of(calls, "worktree add --detach") > 0)
     end)
 
-    it("keeps an existing .gitignore entry and does not duplicate it", function()
-        vim.fn.writefile({ "*.log", "/.worktrees/" }, repo .. "/.gitignore")
+    it("leaves an existing .gitignore untouched and keeps info/exclude to one line", function()
+        vim.fn.writefile({ "*.log" }, repo .. "/.gitignore")
         install_fake_git()
-        local res = call(W.create, { cwd = repo, name = "wt-2" })
-        assert.is_nil(res[2])
-        local lines = vim.fn.readfile(repo .. "/.gitignore")
-        assert.are.same({ "*.log", "/.worktrees/" }, lines)
+        local first = call(W.create, { cwd = repo, name = "wt-2" })
+        assert.is_nil(first[2])
+        local second = call(W.create, { cwd = repo, name = "wt-2b" })
+        assert.is_nil(second[2])
+
+        assert.are.same({ "*.log" }, vim.fn.readfile(repo .. "/.gitignore"))
+        local count = 0
+        for _, line in ipairs(vim.fn.readfile(repo .. "/.git/info/exclude")) do
+            if line == "/.worktrees/" then
+                count = count + 1
+            end
+        end
+        assert.are.equal(1, count)
     end)
 
     it("rejects bad names, non-directories, and existing targets", function()
@@ -1229,8 +1244,8 @@ describe("worktree list", function()
             }),
         }, stale_git_dir .. "/pi2-worktree.json")
 
-        -- A missing registration outside `<repo>/.worktrees/` is not managed and
-        -- must not be reported (it could belong to another tool/user).
+        -- No `pi2-worktree.json` in its git dir: not ours, so it must not be
+        -- reported (A5: only touch checkouts we created), wherever it points.
         local external = root .. "/external"
         local porcelain = table.concat({
             "worktree " .. repo,

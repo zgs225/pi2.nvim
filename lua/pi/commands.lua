@@ -7,14 +7,21 @@ local flag_values = { layout = { "side", "float" } }
 
 --- Worktree names of the current session's repository.
 ---
---- Names come from `<repo>/.worktrees/*`, where the repository root is the
---- current session's worktree root or (falling back) the git checkout its cwd
---- lives in. Best-effort: no worktree module / not in a repo simply yields no
---- candidates, never an error.
+--- Names come from the repository's worktree root (`Worktree.worktrees_root`),
+--- where the repository root is the current session's worktree root or (falling
+--- back) the git checkout its cwd lives in. Best-effort: no worktree module / not
+--- in a repo simply yields no candidates, never an error. Runs synchronously (it
+--- is a command completion callback), so it lists the directory instead of using
+--- the asynchronous `Worktree.list`.
 ---@return string[]
 local function worktree_names()
     local ok, Worktree = pcall(require, "pi.worktree")
-    if not ok or type(Worktree) ~= "table" or type(Worktree.detect) ~= "function" then
+    if
+        not ok
+        or type(Worktree) ~= "table"
+        or type(Worktree.detect) ~= "function"
+        or type(Worktree.worktrees_root) ~= "function"
+    then
         return {}
     end
     local session = require("pi.sessions.manager").get()
@@ -31,7 +38,7 @@ local function worktree_names()
 
     ---@type string[]
     local names = {}
-    for _, path in ipairs(vim.fn.glob(repo_root .. "/.worktrees/*", false, true)) do
+    for _, path in ipairs(vim.fn.glob(Worktree.worktrees_root(repo_root) .. "/*", false, true)) do
         if vim.fn.isdirectory(path) == 1 then
             local name = vim.fn.fnamemodify(path, ":t")
             local valid = true

@@ -1,11 +1,13 @@
 --- Git worktree isolation.
 ---
---- A *worktree* here is a linked git worktree created under `<repo>/.worktrees/<name>`
---- on a **detached HEAD**, so several agent sessions can touch the same repository
+--- A *worktree* here is a linked git worktree created at a path the module
+--- owns — `<repo>/.worktrees/<name>` by default, wherever `M.worktrees_root`
+--- says — on a **detached HEAD**, so several agent sessions can touch the same repository
 --- without racing on one working tree or on a branch. The module owns:
 ---
---- - creation (`.worktrees/<name>`, auto-appended `.gitignore` line, detached
----   checkout, metadata, `.worktreeinclude` copy, optional `setup_cmd` hook),
+--- - creation (`.worktrees/<name>`, one line in `<git-common-dir>/info/exclude`,
+---   detached checkout, metadata, `.worktreeinclude` copy, optional `setup_cmd`
+---   hook),
 --- - detection of the worktree a directory belongs to (pure filesystem read, no
 ---   git subprocess — safe to call from rendering paths),
 --- - state queries (dirty/ahead), snapshotting, cleanup (=release), apply-style
@@ -46,7 +48,7 @@ local uv = vim.uv
 ---@class pi.WorktreeCreateOpts
 ---@field cwd string Directory that selects the repository (usually the session cwd)
 ---@field session_id? string pi session id recorded in the checkout's lock reason (`-` while unknown)
----@field name? string Worktree name (directory under `<repo>/.worktrees/`); generated when omitted
+---@field name? string Worktree name (its directory under the worktree root); generated when omitted
 ---@field mode? string Free-form mode recorded in the metadata (default `"isolated"`)
 ---@field base? string Commit the checkout is detached at (default: the repository's current `HEAD`); any revision `git rev-parse` accepts
 ---@field setup? boolean Run `worktree.setup_cmd` after the checkout is ready (default true); `false` skips it for callers that must stay fast (sub-session spawns)
@@ -117,13 +119,7 @@ local META_FILE = "pi2-worktree.json"
 --- Bumped when the metadata layout changes; readers reject newer versions.
 local META_VERSION = 1
 local WORKTREES_DIR = ".worktrees"
-local GITIGNORE_LINE = "/.worktrees/"
-local GITIGNORE_EQUIVALENTS = {
-    [GITIGNORE_LINE] = true,
-    ["/.worktrees"] = true,
-    [".worktrees/"] = true,
-    [".worktrees"] = true,
-}
+local EXCLUDE_LINE = "/.worktrees/"
 local INCLUDE_FILE = ".worktreeinclude"
 local SNAPSHOT_DIR = "pi2-worktree-snapshots"
 --- Suffix of the snapshot metadata sidecar (`<patch>.json`).
@@ -626,6 +622,47 @@ local function worktree_git_dir(target)
     return realpath(gitdir) or norm(gitdir)
 end
 
+--- Common git dir of a repository, resolved without spawning git.
+---
+--- Declared here (not next to the snapshot helpers that use it) because
+--- `ensure_excluded` needs it: a Lua `local function` is only visible after its
+--- declaration, so a later definition would silently resolve to a global.
+---@param repo_root string
+---@return string? common_dir
+local function repo_common_dir(repo_root)
+    local marker = repo_root .. "/.git"
+    local st = stat(marker)
+    if not st then
+        -- A BARE repository has no `.git` entry: it *is* its own git dir, so
+        -- `worktrees/` and the snapshot store live directly under it. Probe the
+        -- two files git itself uses to recognise one (`objects/` is a directory,
+        -- `HEAD` a file) instead of spawning `git rev-parse --git-dir`.
+        local objects = stat(repo_root .. "/objects")
+        local head = stat(repo_root .. "/HEAD")
+        if objects and objects.type == "directory" and head and head.type == "file" then
+            return realpath(repo_root) or norm(repo_root)
+        end
+        return nil
+    end
+    local git_dir = realpath(marker) or marker
+    if st.type == "directory" then
+        -- A `.git` *directory* can carry a `commondir` file too (a submodule's
+        -- git dir, or a checkout created with `--separate-git-dir`), so it is
+        -- resolved exactly like the gitdir-file case below: skipping it would
+        -- report a private per-worktree dir where the shared one is meant.
+        return resolve_common_dir(git_dir) or git_dir
+    end
+    local gitdir = parse_gitdir_file(read_text(marker))
+    if not gitdir then
+        return nil
+    end
+    if not is_abs(gitdir) then
+        gitdir = repo_root .. "/" .. gitdir
+    end
+    git_dir = realpath(gitdir) or norm(gitdir)
+    return resolve_common_dir(git_dir) or git_dir
+end
+
 --- Build the info table for the work tree containing `cwd`.
 ---@param cwd string Absolute existing directory
 ---@return pi.WorktreeInfo?
@@ -1112,10 +1149,27 @@ function M.sweep_locks(cwd, cb)
     end)
 end
 
+-- Layout --------------------------------------------------------------------
+
+--- Directory holding this repository's worktrees: a worktree called `name`
+--- lives at `<worktrees_root>/<name>`.
+---
+--- The single owner of the layout. Call sites join through here instead of
+--- repeating `repo_root .. "/" .. ".worktrees"`, so a different location (a
+--- sibling directory, a configured absolute root) has exactly one place to
+--- change. Deliberately trivial: no existence check, no `mkdir`, no trailing
+--- slash — callers probe and canonicalize as they need.
+---@param repo_root string Repository root (the main checkout).
+---@return string
+function M.worktrees_root(repo_root)
+    return repo_root .. "/" .. WORKTREES_DIR
+end
+
 -- Name validation ------------------------------------------------------------
 
---- Validate a worktree name. Names become a single directory component under
---- `<repo>/.worktrees/`, so anything that could escape or hide is rejected.
+--- Validate a worktree name. A name is one directory component under the
+--- repository's worktree root (`M.worktrees_root`), so anything that could
+--- escape or hide is rejected.
 ---@param name any
 ---@return boolean ok
 ---@return string? err
@@ -1385,18 +1439,23 @@ function M.resolve_base(opts, cb)
     end)
 end
 
--- .gitignore ----------------------------------------------------------------
+-- info/exclude --------------------------------------------------------------
 
---- Append `line` to a `.gitignore` body unless an equivalent entry exists.
+--- Append `line` to an exclude-file body unless it is already present there.
 --- Pure: returns the new content, or nil when nothing needs to change.
+---
+--- An exact-line test is deliberate: the file is only written after
+--- `git check-ignore --no-index` reported that *no* source ignores the path, so
+--- a differently-spelled equivalent cannot be present. Keeping the helper dumb
+--- leaves the "is it covered?" decision in exactly one place: git itself.
 ---@param content string?
 ---@param line string
 ---@return string?
-function M._append_gitignore_line(content, line)
+function M._append_exclude_line(content, line)
     content = content or ""
     for _, raw in ipairs(vim.split(content, "\n", { plain = true })) do
         local trimmed = vim.trim((raw:gsub("\r", "")))
-        if GITIGNORE_EQUIVALENTS[trimmed] then
+        if trimmed == line then
             return nil
         end
     end
@@ -1407,20 +1466,36 @@ function M._append_gitignore_line(content, line)
     return out .. line .. "\n"
 end
 
---- Make sure `<repo>/.worktrees/` is git-ignored. Appends one line to the
---- repository's `.gitignore` when needed; never stages or commits anything.
+--- Make sure `<repo>/.worktrees/` is git-ignored, writing one line to
+--- `<git-common-dir>/info/exclude` when no ignore source covers it yet.
+---
+--- `info/exclude` is git's answer for "auxiliary files that live inside the
+--- repository but are specific to one user's workflow" (gitignore(5)), and its
+--- anchoring is identical to `.gitignore`. The repository's tracked `.gitignore`
+--- is therefore never touched and never dirtied; nothing is staged or committed.
 ---@param repo_root string
 ---@param cb fun(err: string?)
-local function ensure_gitignore(repo_root, cb)
+local function ensure_excluded(repo_root, cb)
     run({ "git", "-C", repo_root, "check-ignore", "-q", "--no-index", WORKTREES_DIR .. "/" }, {}, function(code)
         if code == 0 then
+            -- Already ignored by some source (.gitignore, info/exclude,
+            -- core.excludesFile): writing anything would only add noise.
             return cb(nil)
         end
         if code ~= 1 then
-            return cb("create: cannot inspect .gitignore (git check-ignore exit " .. code .. ")")
+            return cb("create: cannot inspect ignore rules (git check-ignore exit " .. code .. ")")
         end
-        local path = repo_root .. "/.gitignore"
-        local updated = M._append_gitignore_line(read_text(path), GITIGNORE_LINE)
+        local common = repo_common_dir(repo_root)
+        if not common then
+            return cb("create: cannot resolve the git common dir of " .. repo_root)
+        end
+        local info_dir = common .. "/info"
+        local mkdir_err = mkdirp(info_dir)
+        if mkdir_err then
+            return cb("create: failed to create " .. info_dir .. ": " .. mkdir_err)
+        end
+        local path = info_dir .. "/exclude"
+        local updated = M._append_exclude_line(read_text(path), EXCLUDE_LINE)
         if updated == nil then
             return cb(nil)
         end
@@ -1692,7 +1767,8 @@ end
 --- Steps (in order, each one leaving the repository consistent):
 ---   1. reject non-directories, non-git directories, repositories without a
 ---      commit yet, and creation from *inside* a linked worktree,
----   2. ensure `/.worktrees/` is in the repository `.gitignore`,
+---   2. ensure `/.worktrees/` is excluded (one line in
+---      `<git-common-dir>/info/exclude`; the tracked `.gitignore` is untouched),
 ---   3. `git worktree add --detach <target> <base>` (`opts.base`, default `HEAD`),
 ---   4. write the metadata into the new per-worktree git dir and lock the checkout
 ---      (`worktree.lock`, skipped when it is `false`),
@@ -1748,7 +1824,7 @@ function M.create(opts, cb)
         end
         repo_root = realpath(repo_root) or repo_root
 
-        local worktrees_root = repo_root .. "/" .. WORKTREES_DIR
+        local worktrees_root = M.worktrees_root(repo_root)
         if is_under(cwd, worktrees_root) then
             return cb(nil, "create: refusing to create a worktree inside " .. worktrees_root)
         end
@@ -1767,9 +1843,9 @@ function M.create(opts, cb)
                 return cb(nil, base_err or ("create: cannot resolve a base commit for " .. repo_root))
             end
 
-            ensure_gitignore(repo_root, function(ignore_err)
-                if ignore_err then
-                    return cb(nil, ignore_err)
+            ensure_excluded(repo_root, function(exclude_err)
+                if exclude_err then
+                    return cb(nil, exclude_err)
                 end
 
                 ---@param force boolean
@@ -1886,18 +1962,7 @@ function M.create(opts, cb)
                 local function recover_stale(retry, fail)
                     -- `<repo>/.git` (a directory, or a gitdir file) → the common dir;
                     -- the stale registration's git dir sits under its `worktrees/`.
-                    -- Resolved by hand: `repo_common_dir` is a local defined further
-                    -- down the file and is out of scope here.
-                    local dot_git = repo_root .. "/.git"
-                    local marker = stat(dot_git)
-                    local git_dir = realpath(dot_git) or dot_git
-                    if marker and marker.type ~= "directory" then
-                        local parsed = parse_gitdir_file(read_text(dot_git))
-                        if parsed then
-                            git_dir = is_abs(parsed) and parsed or (repo_root .. "/" .. parsed)
-                        end
-                    end
-                    local common = resolve_common_dir(git_dir) or git_dir
+                    local common = repo_common_dir(repo_root) or (repo_root .. "/.git")
                     local reason = read_lock_reason(common .. "/worktrees/" .. name)
                     if reason == nil then
                         return retry()
@@ -2039,29 +2104,6 @@ end
 local function snapshot_dir(info)
     local common = info.common_dir or resolve_common_dir(info.git_dir) or info.git_dir
     return common .. "/" .. SNAPSHOT_DIR
-end
-
---- Common git dir of a repository, resolved without spawning git.
----@param repo_root string
----@return string? common_dir
-local function repo_common_dir(repo_root)
-    local marker = repo_root .. "/.git"
-    local st = stat(marker)
-    if not st then
-        return nil
-    end
-    if st.type == "directory" then
-        return realpath(marker) or marker
-    end
-    local gitdir = parse_gitdir_file(read_text(marker))
-    if not gitdir then
-        return nil
-    end
-    if not is_abs(gitdir) then
-        gitdir = repo_root .. "/" .. gitdir
-    end
-    local git_dir = realpath(gitdir) or norm(gitdir)
-    return resolve_common_dir(git_dir) or git_dir
 end
 
 --- Write the snapshot sidecar (atomic; overridable in tests).
@@ -2681,6 +2723,190 @@ function M._parse_worktree_list(text)
     return out
 end
 
+--- Read a registry dir's `gitdir` file, normalized for comparison with a work
+--- tree path.
+---
+--- Git writes the absolute path of the work tree's own `.git` file there; a
+--- relative path (git's `worktree.useRelativePaths`) is relative to the registry
+--- dir that holds the file.
+---@param git_dir string Per-worktree git dir (`<common>/worktrees/<name>`)
+---@return string? target Normalized `<work tree>/.git`, nil when unreadable or empty
+local function registry_gitdir_target(git_dir)
+    local text = read_text(git_dir .. "/gitdir")
+    if type(text) ~= "string" then
+        return nil
+    end
+    local target = vim.trim((text:gsub("\r", "")))
+    if target == "" then
+        return nil
+    end
+    if not is_abs(target) then
+        target = git_dir .. "/" .. target
+    end
+    return norm(target)
+end
+
+--- Resolve the per-worktree git dir (git's registry entry under
+--- `<common>/worktrees/`) that belongs to the work tree at `path`.
+---
+--- Git names that directory after the checkout's basename **at creation time**
+--- and never renames it: `git worktree move` rewrites the `gitdir` file *inside
+--- the existing registry dir* instead. So the directory name is a hint at best —
+--- for a checkout that was moved before it disappeared, the basename of `path`
+--- names a registry dir that does not exist or belongs to a different checkout.
+--- The authoritative link is the `gitdir` file, which always points at
+--- `<work tree>/.git`.
+---
+--- A registry dir is only ever accepted on POSITIVE evidence, never because it
+--- happens to exist:
+---
+---   * its `gitdir` file is readable and normalizes to exactly `<path>/.git` —
+---     git's own link, authoritative (`git worktree list` derives the path it
+---     prints from that same file),
+---   * or, when that file is missing/unreadable, its `pi2-worktree.json` records
+---     exactly `<path>` — our own sidecar, which only ever names the checkout it
+---     was written for.
+---
+--- Existence alone proves nothing: the directory name is a creation-time
+--- artefact, so another checkout's registry dir (with another checkout's
+--- metadata) can sit under it, and claiming it would attach a foreign
+--- name/base_sha/session_id to this path and point recovery at the wrong name.
+---
+--- Cost: one read on the happy path (the `gitdir` match); the scan is reached
+--- only when the name yields nothing and never spawns a process.
+---@param common string Common git dir (the directory holding `worktrees/`)
+---@param path string Work tree path recorded by git (the directory may be gone)
+---@return string? git_dir Absolute per-worktree git dir, nil when none matches
+local function find_registry_dir(common, path)
+    local registry = common .. "/worktrees"
+    -- Normalize *before* splitting: a trailing slash makes `basename` return ""
+    -- and would probe the registry root itself (L5). Both sides of every
+    -- comparison below are normalized the same way.
+    local normalized = norm(path)
+    local expected = norm(normalized .. "/.git")
+
+    ---@param candidate string
+    ---@return boolean True only on evidence that this dir belongs to `normalized`
+    local function matches(candidate)
+        local recorded = registry_gitdir_target(candidate)
+        if recorded == expected then
+            return true
+        end
+        if recorded ~= nil then
+            return false
+        end
+        -- No readable `gitdir`: the sidecar is the only evidence left, and only
+        -- when it records exactly this path.
+        local meta = read_meta(candidate)
+        return type(meta) == "table" and type(meta.path) == "string" and norm(meta.path) == normalized
+    end
+
+    local by_name = registry .. "/" .. basename(normalized)
+    if matches(by_name) then
+        return by_name
+    end
+    -- Moved checkout: the registry dir kept its old name, so match on content.
+    local handle = uv.fs_scandir(registry)
+    if not handle then
+        return nil
+    end
+    while true do
+        local name, kind = uv.fs_scandir_next(handle)
+        if name == nil then
+            return nil
+        end
+        if kind == nil or kind == "directory" then
+            local candidate = registry .. "/" .. name
+            if candidate ~= by_name and matches(candidate) then
+                return candidate
+            end
+        end
+    end
+end
+
+--- A checkout resolved to its repository and worktree name without requiring the
+--- checkout to still exist (`M.locate`).
+---@class pi.WorktreeLocator
+---@field repo_root string Nearest ancestor repository of `path` (walked up to the nearest `.git`
+--- marker), which is the checkout's owning repository only while the checkout sits inside it:
+--- a `git worktree move` into another repository reports that repository here.
+---@field name string Worktree name (metadata name when recorded, else the registry dir name).
+---@field path string The normalized input path.
+---@field git_dir? string Registry dir under `<common>/worktrees/`, when one matched.
+---@field missing boolean True when the checkout directory is gone.
+
+--- Resolve a checkout path to its repository and worktree name, WITHOUT
+--- requiring the directory to still exist.
+---
+--- `M.detect` cannot answer this for a deleted checkout (it reads the
+--- checkout's own `.git` file), so a resume that outlived its directory has
+--- no other way back to the snapshot. Deliberately metadata-first: the
+--- registry entry git keeps for the checkout is authoritative, so a checkout
+--- `git worktree move` relocated **inside the repository** still resolves.
+---
+--- That qualification is the caller's to respect: the repository is found by
+--- walking up from the path's parent to the nearest `.git` marker, so a checkout
+--- moved to a directory outside any repository resolves to nil even with its
+--- registry entry intact, and one moved into a *different* repository reports
+--- that (nearest) repository as `repo_root` — the owner only when the checkout
+--- did not leave it. The layout join (`<worktrees_root>/<name>`) is only a LAST
+--- resort, used after `git worktree prune` has removed the registry entry
+--- entirely.
+---@param path string Checkout path, possibly no longer existing.
+---@return pi.WorktreeLocator? locator
+function M.locate(path)
+    if type(path) ~= "string" or path == "" then
+        return nil
+    end
+    local target = norm(path)
+    local missing = not is_dir(target)
+
+    -- The repository, found from OUTSIDE the checkout (which may be gone): walk
+    -- up to the nearest `.git` marker — the checkout's owner while it sits inside
+    -- one. A checkout outside any repository resolves to nothing: an out-of-repo
+    -- layout is not implemented, and its registry entry (which would still name
+    -- the owner) is not reachable from here.
+    local _, _, candidate = find_git_marker(parent(target))
+    if not candidate then
+        return nil
+    end
+    local repo_root = realpath(candidate) or candidate
+
+    ---@param git_dir string Registry dir the `gitdir` file proved belongs to `target`
+    ---@return pi.WorktreeLocator?
+    local function from_registry(git_dir)
+        local meta = read_meta(git_dir) or {}
+        local name = type(meta.name) == "string" and meta.name ~= "" and meta.name or basename(git_dir)
+        if not (M.validate_name(name)) then
+            return nil
+        end
+        return { repo_root = repo_root, name = name, path = target, git_dir = git_dir, missing = missing }
+    end
+
+    local common = repo_common_dir(candidate)
+    if common then
+        local git_dir = find_registry_dir(common, target)
+        if git_dir then
+            local locator = from_registry(git_dir)
+            if locator then
+                return locator
+            end
+        end
+    end
+
+    -- Last resort (after `git worktree prune` deleted the registry entry): the
+    -- layout says a checkout called `name` lives at `<worktrees_root>/<name>`.
+    -- Exactly ONE valid name component — never a general path pattern.
+    local root_prefix = M.worktrees_root(repo_root) .. "/"
+    if target:sub(1, #root_prefix) == root_prefix then
+        local leaf = target:sub(#root_prefix + 1)
+        if leaf ~= "" and not leaf:find("/", 1, true) and (M.validate_name(leaf)) then
+            return { repo_root = repo_root, name = leaf, path = target, missing = missing }
+        end
+    end
+    return nil
+end
+
 --- Entry for a registered worktree whose directory is gone (git reports it
 --- prunable). Built from the porcelain record plus whatever metadata the
 --- per-worktree git dir still holds, so `History.list(path)` can still find the
@@ -2693,17 +2919,20 @@ local function missing_list_entry(main_root, record)
     if type(path) ~= "string" or path == "" then
         return nil
     end
-    local name = basename(path)
+    local common = repo_common_dir(main_root)
+    local git_dir = find_registry_dir(common or (main_root .. "/.git"), path)
+    if not git_dir then
+        return nil
+    end
+    local meta = read_meta(git_dir) or {}
+    local name = type(meta.name) == "string" and meta.name ~= "" and meta.name or basename(git_dir)
     if not (M.validate_name(name)) then
         return nil
     end
-    local common = repo_common_dir(main_root)
-    local git_dir = (common and (common .. "/worktrees/" .. name)) or (main_root .. "/.git/worktrees/" .. name)
-    local meta = read_meta(git_dir) or {}
     ---@type pi.WorktreeListEntry
     return {
         kind = "linked",
-        name = type(meta.name) == "string" and meta.name ~= "" and meta.name or name,
+        name = name,
         path = norm(path),
         repo_root = main_root,
         git_dir = git_dir,
@@ -2728,8 +2957,9 @@ end
 ---
 --- Each entry is the `detect()` info (metadata included) plus the porcelain
 --- `head`/`branch`/`detached`/`prunable` fields — what a cross-worktree resume
---- picker needs. Worktrees whose directory is gone are skipped (nothing to
---- resume there).
+--- picker needs. A registered checkout whose directory is gone (git reports it
+--- prunable) is reported as `missing` **only when our metadata says it is ours**;
+--- a foreign prunable registration is dropped (A5), wherever it points.
 ---@param cwd string? Directory inside the repository (default: the process cwd)
 ---@param cb fun(entries: pi.WorktreeListEntry[]?, err: string?)
 function M.list(cwd, cb)
@@ -2761,7 +2991,6 @@ function M.list(cwd, cb)
             if records[1] and records[1].path ~= "" then
                 main_root = realpath(records[1].path) or norm(records[1].path)
             end
-            local managed_root = norm(main_root .. "/" .. WORKTREES_DIR)
             for _, record in ipairs(records) do
                 local path = record.path
                 local normalized = path ~= "" and (realpath(path) or norm(path)) or ""
@@ -2793,13 +3022,17 @@ function M.list(cwd, cb)
                             }
                             entries[#entries + 1] = entry
                         end
-                    elseif is_under(normalized, managed_root) then
+                    else
                         -- Registered but the directory is gone (git reports it
                         -- prunable). Resume still needs the entry to locate the
-                        -- transcript by its path, so report it as missing instead of
-                        -- dropping it.
+                        -- transcript by its path, so report it as missing instead
+                        -- of dropping it — but only when our metadata proves the
+                        -- checkout is ours (A5: never touch checkouts other tools
+                        -- created). Where the checkout lived is not evidence:
+                        -- `git worktree move` can put a managed checkout
+                        -- anywhere, at any time.
                         local entry = missing_list_entry(main_root, record)
-                        if entry then
+                        if entry and entry.managed then
                             entries[#entries + 1] = entry
                         end
                     end

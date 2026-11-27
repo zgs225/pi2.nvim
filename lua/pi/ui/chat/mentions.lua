@@ -238,7 +238,9 @@ end
 --- The mention is rendered relative to the workspace pi resolves it in: an
 --- explicit `opts.cwd` wins, otherwise the session's own cwd. A worktree
 --- session's cwd is not Neovim's, so relativising against Neovim's cwd would
---- emit `@.worktrees/wt/src/a.lua` where pi expects `@src/a.lua`.
+--- emit a path that includes the checkout's own directory (e.g.
+--- `@.worktrees/wt/src/a.lua` for a checkout under `<repo>/.worktrees/<name>`)
+--- where pi expects `@src/a.lua`.
 ---@param loc { path: string, start_line?: integer, end_line?: integer }
 ---@param opts? { focus?: boolean, cwd?: string } `cwd` is the session's workspace (default: the session cwd, then Neovim's cwd); `focus` defaults to true.
 function M.send(loc, opts)

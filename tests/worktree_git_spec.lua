@@ -4,7 +4,7 @@
 -- async API (vim.system under the hood) with vim.wait(), and asserts on git's
 -- own view (`worktree list --porcelain`, `status`, `rev-parse`) rather than on
 -- the module's own bookkeeping alone. Global/system git config is neutralized so
--- a user-level excludes file cannot change the .gitignore assertions.
+-- a user-level excludes file cannot change the ignore-file assertions.
 
 local Config = require("pi.config")
 local RepoConfig = require("pi.worktree_config")
@@ -77,12 +77,27 @@ end
 
 ---@param repo string
 ---@return string[]
-local function gitignore_lines(repo)
-    local path = repo .. "/.gitignore"
+local function exclude_lines(repo)
+    local path = repo .. "/.git/info/exclude"
     if not vim.uv.fs_stat(path) then
         return {}
     end
     return vim.fn.readfile(path)
+end
+
+--- Raw bytes of `path` (nil when the file does not exist), for byte-identical
+--- comparisons: `readfile()` normalizes line endings and the trailing newline.
+---@param path string
+---@return string?
+local function read_bytes(path)
+    local fd = vim.uv.fs_open(path, "r", 420)
+    if not fd then
+        return nil
+    end
+    local st = vim.uv.fs_fstat(fd)
+    local data = st and vim.uv.fs_read(fd, st.size, 0) or nil
+    vim.uv.fs_close(fd)
+    return data
 end
 
 ---@param repo string
@@ -109,7 +124,7 @@ local function make_nested_repo(dir)
 end
 
 --- Global/system git config is neutralized for the whole file so a user-level
---- excludes file cannot change the .gitignore assertions (children inherit the
+--- excludes file cannot change the ignore-file assertions (children inherit the
 --- process environment, which is why this works for `vim.system`).
 local SAVED_GIT_CONFIG_GLOBAL = vim.env.GIT_CONFIG_GLOBAL
 local SAVED_GIT_CONFIG_SYSTEM = vim.env.GIT_CONFIG_SYSTEM
@@ -176,7 +191,13 @@ describe("worktree create (real git)", function()
         teardown_repo(ctx)
     end)
 
-    it("creates a detached worktree under .worktrees/<name> and ignores it", function()
+    it("creates a detached worktree under .worktrees/<name> and excludes it", function()
+        -- A tracked `.gitignore` is the user's file: capture its exact bytes.
+        vim.fn.writefile({ "*.log" }, repo .. "/.gitignore")
+        git_ok({ "git", "-C", repo, "add", ".gitignore" }, repo)
+        git_ok({ "git", "-C", repo, "commit", "-qm", "ignore" }, repo)
+        local ignore_before = read_bytes(repo .. "/.gitignore")
+
         local base = head_of(repo)
         local info = create_wt(repo, "wt-real")
         local wt = repo .. "/.worktrees/wt-real"
@@ -196,15 +217,15 @@ describe("worktree create (real git)", function()
             git_ok({ "git", "-C", repo, "worktree", "list", "--porcelain" }, repo):find("detached", 1, true)
         )
 
-        -- ./.gitignore got the anchored entry, and git agrees it is ignored.
-        assert.is_true(vim.tbl_contains(gitignore_lines(repo), "/.worktrees/"))
-        assert.are.equal(0, (sh({ "git", "-C", repo, "check-ignore", "-q", ".worktrees/" }, repo)))
+        -- The exclusion landed in `<common>/info/exclude`; the tracked
+        -- `.gitignore` is byte-identical to what the user had.
+        assert.is_true(vim.tbl_contains(exclude_lines(repo), "/.worktrees/"))
+        assert.are.equal(ignore_before, read_bytes(repo .. "/.gitignore"))
+        assert.are.equal(0, (sh({ "git", "-C", repo, "check-ignore", "-q", "--no-index", ".worktrees/" }, repo)))
 
-        -- Nothing about the worktree shows up as untracked in the main checkout;
-        -- only the (intentionally uncommitted) .gitignore edit does.
-        local status = git_ok({ "git", "-C", repo, "status", "--porcelain" }, repo)
-        assert.is_nil(status:find(".worktrees", 1, true))
-        assert.is_truthy(status:find(".gitignore", 1, true))
+        -- Nothing about the worktree shows up as untracked in the main checkout,
+        -- and nothing was staged: the repository is clean.
+        assert.are.equal("", git_ok({ "git", "-C", repo, "status", "--porcelain" }, repo))
         assert.are.equal("", git_ok({ "git", "-C", repo, "diff", "--cached", "--name-only" }, repo))
     end)
 
@@ -230,16 +251,34 @@ describe("worktree create (real git)", function()
         assert.is_nil(vim.uv.fs_stat(meta_path .. ".tmp"))
     end)
 
-    it("keeps .gitignore idempotent across several creations", function()
+    it("keeps info/exclude idempotent across several creations", function()
         create_wt(repo, "wt-a")
         create_wt(repo, "wt-b")
         local count = 0
-        for _, line in ipairs(gitignore_lines(repo)) do
+        for _, line in ipairs(exclude_lines(repo)) do
             if line == "/.worktrees/" then
                 count = count + 1
             end
         end
         assert.are.equal(1, count)
+        -- No tracked ignore file was created along the way.
+        assert.is_nil(vim.uv.fs_stat(repo .. "/.gitignore"))
+    end)
+
+    it("does not touch info/exclude when .gitignore already covers the path", function()
+        vim.fn.writefile({ "/.worktrees/" }, repo .. "/.gitignore")
+        git_ok({ "git", "-C", repo, "add", ".gitignore" }, repo)
+        git_ok({ "git", "-C", repo, "commit", "-qm", "cover worktrees" }, repo)
+        local ignore_before = read_bytes(repo .. "/.gitignore")
+        -- `git init` ships an `info/exclude` template; it must stay untouched.
+        local exclude_before = read_bytes(repo .. "/.git/info/exclude")
+
+        create_wt(repo, "wt-covered")
+
+        assert.are.equal(ignore_before, read_bytes(repo .. "/.gitignore"))
+        assert.are.equal(exclude_before, read_bytes(repo .. "/.git/info/exclude"))
+        assert.is_false(vim.tbl_contains(exclude_lines(repo), "/.worktrees/"))
+        assert.are.equal("", git_ok({ "git", "-C", repo, "status", "--porcelain" }, repo))
     end)
 
     it("copies only the gitignored files matched by .worktreeinclude", function()
