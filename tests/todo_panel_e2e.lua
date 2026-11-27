@@ -12,7 +12,7 @@
 --      absolute 6)
 --   4. refresh renders new content; a manual resize persists (restack runs
 --      on claim/release, not on refresh)
---   6. hide_when_empty: cleared list -> manual panel keeps "no todos" placeholder
+--   6. hide_when_empty: cleared list -> manual panel keeps its empty state
 --   7. replay-style toolResult + non-todo tool gating
 --   8. per-tab buffers: two tabs with open panels each show their own list
 --   9. opened_by semantics: auto-opened panel closes on clear, manual keeps
@@ -298,10 +298,9 @@ todo_win = vim.api.nvim_get_current_win()
 Manager._update_todo_mirror("todo_write", { details = { todos = {}, completed = 0, total = 0 } })
 pump()
 local lines3 = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(todo_win), 0, -1, false)
-eq(
-    { "", TODO_TITLE, "", "  no todos" },
-    lines3,
-    "explicit panel keeps the title and shows the no-todos placeholder after clear"
+check(
+    lines3[2] == TODO_TITLE and lines3[4]:find("the list was cleared", 1, true) ~= nil,
+    "explicit panel keeps the title and shows the empty state after clear (got " .. vim.inspect(lines3) .. ")"
 )
 Todo.close()
 
@@ -372,10 +371,12 @@ eq("manual", Todo._opened_by(), "tab 1 reopened manually")
 Manager._update_todo_mirror("todo_write", { details = { todos = {}, completed = 0, total = 0 } })
 pump()
 check(Todo.is_open(), "manual panel stays open after clear")
-eq(
-    { "", TODO_TITLE, "", "  no todos" },
-    vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(Todo.win(tab1)), 0, -1, false),
-    "manual panel keeps the title and shows the placeholder after clear"
+local cleared_lines = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(Todo.win(tab1)), 0, -1, false)
+check(
+    cleared_lines[2] == TODO_TITLE
+        and cleared_lines[4]:find("the list was cleared", 1, true) ~= nil
+        and cleared_lines[#cleared_lines]:find("q close", 1, true) ~= nil,
+    "manual panel keeps the title and shows the empty state after clear (got " .. vim.inspect(cleared_lines) .. ")"
 )
 -- Auto panel on tab 2 closes on clear.
 vim.api.nvim_set_current_tabpage(tab2)

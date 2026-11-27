@@ -122,4 +122,98 @@ describe("panel header shell", function()
             assert.equals("  no rows", header.lines[4])
         end)
     end)
+
+    describe("empty state", function()
+        it("centres the headline and puts the hint after a blank line", function()
+            local header = PanelHeader.build({
+                name = "Todo",
+                noun = "todos",
+                width = 24,
+                empty = { headline = "nothing planned", detail = "ask me", hint = "q close" },
+            })
+            assert.same({
+                "",
+                "  Todo",
+                "",
+                "    nothing planned",
+                "         ask me",
+                "",
+                "        q close",
+            }, header.lines)
+            assert.equals(3, header.header_lines, "the empty block sits below the header")
+            assert.is_true(header.empty)
+        end)
+
+        it("renders the headline as content and the detail as dim chrome", function()
+            local header = PanelHeader.build({
+                name = "Todo",
+                noun = "todos",
+                width = 24,
+                empty = { headline = "nothing planned", detail = "ask me", hint = "q close" },
+            })
+            assert.is_nil(header.chunks[4], "the headline carries no chunk: it inherits the window text colour")
+            assert.equals("PiPanelTitle", header.chunks[5][1][3])
+            assert.equals("PiPanelTitle", header.chunks[7][1][3])
+        end)
+
+        it("lets the panel paint the detail with a semantic group", function()
+            local header = PanelHeader.build({
+                name = "Todo",
+                noun = "todos",
+                width = 24,
+                empty = { headline = "the list was cleared", detail = "5/5 completed", detail_hl = "PiTodoDone" },
+            })
+            assert.equals("PiTodoDone", header.chunks[5][1][3])
+        end)
+
+        it("drops the detail first when it does not fit, keeping the hint", function()
+            local header = PanelHeader.build({
+                name = "Todo",
+                noun = "todos",
+                width = 20,
+                empty = { headline = "nothing planned yet", detail = "ask, and I'll track it", hint = "q close" },
+            })
+            -- 1 cell of slack: the block keeps the shell indent instead of
+            -- hugging column 0.
+            assert.same({ "", "  Todo", "", " nothing planned yet", "", "      q close" }, header.lines)
+        end)
+
+        it("keeps only the headline when nothing else fits, truncating it last", function()
+            local header = PanelHeader.build({
+                name = "Todo",
+                noun = "todos",
+                width = 6,
+                empty = { headline = "nothing planned yet", detail = "ask, and I'll track it", hint = "q close" },
+            })
+            assert.same({ "", "  Todo", "", "nothi…" }, header.lines)
+        end)
+
+        it("centres a CJK line by display width, not by character count", function()
+            local header = PanelHeader.build({
+                name = "Todo",
+                noun = "todos",
+                width = 20,
+                -- 7 glyphs = 14 cells, so 3 cells of padding on the left
+                empty = { headline = "还没有任务清单", detail = "说要做什么，我拆给你看" },
+            })
+            assert.equals("   还没有任务清单", header.lines[4])
+            -- 12 glyphs = 24 cells: the detail does not fit and is dropped
+            assert.equals(4, #header.lines)
+        end)
+
+        it("keeps the shell indent when the caller does not know its width", function()
+            local header = PanelHeader.build({
+                name = "Todo",
+                noun = "todos",
+                empty = { headline = "nothing planned yet", hint = "q close" },
+            })
+            assert.same({ "", "  Todo", "", "  nothing planned yet", "", "  q close" }, header.lines)
+        end)
+
+        it("leaves the legacy placeholder alone when no empty state is supplied", function()
+            local header = PanelHeader.build({ name = "Compactions", noun = "compactions", width = 24 }, {})
+            assert.equals("  no compactions", header.lines[4])
+            assert.equals(4, #header.lines, "a width alone does not turn the placeholder into a block")
+        end)
+    end)
 end)

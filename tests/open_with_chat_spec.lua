@@ -6,8 +6,8 @@
 --     reports whether it asked for anything (idempotent: `open()` only focuses
 --     an existing window)
 --   * a chat-opened todo panel is a MANUAL panel (`_opened_by() == "manual"`),
---     which is what keeps its `no todos` placeholder instead of closing when
---     the list empties (tests/todo_panel_e2e.lua section 9 pins that mapping)
+--     which is what keeps its composed empty state instead of closing when the
+--     list empties (tests/todo_panel_e2e.lua section 9 pins that mapping)
 --   * `tasks_panel.open_with_chat` disables the all-tasks-finished auto-close;
 --     without the flag the panel still closes as before
 --
@@ -110,13 +110,17 @@ describe("open_with_chat", function()
         assert.is_not_nil(Todo.win(tab()))
     end)
 
-    it("marks a chat-opened todo panel manual, so its placeholder survives", function()
+    it("marks a chat-opened todo panel manual, so its empty state survives", function()
         set_flags(false, true)
         Layout._open_with_chat_panels()
         local win = Todo.win(tab())
         assert.are.equal("manual", Todo._opened_by())
         local lines = vim.api.nvim_buf_get_lines(vim.api.nvim_win_get_buf(win), 0, -1, false)
-        assert.is_truthy(table.concat(lines, "\n"):find("no todos", 1, true))
+        -- No session is bound in this spec, so the empty state names that and
+        -- ends with the panel's only key (the composed block, not `no todos`).
+        local text = table.concat(lines, "\n")
+        assert.is_truthy(text:find("no session in this tab", 1, true))
+        assert.is_truthy(text:find("q close", 1, true))
     end)
 
     it("is idempotent: a second call focuses the existing window", function()

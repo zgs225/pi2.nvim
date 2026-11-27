@@ -10,7 +10,7 @@
 --   1. a real session opened with both flags on has the :PiTasks and :PiTodo
 --      windows in the tab, in the chat layout's right column (tasks above todo)
 --   2. the hook never steals the cursor: the chat prompt keeps focus
---   3. both panels hold their empty-state placeholder (`no tasks` / `no todos`)
+--   3. both panels hold their composed empty state (headline + hint)
 --      instead of closing — a chat-opened panel is part of the chat UI
 --   4. :PiToggleChat (hide_ui/show_ui) closes them with the chat and brings
 --      them back
@@ -161,13 +161,15 @@ local ok_body, err = pcall(function()
 
     -- 3. Empty state, not a closed window -----------------------------------
     check(
-        "the tasks panel keeps its no-tasks placeholder",
-        win_text(tasks_win):find("no tasks", 1, true) ~= nil,
+        "the tasks panel keeps its empty state",
+        win_text(tasks_win):find("no background tasks", 1, true) ~= nil
+            and win_text(tasks_win):find("? help · q close", 1, true) ~= nil,
         ("got=%q"):format(win_text(tasks_win))
     )
     check(
-        "the todo panel keeps its no-todos placeholder",
-        win_text(todo_win):find("no todos", 1, true) ~= nil,
+        "the todo panel keeps its empty state",
+        win_text(todo_win):find("nothing planned yet", 1, true) ~= nil
+            and win_text(todo_win):find("q close", 1, true) ~= nil,
         ("got=%q"):format(win_text(todo_win))
     )
 

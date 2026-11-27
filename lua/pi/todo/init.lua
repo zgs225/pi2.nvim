@@ -86,8 +86,8 @@ local TITLE_SPEC = {
 
 --- How the panel window in a tab came to be open.
 ---   manual: the user ran :PiTodo (M.open()/M.toggle()) — the panel stays open
----           and shows a one-line "no todos" placeholder when the list empties
----           (unless hide_when_empty = false, same behavior).
+---           and shows its composed empty state when the list empties (unless
+---           hide_when_empty = false, same behavior).
 ---   auto:   opened by the empty→non-empty transition when
 ---           todo.panel.auto_open is set — when the list clears and
 ---           hide_when_empty is true, the panel closes instead of lingering.
@@ -98,6 +98,12 @@ local TITLE_SPEC = {
 --- panel renders whichever of them the tab is currently viewing).
 ---@type table<pi.Session, pi.TodoDetails>
 local state = {}
+
+--- Newest NON-EMPTY snapshot per session, kept when the list gets cleared so
+--- the empty state can report what the list held (`5/5 completed`) instead of
+--- only saying that it is gone. Never read while the list is non-empty.
+---@type table<pi.Session, pi.TodoDetails>
+local last_filled = {}
 
 ---@type table<pi.TabId, integer> panel window per tab
 local wins = {}
@@ -178,16 +184,108 @@ local function state_for_tab(tab)
     return session ~= nil and state[session] or nil
 end
 
+--- The hint every todo empty state ends with: `q` is the panel's only key.
+local EMPTY_HINT = "q close"
+
+--- Copy of the composed empty state (pi.PanelEmpty), per reason and language.
+---
+--- The todo panel already localizes its rows (`pi.todo.tool_ui.resolve_lang`),
+--- so its empty state follows the same language; `cleared` carries only the
+--- headline because its detail is the last non-empty progress fraction, which
+--- is already localized by `progress_text`.
+---@type table<"en"|"zh", { no_session: pi.PanelEmpty, never: pi.PanelEmpty, cleared: string }>
+local EMPTY_TEXT = {
+    en = {
+        cleared = "the list was cleared",
+        no_session = { headline = "no session in this tab", detail = "open one from :PiSessions" },
+        never = { headline = "nothing planned yet", detail = "ask, and I'll track it" },
+    },
+    zh = {
+        cleared = "清单已经清空了",
+        no_session = { headline = "此标签还没有会话", detail = "从 :PiSessions 里挑一个" },
+        never = { headline = "还没有任务清单", detail = "说要做什么，我拆给你看" },
+    },
+}
+
+--- Language of the empty state: the same resolution the checklist rows use.
+--- pcall'd because the panel must keep working while pi.todo.tool_ui is absent
+--- or stubbed (the specs replace it wholesale).
+---@return "en"|"zh"
+local function empty_lang()
+    local ok, lang = pcall(function()
+        return require("pi.todo.tool_ui").resolve_lang()
+    end)
+    if ok and lang == "zh" then
+        return "zh"
+    end
+    return "en"
+end
+
+--- Why this tab's panel has nothing to list, and what it should say about it.
+---
+--- The three reasons are already known here and each has a different next move
+--- for the user, so the panel reports the reason instead of a bare `no todos`
+--- (see doc/usage.md#the-pitodo-panel):
+---   - no session in the tab    -> where to get one
+---   - the session never wrote  -> what will fill the list
+---   - the list was cleared     -> what it held, from the last non-empty snapshot
+---@param tab pi.TabId
+---@return pi.PanelEmpty
+local function empty_state(tab)
+    local copy = EMPTY_TEXT[empty_lang()]
+    local session = viewed_session(tab)
+    if session == nil then
+        return { headline = copy.no_session.headline, detail = copy.no_session.detail, hint = EMPTY_HINT }
+    end
+    if state[session] == nil then
+        return { headline = copy.never.headline, detail = copy.never.detail, hint = EMPTY_HINT }
+    end
+    local filled = last_filled[session]
+    local detail, detail_hl = nil, nil
+    if filled ~= nil then
+        local ok, progress = pcall(function()
+            return require("pi.todo.tool_ui").progress_text(filled)
+        end)
+        if ok and type(progress) == "string" and progress ~= "" then
+            detail = progress
+        end
+        -- A list that was finished before it was cleared gets the completion
+        -- colour; a half-done one stays dim chrome.
+        if filled.completed ~= nil and filled.completed == filled.total then
+            detail_hl = "PiTodoDone"
+        end
+    end
+    return { headline = copy.cleared, detail = detail, detail_hl = detail_hl, hint = EMPTY_HINT }
+end
+
+--- The panel's display width in cells: the open window's width when there is
+--- one, else the configured `todo.panel.width`. The panel paints once before
+--- its window exists (open() needs the lines to decide whether to open at all)
+--- and open() re-renders once the window is up, so the centring converges on
+--- the real width.
+---@param tab pi.TabId
+---@return integer
+local function panel_width(tab)
+    local win = wins[tab]
+    if win and vim.api.nvim_win_is_valid(win) then
+        local ok, width = pcall(vim.api.nvim_win_get_width, win)
+        if ok and type(width) == "number" and width > 0 then
+            return width
+        end
+    end
+    return math.floor(panel_config().width)
+end
+
 --- Render lines for the panel's content, with the shared panel shell applied
---- (lua/pi/ui/panel_header.lua — spacer, title, spacer, then rows or the
---- placeholder). The title carries the panel-specific metric: the progress
---- fraction from pi.todo.tool_ui. The returned chunk map holds the extmark
---- highlights for the header block (PiPanelTitle) and, keyed by buffer line,
---- nothing else — the checklist rows stay plain.
---- Returns nil when the panel should render nothing. An empty list renders
---- the title plus the "no todos" placeholder only for manually-opened panels
---- (or when hide_when_empty is false); auto-opened panels are closed by
---- refresh() instead.
+--- (lua/pi/ui/panel_header.lua — spacer, title, spacer, then rows or the empty
+--- state). The title carries the panel-specific metric: the progress fraction
+--- from pi.todo.tool_ui. The returned chunk map holds the extmark highlights
+--- for the header block (PiPanelTitle) and the empty state's detail line, and
+--- nothing for the checklist rows — those stay plain.
+--- Returns nil when the panel should render nothing. An empty list renders the
+--- title plus the composed empty state (empty_state above) only for
+--- manually-opened panels (or when hide_when_empty is false); auto-opened
+--- panels are closed by refresh() instead.
 ---@param tab pi.TabId
 ---@return string[]? lines
 ---@return table<integer, [integer, integer, string][]>? chunks
@@ -200,7 +298,10 @@ local function panel_lines(tab)
         if cfg.hide_when_empty and opened_by[tab] ~= "manual" then
             return nil
         end
-        local header = PanelHeader.build(TITLE_SPEC)
+        local header = PanelHeader.build(vim.tbl_extend("force", TITLE_SPEC, {
+            empty = empty_state(tab),
+            width = panel_width(tab),
+        }))
         return header.lines, header.chunks
     end
     local todos = details.todos
@@ -429,8 +530,8 @@ end
 --- the tab's sidebar edge, the panel splits the last of them and stacks in
 --- the shared column/row; otherwise it opens as its own sidebar column. The
 --- window claims the edge in pi.ui.sidebar with a weight/order derived from
---- todo.panel.height / todo.panel.position. The panel shows a "no todos"
---- placeholder even when the list is empty (manually-opened windows ignore
+--- todo.panel.height / todo.panel.position. The panel shows its composed empty
+--- state even when the list is empty (manually-opened windows ignore
 --- hide_when_empty).
 --- `how` records how the panel came to be open ("auto" for the auto_open
 --- transition, default "manual" for :PiTodo); see pi.TodoOpenedBy.
@@ -492,6 +593,9 @@ function M.open(how)
     end
     if win then
         wins[tab] = win
+        -- Paint again now that the window exists: the empty state is centred on
+        -- the window width, and the first paint only knew the configured one.
+        render_buf(tab)
     end
 end
 
@@ -559,7 +663,7 @@ end
 --- The tab's viewed session changed (bind_chat rebind, tab detach): re-render
 --- that tab's open panel under the NEW viewed session's state — closing it
 --- when the new session has no todos (hide_when_empty, auto-opened panel) or
---- keeping the "no todos" placeholder for a manually-opened one. A closed
+--- keeping the composed empty state for a manually-opened one. A closed
 --- panel is not popped open here. Deferred via vim.schedule: safe from RPC
 --- callbacks and session-switch flows.
 ---@param tab pi.TabId
@@ -579,6 +683,7 @@ end
 function M.on_session_closed(session)
     if type(session) == "table" then
         state[session] = nil
+        last_filled[session] = nil
     end
     if refresh_scheduled then
         return
@@ -603,6 +708,7 @@ end
 function M.on_conversation_replaced(session)
     if type(session) == "table" then
         state[session] = nil
+        last_filled[session] = nil
         local tab = session.attached_tab or session.tab
         if tab then
             auto_open_pending[tab] = nil
@@ -653,6 +759,11 @@ function M.update_from_details(details, session)
     local tab = session.attached_tab or session.tab
     local is_viewed = tab ~= nil and viewed_session(tab) == session
     local was_empty = not has_todos(state[session])
+    -- Remember the newest non-empty list before overwriting it: a cleared list
+    -- still has something worth saying (`5/5 completed`).
+    if has_todos(state[session]) then
+        last_filled[session] = state[session]
+    end
     state[session] = {
         todos = details.todos,
         completed = tonumber(details.completed) or 0,
@@ -724,6 +835,7 @@ function M._reset()
     wins = {}
     bufs = {}
     state = {}
+    last_filled = {}
     opened_by = {}
     refresh_scheduled = false
     auto_open_pending = {}

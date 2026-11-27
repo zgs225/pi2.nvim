@@ -274,7 +274,7 @@ describe("todo panel new_session and conversation replacement", function()
         assert.is_nil(Todo._opened_by())
     end)
 
-    it("manually opened panel (M.open('manual')) stays open showing the '  no todos' placeholder", function()
+    it("manually opened panel (M.open('manual')) stays open showing the empty state", function()
         local tab = vim.api.nvim_get_current_tabpage()
         local session = make_session("sess-manual")
         Manager._bind_shim_for_test(session, tab)
@@ -298,7 +298,10 @@ describe("todo panel new_session and conversation replacement", function()
         local lines_after = panel_lines(tab)
         assert.is_truthy(lines_after)
         assert.are.equal(TODO_TITLE, lines_after[2], "the shell keeps its title after /new")
-        assert.are.equal("  no todos", lines_after[4], "placeholder is rendered instead of stale todos")
+        assert.is_truthy(
+            lines_after[4]:find("nothing planned yet", 1, true),
+            "the empty state is rendered instead of stale todos"
+        )
     end)
 
     it("auto_open_pending is cleared: a stale marker for that tab does not re-open the panel", function()
