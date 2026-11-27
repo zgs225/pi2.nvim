@@ -48,6 +48,28 @@ describe("ask renderer", function()
         return table.concat(vim.api.nvim_buf_get_lines(h:buf(), 0, -1, false), "\n")
     end
 
+    it("paints the header with its own icon, not the generic tool fallback", function()
+        -- Blocks are read by their glyph: the generic fallback makes an ask look
+        -- like an unrecognized tool. nf-md-comment_question_outline is the
+        -- speech bubble with a question mark — a question addressed to the
+        -- reader, which is what the ask tool is.
+        local icon = vim.fn.nr2char(0xF0186, 1)
+        assert.are.equal(icon, Tools.get_tool_icon("ask"))
+        assert.is_not.equal(Config.options.labels.tool, Tools.get_tool_icon("ask"))
+        local text = render(1208, {}, {
+            content = { { type = "text", text = "answered 1/1" } },
+            details = {
+                v = 1,
+                questions = { { id = "q1", header = "Database" } },
+                answers = { { id = "q1", answered = true, labels = { "Postgres" } } },
+            },
+        })
+        local header = vim.split(text, "\n", { plain = true })[1]
+        assert.matches(icon .. " ask", header)
+        -- The count still renders, on the block's first body row.
+        assert.matches("ask · 1 question", text)
+    end)
+
     it("renders a cancelled ask as one cancelled row", function()
         local text = render(1201, { questions = {} }, {
             content = { { type = "text", text = "User cancelled the questions." } },

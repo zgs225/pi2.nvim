@@ -34,6 +34,7 @@ local TOOL_ICONS = {
     stop_task = nf(0xF04DB), -- nf-md-stop (model-side stop of a bash task)
     list_tasks = nf(0xF0279), -- nf-md-format-list-bulleted
     task_input = nf(0xF030C), -- nf-md-keyboard (writing to a bg task's stdin)
+    ask = nf(0xF0186), -- nf-md-comment_question_outline (the model asks you a question)
     codemode = nf(0xF031E), -- nf-md-language_javascript
     read = nf(0xF0219), -- nf-md-file-document
     edit = nf(0xF03EB), -- nf-md-pencil
