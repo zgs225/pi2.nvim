@@ -581,6 +581,38 @@ function Layout:on_resize()
     end
 end
 
+--- Open the side panels configured to come up with the chat
+--- (`tasks_panel.open_with_chat` / `todo.panel.open_with_chat`) — the
+--- `:PiTasks` / `:PiTodo` counterpart of `sessions_list.auto_open`.
+---
+--- Deliberately called from `Layout:show()`, next to the sessions hook, so every
+--- path that makes the chat visible (initial open, `set_layout`, `set_mode`,
+--- the restore after `hide_ui`) brings the panel back: an `open()` is idempotent
+--- (it only focuses an existing window). It runs AFTER the chat windows exist so
+--- a new side column anchors on the chat column instead of on the editor's
+--- borrowed window, and `Chat:show()` focuses the prompt afterwards, so the
+--- hook never steals the cursor.
+---
+--- Exposed as `Layout._open_with_chat_panels` so a spec can drive the decision
+--- without constructing a whole chat.
+---@return boolean opened whether at least one panel was requested
+local function open_with_chat_panels()
+    local opened = false
+    local tasks_cfg = Config.options.tasks_panel or {}
+    if tasks_cfg.open_with_chat then
+        require("pi.ui.tasks").open()
+        opened = true
+    end
+    local todo_cfg = (Config.options.todo or {}).panel or {}
+    if todo_cfg.open_with_chat then
+        require("pi.todo").open()
+        opened = true
+    end
+    return opened
+end
+
+Layout._open_with_chat_panels = open_with_chat_panels
+
 ---@return boolean opened true if a fresh open occurred
 function Layout:show()
     if self._history_win and vim.api.nvim_win_is_valid(self._history_win) then
@@ -597,6 +629,7 @@ function Layout:show()
     if Config.options.sessions_list.auto_open then
         require("pi.ui.sessions").open()
     end
+    open_with_chat_panels()
     return true
 end
 

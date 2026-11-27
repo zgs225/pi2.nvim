@@ -221,6 +221,7 @@
 
 ---@class pi.TodoPanelConfig
 ---@field auto_open? boolean Open the todo side panel automatically when a session has unfinished items (default false)
+---@field open_with_chat? boolean Open the panel together with the chat, so it is on screen the moment the session opens and survives a layout switch (default false). The panel then behaves like a manual open: it keeps the `no todos` placeholder instead of closing when the list empties
 ---@field height? number Stacked panel height: fraction of the shared column when < 1 (default 0.5, an even split), absolute lines when >= 1
 ---@field position? "left"|"right"|"above"|"below" Side column (left/right) the panel lives in (default "right"); the legacy "above"/"below" stack it around the :PiSessions panel instead
 ---@field width? number Column width when the panel opens a side column on its own: columns (>=1) or a fraction of the editor width (<1, default 40)
@@ -255,6 +256,7 @@
 ---@field width integer Window width for left/right placement in the side layout (default 40)
 ---@field height integer Window height for top/bottom placement in the side layout (default 12)
 ---@field auto_open? boolean Open the tasks panel when a background task starts in the current tab (default false)
+---@field open_with_chat? boolean Open the panel together with the chat, so it is on screen the moment the session opens and survives a layout switch (default false). The all-tasks-finished auto-close is disabled then: the panel belongs to the chat UI, not to one task
 
 ---@class pi.CompactionCleanerConfig Bounded, deterministic file lists for pi's default compaction (no LLM)
 ---@field enabled? boolean Bound the file lists before pi summarises (default true)
@@ -692,6 +694,7 @@ local defaults = {
         max_items = 20,
         panel = {
             auto_open = false,
+            open_with_chat = false,
             height = 0.5,
             position = "right",
             width = 40,
@@ -720,6 +723,7 @@ local defaults = {
         width = 40,
         height = 12,
         auto_open = false,
+        open_with_chat = false,
     },
     background_tasks = {
         wake_on_completion = "never",
