@@ -285,18 +285,21 @@ describe("todo panel", function()
             assert.is_false(Todo.is_open())
         end)
 
-        it("open when no todos still shows the placeholder (explicit toggle)", function()
+        it("open when no todos still shows the empty state (explicit toggle)", function()
             update({ todos = {}, completed = 0, total = 0 })
             Todo.open()
             assert.is_true(Todo.is_open())
             local bufnr = vim.api.nvim_win_get_buf(vim.api.nvim_get_current_win())
             local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
-            -- The shared shell keeps the title on an empty list; the
-            -- placeholder sits below the header block.
+            -- The shared shell keeps the title on an empty list; the composed
+            -- empty state (headline + hint here: nothing was filled before) sits
+            -- below the header block.
             assert.are.equal("", lines[1])
             assert.are.equal(TODO_TITLE, lines[2])
             assert.are.equal("", lines[3])
-            assert.are.equal("  no todos", lines[4])
+            assert.is_truthy(lines[4]:find("the list was cleared", 1, true))
+            assert.are.equal("", lines[5])
+            assert.is_truthy(lines[6]:find("q close", 1, true))
         end)
 
         it("close is a safe no-op when nothing is open", function()
@@ -344,6 +347,77 @@ describe("todo panel", function()
             local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
             assert.are.equal(TODO_TITLE .. " · 0/1 completed", lines[2])
             assert.are.equal("  ○ only item", lines[4])
+        end)
+    end)
+
+    describe("empty state", function()
+        --- Buffer lines of the panel open in the current tab.
+        ---@return string[]
+        local function lines()
+            local bufnr = vim.api.nvim_win_get_buf(vim.api.nvim_get_current_win())
+            return vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+        end
+
+        it("names the missing session when the tab hosts none", function()
+            Todo.open()
+            local l = lines()
+            assert.is_truthy(l[4]:find("no session in this tab", 1, true))
+            assert.is_truthy(l[5]:find(":PiSessions", 1, true))
+        end)
+
+        it("says what will fill the list when the session never wrote one", function()
+            session_for_tab(vim.api.nvim_get_current_tabpage())
+            Todo.open()
+            local l = lines()
+            assert.is_truthy(l[4]:find("nothing planned yet", 1, true))
+            assert.is_truthy(l[5]:find("ask, and I'll track it", 1, true))
+        end)
+
+        it("reports what a cleared list held, not just that it is gone", function()
+            update(details({
+                { content = "a", status = "completed" },
+                { content = "b", status = "completed" },
+            }))
+            update({ todos = {}, completed = 0, total = 0 })
+            Todo.open()
+            local l = lines()
+            assert.is_truthy(l[4]:find("the list was cleared", 1, true))
+            assert.is_truthy(l[5]:find("2/2 completed", 1, true), "the last non-empty progress survives the clear")
+        end)
+
+        it("paints a fully finished list's detail with PiTodoDone", function()
+            update(details({ { content = "a", status = "completed" } }))
+            update({ todos = {}, completed = 0, total = 0 })
+            Todo.open()
+            local bufnr = vim.api.nvim_win_get_buf(vim.api.nvim_get_current_win())
+            local found
+            for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(bufnr, -1, 0, -1, { details = true })) do
+                local details_ = mark[4]
+                if mark[2] == 4 and details_.hl_group == "PiTodoDone" then
+                    found = true
+                end
+            end
+            assert.is_true(found, "a 1/1 cleared list reads as done, not as dim chrome")
+        end)
+
+        it("keeps a half-finished list's detail dim", function()
+            update(details({
+                { content = "a", status = "completed" },
+                { content = "b", status = "pending" },
+            }))
+            update({ todos = {}, completed = 0, total = 0 })
+            Todo.open()
+            local bufnr = vim.api.nvim_win_get_buf(vim.api.nvim_get_current_win())
+            for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(bufnr, -1, 0, -1, { details = true })) do
+                assert.are_not.equal("PiTodoDone", mark[4].hl_group, "a 1/2 list is not `all finished`")
+            end
+        end)
+
+        it("always ends with the panel's only key", function()
+            update({ todos = {}, completed = 0, total = 0 })
+            Todo.open()
+            local l = lines()
+            assert.is_truthy(l[#l]:find("q close", 1, true))
         end)
     end)
 
@@ -650,7 +724,8 @@ describe("todo panel", function()
             local bufnr = vim.api.nvim_win_get_buf(vim.api.nvim_get_current_win())
             local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
             assert.are.equal(TODO_TITLE, lines[2], "the title survives the empty list")
-            assert.are.equal("  no todos", lines[4])
+            assert.is_truthy(lines[4]:find("the list was cleared", 1, true))
+            assert.is_truthy(lines[5]:find("0/1 completed", 1, true))
         end)
     end)
 
@@ -677,7 +752,8 @@ describe("todo panel", function()
             local bufnr = vim.api.nvim_win_get_buf(vim.api.nvim_get_current_win())
             local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
             assert.are.equal(TODO_TITLE, lines[2], "the title survives the empty list")
-            assert.are.equal("  no todos", lines[4])
+            assert.is_truthy(lines[4]:find("the list was cleared", 1, true))
+            assert.is_truthy(lines[5]:find("0/1 completed", 1, true))
         end)
     end)
 

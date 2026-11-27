@@ -59,7 +59,7 @@ And mid-session management:
 
 | Command | Lua | What it does |
 | --- | --- | --- |
-| `:PiNewSession` | `pi.new_session()` | Discard the current session in this tab and start a fresh one. When viewing a sub-session, switches back to the parent first. Sub-session rows from the previous conversation are hidden in `:PiSessions` (press `H` or use `:PiSubSwitch` to recall them), and its todo list is dropped as well — an auto-opened `:PiTodo` panel closes, an explicitly opened one shows the `no todos` placeholder. Extensions can cancel this via the `session_before_switch` hook (e.g. to warn about unsaved draft state). |
+| `:PiNewSession` | `pi.new_session()` | Discard the current session in this tab and start a fresh one. When viewing a sub-session, switches back to the parent first. Sub-session rows from the previous conversation are hidden in `:PiSessions` (press `H` or use `:PiSubSwitch` to recall them), and its todo list is dropped as well — an auto-opened `:PiTodo` panel closes, an explicitly opened one falls back to its empty state. Extensions can cancel this via the `session_before_switch` hook (e.g. to warn about unsaved draft state). |
 | `:PiTree` | `pi.tree()` | Navigate the session tree: jump back to any past conversation point, optionally summarizing the abandoned branch. See [Session tree navigation](#session-tree-navigation-pitree). |
 | `:PiFork` | `pi.fork()` | Start a new session from a past user message. See [Fork and clone](#fork-and-clone). |
 | `:PiClone` | `pi.clone()` | Duplicate the current branch into a new session file. See [Fork and clone](#fork-and-clone). |

@@ -175,7 +175,7 @@ The shared container of the side panels (`:PiTodo`, `:PiTasks`, `:PiCompactions`
 
 | Group | Role |
 | --- | --- |
-| `PiPanelTitle` | The whole dimmed header block: the panel title line (`󰝖 Todo · 2/5 completed`, ` Tasks · 1 running · 2 finished`, `󰏗 Compactions · 3`), the optional keybinding hint line (`? help · q close`), and the empty-list placeholder (`no todos`, `no tasks`, `no compactions`). Dim by default (the comment colour, not bold) so the panel's own rows carry the emphasis. |
+| `PiPanelTitle` | The dimmed chrome of a side panel: the title line (`󰝖 Todo · 2/5 completed`, ` Tasks · 1 running · 2 finished`, `󰏗 Compactions · 3`), the optional keybinding hint line (`? help · q close`), the empty state's detail and key-cue lines (`ask, and I'll track it`, `q close`), and the legacy `no <noun>` placeholder (`:PiCompactions` still uses it). Dim by default (the comment colour, not bold) so the panel's own rows carry the emphasis. The empty state's **headline** is deliberately excluded: it carries no highlight and renders in the window's own text colour (`PiFloat` in a float, `Normal` in a side split), because it states content rather than chrome. |
 
 ## Sessions overview
 
@@ -213,6 +213,6 @@ The shared container of the side panels (`:PiTodo`, `:PiTasks`, `:PiCompactions`
 
 | Group | Role |
 | --- | --- |
-| `PiTodoDone` | Completed (`✓`) todo row / footer summary chunk in the sub-session viewer's todo display (links to `DiagnosticOk`) |
+| `PiTodoDone` | Completed (`✓`) todo row / footer summary chunk in the sub-session viewer's todo display, and the `:PiTodo` panel's empty-state detail when the cleared list had every item finished (links to `DiagnosticOk`) |
 | `PiTodoInProgress` | In-progress (`◐`) todo row / footer summary chunk in the sub-session viewer's todo display (links to `DiagnosticWarn`) |
 | `PiTodoPending` | Pending (`○`) todo row / footer summary chunk in the sub-session viewer's todo display (links to `Comment`) |

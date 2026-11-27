@@ -448,17 +448,53 @@ describe("tasks panel UI", function()
             assert.are.equal(3, pos[2], "marker on the indented dot")
         end)
 
-        it("shows a dimmed no-tasks placeholder under a count-free title", function()
+        it("shows a composed empty state under a count-free title", function()
             Panel.open()
             local lines = panel_lines()
-            assert.are.equal(4, #lines)
             assert.are.equal("", lines[1])
             assert.are.equal("  " .. ICON .. " Tasks", lines[2], "title carries no counts without tasks")
             assert.is_nil(lines[2]:find("·", 1, true), "no counts appended")
             assert.are.equal("", lines[3])
-            assert.are.equal("  no tasks", lines[4])
+            -- No session in the tab: the empty state names that, and where
+            -- sessions come from, instead of a bare `no tasks`.
+            assert.is_truthy(lines[4]:find("no session in this tab", 1, true))
+            assert.is_truthy(lines[5]:find("open one from :PiSessions", 1, true))
+            assert.are.equal("", lines[6])
+            assert.is_truthy(lines[7]:find("? help · q close", 1, true))
             assert.is_truthy(hl_on_line(2).PiPanelTitle, "title keeps its dim shell style")
-            assert.is_truthy(hl_on_line(4).PiPanelTitle, "placeholder renders dimmed")
+            assert.is_truthy(hl_on_line(5).PiPanelTitle, "the detail line renders dimmed")
+            assert.is_falsy(hl_on_line(4).PiPanelTitle, "the headline renders as content, not as chrome")
+        end)
+
+        it("teaches the A key when only other sessions have tasks", function()
+            seed({ id = "theirs", command = "theirs cmd", session_id = "sess-2", tab = 2 })
+            Panel._set_session_resolver(function()
+                return "sess-1"
+            end)
+            Panel.open()
+            local lines = panel_lines()
+            assert.is_truthy(lines[4]:find("no tasks in this session", 1, true))
+            assert.is_truthy(lines[5]:find("A  shows 1 in other tabs", 1, true))
+        end)
+
+        it("teaches the !& prefix when the registry is empty for this session", function()
+            Panel._set_session_resolver(function()
+                return "sess-1"
+            end)
+            Panel.open()
+            local lines = panel_lines()
+            assert.is_truthy(lines[4]:find("no background tasks", 1, true))
+            assert.is_truthy(lines[5]:find("!& npm run dev", 1, true))
+        end)
+
+        it("keeps the empty state out of the row list and the marker path", function()
+            Panel.open()
+            local win = Panel.win(vim.api.nvim_get_current_tabpage())
+            for lnum = 4, 7 do
+                vim.api.nvim_win_set_cursor(win, { lnum, 0 })
+                local row = Panel._row_task_under_cursor()
+                assert.is_nil(row, "no row behind the empty block (line " .. lnum .. ")")
+            end
         end)
     end)
 

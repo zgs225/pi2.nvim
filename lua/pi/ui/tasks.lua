@@ -439,6 +439,43 @@ local function refresh_current_markers(session_id)
     end
 end
 
+--- Copy of the composed empty state (pi.PanelEmpty), per reason.
+---
+--- English only, deliberately: this panel's rows carry no localized strings
+--- (`held (cache)`, `log removed`, `3m ago`), so a translated empty state would
+--- be the only Chinese line in an English panel. Each reason names the user's
+--- next move, which differs every time: the `A` key for the other sessions'
+--- tasks, `!&` to start one, or a session to open.
+---@type table<string, pi.PanelEmpty>
+local EMPTY_TEXT = {
+    no_session = { headline = "no session in this tab", detail = "open one from :PiSessions" },
+    none = { headline = "no background tasks", detail = "!& npm run dev  starts one" },
+}
+
+--- The panel's empty-state hint: `?` is the shortcut overlay, `q` closes.
+local EMPTY_HINT = "? help · q close"
+
+--- The empty state of the panel: why nothing is listed, and what to do about it.
+---
+--- Three reasons with three different next moves, all of them already known
+--- here: this session has no tasks but other sessions do (so name the `A` key),
+--- the tab hosts no session (so say where sessions come from), or the registry
+--- is empty (so teach the `!&` prefix that starts a background task).
+---@param session_id string? owning session of the panel's tab (nil = no session)
+---@param all_rows pi.TasksRow[] every known row, before the session filter
+---@return pi.PanelEmpty
+local function empty_state(session_id, all_rows)
+    if #all_rows > 0 and not show_all then
+        return {
+            headline = "no tasks in this session",
+            detail = ("A  shows %d in other tabs"):format(#all_rows),
+            hint = EMPTY_HINT,
+        }
+    end
+    local copy = session_id == nil and EMPTY_TEXT.no_session or EMPTY_TEXT.none
+    return { headline = copy.headline, detail = copy.detail, hint = EMPTY_HINT }
+end
+
 --- Rebuild the buffer contents from live task state.
 function M._render()
     if not buf or not vim.api.nvim_buf_is_valid(buf) then
@@ -446,9 +483,10 @@ function M._render()
     end
 
     local session_id = current_session_id()
+    local all_rows = Tasks.build_rows()
     ---@type pi.TasksRow[]
     rows = {}
-    for _, row in ipairs(Tasks.build_rows()) do
+    for _, row in ipairs(all_rows) do
         if show_all or session_id == nil or row.task.session_id == session_id then
             rows[#rows + 1] = row
         end
@@ -465,20 +503,32 @@ function M._render()
         end
     end
     -- No rows means nothing to count: the shared shell then renders the bare
-    -- name and the `no tasks` placeholder instead of a `0 running · 0 finished`.
+    -- name and the empty state instead of a `0 running · 0 finished`.
     local metric = nil
     if #rows > 0 then
         metric = ("%d running · %d finished"):format(running, finished)
     end
 
-    -- Rows are formatted against the widest visible list window; the summary
-    -- budget inside format_line subtracts the shell indent.
+    -- Rows are formatted against the widest visible list window (with a floor
+    -- of 80, so a narrow column clips rather than making every summary
+    -- ellipsis-thin); the empty block is centred against the REAL window width
+    -- instead, or it would drift off-centre in a 40-column column.
     local width = 80
+    local empty_width = nil
     for _, win in pairs(wins) do
         if vim.api.nvim_win_is_valid(win) then
-            width = math.max(width, vim.api.nvim_win_get_width(win))
+            local win_width = vim.api.nvim_win_get_width(win)
+            width = math.max(width, win_width)
+            empty_width = math.max(empty_width or 0, win_width)
         end
     end
+    empty_width = empty_width or panel_cfg().width
+
+    local empty = nil
+    if #rows == 0 then
+        empty = empty_state(session_id, all_rows)
+    end
+
     ---@type pi.PanelRow[]
     local row_specs = {}
     for i, row in ipairs(rows) do
@@ -486,7 +536,10 @@ function M._render()
         row_specs[i] = { line = line, chunks = chunks }
     end
 
-    local header = PanelHeader.build(vim.tbl_extend("force", TITLE_SPEC, { metric = metric }), row_specs)
+    local header = PanelHeader.build(
+        vim.tbl_extend("force", TITLE_SPEC, { metric = metric, empty = empty, width = empty_width }),
+        row_specs
+    )
     local lines = header.lines
     local line_chunks = header.chunks
     -- The current-row marker sits on the status dot: the first chunk of the
